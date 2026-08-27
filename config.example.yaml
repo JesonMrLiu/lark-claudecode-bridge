@@ -1,0 +1,10 @@
+feishu:
+  app_id: cli_xxxx        # 飞书开放平台 → 凭证与基础信息
+  app_secret: xxxx
+  # domain: lark          # 国际版 Lark 才需要
+workspaces:                # 工作区白名单：名字 + 路径
+  - name: demo
+    path: F:\workspace\demo
+defaults:
+  workspace: demo
+concurrency: 3             # 通道间并发上限
