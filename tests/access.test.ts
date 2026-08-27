@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -49,4 +49,26 @@ describe('AccessControl', () => {
     expect(a.listPending().length).toBe(1);
     expect(a.approvePairing(c2).ok).toBe(true);
   });
+  it('配对结果持久化：重新 load 后仍在白名单（round-trip）', () => {
+    const storePath = join(mkdtempSync(join(tmpdir(), 'lcb-a-')), 'access.json');
+    const a = AccessControl.load(storePath);
+    a.approvePairing(a.beginPairing('ou_persist', '持久'));
+    // 用同一路径重新加载，断言状态确实落盘而非仅内存
+    const b = AccessControl.load(storePath);
+    expect(b.isAllowed('ou_persist')).toBe(true);
+    expect(b.isAdmin('ou_persist')).toBe(true);
+  });
+  it('超过 15 分钟的配对码过期拒绝（真实时钟推进）', () => {
+    vi.useFakeTimers();
+    const a = fresh();
+    const code = a.beginPairing('ou_late', '迟到');
+    // 推进 16 分钟，覆盖 evict 的 expiresAt 分支
+    vi.setSystemTime(Date.now() + 16 * 60 * 1000);
+    expect(a.approvePairing(code).ok).toBe(false);
+    expect(a.listPending().length).toBe(0);
+  });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
