@@ -1,6 +1,6 @@
 // Claude 执行器：封装 Agent SDK 的 query()，把流消息转成进度事件并收集产出
 // 注意：不覆盖/清理任何 ANTHROPIC_* 环境变量，凭证与代理配置透传 process.env
-import { query, type CanUseTool, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { OutputCollector } from './output-collector.js';
 import type { ProgressEvent, TaskOutcome } from '../types.js';
 
@@ -12,9 +12,12 @@ export interface RunTaskOptions {
   cwd: string;
   resumeSessionId?: string;
   signal?: AbortSignal;
-  // 收窄签名：SDK 的 CanUseTool 还带第三参 options（signal/suggestions 等），
-  // 此处仅暴露 (toolName, input)；deny 时实现方必须带 message（SDK 要求）
-  canUseTool?: (toolName: string, input: Record<string, unknown>) => Promise<{ behavior: 'allow' | 'deny'; message?: string }>;
+  // 收窄签名：SDK 的 CanUseTool 还带第三参 options（signal/suggestions 等），此处仅暴露 (toolName, input)。
+  // deny 分支 message 必填，与 SDK PermissionResult 判别联合结构兼容，可直接透传
+  canUseTool?: (
+    toolName: string,
+    input: Record<string, unknown>,
+  ) => Promise<{ behavior: 'allow'; message?: string } | { behavior: 'deny'; message: string }>;
 }
 
 // SDK 选项只收 abortController（无 signal 项），把外部 signal 的中止转发给它
@@ -43,8 +46,7 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
     permissionMode: 'default',
     includePartialMessages: false,
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
-    // 收窄签名与 SDK CanUseTool 返回结构不兼容（deny 分支 message 可选 vs 必填），断言透传，引用保持原样
-    ...(opts.canUseTool ? { canUseTool: opts.canUseTool as unknown as CanUseTool } : {}),
+    ...(opts.canUseTool ? { canUseTool: opts.canUseTool } : {}),
     ...(opts.signal ? { abortController: bridgeSignal(opts.signal) } : {}),
   };
   const q = query({ prompt, options });
