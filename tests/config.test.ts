@@ -43,4 +43,16 @@ describe('loadConfig', () => {
     const bad = VALID.replace('workspace: demo', 'workspace: nope');
     expect(() => loadConfig(tmpYaml(bad))).toThrow(/nope/);
   });
+  it('concurrency 非数字（\'abc\' → NaN）抛可读错误', () => {
+    // 修复前 NaN 透传给 Semaphore → 任务永远拿不到许可（死锁）
+    expect(() => loadConfig(tmpYaml(VALID + '\nconcurrency: abc\n'))).toThrow(/concurrency/);
+    expect(() => loadConfig(tmpYaml(VALID + '\nconcurrency: abc\n'))).toThrow(/1-100/);
+  });
+  it('concurrency 为 0 或超出上限抛错', () => {
+    expect(() => loadConfig(tmpYaml(VALID + '\nconcurrency: 0\n'))).toThrow(/concurrency/);
+    expect(() => loadConfig(tmpYaml(VALID + '\nconcurrency: 101\n'))).toThrow(/concurrency/);
+    // 合法边界仍通过
+    expect(loadConfig(tmpYaml(VALID + '\nconcurrency: 1\n')).concurrency).toBe(1);
+    expect(loadConfig(tmpYaml(VALID + '\nconcurrency: 100\n')).concurrency).toBe(100);
+  });
 });

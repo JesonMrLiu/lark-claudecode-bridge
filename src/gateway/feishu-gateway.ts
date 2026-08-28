@@ -25,6 +25,9 @@ export interface FeishuSdk {
       image: { create(payload: { data: { image_type: 'message'; image: NodeJS.ReadableStream } }): Promise<{ image_key?: string } | null> };
       file: { create(payload: { data: { file_type: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream'; file_name: string; file: NodeJS.ReadableStream } }): Promise<{ file_key?: string } | null> };
     };
+    // 通用请求口（SDK 1.73.0 未封装 bot info 接口，经此调 GET /open-apis/bot/v3/info 拿机器人 open_id）
+    request(payload: { method: string; url: string }):
+      Promise<{ code?: number; msg?: string; bot?: { open_id?: string } }>;
   };
   Domain: { Feishu: unknown; Lark: unknown };
 }
@@ -49,13 +52,17 @@ interface RawMessagePayload {
 /**
  * 解析 im.message.receive_v1 事件为 IncomingMessage。
  *
+ * 群聊 @检测：botOpenId（机器人 open_id）可用时按 mentions 数组精确匹配——
+ * 占位符/mentions 非空无法区分 @机器人 vs @普通人（群里 @任何人都命中，会被误当任务执行）；
+ * botOpenId 缺失（获取失败/未提供）时退化为旧的占位符 + mentions 非空判定。
+ *
  * ⚠️ 数据结构说明（与 brief 参考实现不同）：node-sdk 的 EventDispatcher 回调收到的是
  * RequestHandle.parse() 展平后的数据——v2 事件 {schema, header, event} 被解包为
  * 顶层 {...header, ...event}，即顶层 {sender, message}；而非 {event: {message, sender}}。
  * 本函数以展平结构为主，同时兼容 {event: {...}} 包裹形态（原始事件体直投）。
  * 结构不合法一律返回 null，绝不抛异常。
  */
-export function parseIncomingMessage(event: unknown): IncomingMessage | null {
+export function parseIncomingMessage(event: unknown, botOpenId?: string): IncomingMessage | null {
   try {
     if (event === null || typeof event !== 'object') return null;
     const raw = event as { event?: RawMessagePayload } & RawMessagePayload;
@@ -65,11 +72,19 @@ export function parseIncomingMessage(event: unknown): IncomingMessage | null {
     const text = (JSON.parse(m.content ?? '{}') as { text?: string }).text ?? '';
     if (!text.trim()) return null;
     const isGroup = m.chat_type !== 'p2p';
-    // 群聊必须 @机器人 才处理：文本里渲染为 @_user_N 占位；mentions 数组兜底
-    //（部分客户端形态下占位符缺失但 mentions 存在）
-    const mentionedInText = /@_user_\d+/.test(text);
-    const hasMention = mentionedInText || (m.mentions?.length ?? 0) > 0;
-    if (isGroup && !hasMention) return null;
+    if (isGroup) {
+      if (botOpenId) {
+        // 精确判定：mentions 中存在 open_id === 机器人 open_id 的条目才算 @机器人
+        const mentionsBot = (m.mentions ?? []).some((t) => t.id?.open_id === botOpenId);
+        if (!mentionsBot) return null;
+      } else {
+        // 退化判定：文本里渲染为 @_user_N 占位；mentions 数组兜底
+        //（部分客户端形态下占位符缺失但 mentions 存在）
+        const mentionedInText = /@_user_\d+/.test(text);
+        const hasMention = mentionedInText || (m.mentions?.length ?? 0) > 0;
+        if (!hasMention) return null;
+      }
+    }
     const userId = payload?.sender?.sender_id?.open_id;
     if (!userId) return null;
     return {
@@ -124,19 +139,39 @@ export class FeishuGateway {
     this.client = new this.sdk.Client({ appId: cfg.appId, appSecret: cfg.appSecret, domain });
   }
 
+  /**
+   * 拉取机器人 open_id：群聊 @检测的精确匹配依据。
+   * SDK 1.73.0 未封装「获取机器人信息」接口（bot 命名空间仅 v4.bot.search），
+   * 经通用 request() 调 GET /open-apis/bot/v3/info。失败不阻断启动，
+   * 仅 warn 一次并让群聊 @检测退化为占位符匹配。
+   */
+  private async fetchBotOpenId(): Promise<string | undefined> {
+    try {
+      const res = await this.client.request({ method: 'GET', url: '/open-apis/bot/v3/info' });
+      const openId = res?.bot?.open_id;
+      if (openId) return openId;
+      console.warn(`[gateway] 机器人信息未返回 open_id：${JSON.stringify(res)}，群聊 @检测退化为占位符匹配`);
+    } catch (e) {
+      console.warn('[gateway] 获取机器人 open_id 失败（不影响启动），群聊 @检测退化为占位符匹配：', e);
+    }
+    return undefined;
+  }
+
   /** 建立 WS 长连接并注册事件分发（im.message.receive_v1 / card.action.trigger） */
   async start(handlers: GatewayHandlers): Promise<void> {
+    const botOpenId = await this.fetchBotOpenId();
     const ws = new this.sdk.WSClient({ appId: this.cfg.appId, appSecret: this.cfg.appSecret });
     const dispatcher = new this.sdk.EventDispatcher({}).register({
       'im.message.receive_v1': async (data: never) => {
-        const msg = parseIncomingMessage(data);
+        const msg = parseIncomingMessage(data, botOpenId);
         if (msg) await handlers.onMessage(msg);
       },
-      // 卡片回调必须返回 {}（飞书 SDK 契约：返回值经 WS 回传，undefined 会被当异常）
+      // 卡片回调必须返回对象（飞书 SDK 契约：返回值经 WS 回传，undefined 会被当异常）；
+      // handler 返回了响应体（如非发起人点击的 toast）则透传，否则返回 {}
       'card.action.trigger': async (data: never) => {
         const action = parseCardAction(data);
-        if (action) await handlers.onCardAction(action);
-        return {};
+        const ret = action ? await handlers.onCardAction(action) : undefined;
+        return ret ?? {};
       },
     });
     await ws.start({ eventDispatcher: dispatcher });

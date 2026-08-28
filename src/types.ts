@@ -12,9 +12,11 @@ export interface IncomingMessage {
 }
 export interface CardActionValue { requestId: string; decision: 'allow' | 'deny' | 'allow-session' }
 export interface CardActionEvent { value: CardActionValue; operatorId: string; openMessageId: string }
+/** card.action.trigger 回调的返回体：非空时由 gateway 透传给飞书（toast 等轻提示） */
+export interface CardActionResponse { toast?: { type: 'info' | 'success' | 'error' | 'warning'; content: string } }
 export interface GatewayHandlers {
   onMessage(msg: IncomingMessage): Promise<void>;
-  onCardAction(action: CardActionEvent): Promise<void>;
+  onCardAction(action: CardActionEvent): Promise<CardActionResponse | void>;
 }
 export interface ConfirmationRequest {
   requestId: string; toolName: string; summary: string; diff?: string; workspaceName: string;

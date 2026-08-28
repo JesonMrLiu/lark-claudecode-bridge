@@ -29,6 +29,11 @@ export function loadConfig(path: string = CONFIG_PATH): BridgeConfig {
   if (!workspaces.some((w) => w.name === defaults.workspace)) {
     throw new Error(`defaults.workspace "${defaults.workspace}" 不在 workspaces 列表中`);
   }
+  // 非法值必须在此处抛错：NaN/0 透传给 Semaphore 会导致任务永远拿不到许可（死锁）
+  const concurrency = Number(doc.concurrency ?? 3);
+  if (!Number.isFinite(concurrency) || concurrency < 1 || concurrency > 100) {
+    throw new Error(`concurrency 必须为 1-100 的数字（当前值：${String(doc.concurrency)}），请检查 config.yaml`);
+  }
   return {
     feishu: {
       appId: feishu.app_id,
@@ -37,6 +42,6 @@ export function loadConfig(path: string = CONFIG_PATH): BridgeConfig {
     },
     workspaces,
     defaults: { workspace: defaults.workspace },
-    concurrency: Number(doc.concurrency ?? 3),
+    concurrency,
   };
 }

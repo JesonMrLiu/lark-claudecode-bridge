@@ -1,5 +1,5 @@
 import { afterAll, describe, it, expect, vi, type Mock } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createBridge, type BridgeDeps } from '../src/index.js';
@@ -136,5 +136,106 @@ describe('createBridge 装配', () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(executor).not.toHaveBeenCalled();
     expect(JSON.stringify(sent)).toContain('/new');
+  });
+  it('I2 回归：非发起人点击不改写卡片（按钮保留），发起人后续点击仍放行', async () => {
+    let decision: { behavior: string } | undefined;
+    const executor = vi.fn().mockImplementation(async (_p: string, opts: { canUseTool?: (n: string, i: Record<string, unknown>) => Promise<{ behavior: string }> }) => {
+      decision = await opts.canUseTool!('Bash', { command: 'rm -rf /' });
+      return { sessionId: 's1', finalText: '', producedFiles: [], turns: 1 };
+    });
+    const { deps, sent } = makeDeps(executor);
+    const bridge = createBridge(cfg, deps);
+    await bridge.onMessage(msg('删东西'));
+    await new Promise((r) => setTimeout(r, 50));
+    const confirmCard = sent.find((s) => JSON.stringify(s.card).includes('请求执行操作'))!;
+    const m = /"requestId":"([^"]+)"/.exec(JSON.stringify(confirmCard.card))!;
+    // 他人点击：返回 toast、不 PATCH 卡片、不 resolve 决策
+    const ret = await bridge.onCardAction({ value: { requestId: m[1], decision: 'deny' }, operatorId: 'ou_other', openMessageId: 'om_c' });
+    expect(ret).toEqual({ toast: { type: 'info', content: '仅任务发起人可确认' } });
+    expect(deps.gateway.updateCard).not.toHaveBeenCalled(); // 卡片保持原样（按钮保留）
+    expect(decision).toBeUndefined();                       // 等待真正发起人
+    // 发起人点击：仍放行
+    await bridge.onCardAction({ value: { requestId: m[1], decision: 'allow' }, operatorId: 'ou_u', openMessageId: 'om_c' });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(decision).toEqual({ behavior: 'allow' });
+    expect(executor).toHaveBeenCalledOnce();
+  });
+  it('I1 回归：「本次会话不再询问」通道级生效（跨任务），/new 后恢复询问', async () => {
+    const executor = vi.fn().mockImplementation(async (_p: string, opts: { canUseTool?: (n: string, i: Record<string, unknown>) => Promise<{ behavior: string }> }) => {
+      await opts.canUseTool!('Bash', { command: 'x' });
+      return { sessionId: 's' + executor.mock.calls.length, finalText: '', producedFiles: [], turns: 1 };
+    });
+    const { deps, sent } = makeDeps(executor);
+    const bridge = createBridge(cfg, deps);
+    const confirmCardCount = () => sent.filter((s) => JSON.stringify(s.card).includes('请求执行操作')).length;
+    const clickLatest = async (decision: 'allow' | 'deny' | 'allow-session') => {
+      const confirmCard = [...sent].reverse().find((s) => JSON.stringify(s.card).includes('请求执行操作'))!;
+      const m = /"requestId":"([^"]+)"/.exec(JSON.stringify(confirmCard.card))!;
+      await bridge.onCardAction({ value: { requestId: m[1], decision }, operatorId: 'ou_u', openMessageId: 'om_c' });
+      await new Promise((r) => setTimeout(r, 50));
+    };
+    // 任务 A：询问一次，点「本次会话不再询问」
+    await bridge.onMessage(msg('任务A'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(confirmCardCount()).toBe(1);
+    await clickLatest('allow-session');
+    // 任务 B：同工具不再询问（修复前 gate 每任务新建，会再次发确认卡）
+    await bridge.onMessage(msg('任务B'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(confirmCardCount()).toBe(1);
+    // /new：会话结束，通道 gate 记忆清除
+    await bridge.onMessage(msg('/new'));
+    await new Promise((r) => setTimeout(r, 50));
+    // 任务 C：恢复询问
+    await bridge.onMessage(msg('任务C'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(confirmCardCount()).toBe(2);
+    await clickLatest('allow');
+    expect(executor).toHaveBeenCalledTimes(3);
+  });
+  it('I4 回归：/stop 中止后任务显示「已停止」、不上传产出文件（会话归档保留）', async () => {
+    let releaseTask: () => void = () => {};
+    const blocked = new Promise<void>((r) => { releaseTask = r; });
+    const executor = vi.fn().mockImplementation(async (_p: string, _opts: unknown) => {
+      await blocked; // 挂起模拟长任务，等测试发 /stop
+      // abort 后 SDK 流仍正常收尾返回成功形状（这正是 I4 的触发条件）
+      return { sessionId: 's_stop', finalText: '', producedFiles: ['F:/demo/out.md'], turns: 1 };
+    });
+    const { deps, sent } = makeDeps(executor);
+    const bridge = createBridge(cfg, deps);
+    await bridge.onMessage(msg('长任务'));
+    await new Promise((r) => setTimeout(r, 50)); // 任务已启动并挂起
+    await bridge.onMessage(msg('/stop'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(JSON.stringify(sent)).toContain('已发送停止信号');
+    releaseTask(); // 任务流收尾
+    await new Promise((r) => setTimeout(r, 50));
+    expect(JSON.stringify(sent)).not.toContain('✅ 完成');     // 不误报完成
+    expect(deps.gateway.uploadAndSendFile).not.toHaveBeenCalled(); // 产出文件不上传
+    expect(deps.store.listSessions('oc_1:ou_u')).toHaveLength(1);  // 会话归档保留
+    expect(deps.store.listSessions('oc_1:ou_u')[0].sessionId).toBe('s_stop');
+  });
+  it('C1 回归：外部进程批准配对写盘后，桥在下一条消息即可识别（无需重启/不再死循环）', async () => {
+    const executor = vi.fn().mockResolvedValue({ sessionId: 's1', finalText: 'ok', producedFiles: [], turns: 1 });
+    const { deps } = makeDeps(executor);
+    const bridge = createBridge(cfg, deps);
+    const storePath = (deps.access as unknown as { storePath: string }).storePath;
+    // 第 1 条消息：未知用户进配对分支（beginPairing 把内存态整盘落盘）
+    await bridge.onMessage({ ...msg('hi'), userId: 'ou_new' });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(executor).not.toHaveBeenCalled();
+    // 模拟 lcb pair 独立进程批准：直接改写 store 文件（桥内存实例对此无感知）
+    const disk = JSON.parse(readFileSync(storePath, 'utf8')) as {
+      users: Record<string, unknown>;
+      pending: Record<string, unknown>;
+    };
+    disk.users.ou_new = { name: '新用户', role: 'member', pairedAt: new Date().toISOString() };
+    delete disk.pending.ou_new;
+    writeFileSync(storePath, JSON.stringify(disk), 'utf8');
+    // 第 2 条消息：onMessage 入口先 reload → isAllowed 命中新用户 → 正常执行（修复前：仍查旧内存 → 再发配对码且 save() 抹掉刚批准的 users）
+    await bridge.onMessage({ ...msg('干活'), userId: 'ou_new' });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(executor).toHaveBeenCalledOnce();
+    expect(deps.access.isAllowed('ou_new')).toBe(true);
   });
 });

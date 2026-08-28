@@ -28,13 +28,42 @@ describe('parseIncomingMessage', () => {
   it('非文本消息返回 null', () => {
     expect(parseIncomingMessage({ message: { ...feishuEvent.message, message_type: 'image' } })).toBeNull();
   });
-  it('群聊未 @机器人 忽略，@了才处理（@ 在文本中渲染为 @_user_N 占位）', () => {
+  it('群聊未 @机器人 忽略，@了才处理（@ 在文本中渲染为 @_user_N 占位；未提供 botOpenId 的退化判定）', () => {
     const group = { sender: feishuEvent.sender, message: { ...feishuEvent.message, chat_type: 'group', content: JSON.stringify({ text: '没有提及' }) } };
     expect(parseIncomingMessage(group)).toBeNull();
     const groupMention = { sender: feishuEvent.sender, message: { ...feishuEvent.message, chat_type: 'group', content: JSON.stringify({ text: '@_user_1 帮我查' }) } };
     expect(parseIncomingMessage(groupMention)?.text).toBe('帮我查');
   });
-  it('群聊仅有 mentions 数组（文本占位被客户端吃掉）也处理', () => {
+  it('群聊精确判定：mentions 含机器人 open_id 才处理', () => {
+    const groupBotMention = {
+      sender: feishuEvent.sender,
+      message: {
+        ...feishuEvent.message, chat_type: 'group',
+        content: JSON.stringify({ text: '@_user_1 帮我查' }),
+        mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'bot' }],
+      },
+    };
+    const msg = parseIncomingMessage(groupBotMention, 'ou_bot');
+    expect(msg?.text).toBe('帮我查');
+    expect(msg?.chatType).toBe('group');
+  });
+  it('群聊 @普通人（mentions 不含机器人 open_id）忽略——修复前会被误当任务执行', () => {
+    const groupHumanMention = {
+      sender: feishuEvent.sender,
+      message: {
+        ...feishuEvent.message, chat_type: 'group',
+        content: JSON.stringify({ text: '@_user_1 你怎么看' }),
+        mentions: [{ key: '@_user_1', id: { open_id: 'ou_human' }, name: '同事' }],
+      },
+    };
+    expect(parseIncomingMessage(groupHumanMention, 'ou_bot')).toBeNull();
+    // mentions 为空（纯文本被 @ 占位符污染等形态）同样忽略
+    expect(parseIncomingMessage({
+      sender: feishuEvent.sender,
+      message: { ...feishuEvent.message, chat_type: 'group', content: JSON.stringify({ text: '@_user_1 帮我查' }) },
+    }, 'ou_bot')).toBeNull();
+  });
+  it('群聊仅有 mentions 数组（文本占位被客户端吃掉）也处理（退化判定）', () => {
     const group = {
       sender: feishuEvent.sender,
       message: {
@@ -81,6 +110,10 @@ function makeFakeSdk() {
       return this; // 对齐真实 SDK：register 返回 this
     }
   }
+  // 真实 Client 通用 request：这里返回 bot/v3/info 形状（open_id 固定 ou_bot 供群聊精确匹配用例）
+  class FakeClient {
+    request = vi.fn(async () => ({ code: 0, msg: 'ok', bot: { open_id: 'ou_bot' } }));
+  }
   const fakeSdk: any = {
     WSClient: class {
       async start(o: { eventDispatcher: { register: unknown } }) {
@@ -89,7 +122,7 @@ function makeFakeSdk() {
       }
     },
     EventDispatcher: FakeDispatcher,
-    Client: class {},
+    Client: FakeClient,
     Domain: { Feishu: 0, Lark: 1 },
   };
   return { fakeSdk, register };
@@ -120,6 +153,60 @@ describe('FeishuGateway 分发（注入假 SDK）', () => {
     expect(onMessage).not.toHaveBeenCalled();
   });
 
+  it('start 时经 GET /open-apis/bot/v3/info 拉取机器人 open_id，群聊 @机器人 才分发', async () => {
+    const onMessage = vi.fn();
+    const requestMock = vi.fn(async () => ({ code: 0, msg: 'ok', bot: { open_id: 'ou_bot' } }));
+    const { fakeSdk, register } = makeFakeSdk();
+    fakeSdk.Client = class { request = requestMock; }; // 闭包共享，断言 gateway 内部实例的调用
+    const gw = new FeishuGateway({ appId: 'cli_0123456789abcdef', appSecret: 's' }, { sdk: fakeSdk });
+    await gw.start({ onMessage, onCardAction: vi.fn() });
+    expect(requestMock).toHaveBeenCalledWith({ method: 'GET', url: '/open-apis/bot/v3/info' });
+    const handlers = register.mock.results[0].value as Record<string, (d: unknown) => Promise<unknown>>;
+    // @机器人（mentions 含 bot open_id）→ 分发
+    await handlers['im.message.receive_v1']({
+      sender: feishuEvent.sender,
+      message: {
+        ...feishuEvent.message, chat_type: 'group',
+        content: JSON.stringify({ text: '@_user_1 帮我查' }),
+        mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'bot' }],
+      },
+    });
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onMessage.mock.calls[0][0]).toMatchObject({ chatType: 'group', text: '帮我查' });
+    // @普通人（mentions 不含 bot open_id）→ 不分发（I3 回归）
+    await handlers['im.message.receive_v1']({
+      sender: feishuEvent.sender,
+      message: {
+        ...feishuEvent.message, chat_type: 'group',
+        content: JSON.stringify({ text: '@_user_1 你怎么看' }),
+        mentions: [{ key: '@_user_1', id: { open_id: 'ou_human' }, name: '同事' }],
+      },
+    });
+    expect(onMessage).toHaveBeenCalledTimes(1); // 仍只有 @机器人 那条
+  });
+
+  it('bot open_id 拉取失败时降级为占位符判定（不阻断启动）', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const onMessage = vi.fn();
+      const { fakeSdk, register } = makeFakeSdk();
+      fakeSdk.Client = class { request = vi.fn(async () => { throw new Error('network down'); }); };
+      const gw = new FeishuGateway({ appId: 'cli_0123456789abcdef', appSecret: 's' }, { sdk: fakeSdk });
+      await gw.start({ onMessage, onCardAction: vi.fn() }); // 启动不被阻断
+      const handlers = register.mock.results[0].value as Record<string, (d: unknown) => Promise<unknown>>;
+      expect(warn).toHaveBeenCalled();
+      // 退化判定：占位符命中即处理
+      await handlers['im.message.receive_v1']({
+        sender: feishuEvent.sender,
+        message: { ...feishuEvent.message, chat_type: 'group', content: JSON.stringify({ text: '@_user_1 帮我查' }) },
+      });
+      expect(onMessage).toHaveBeenCalledOnce();
+      expect(onMessage.mock.calls[0][0]).toMatchObject({ text: '帮我查' });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('卡片按钮回调调用 onCardAction 并返回 {}（飞书 SDK 契约）', async () => {
     const onCardAction = vi.fn();
     const { fakeSdk, register } = makeFakeSdk();
@@ -137,6 +224,30 @@ describe('FeishuGateway 分发（注入假 SDK）', () => {
       operatorId: 'ou_clicker',
       openMessageId: 'om_card',
     });
+  });
+
+  it('onCardAction 返回响应体（toast）时透传给飞书，返回空时仍回 {}', async () => {
+    const onCardAction = vi.fn().mockResolvedValue({ toast: { type: 'info', content: '仅任务发起人可确认' } });
+    const { fakeSdk, register } = makeFakeSdk();
+    const gw = new FeishuGateway({ appId: 'cli_0123456789abcdef', appSecret: 's' }, { sdk: fakeSdk });
+    await gw.start({ onMessage: vi.fn(), onCardAction });
+    const handlers = register.mock.results[0].value as Record<string, (d: unknown) => Promise<unknown>>;
+    const ret = await handlers['card.action.trigger']({
+      operator: { open_id: 'ou_clicker' },
+      action: { tag: 'button', value: { requestId: 'req_1', decision: 'allow' } },
+    });
+    expect(ret).toEqual({ toast: { type: 'info', content: '仅任务发起人可确认' } });
+    // handler 无返回值（发起人正常确认）→ 回 {}，维持 SDK 契约
+    const onCardActionVoid = vi.fn().mockResolvedValue(undefined);
+    const { fakeSdk: sdk2, register: register2 } = makeFakeSdk();
+    const gw2 = new FeishuGateway({ appId: 'cli_0123456789abcdef', appSecret: 's' }, { sdk: sdk2 });
+    await gw2.start({ onMessage: vi.fn(), onCardAction: onCardActionVoid });
+    const handlers2 = register2.mock.results[0].value as Record<string, (d: unknown) => Promise<unknown>>;
+    const ret2 = await handlers2['card.action.trigger']({
+      operator: { open_id: 'ou_clicker' },
+      action: { tag: 'button', value: { requestId: 'req_2', decision: 'deny' } },
+    });
+    expect(ret2).toEqual({});
   });
 
   it('缺关键字段的卡片回调不调用 onCardAction，仍返回 {}', async () => {

@@ -22,6 +22,20 @@ export class AccessControl {
       return new AccessControl(storePath);
     }
   }
+  /**
+   * 重读 store 文件并整体替换内存态：`lcb pair` / 运行终端等独立路径批准写盘后，
+   * 桥内长存实例经 reload 即可感知（否则 isAllowed 查旧内存 → 反复发配对码 →
+   * beginPairing 的整盘覆写把刚批准的 users 抹掉，形成死循环）。
+   * 读盘失败（文件不存在/损坏）保持内存不动——首次配对前 store 尚未落盘属正常。
+   */
+  reload(): void {
+    try {
+      const raw = JSON.parse(readFileSync(this.storePath, 'utf8')) as AccessStoreData;
+      this.data = { users: raw.users ?? {}, pending: raw.pending ?? {} };
+    } catch {
+      // 忽略：以上一次内存态继续服务
+    }
+  }
   private save(): void {
     mkdirSync(dirname(this.storePath), { recursive: true });
     writeFileSync(this.storePath, JSON.stringify(this.data, null, 2), 'utf8');

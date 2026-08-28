@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccessControl } from '../src/access/access-control.js';
@@ -66,6 +66,28 @@ describe('AccessControl', () => {
     vi.setSystemTime(Date.now() + 16 * 60 * 1000);
     expect(a.approvePairing(code).ok).toBe(false);
     expect(a.listPending().length).toBe(0);
+  });
+  it('reload 后外部进程批准的用户可见；读盘失败保持内存不动', () => {
+    const storePath = join(mkdtempSync(join(tmpdir(), 'lcb-a-')), 'access.json');
+    const bridge = AccessControl.load(storePath); // 模拟桥内长存实例
+    bridge.approvePairing(bridge.beginPairing('ou_a', 'A'));
+    // 模拟另一进程（lcb pair / 运行终端）批准 ou_b：独立实例操作同一 store 文件
+    const external = AccessControl.load(storePath);
+    external.approvePairing(external.beginPairing('ou_b', 'B'));
+    // reload 前：桥内存查不到新用户（这正是 C1 死循环的根源）
+    expect(bridge.isAllowed('ou_b')).toBe(false);
+    bridge.reload();
+    expect(bridge.isAllowed('ou_b')).toBe(true);
+    expect(bridge.isAllowed('ou_a')).toBe(true);
+    // 文件损坏 → reload 失败，内存态原样保留
+    writeFileSync(storePath, 'not-json{{', 'utf8');
+    expect(() => bridge.reload()).not.toThrow();
+    expect(bridge.isAllowed('ou_a')).toBe(true);
+    expect(bridge.isAllowed('ou_b')).toBe(true);
+    // 文件被删 → 同样保持内存不动
+    rmSync(storePath);
+    expect(() => bridge.reload()).not.toThrow();
+    expect(bridge.isAllowed('ou_b')).toBe(true);
   });
 });
 

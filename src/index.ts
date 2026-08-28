@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { promisify } from 'node:util';
 import type {
-  BridgeConfig, CardActionEvent, ConfirmationRequest, GatewayHandlers,
+  BridgeConfig, CardActionEvent, CardActionResponse, ConfirmationRequest, GatewayHandlers,
   IncomingMessage, PermissionDecision, ProgressEvent,
 } from './types.js';
 import { CONFIG_DIR, CONFIG_PATH, loadConfig } from './config.js';
@@ -72,6 +72,9 @@ export function createBridge(
 ): GatewayHandlers {
   const sem = new Semaphore(config.concurrency);
   const runtimes = new Map<string, ChannelRuntime>();
+  // 通道级权限闸：「本次会话不再询问」的记忆跨任务生效（spec：直至 /new），
+  // 故 gate 归通道持有而非每任务新建——每任务新建会把授权缩成任务级，任务 B 又要重新确认
+  const gates = new Map<string, PermissionGate>();
   const confirmPending = new Map<string, {
     resolve: (d: PermissionDecision) => void;
     req: ConfirmationRequest;
@@ -95,6 +98,9 @@ export function createBridge(
   async function processMessage(msg: IncomingMessage): Promise<void> {
     const key = channelKey(msg.chatId, msg.userId);
     // 1. 访问控制：白名单外发配对码（首个配对成功者自动成为 admin，见 AccessControl）
+    // 每条消息先重读 access.json：lcb pair / 运行终端等独立进程批准写盘后，
+    // 长存的内存实例不 reload 会查到旧白名单 → 反复发配对码且整盘覆写抹掉新用户（死循环）
+    deps.access.reload();
     if (!deps.access.isAllowed(msg.userId)) {
       const code = deps.access.beginPairing(msg.userId, msg.userId);
       console.log(`[配对] 未知用户 ${msg.userId} 请求接入，配对码：${code}（在终端输入 lcb pair ${code} 批准）`);
@@ -119,6 +125,9 @@ export function createBridge(
     });
     if (cmd.handled) {
       if (cmd.reply) await deps.gateway.sendTextTo(msg.chatId, cmd.reply);
+      // /new 开启新会话：「本次会话不再询问」的授权随之失效（handleCommand 无权访问 wiring
+      // 持有的 gate，故在命令处理分支后于 wiring 侧检测并 reset）
+      if (/^\/new(?:\s|$)/.test(msg.text.trim())) gates.get(key)?.reset();
       return;
     }
     // 3. 普通文本：通道内串行入队（每 key 一条 Promise 链），全局并发由 Semaphore 限制
@@ -142,33 +151,38 @@ export function createBridge(
       `任务 · ${wsName}`,
     );
     const confirmTimeoutMs = opts.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
-    const gate = new PermissionGate({
-      ask: async (req) => {
-        // 发确认卡片并挂起，等待 onCardAction 按 requestId 唤醒；
-        // 超时由本闭包自管：到点删除条目 + 卡片置为过期态 + 以 deny 继续——
-        // 条目有界（无人点击、/stop、4h abort 挂起中的 ask 均会被定时器清理），
-        // 此后的迟到点击因条目已删被静默忽略，卡片不再被改写为与实际不符的决策态
-        const cardId = await deps.gateway.sendCardTo(msg.chatId, buildConfirmCard(req));
-        return new Promise<PermissionDecision>((resolve) => {
-          const gc = setTimeout(() => {
-            confirmPending.delete(req.requestId);
-            void deps.gateway.updateCard(cardId, expiredConfirmCard(req, confirmTimeoutMs)).catch(() => {});
-            resolve('deny');
-          }, confirmTimeoutMs);
-          gc.unref();
-          confirmPending.set(req.requestId, {
-            resolve: (d) => {
-              clearTimeout(gc); // 用户已及时确认：撤销过期态 PATCH，防止已决策的卡片被改写为超时
-              resolve(d);
-            },
-            req,
-            ownerId: msg.userId,
-            cardId,
+    // 通道级复用：已存在则沿用（allow-session 记忆跨任务），不存在才建
+    let gate = gates.get(key);
+    if (!gate) {
+      gate = new PermissionGate({
+        ask: async (req) => {
+          // 发确认卡片并挂起，等待 onCardAction 按 requestId 唤醒；
+          // 超时由本闭包自管：到点删除条目 + 卡片置为过期态 + 以 deny 继续——
+          // 条目有界（无人点击、/stop、4h abort 挂起中的 ask 均会被定时器清理），
+          // 此后的迟到点击因条目已删被静默忽略，卡片不再被改写为与实际不符的决策态
+          const cardId = await deps.gateway.sendCardTo(msg.chatId, buildConfirmCard(req));
+          return new Promise<PermissionDecision>((resolve) => {
+            const gc = setTimeout(() => {
+              confirmPending.delete(req.requestId);
+              void deps.gateway.updateCard(cardId, expiredConfirmCard(req, confirmTimeoutMs)).catch(() => {});
+              resolve('deny');
+            }, confirmTimeoutMs);
+            gc.unref();
+            confirmPending.set(req.requestId, {
+              resolve: (d) => {
+                clearTimeout(gc); // 用户已及时确认：撤销过期态 PATCH，防止已决策的卡片被改写为超时
+                resolve(d);
+              },
+              req,
+              ownerId: msg.userId,
+              cardId,
+            });
           });
-        });
-      },
-      timeoutMs: GATE_FALLBACK_TIMEOUT_MS,
-    });
+        },
+        timeoutMs: GATE_FALLBACK_TIMEOUT_MS,
+      });
+      gates.set(key, gate);
+    }
     const hardTimeout = setTimeout(() => abort.abort(), TASK_HARD_TIMEOUT_MS);
     hardTimeout.unref();
     try {
@@ -189,6 +203,13 @@ export function createBridge(
           } else if (e.kind === 'tool-result') progress.toolResult(e.content, e.ok ?? true);
         },
       });
+      if (abort.signal.aborted) {
+        // /stop（或硬超时）中止后 SDK 流仍会正常收尾走成功分支——按停止处理，不误报「完成」。
+        // 会话归档保留（中断任务的会话上下文仍有价值），但跳过结果与产出文件回传
+        await progress.finish('🛑 已停止');
+        deps.store.archiveSession(key, outcome.sessionId, prompt);
+        return;
+      }
       await progress.finish(`✅ 完成`);
       deps.store.archiveSession(key, outcome.sessionId, prompt);
       // 会话超长提醒（累计轮次粗略估计，防上下文爆炸）
@@ -219,14 +240,15 @@ export function createBridge(
     }
   }
 
-  async function handleCardAction(action: CardActionEvent): Promise<void> {
+  async function handleCardAction(action: CardActionEvent): Promise<CardActionResponse | undefined> {
     try {
       const pending = confirmPending.get(action.value.requestId);
       if (!pending) return; // 已过期/不存在的 requestId：静默忽略
       if (action.operatorId !== pending.ownerId) {
-        // 非发起人点击：不 resolve（等待真正发起人），卡片置为无权限提示态
-        await deps.gateway.updateCard(pending.cardId, buildConfirmResultCard(pending.req, action.value.decision, '无权限操作者（仅任务发起人可确认）'));
-        return;
+        // 非发起人点击：卡片保持原样（按钮保留，发起人仍可确认）——PATCH 成无按钮的结果卡
+        // 会让发起人从此无法操作，群聊可被任意成员 DoS。仅回 toast 提示 + resolve 落空
+        console.log(`[卡片回调] 非发起人 ${action.operatorId} 点击确认卡 ${action.value.requestId}，已忽略`);
+        return { toast: { type: 'info', content: '仅任务发起人可确认' } };
       }
       confirmPending.delete(action.value.requestId);
       pending.resolve(action.value.decision);
