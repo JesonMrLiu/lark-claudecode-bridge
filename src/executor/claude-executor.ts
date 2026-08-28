@@ -1,0 +1,90 @@
+// Claude 执行器：封装 Agent SDK 的 query()，把流消息转成进度事件并收集产出
+// 注意：不覆盖/清理任何 ANTHROPIC_* 环境变量，凭证与代理配置透传 process.env
+import { query, type CanUseTool, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { OutputCollector } from './output-collector.js';
+import type { ProgressEvent, TaskOutcome } from '../types.js';
+
+export interface ExecutorCallbacks {
+  onProgress(event: ProgressEvent): Promise<void> | void;
+}
+
+export interface RunTaskOptions {
+  cwd: string;
+  resumeSessionId?: string;
+  signal?: AbortSignal;
+  // 收窄签名：SDK 的 CanUseTool 还带第三参 options（signal/suggestions 等），
+  // 此处仅暴露 (toolName, input)；deny 时实现方必须带 message（SDK 要求）
+  canUseTool?: (toolName: string, input: Record<string, unknown>) => Promise<{ behavior: 'allow' | 'deny'; message?: string }>;
+}
+
+// SDK 选项只收 abortController（无 signal 项），把外部 signal 的中止转发给它
+function bridgeSignal(signal: AbortSignal): AbortController {
+  const controller = new AbortController();
+  if (signal.aborted) {
+    controller.abort();
+    return controller;
+  }
+  signal.addEventListener('abort', () => controller.abort(), { once: true });
+  return controller;
+}
+
+function summarizeToolInput(input: Record<string, unknown>): string {
+  if (typeof input.command === 'string') return input.command;
+  if (typeof input.file_path === 'string') return input.file_path;
+  if (typeof input.pattern === 'string') return input.pattern;
+  return JSON.stringify(input).slice(0, 100);
+}
+
+export async function runTask(prompt: string, opts: RunTaskOptions, cb: ExecutorCallbacks): Promise<TaskOutcome> {
+  const collector = new OutputCollector();
+  const options: Options = {
+    cwd: opts.cwd,
+    settingSources: ['user', 'project'],
+    permissionMode: 'default',
+    includePartialMessages: false,
+    ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
+    // 收窄签名与 SDK CanUseTool 返回结构不兼容（deny 分支 message 可选 vs 必填），断言透传，引用保持原样
+    ...(opts.canUseTool ? { canUseTool: opts.canUseTool as unknown as CanUseTool } : {}),
+    ...(opts.signal ? { abortController: bridgeSignal(opts.signal) } : {}),
+  };
+  const q = query({ prompt, options });
+  let finalText = '';
+  let sessionId = opts.resumeSessionId ?? '';
+  let turns = 0;
+  const toolNames = new Map<string, string>(); // tool_use_id → 工具名（tool_result 块本身不带 name）
+  for await (const message of q as AsyncIterable<SDKMessage>) {
+    switch (message.type) {
+      case 'assistant': {
+        turns++;
+        for (const block of message.message.content) {
+          if (block.type === 'text') {
+            await cb.onProgress({ kind: 'text', content: block.text });
+          } else if (block.type === 'tool_use') {
+            const input = (block.input ?? {}) as Record<string, unknown>;
+            toolNames.set(block.id, block.name);
+            collector.track(block.name, input);
+            await cb.onProgress({ kind: 'tool-start', content: `${block.name}: ${summarizeToolInput(input)}` });
+          }
+        }
+        break;
+      }
+      case 'user': {
+        const content = message.message.content;
+        if (!Array.isArray(content)) break;
+        for (const block of content) {
+          if (block.type === 'tool_result') {
+            const name = toolNames.get(block.tool_use_id) ?? '';
+            await cb.onProgress({ kind: 'tool-result', content: name, ok: !block.is_error });
+          }
+        }
+        break;
+      }
+      case 'result': {
+        if (message.subtype === 'success') finalText = message.result;
+        if ('session_id' in message && typeof message.session_id === 'string') sessionId = message.session_id;
+        break;
+      }
+    }
+  }
+  return { sessionId, finalText, producedFiles: collector.files(), turns };
+}
