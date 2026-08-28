@@ -1,0 +1,11 @@
+[Unit]
+Description=lark-claudecode-bridge
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/env lcb start
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
