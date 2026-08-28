@@ -92,13 +92,16 @@ interface RawCardActionPayload {
   open_message_id?: string;
 }
 
-/** 解析 card.action.trigger 回调；不完整返回 null */
+const VALID_DECISIONS: ReadonlySet<string> = new Set(['allow', 'deny', 'allow-session']);
+
+/** 解析 card.action.trigger 回调；不完整或 decision 不在合法枚举内返回 null */
 function parseCardAction(data: unknown): { value: { requestId: string; decision: 'allow' | 'deny' | 'allow-session' }; operatorId: string; openMessageId: string } | null {
   try {
     if (data === null || typeof data !== 'object') return null;
     const d = data as RawCardActionPayload;
     const value = d.action?.value;
-    if (!value?.requestId || !value.decision || !d.operator?.open_id) return null;
+    // decision 必须严格匹配枚举：畸形字符串（如 'ALLOW'）不能流入 CardActionValue.decision
+    if (!value?.requestId || typeof value.decision !== 'string' || !VALID_DECISIONS.has(value.decision) || !d.operator?.open_id) return null;
     return {
       value: { requestId: value.requestId, decision: value.decision },
       operatorId: d.operator.open_id,
@@ -164,6 +167,8 @@ export class FeishuGateway {
    * 其余走 im.file.create（返回顶层 file_key）。
    * ⚠️ 与 brief 参考实现不同：这两个上传接口的 SDK 封装比普通接口多拆一层，
    * 返回 {image_key} / {file_key} 顶层对象（或 null），不存在 res.data 包装。
+   * 上传与发消息两步都校验关键返回值——SDK 业务级失败（HTTP 200 + code!=0）不抛错，
+   * 不校验会静默 resolve，用户收不到文件且无任何报错。
    */
   async uploadAndSendFile(chatId: string, filePath: string): Promise<void> {
     const ext = extname(filePath).toLowerCase();
@@ -173,20 +178,22 @@ export class FeishuGateway {
       });
       const imageKey = up?.image_key;
       if (!imageKey) throw new Error(`上传图片失败: ${JSON.stringify(up)}`);
-      await this.client.im.message.create({
+      const res = await this.client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: { receive_id: chatId, msg_type: 'image', content: JSON.stringify({ image_key: imageKey }) },
       });
+      if (!res.data?.message_id) throw new Error(`发送图片消息失败: ${JSON.stringify(res)}`);
     } else {
       const up = await this.client.im.file.create({
         data: { file_type: 'stream', file_name: basename(filePath), file: createReadStream(filePath) },
       });
       const fileKey = up?.file_key;
       if (!fileKey) throw new Error(`上传文件失败: ${JSON.stringify(up)}`);
-      await this.client.im.message.create({
+      const res = await this.client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: { receive_id: chatId, msg_type: 'file', content: JSON.stringify({ file_key: fileKey }) },
       });
+      if (!res.data?.message_id) throw new Error(`发送文件消息失败: ${JSON.stringify(res)}`);
     }
   }
 }

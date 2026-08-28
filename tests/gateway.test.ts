@@ -53,6 +53,10 @@ describe('parseIncomingMessage', () => {
     expect(parseIncomingMessage(null)).toBeNull();
     expect(parseIncomingMessage({ message: { ...feishuEvent.message, content: 'not json' } })).toBeNull();
   });
+  it('sender 缺失返回 null（消息合法但无法归属用户）', () => {
+    expect(parseIncomingMessage({ message: { ...feishuEvent.message } })).toBeNull();
+    expect(parseIncomingMessage({ sender: {}, message: { ...feishuEvent.message } })).toBeNull();
+  });
 });
 
 describe('stripMention', () => {
@@ -143,6 +147,22 @@ describe('FeishuGateway 分发（注入假 SDK）', () => {
     const handlers = register.mock.results[0].value as Record<string, (d: unknown) => Promise<unknown>>;
     const ret = await handlers['card.action.trigger']({ action: { value: {} } });
     expect(ret).toEqual({});
+    expect(onCardAction).not.toHaveBeenCalled();
+  });
+
+  it('decision 非法（不在 allow/deny/allow-session 枚举内）不调用 onCardAction，仍返回 {}', async () => {
+    const onCardAction = vi.fn();
+    const { fakeSdk, register } = makeFakeSdk();
+    const gw = new FeishuGateway({ appId: 'cli_0123456789abcdef', appSecret: 's' }, { sdk: fakeSdk });
+    await gw.start({ onMessage: vi.fn(), onCardAction });
+    const handlers = register.mock.results[0].value as Record<string, (d: unknown) => Promise<unknown>>;
+    for (const decision of ['ALLOW', 'yes', '', 123]) {
+      const ret = await handlers['card.action.trigger']({
+        operator: { open_id: 'ou_clicker' },
+        action: { tag: 'button', value: { requestId: 'req_1', decision } },
+      });
+      expect(ret).toEqual({});
+    }
     expect(onCardAction).not.toHaveBeenCalled();
   });
 });
@@ -247,5 +267,32 @@ describe('FeishuGateway 收发（注入假 Client）', () => {
     const sent = create.mock.calls[0][0].data;
     expect(sent.msg_type).toBe('file');
     expect(JSON.parse(sent.content)).toEqual({ file_key: 'file_v2_key' });
+  });
+
+  it('上传成功但发消息业务级失败（code 230002 无 message_id）时 reject', async () => {
+    // SDK 业务级失败不抛（HTTP 200 + code!=0），必须显式校验 message_id
+    const fileCreate = vi.fn(async (p: { data: { file: NodeJS.ReadableStream } }) => {
+      await new Promise<void>((resolve) => {
+        const s = p.data.file as NodeJS.ReadableStream & { resume(): void; once(ev: 'end' | 'error', cb: () => void): unknown };
+        s.once('end', () => resolve());
+        s.once('error', () => resolve());
+        s.resume();
+      });
+      return { file_key: 'file_v2_key' };
+    });
+    const create = vi.fn(async () => ({ code: 230002, msg: 'bot not in chat' }));
+    const fakeSdk = fakeClientSdk({ message: { create }, file: { create: fileCreate } });
+    const gw = new FeishuGateway({ appId: 'a', appSecret: 's' }, { sdk: fakeSdk });
+    await expect(gw.uploadAndSendFile('oc_1', pdfPath)).rejects.toThrow(/230002/);
+    expect(create).toHaveBeenCalledOnce(); // 已走到发消息这一步才失败
+  });
+
+  it('图片上传失败（无 image_key）时 reject 且不发消息', async () => {
+    const imageCreate = vi.fn(async () => null); // SDK 返回 null 表示上传失败
+    const create = vi.fn(async () => ({ code: 0, data: { message_id: 'om_x' } }));
+    const fakeSdk = fakeClientSdk({ message: { create }, image: { create: imageCreate } });
+    const gw = new FeishuGateway({ appId: 'a', appSecret: 's' }, { sdk: fakeSdk });
+    await expect(gw.uploadAndSendFile('oc_1', pngPath)).rejects.toThrow(/上传图片失败/);
+    expect(create).not.toHaveBeenCalled();
   });
 });
