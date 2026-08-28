@@ -25,6 +25,26 @@ const execFileP = promisify(execFile);
 const MAX_FILES_BEFORE_ZIP = 10;
 // 任务总超时 4 小时（防挂死；确认等待、长编译均在正常范围）
 const TASK_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+// 确认等待窗：无人确认则自动拒绝。超时判定由 wiring 侧自管（ask 闭包内的定时器），
+// 从而到点即清理 confirmPending 条目并把卡片 PATCH 为过期态——条目有界不泄漏，
+// 迟到点击因条目已删被 handleCardAction 静默忽略，永不显示与实际不符的决策态
+const CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
+// PermissionGate 的兜底超时：仅当 wiring 侧超时机制失效时才触发（正常流程 ask 必在 CONFIRM_TIMEOUT_MS 内 settle）
+const GATE_FALLBACK_TIMEOUT_MS = CONFIRM_TIMEOUT_MS + 60_000;
+
+/** 确认超时后的过期态卡片（此后迟到点击不再改写此卡片） */
+function expiredConfirmCard(req: ConfirmationRequest, timeoutMs: number): unknown {
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    body: {
+      elements: [{
+        tag: 'markdown',
+        content: `**🔐 Claude 请求执行操作**\n\n工具: \`${req.toolName}\`　工作区: \`${req.workspaceName}\`\n\`\`\`\n${req.summary.slice(0, 500)}\n\`\`\`\n\n⏰ 已超时自动拒绝（${Math.round(timeoutMs / 60000)} 分钟未确认）`,
+      }],
+    },
+  };
+}
 
 interface ChannelRuntime {
   queue: Promise<void>;
@@ -44,7 +64,11 @@ export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真
   executor: typeof runTask;
 }
 
-export function createBridge(config: BridgeConfig, deps: BridgeDeps): GatewayHandlers {
+export function createBridge(
+  config: BridgeConfig,
+  deps: BridgeDeps,
+  opts: { confirmTimeoutMs?: number } = {}, // 测试可注入更短的确认等待窗
+): GatewayHandlers {
   const sem = new Semaphore(config.concurrency);
   const runtimes = new Map<string, ChannelRuntime>();
   const confirmPending = new Map<string, {
@@ -116,14 +140,33 @@ export function createBridge(config: BridgeConfig, deps: BridgeDeps): GatewayHan
       },
       `任务 · ${wsName}`,
     );
+    const confirmTimeoutMs = opts.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
     const gate = new PermissionGate({
       ask: async (req) => {
-        // 发确认卡片并挂起，等待 onCardAction 按 requestId 唤醒
+        // 发确认卡片并挂起，等待 onCardAction 按 requestId 唤醒；
+        // 超时由本闭包自管：到点删除条目 + 卡片置为过期态 + 以 deny 继续——
+        // 条目有界（无人点击、/stop、4h abort 挂起中的 ask 均会被定时器清理），
+        // 此后的迟到点击因条目已删被静默忽略，卡片不再被改写为与实际不符的决策态
         const cardId = await deps.gateway.sendCardTo(msg.chatId, buildConfirmCard(req));
         return new Promise<PermissionDecision>((resolve) => {
-          confirmPending.set(req.requestId, { resolve, req, ownerId: msg.userId, cardId });
+          const gc = setTimeout(() => {
+            confirmPending.delete(req.requestId);
+            void deps.gateway.updateCard(cardId, expiredConfirmCard(req, confirmTimeoutMs)).catch(() => {});
+            resolve('deny');
+          }, confirmTimeoutMs);
+          gc.unref();
+          confirmPending.set(req.requestId, {
+            resolve: (d) => {
+              clearTimeout(gc); // 用户已及时确认：撤销过期态 PATCH，防止已决策的卡片被改写为超时
+              resolve(d);
+            },
+            req,
+            ownerId: msg.userId,
+            cardId,
+          });
         });
       },
+      timeoutMs: GATE_FALLBACK_TIMEOUT_MS,
     });
     const hardTimeout = setTimeout(() => abort.abort(), TASK_HARD_TIMEOUT_MS);
     hardTimeout.unref();

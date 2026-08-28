@@ -1,4 +1,4 @@
-import { afterAll, describe, it, expect, vi } from 'vitest';
+import { afterAll, describe, it, expect, vi, type Mock } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -29,7 +29,7 @@ function makeDeps(executor = vi.fn()) {
       start: vi.fn(),
       sendCardTo: async (chatId, card) => { sent.push({ chatId, card }); return `m${sent.length}`; },
       sendTextTo: async (chatId, markdown) => { sent.push({ chatId, card: markdown }); return `m${sent.length}`; },
-      updateCard: async () => {},
+      updateCard: vi.fn(async () => {}),
       uploadAndSendFile: vi.fn(),
     },
     access: new AccessControl(join(dir, 'access.json')),
@@ -79,9 +79,10 @@ describe('createBridge 装配', () => {
     expect(JSON.stringify(sent)).toContain('配对');
   });
   it('确认流：写操作发确认卡片，按钮点击放行', async () => {
-    let askFn!: (d: 'allow' | 'deny' | 'allow-session') => void;
+    let decision: { behavior: string } | undefined;
     const executor = vi.fn().mockImplementation(async (_p: string, opts: { canUseTool?: (n: string, i: Record<string, unknown>) => Promise<{ behavior: string }> }) => {
-      return opts.canUseTool!('Bash', { command: 'rm -rf /' });
+      decision = await opts.canUseTool!('Bash', { command: 'rm -rf /' });
+      return { sessionId: 's1', finalText: '', producedFiles: [], turns: 1 };
     });
     const { deps, sent } = makeDeps(executor);
     const bridge = createBridge(cfg, deps);
@@ -89,17 +90,37 @@ describe('createBridge 装配', () => {
     await new Promise((r) => setTimeout(r, 50));
     const confirmCard = sent.find((s) => JSON.stringify(s.card).includes('请求执行操作'));
     expect(confirmCard).toBeTruthy();
-    // 模拟用户点允许
-    const value = JSON.parse(JSON.stringify(confirmCard!.card)) as never as { requestId?: string };
-    void value;
-    // 从卡片 JSON 提取 requestId
+    // 模拟用户点允许：从卡片 JSON 提取 requestId
     const m = /"requestId":"([^"]+)"/.exec(JSON.stringify(confirmCard!.card))!;
     const action: CardActionEvent = { value: { requestId: m[1], decision: 'allow' }, operatorId: 'ou_u', openMessageId: 'om_c' };
-    const result = await bridge.onCardAction(action);
-    void result;
-    void askFn;
-    // executor 的 canUseTool 返回值应被允许——通过 executor 被调用且无异常即验证链路
+    await bridge.onCardAction(action);
+    await new Promise((r) => setTimeout(r, 50)); // 等放行后的 canUseTool 返回与任务收尾
+    // 「点击→放行」必须真正发生：确认链路失效（resolve 未发生）时此断言失败
+    expect(decision).toEqual({ behavior: 'allow' });
     expect(executor).toHaveBeenCalledOnce();
+  });
+  it('确认超时：卡片置为过期态、任务按拒绝继续，迟到点击静默不产生决策态', async () => {
+    let decision: { behavior: string } | undefined;
+    const executor = vi.fn().mockImplementation(async (_p: string, opts: { canUseTool?: (n: string, i: Record<string, unknown>) => Promise<{ behavior: string }> }) => {
+      decision = await opts.canUseTool!('Bash', { command: 'rm -rf /' });
+      return { sessionId: 's1', finalText: 'done', producedFiles: [], turns: 1 };
+    });
+    const { deps, sent } = makeDeps(executor);
+    const bridge = createBridge(cfg, deps, { confirmTimeoutMs: 30 });
+    await bridge.onMessage(msg('删东西'));
+    await new Promise((r) => setTimeout(r, 50)); // 确认卡片已发出并挂起等待
+    await new Promise((r) => setTimeout(r, 100)); // 超时已触发，任务按 deny 继续并收尾
+    const updates = (deps.gateway.updateCard as Mock).mock.calls as Array<[string, unknown]>;
+    expect(updates.some(([, card]) => JSON.stringify(card).includes('超时'))).toBe(true); // 卡片被 PATCH 为过期态
+    expect(decision?.behavior).toBe('deny');                        // gate 收到拒绝，任务未被卡死
+    expect(JSON.stringify(sent)).toContain('done');                 // 任务正常收尾
+    // 迟到点击（条目已被超时清理）：静默忽略，不产生新的卡片更新——不得显示与实际不符的决策态
+    const confirmCard = sent.find((s) => JSON.stringify(s.card).includes('请求执行操作'));
+    const m = /"requestId":"([^"]+)"/.exec(JSON.stringify(confirmCard!.card))!;
+    const before = updates.length;
+    await bridge.onCardAction({ value: { requestId: m[1], decision: 'allow' }, operatorId: 'ou_u', openMessageId: 'om_c' });
+    await new Promise((r) => setTimeout(r, 50));
+    expect((deps.gateway.updateCard as Mock).mock.calls.length).toBe(before);
   });
   it('他人点击按钮无权限', async () => {
     const { deps } = makeDeps(vi.fn().mockResolvedValue({ sessionId: 's', finalText: '', producedFiles: [], turns: 1 }));
