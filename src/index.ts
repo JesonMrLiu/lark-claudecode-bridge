@@ -19,7 +19,8 @@ import { SessionStore } from './session/session-store.js';
 import { handleCommand } from './session/commands.js';
 import { Semaphore, channelKey } from './session/channel.js';
 
-export const VERSION = '0.1.0';
+// 版本号收敛到 version.ts 单一来源（bin/lcb.ts 与 smoke 测试均引用）
+export { VERSION } from './version.js';
 
 const execFileP = promisify(execFile);
 const MAX_FILES_BEFORE_ZIP = 10;
