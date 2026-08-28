@@ -66,12 +66,13 @@ describe('Semaphore', () => {
     await new Promise((r) => setTimeout(r, 10)); // 确保 waiter 已入队
     // 竞态批：release 与新 acquire 在同一同步批，挤在 waiter 的 microtask 恢复之前
     r1();
-    const p4 = sem.acquire();
+    // p4 必须立即 track：否则旧实现下 p4 在窗口内超发拿槽对计数器隐形，断言失效
+    const p4 = sem.acquire().then(track);
     // waiter（p3）获得转移的许可；p4 必须仍在排队（旧实现会立即拿槽导致超发）
     const r3 = await p3; // p3 已含 track 包装（.then(track)），不可再包一层
-    expect(holders).toBe(n); // r2 + r3 恰好占满，p4 未持有
+    expect(holders).toBe(n); // r2 + r3 恰好占满，p4 未持有（旧实现此处 holders=3）
     r3();
-    const r4 = track(await p4);
+    const r4 = await p4; // p4 已含 track 包装
     expect(peak).toBeLessThanOrEqual(n);
     // 清理
     r4();
