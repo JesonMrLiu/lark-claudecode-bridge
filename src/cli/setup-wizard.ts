@@ -105,7 +105,8 @@ export async function runSetup(configPath: string): Promise<void> {
     + '  4. 卡片交互配置选「长连接」\n');
   const appId = await ask('App ID (cli_ 开头，形如 cli_aabbccddeeff0011)');
   const appSecret = await ask('App Secret');
-  if (!APP_ID_RE.test(appId)) console.warn(`⚠️ App ID ${appId} 不符合常见形状 cli_ + 16 位十六进制，请确认（不阻止继续）`);
+  // 空值（EOF 截断/直接回车）不警告——后续 workspaces 校验会让流程退出，此处无需噪声
+  if (appId && !APP_ID_RE.test(appId)) console.warn(`⚠️ App ID ${appId} 不符合常见形状 cli_ + 16 位十六进制，请确认（不阻止继续）`);
   const workspaces: Array<{ name: string; path: string }> = [];
   let defaultWorkspace = '';
   for (let i = 0; ; i++) {

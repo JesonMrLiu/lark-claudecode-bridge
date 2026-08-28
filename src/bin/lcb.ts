@@ -2,6 +2,7 @@
 // lcb 命令行入口：setup / start / pair / version
 import { createInterface } from 'node:readline/promises';
 import { runSetup, APP_ID_RE } from '../cli/setup-wizard.js';
+import { approvePairingLine } from '../cli/stdin-pairing.js';
 import { startBridge } from '../index.js';
 import { loadConfig, CONFIG_PATH, CONFIG_DIR } from '../config.js';
 import { AccessControl } from '../access/access-control.js';
@@ -26,16 +27,12 @@ async function main(): Promise<void> {
         console.warn(`⚠️ App ID "${config.feishu.appId}" 不符合常见形状 cli_ + 16 位十六进制，启动继续；若后续连接失败请先核对`);
       }
       await startBridge(CONFIG_PATH);
-      // 前台监听 stdin：管理员可直接在运行终端输入配对码批准
-      const access = AccessControl.load(join(CONFIG_DIR, 'access.json'));
+      // 前台监听 stdin：管理员可直接在运行终端输入配对码批准。
+      // 现读现批（每次 load 新实例再 approve）：桥运行中 beginPairing 写入的新 pending
+      // 不在启动快照里——复用启动实例必然「配对码无效」，且其 save() 整盘覆写会
+      // 抹掉桥内新 pending。与独立进程 lcb pair 走同一条现读路径
       const rl = createInterface({ input: process.stdin });
-      rl.on('line', (line) => {
-        const code = line.trim();
-        if (/^\d{6}$/.test(code)) {
-          const r = access.approvePairing(code);
-          console.log(r.ok ? `✅ 已批准用户 ${r.userId}${r.isFirstAdmin ? '（admin）' : ''}` : `❌ ${r.error}`);
-        }
-      });
+      rl.on('line', (line) => approvePairingLine(line, join(CONFIG_DIR, 'access.json')));
       break;
     }
     case 'pair': {
