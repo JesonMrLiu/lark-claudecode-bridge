@@ -50,6 +50,13 @@ describe('PermissionGate', () => {
     expect(r.behavior).toBe('deny');
     vi.useRealTimers();
   });
+  it('ask 及时答复后清理超时 timer，不残留', async () => {
+    vi.useFakeTimers();
+    const g = new PermissionGate({ ask: () => Promise.resolve('allow'), timeoutMs: 1000 });
+    await g.decide('Bash', { command: 'x' }, 'ws');
+    // 常驻进程中每个已答复的 decide 不应留下存活的超时 timer（unref 只解决进程退出，不清理 timer）
+    expect(vi.getTimerCount()).toBe(0);
+  });
   it('reset 清除会话记忆', async () => {
     const ask = vi.fn().mockResolvedValue('allow-session' as const);
     const g = new PermissionGate({ ask });
@@ -63,7 +70,8 @@ describe('PermissionGate', () => {
     const g = new PermissionGate({ ask });
     await g.decide('Bash', { command: 'npm test' }, 'my-ws');
     const req = ask.mock.calls[0][0];
-    expect(req.requestId).toMatch(/[0-9a-f-]{36}/);
+    // UUID v4 形状：版本位为 4，变体位为 8/9/a/b
+    expect(req.requestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(req.toolName).toBe('Bash');
     expect(req.summary).toBe('npm test');
     expect(req.workspaceName).toBe('my-ws');

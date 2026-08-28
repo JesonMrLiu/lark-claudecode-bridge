@@ -36,12 +36,18 @@ export class PermissionGate {
       workspaceName,
     };
     const timeoutMs = this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const decision = await Promise.race<AskOutcome>([
-      this.opts.ask(req),
-      new Promise<typeof TIMED_OUT>((resolve) =>
-        setTimeout(() => resolve(TIMED_OUT), timeoutMs).unref(),
-      ),
-    ]);
+    // 持 timer handle：ask 及时答复后主动清理，避免常驻进程中每个已答复 decide 留一个最长 10 分钟的存活 timer
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<typeof TIMED_OUT>((resolve) => {
+      timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
+      timer.unref();
+    });
+    let decision: AskOutcome;
+    try {
+      decision = await Promise.race<AskOutcome>([this.opts.ask(req), timeoutPromise]);
+    } finally {
+      clearTimeout(timer);
+    }
     if (decision === 'allow-session') this.rememberSession(toolName);
     if (decision === TIMED_OUT) {
       return { behavior: 'deny', message: `确认超时（${Math.round(timeoutMs / 60000)} 分钟未响应），已自动拒绝 ${toolName}` };
