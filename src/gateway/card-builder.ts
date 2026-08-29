@@ -23,24 +23,31 @@ export function buildConfirmCard(req: ConfirmationRequest): unknown {
   const body = req.diff
     ? `\`\`\`diff\n${req.diff.slice(0, 1500)}\n\`\`\``
     : `\`\`\`\n${req.summary.slice(0, 1500)}\n\`\`\``;
+  const button = (decision: 'allow' | 'deny' | 'allow-session') => ({
+    tag: 'button',
+    text: { tag: 'plain_text', content: decision === 'allow' ? '✅ 允许' : decision === 'deny' ? '❌ 拒绝' : '⏭ 本次会话不再询问' },
+    type: decision === 'allow' ? 'primary' : decision === 'deny' ? 'danger' : 'default',
+    behaviors: [{ type: 'callback', value: { requestId: req.requestId, decision } }],
+  });
   return card([
     md(`**🔐 Claude 请求执行操作**\n\n工具: \`${req.toolName}\`　工作区: \`${req.workspaceName}\`\n${body}`),
     {
-      tag: 'action',
-      actions: (['allow', 'deny', 'allow-session'] as const).map((decision) => ({
-        tag: 'button',
-        text: { tag: 'plain_text', content: decision === 'allow' ? '✅ 允许' : decision === 'deny' ? '❌ 拒绝' : '⏭ 本次会话不再询问' },
-        type: decision === 'allow' ? 'primary' : decision === 'deny' ? 'danger' : 'default',
-        behaviors: [{ type: 'callback', value: { requestId: req.requestId, decision } }],
+      // 卡片 V2 已废弃 tag:'action' 交互模块，改用 column_set 分栏实现按钮并排
+      tag: 'column_set',
+      flex_mode: 'flow',
+      columns: (['allow', 'deny', 'allow-session'] as const).map((decision) => ({
+        tag: 'column', width: 'auto', weight: 1, vertical_align: 'top',
+        elements: [button(decision)],
       })),
     },
   ]);
 }
-const DECISION_TEXT: Record<PermissionDecision, string> = {
+export const DECISION_TEXT: Record<PermissionDecision, string> = {
   allow: '✅ 已允许',
   deny: '❌ 已拒绝',
   'allow-session': '⏭ 本次会话不再询问',
 };
 export function buildConfirmResultCard(req: ConfirmationRequest, decision: PermissionDecision, byName: string): unknown {
-  return card([md(`**🔐 Claude 请求执行操作**\n\n工具: \`${req.toolName}\`　工作区: \`${req.workspaceName}\`\n\`\`\`\n${req.summary.slice(0, 500)}\n\`\`\`\n\n${DECISION_TEXT[decision]}（由 ${byName} 操作）`)]);
+  // 摘要截断与确认卡一致（1500）：点击瞬间回调响应内联换卡，摘要突然缩水会被用户看到
+  return card([md(`**🔐 Claude 请求执行操作**\n\n工具: \`${req.toolName}\`　工作区: \`${req.workspaceName}\`\n\`\`\`\n${req.summary.slice(0, 1500)}\n\`\`\`\n\n${DECISION_TEXT[decision]}（由 ${byName} 操作）`)]);
 }

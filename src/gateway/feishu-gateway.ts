@@ -167,7 +167,8 @@ export class FeishuGateway {
         if (msg) await handlers.onMessage(msg);
       },
       // 卡片回调必须返回对象（飞书 SDK 契约：返回值经 WS 回传，undefined 会被当异常）；
-      // handler 返回了响应体（如非发起人点击的 toast）则透传，否则返回 {}
+      // handler 返回了响应体（如 toast / 内联换卡 card）则透传，否则返回 {}。
+      // 畸形回调（parseCardAction 为 null）有意静默返回 {}：无有效操作对象，弹 toast 无服务意义
       'card.action.trigger': async (data: never) => {
         const action = parseCardAction(data);
         const ret = action ? await handlers.onCardAction(action) : undefined;

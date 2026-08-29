@@ -237,7 +237,24 @@ describe('FeishuGateway 分发（注入假 SDK）', () => {
       action: { tag: 'button', value: { requestId: 'req_1', decision: 'allow' } },
     });
     expect(ret).toEqual({ toast: { type: 'info', content: '仅任务发起人可确认' } });
-    // handler 无返回值（发起人正常确认）→ 回 {}，维持 SDK 契约
+    // handler 返回 toast + card（发起人有效点击的内联换卡响应）→ 原样透传，gateway 不加码不改写
+    const onCardActionCard = vi.fn().mockResolvedValue({
+      toast: { type: 'success', content: '✅ 已允许' },
+      card: { type: 'raw', data: { schema: '2.0', config: { update_multi: true }, body: { elements: [] } } },
+    });
+    const { fakeSdk: sdkC, register: regC } = makeFakeSdk();
+    const gwC = new FeishuGateway({ appId: 'cli_0123456789abcdef', appSecret: 's' }, { sdk: sdkC });
+    await gwC.start({ onMessage: vi.fn(), onCardAction: onCardActionCard });
+    const handlersC = regC.mock.results[0].value as Record<string, (d: unknown) => Promise<unknown>>;
+    const retC = await handlersC['card.action.trigger']({
+      operator: { open_id: 'ou_clicker' },
+      action: { tag: 'button', value: { requestId: 'req_3', decision: 'allow' } },
+    });
+    expect(retC).toEqual({
+      toast: { type: 'success', content: '✅ 已允许' },
+      card: { type: 'raw', data: { schema: '2.0', config: { update_multi: true }, body: { elements: [] } } },
+    });
+    // handler 无返回值（畸形回调等被 gateway 拦下的场景）→ 回 {}，维持 SDK 契约
     const onCardActionVoid = vi.fn().mockResolvedValue(undefined);
     const { fakeSdk: sdk2, register: register2 } = makeFakeSdk();
     const gw2 = new FeishuGateway({ appId: 'cli_0123456789abcdef', appSecret: 's' }, { sdk: sdk2 });

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // lcb 命令行入口：setup / start / pair / version
 import { createInterface } from 'node:readline/promises';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { runSetup, APP_ID_RE } from '../cli/setup-wizard.js';
+import { addWorkspace, removeWorkspace } from '../cli/ws-manager.js';
 import { approvePairingLine } from '../cli/stdin-pairing.js';
 import { startBridge } from '../index.js';
 import { loadConfig, CONFIG_PATH, CONFIG_DIR } from '../config.js';
@@ -49,6 +51,55 @@ async function main(): Promise<void> {
       console.log('注：若桥接器正在运行，需重启或改在运行终端输入配对码');
       break;
     }
+    case 'ws': {
+      // 先整体校验再增量修改：带着非法配置做 add/remove 会把错误掩埋进写回结果
+      let config: ReturnType<typeof loadConfig>;
+      try {
+        config = loadConfig(CONFIG_PATH);
+      } catch (e) {
+        console.error(`❌ ${e instanceof Error ? e.message : String(e)}`);
+        process.exit(1);
+      }
+      const sub = args[0];
+      if (sub === 'list') {
+        console.log(config.workspaces
+          .map((w) => `${w.name === config.defaults.workspace ? '*' : ' '} ${w.name}  ${w.path}`)
+          .join('\n'));
+        break;
+      }
+      const raw = readFileSync(CONFIG_PATH, 'utf8'); // 保留注释的增量改写基于原文，而非重序列化内存对象
+      if (sub === 'add') {
+        const [name, path] = args.slice(1);
+        if (!name || !path) {
+          console.log('用法：lcb ws add <名字> <路径>（路径需已存在，含空格需加引号）');
+          process.exit(1);
+        }
+        const r = addWorkspace(raw, name, path);
+        if (!r.ok) {
+          console.error(`❌ ${r.error}`);
+          process.exit(1);
+        }
+        writeFileSync(CONFIG_PATH, r.yaml, 'utf8');
+        console.log(`✅ 已添加工作区 ${name}（${path}）`);
+        console.log('桥接器若正在运行，下一条消息时自动生效，无需重启');
+      } else if (sub === 'remove') {
+        const name = args[1];
+        if (!name) {
+          console.log('用法：lcb ws remove <名字>');
+          process.exit(1);
+        }
+        const r = removeWorkspace(raw, name);
+        if (!r.ok) {
+          console.error(`❌ ${r.error}`);
+          process.exit(1);
+        }
+        writeFileSync(CONFIG_PATH, r.yaml, 'utf8');
+        console.log(`✅ 已删除工作区 ${name}`);
+      } else {
+        console.log('用法：lcb ws add <名字> <路径> | lcb ws remove <名字> | lcb ws list');
+      }
+      break;
+    }
     case 'version':
       console.log(VERSION);
       break;
@@ -56,10 +107,13 @@ async function main(): Promise<void> {
       console.log(`lcb — 飞书 ↔ Claude Code 桥接器 v${VERSION}
 
 用法：
-  lcb setup           引导式配置
-  lcb start           启动桥接器（前台）
-  lcb pair <code>     批准配对码
-  lcb version         版本`);
+  lcb setup              引导式配置
+  lcb start              启动桥接器（前台）
+  lcb pair <code>        批准配对码
+  lcb ws add <名> <路径>  添加工作区（运行中热生效）
+  lcb ws remove <名>     删除工作区
+  lcb ws list            列出工作区（* 为默认）
+  lcb version            版本`);
       break;
   }
 }

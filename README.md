@@ -32,7 +32,7 @@ lcb start
 1. https://open.feishu.cn → 创建企业自建应用 → 添加「机器人」能力
 2. 权限管理开通：`im:message`、`im:message:send_as_bot`、`im:resource`、`contact:user.base:readonly`
 3. 事件与回调 → 事件配置 → 订阅方式选「使用长连接接收事件」→ 添加 `im.message.receive_v1`
-4. 事件与回调 → 卡片交互配置 → 同样选择长连接
+4. 事件与回调 → 回调配置 → 订阅方式选「使用长连接接收回调」→「已订阅的回调」点「添加回调」，添加「卡片回传交互」（`card.action.trigger`）
 5. 凭证与基础信息 → 复制 App ID / App Secret
 6. 版本管理与发布 → 创建版本并发布，管理员审核通过
 7. 运行 `lcb setup` 填入凭证 → `lcb start` → 私聊机器人发「/help」
@@ -48,7 +48,12 @@ lcb start
 | `lcb setup` | 引导式配置（写入 `~/.lark-claudecode-bridge/config.yaml`） |
 | `lcb start` | 启动桥接器（前台，终端可直接输入配对码批准） |
 | `lcb pair <code>` | 另开终端批准 6 位配对码 |
+| `lcb ws add <名字> <路径>` | 添加工作区（路径需已存在；增量写回，保留 config.yaml 注释） |
+| `lcb ws remove <名字>` | 删除工作区（默认工作区被删时自动回退到剩余第一个） |
+| `lcb ws list` | 列出工作区（`*` 为默认） |
 | `lcb version` | 查看版本 |
+
+> **热生效**：桥接器运行中执行 `lcb ws add / remove`，下一条消息到达时自动重读配置，无需重启（feishu 凭证与 `concurrency` 改动除外，需重启）。
 
 ## 命令速查（飞书里发给机器人）
 
@@ -63,7 +68,7 @@ lcb start
 
 ## 配置文件 ~/.lark-claudecode-bridge/config.yaml
 
-`lcb setup` 会引导生成，也可手动编辑。字段说明见仓库内 `config.example.yaml`：
+`lcb setup` 会引导生成，也可手动编辑（或用 `lcb ws add / remove` 增量维护工作区列表）。字段说明见仓库内 `config.example.yaml`：
 
 ```yaml
 feishu:
@@ -141,8 +146,6 @@ npm test          # vitest 全量单测
 npm run build     # tsc → dist/
 node dist/bin/lcb.js version
 ```
-
-发布前真机验证清单见 [docs/e2e-checklist.md](docs/e2e-checklist.md)。
 
 ## License
 

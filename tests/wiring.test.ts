@@ -2,7 +2,9 @@ import { afterAll, describe, it, expect, vi, type Mock } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createBridge, type BridgeDeps } from '../src/index.js';
+import { createBridge, createConfigReloader, type BridgeDeps } from '../src/index.js';
+import { DECISION_TEXT } from '../src/gateway/card-builder.js';
+import { loadConfig } from '../src/config.js';
 import { AccessControl } from '../src/access/access-control.js';
 import { SessionStore } from '../src/session/session-store.js';
 import type { BridgeConfig, CardActionEvent, IncomingMessage } from '../src/types.js';
@@ -93,7 +95,20 @@ describe('createBridge 装配', () => {
     // 模拟用户点允许：从卡片 JSON 提取 requestId
     const m = /"requestId":"([^"]+)"/.exec(JSON.stringify(confirmCard!.card))!;
     const action: CardActionEvent = { value: { requestId: m[1], decision: 'allow' }, operatorId: 'ou_u', openMessageId: 'om_c' };
+    const ret = await bridge.onCardAction(action);
+    // 点击反馈：success toast 即时提示 + 响应内联结果卡同步换卡（按钮消失）
+    expect(ret).toMatchObject({ toast: { type: 'success', content: DECISION_TEXT.allow }, card: { type: 'raw' } });
+    expect(JSON.stringify(ret?.card?.data)).toContain('已允许');
+    // 兜底 PATCH 换结果卡：按确认卡 cardId 'm2' 过滤（进度卡 flush 也调同一 mock，不可裸计数）
+    const confirmUpdates = () => (deps.gateway.updateCard as Mock).mock.calls
+      .filter(([id]) => id === 'm2') as Array<[string, unknown]>;
+    expect(confirmUpdates()).toHaveLength(1);
+    expect(JSON.stringify(confirmUpdates()[0][1])).toContain('已允许');
+    // 重复点击同 requestId（决策已生效）：info toast 提示，不再新增 PATCH、不再 resolve
+    const ret2 = await bridge.onCardAction(action);
+    expect(ret2).toEqual({ toast: { type: 'info', content: '该确认已被处理或已过期，无需重复操作' } });
     await bridge.onCardAction(action);
+    expect(confirmUpdates()).toHaveLength(1);
     await new Promise((r) => setTimeout(r, 50)); // 等放行后的 canUseTool 返回与任务收尾
     // 「点击→放行」必须真正发生：确认链路失效（resolve 未发生）时此断言失败
     expect(decision).toEqual({ behavior: 'allow' });
@@ -114,7 +129,7 @@ describe('createBridge 装配', () => {
     expect(updates.some(([, card]) => JSON.stringify(card).includes('超时'))).toBe(true); // 卡片被 PATCH 为过期态
     expect(decision?.behavior).toBe('deny');                        // gate 收到拒绝，任务未被卡死
     expect(JSON.stringify(sent)).toContain('done');                 // 任务正常收尾
-    // 迟到点击（条目已被超时清理）：静默忽略，不产生新的卡片更新——不得显示与实际不符的决策态
+    // 迟到点击（条目已被超时清理）：toast 提示后忽略，不产生新的卡片更新——不得显示与实际不符的决策态
     const confirmCard = sent.find((s) => JSON.stringify(s.card).includes('请求执行操作'));
     const m = /"requestId":"([^"]+)"/.exec(JSON.stringify(confirmCard!.card))!;
     const before = updates.length;
@@ -122,11 +137,13 @@ describe('createBridge 装配', () => {
     await new Promise((r) => setTimeout(r, 50));
     expect((deps.gateway.updateCard as Mock).mock.calls.length).toBe(before);
   });
-  it('他人点击按钮无权限', async () => {
+  it('已处理/过期的 requestId 返回提示 toast，不抛异常', async () => {
     const { deps } = makeDeps(vi.fn().mockResolvedValue({ sessionId: 's', finalText: '', producedFiles: [], turns: 1 }));
     const bridge = createBridge(cfg, deps);
-    // 无 pending 的 requestId：应静默/提示，不抛异常
-    await expect(bridge.onCardAction({ value: { requestId: 'nope', decision: 'allow' }, operatorId: 'ou_u', openMessageId: 'om_c' })).resolves.toBeUndefined();
+    // 无 pending 的 requestId（已处理/过期/桥接器重启后的孤儿卡）：info toast 反馈，不 PATCH、不抛异常
+    const ret = await bridge.onCardAction({ value: { requestId: 'nope', decision: 'allow' }, operatorId: 'ou_u', openMessageId: 'om_c' });
+    expect(ret).toEqual({ toast: { type: 'info', content: '该确认已被处理或已过期，无需重复操作' } });
+    expect(deps.gateway.updateCard).not.toHaveBeenCalled();
   });
   it('/help 命令直接回复不进执行器', async () => {
     const executor = vi.fn();
@@ -149,13 +166,15 @@ describe('createBridge 装配', () => {
     await new Promise((r) => setTimeout(r, 50));
     const confirmCard = sent.find((s) => JSON.stringify(s.card).includes('请求执行操作'))!;
     const m = /"requestId":"([^"]+)"/.exec(JSON.stringify(confirmCard.card))!;
-    // 他人点击：返回 toast、不 PATCH 卡片、不 resolve 决策
+    // 他人点击：返回 toast、不 PATCH 卡片、不 resolve 决策；
+    // toEqual 全等断言同时锁定响应不得携带 card 字段（内联换卡会把发起人的按钮一并抹掉）
     const ret = await bridge.onCardAction({ value: { requestId: m[1], decision: 'deny' }, operatorId: 'ou_other', openMessageId: 'om_c' });
     expect(ret).toEqual({ toast: { type: 'info', content: '仅任务发起人可确认' } });
     expect(deps.gateway.updateCard).not.toHaveBeenCalled(); // 卡片保持原样（按钮保留）
     expect(decision).toBeUndefined();                       // 等待真正发起人
-    // 发起人点击：仍放行
-    await bridge.onCardAction({ value: { requestId: m[1], decision: 'allow' }, operatorId: 'ou_u', openMessageId: 'om_c' });
+    // 发起人点击：仍放行，且反馈含 success toast + 内联换卡
+    const ret2 = await bridge.onCardAction({ value: { requestId: m[1], decision: 'allow' }, operatorId: 'ou_u', openMessageId: 'om_c' });
+    expect(ret2).toMatchObject({ toast: { type: 'success', content: DECISION_TEXT.allow }, card: { type: 'raw' } });
     await new Promise((r) => setTimeout(r, 50));
     expect(decision).toEqual({ behavior: 'allow' });
     expect(executor).toHaveBeenCalledOnce();
@@ -237,5 +256,55 @@ describe('createBridge 装配', () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(executor).toHaveBeenCalledOnce();
     expect(deps.access.isAllowed('ou_new')).toBe(true);
+  });
+  it('配置热重载：外部 lcb ws add 写盘后，/ws list 免重启可见', async () => {
+    // 真实临时 config 文件 + createConfigReloader，复刻 startBridge 的注入方式
+    const dir = mkdtempSync(join(tmpdir(), 'lcb-wiring-'));
+    tempDirs.push(dir);
+    const cfgPath = join(dir, 'config.yaml');
+    const writeCfg = (ws: Array<{ name: string; path: string }>) => writeFileSync(cfgPath, [
+      'feishu:', '  app_id: a', '  app_secret: s',
+      'workspaces:', ...ws.flatMap((w) => [`  - name: ${w.name}`, `    path: ${w.path}`]),
+      'defaults:', `  workspace: ${ws[0].name}`, 'concurrency: 3',
+    ].join('\n') + '\n', 'utf8');
+    writeCfg([{ name: 'demo', path: 'F:/demo' }]);
+    const live = loadConfig(cfgPath); // 桥「启动时」加载的实例
+    const { deps, sent } = makeDeps(vi.fn().mockResolvedValue({ sessionId: 's1', finalText: 'ok', producedFiles: [], turns: 1 }));
+    const bridge = createBridge(live, deps, { reloadConfig: createConfigReloader(live, cfgPath) });
+    await bridge.onMessage(msg('/ws list'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(JSON.stringify(sent)).not.toContain('blog');
+    // 模拟 lcb ws add 独立进程写盘（桥内存实例对此无感知）
+    writeCfg([{ name: 'demo', path: 'F:/demo' }, { name: 'blog', path: 'F:/blog' }]);
+    await bridge.onMessage(msg('/ws list'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(JSON.stringify(sent)).toContain('blog'); // 下一条消息即见新工作区，无需重启
+  });
+});
+
+describe('createConfigReloader', () => {
+  /** 写临时 config 并 loadConfig，返回活配置与文件改写器 */
+  function fixture() {
+    const dir = mkdtempSync(join(tmpdir(), 'lcb-reload-'));
+    tempDirs.push(dir);
+    const cfgPath = join(dir, 'config.yaml');
+    const write = (yaml: string) => writeFileSync(cfgPath, yaml, 'utf8');
+    write('feishu:\n  app_id: a\n  app_secret: s\nworkspaces:\n  - name: demo\n    path: F:/demo\ndefaults:\n  workspace: demo\nconcurrency: 3\n');
+    return { cfgPath, write, live: loadConfig(cfgPath) };
+  }
+  it('热应用 workspaces + defaults；不热应用 concurrency / feishu（启动时构造的资源无法热替换）', () => {
+    const { cfgPath, write, live } = fixture();
+    write('feishu:\n  app_id: changed\n  app_secret: s\nworkspaces:\n  - name: demo\n    path: F:/demo\n  - name: blog\n    path: F:/blog\ndefaults:\n  workspace: blog\nconcurrency: 9\n');
+    createConfigReloader(live, cfgPath)();
+    expect(live.workspaces.map((w) => w.name)).toEqual(['demo', 'blog']);
+    expect(live.defaults.workspace).toBe('blog');
+    expect(live.concurrency).toBe(3);        // 保持启动值
+    expect(live.feishu.appId).toBe('a');     // 保持启动值
+  });
+  it('读失败（文件写坏的中间态）沿用旧值不抛', () => {
+    const { cfgPath, write, live } = fixture();
+    write('feishu: [broken');
+    expect(() => createConfigReloader(live, cfgPath)()).not.toThrow();
+    expect(live.workspaces).toHaveLength(1);
   });
 });

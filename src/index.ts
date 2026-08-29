@@ -12,7 +12,7 @@ import { CONFIG_DIR, CONFIG_PATH, loadConfig } from './config.js';
 import { AccessControl } from './access/access-control.js';
 import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard } from './gateway/progress-card.js';
-import { buildConfirmCard, buildConfirmResultCard } from './gateway/card-builder.js';
+import { buildConfirmCard, buildConfirmResultCard, DECISION_TEXT } from './gateway/card-builder.js';
 import { runTask } from './executor/claude-executor.js';
 import { PermissionGate } from './executor/permission-gate.js';
 import { SessionStore } from './session/session-store.js';
@@ -28,7 +28,7 @@ const MAX_FILES_BEFORE_ZIP = 10;
 const TASK_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 // 确认等待窗：无人确认则自动拒绝。超时判定由 wiring 侧自管（ask 闭包内的定时器），
 // 从而到点即清理 confirmPending 条目并把卡片 PATCH 为过期态——条目有界不泄漏，
-// 迟到点击因条目已删被 handleCardAction 静默忽略，永不显示与实际不符的决策态
+// 迟到点击因条目已删被 handleCardAction toast 提示后忽略，永不显示与实际不符的决策态
 const CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
 // PermissionGate 的兜底超时：仅当 wiring 侧超时机制失效时才触发（正常流程 ask 必在 CONFIRM_TIMEOUT_MS 内 settle）
 const GATE_FALLBACK_TIMEOUT_MS = CONFIRM_TIMEOUT_MS + 60_000;
@@ -68,7 +68,7 @@ export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真
 export function createBridge(
   config: BridgeConfig,
   deps: BridgeDeps,
-  opts: { confirmTimeoutMs?: number } = {}, // 测试可注入更短的确认等待窗
+  opts: { confirmTimeoutMs?: number; reloadConfig?: () => void } = {}, // 测试可注入更短的确认等待窗 / 自定义配置重载
 ): GatewayHandlers {
   const sem = new Semaphore(config.concurrency);
   const runtimes = new Map<string, ChannelRuntime>();
@@ -101,6 +101,8 @@ export function createBridge(
     // 每条消息先重读 access.json：lcb pair / 运行终端等独立进程批准写盘后，
     // 长存的内存实例不 reload 会查到旧白名单 → 反复发配对码且整盘覆写抹掉新用户（死循环）
     deps.access.reload();
+    // 配置热重载：lcb ws add/remove 独立进程写盘后，本实例下一条消息即读到新工作区
+    opts.reloadConfig?.();
     if (!deps.access.isAllowed(msg.userId)) {
       const code = deps.access.beginPairing(msg.userId, msg.userId);
       console.log(`[配对] 未知用户 ${msg.userId} 请求接入，配对码：${code}（在终端输入 lcb pair ${code} 批准）`);
@@ -159,7 +161,7 @@ export function createBridge(
           // 发确认卡片并挂起，等待 onCardAction 按 requestId 唤醒；
           // 超时由本闭包自管：到点删除条目 + 卡片置为过期态 + 以 deny 继续——
           // 条目有界（无人点击、/stop、4h abort 挂起中的 ask 均会被定时器清理），
-          // 此后的迟到点击因条目已删被静默忽略，卡片不再被改写为与实际不符的决策态
+          // 此后的迟到点击因条目已删被 toast 提示后忽略，卡片不再被改写为与实际不符的决策态
           const cardId = await deps.gateway.sendCardTo(msg.chatId, buildConfirmCard(req));
           return new Promise<PermissionDecision>((resolve) => {
             const gc = setTimeout(() => {
@@ -240,10 +242,19 @@ export function createBridge(
     }
   }
 
+  /**
+   * 卡片回调：所有路径必须给用户可感知反馈（点击无响应会导致反复点击）。
+   * 发起人有效点击走回调响应内联结果卡（飞书收到响应瞬间同步换卡，按钮即刻消失），
+   * toast 仅作即时提示；!pending 等分支严禁携带 card（卡片可能已是结果态，带卡会把
+   * 结果卡换回带按钮状态，等同剥夺发起人操作权——参照 I2 教训）。
+   */
   async function handleCardAction(action: CardActionEvent): Promise<CardActionResponse | undefined> {
     try {
       const pending = confirmPending.get(action.value.requestId);
-      if (!pending) return; // 已过期/不存在的 requestId：静默忽略
+      if (!pending) {
+        // 已处理/超时清理/桥接器重启后的孤儿卡：toast 提示后忽略，不重复决策
+        return { toast: { type: 'info', content: '该确认已被处理或已过期，无需重复操作' } };
+      }
       if (action.operatorId !== pending.ownerId) {
         // 非发起人点击：卡片保持原样（按钮保留，发起人仍可确认）——PATCH 成无按钮的结果卡
         // 会让发起人从此无法操作，群聊可被任意成员 DoS。仅回 toast 提示 + resolve 落空
@@ -252,13 +263,51 @@ export function createBridge(
       }
       confirmPending.delete(action.value.requestId);
       pending.resolve(action.value.decision);
-      await deps.gateway.updateCard(pending.cardId, buildConfirmResultCard(pending.req, action.value.decision, '任务发起人'));
+      const resultCard = buildConfirmResultCard(pending.req, action.value.decision, '任务发起人');
+      // 兜底 PATCH 不再 await：回调须在 3 秒内响应（协议 200341），且响应体已内联结果卡同步换卡，
+      // PATCH 仅在 WS 回传响应丢失时保证最终一致（同时消掉 await PATCH 慢网络下拖垮响应窗口的隐患）
+      void deps.gateway.updateCard(pending.cardId, resultCard)
+        .catch((e) => console.error('[卡片兜底更新失败]', action.value.requestId, e));
+      return {
+        toast: { type: 'success', content: DECISION_TEXT[action.value.decision] },
+        card: { type: 'raw', data: resultCard },
+      };
     } catch (e) {
       console.error('[卡片回调异常]', action.value.requestId, e);
+      // resolve 之后的代码理论不可抛；若未来插入可抛代码，按条目是否仍在区分决策是否已生效
+      const retryable = confirmPending.has(action.value.requestId);
+      return { toast: { type: 'error', content: retryable ? '处理失败，请重试' : '处理出现异常，决策可能已生效，请勿盲目重试' } };
     }
   }
 
   return { onMessage: handleIncoming, onCardAction: handleCardAction };
+}
+
+/**
+ * 配置热重载器：lcb ws add/remove 写盘后，运行实例下一条消息即见新工作区
+ * （与 access.reload 同款模式——长驻进程不重读会持旧配置直至重启）。
+ * 只热应用 workspaces + defaults：FeishuGateway 与 Semaphore 均为启动时构造，
+ * feishu 凭证 / concurrency 变更无法热生效，打警告提示重启，避免「以为已生效」的坑。
+ * 读失败（文件被写坏的中间态等）沿用旧值不崩。
+ */
+export function createConfigReloader(config: BridgeConfig, configPath: string): () => void {
+  return () => {
+    let fresh: BridgeConfig;
+    try {
+      fresh = loadConfig(configPath);
+    } catch (e) {
+      console.warn('[配置热重载] 读取失败，沿用旧配置：', e instanceof Error ? e.message : e);
+      return;
+    }
+    const feishuChanged = fresh.feishu.appId !== config.feishu.appId
+      || fresh.feishu.appSecret !== config.feishu.appSecret
+      || fresh.feishu.domain !== config.feishu.domain;
+    if (feishuChanged || fresh.concurrency !== config.concurrency) {
+      console.warn('[配置热重载] 检测到 feishu 凭证或 concurrency 变更，需重启后生效');
+    }
+    config.workspaces = fresh.workspaces;
+    config.defaults = fresh.defaults;
+  };
 }
 
 export async function startBridge(configPath: string = CONFIG_PATH): Promise<void> {
@@ -276,7 +325,7 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     store: SessionStore.load(join(CONFIG_DIR, 'sessions.json')),
     executor: runTask,
   };
-  const bridge = createBridge(config, deps);
+  const bridge = createBridge(config, deps, { reloadConfig: createConfigReloader(config, configPath) });
   await gateway.start(bridge);
   console.log('🚀 lark-claudecode-bridge 已启动（长连接模式，无需公网 IP）');
 }

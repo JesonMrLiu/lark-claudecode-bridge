@@ -19,6 +19,8 @@ describe('card-builder', () => {
     expect(json).toContain('"decision":"allow"');
     expect(json).toContain('"decision":"deny"');
     expect(json).toContain('"decision":"allow-session"');
+    expect(json).not.toContain('"tag":"action"'); // V2 已废弃 action 包裹，防回归
+    expect(json).toContain('"tag":"column_set"'); // 按钮以分栏布局并排
   });
   it('确认卡片展示命令摘要与工作区', () => {
     const json = JSON.stringify(buildConfirmCard(req));

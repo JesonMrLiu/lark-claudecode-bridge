@@ -12,8 +12,17 @@ export interface IncomingMessage {
 }
 export interface CardActionValue { requestId: string; decision: 'allow' | 'deny' | 'allow-session' }
 export interface CardActionEvent { value: CardActionValue; operatorId: string; openMessageId: string }
-/** card.action.trigger 回调的返回体：非空时由 gateway 透传给飞书（toast 等轻提示） */
-export interface CardActionResponse { toast?: { type: 'info' | 'success' | 'error' | 'warning'; content: string } }
+/**
+ * card.action.trigger 回调的返回体：非空时由 gateway 透传给飞书。
+ * toast 为客户端弹窗提示；card 为回调响应内联新卡片，飞书收到响应后同步替换
+ * 被点击的卡片（3 秒内响应有效）——仅发起人有效点击路径使用，
+ * !pending 等分支严禁携带（此时卡片可能已是结果卡，带卡会把结果卡换回带按钮状态，
+ * 等同剥夺发起人操作权，参照 I2 教训）。
+ */
+export interface CardActionResponse {
+  toast?: { type: 'info' | 'success' | 'error' | 'warning'; content: string };
+  card?: { type: 'raw'; data: unknown };
+}
 export interface GatewayHandlers {
   onMessage(msg: IncomingMessage): Promise<void>;
   onCardAction(action: CardActionEvent): Promise<CardActionResponse | void>;
