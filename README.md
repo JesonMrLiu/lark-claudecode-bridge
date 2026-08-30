@@ -34,12 +34,32 @@ lcb start
 ## 飞书应用配置（图文）
 
 1. https://open.feishu.cn → 创建企业自建应用 → 添加「机器人」能力
-2. 权限管理开通：`im:message`、`im:message:send_as_bot`、`im:resource`、`contact:user.base:readonly`
+2. 权限管理开通：`im:message`、`im:message:send_as_bot`、`im:resource`、`contact:user.base:readonly`、 `application:app_slash_command:write`(这里的目的是可以为飞书机器人增加斜杆命令。如：/help)
 3. 事件与回调 → 事件配置 → 订阅方式选「使用长连接接收事件」→ 添加 `im.message.receive_v1`
 4. 事件与回调 → 回调配置 → 订阅方式选「使用长连接接收回调」→「已订阅的回调」点「添加回调」，添加「卡片回传交互」（`card.action.trigger`）
 5. 凭证与基础信息 → 复制 App ID / App Secret
 6. 版本管理与发布 → 创建版本并发布，管理员审核通过
 7. 运行 `lcb setup` 填入凭证 → `lcb start` → 私聊机器人发「/help」
+
+### 配置斜杆命令
+```curl
+curl --location --request POST 'https://open.feishu.cn/open-apis/application/v7/app_slash_commands' \
+--header 'Authorization: Bearer YOUR_TENANT_ACCESS_TOKEN' \
+--header 'Content-Type: application/json; charset=utf-8' \
+--data-raw '{
+    "command": "greet",
+    "description": {
+        "default_value": "发送一句问候",
+        "i18n": {
+            "en_us": "Send a greeting",
+            "zh_cn": "发送一句问候"
+        },
+        "icon": {
+          "icon_key": "skill_outlined"
+        }
+    }
+}'
+```
 
 ## 首次配对
 
@@ -84,21 +104,21 @@ lcb start
 
 ```yaml
 apps:                      # 多机器人：每个应用一条长连接
-  - name: 主力助手          # 显示名，缺省取 app_id
-    app_id: cli_xxxx        # 飞书开放平台 → 凭证与基础信息
-    app_secret: xxxx
-    # domain: lark          # 国际版 Lark 才需要
-    # default_workspace: demo   # 该机器人的默认工作区
-    # concurrency: 2        # 该机器人的并发上限
-    # append_system_prompt: '你是我的素材收集助手'   # 人格补充（多机器人差异化定位的主要手段）
-    # env:                  # per-app 环境变量（注意 ~/.claude/settings.json 的 env 优先级更高，
-    #                         此处适合放 settings.json 里没有的键）
-    #   SOME_PLUGIN_KEY: xxx
+   - name: 主力助手          # 显示名，缺省取 app_id
+     app_id: cli_xxxx        # 飞书开放平台 → 凭证与基础信息
+     app_secret: xxxx
+      # domain: lark          # 国际版 Lark 才需要
+      # default_workspace: demo   # 该机器人的默认工作区
+      # concurrency: 2        # 该机器人的并发上限
+      # append_system_prompt: '你是我的素材收集助手'   # 人格补充（多机器人差异化定位的主要手段）
+      # env:                  # per-app 环境变量（注意 ~/.claude/settings.json 的 env 优先级更高，
+      #                         此处适合放 settings.json 里没有的键）
+      #   SOME_PLUGIN_KEY: xxx
 workspaces:                # 工作区白名单（列表全局共享；「当前用哪个」per-app 隔离）
-  - name: demo
-    path: F:\workspace\demo
+   - name: demo
+     path: F:\workspace\demo
 defaults:
-  workspace: demo
+   workspace: demo
 concurrency: 3             # 通道间并发上限（未单独配置的 app 沿用）
 # transcripts:             # 对话落盘清理策略；缺省 = 永久保留
 #   retention_days: 90
@@ -169,11 +189,11 @@ lcb start >> "%USERPROFILE%\.lark-claudecode-bridge\bridge.log" 2>&1
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.lark-claudecode-bridge</string>
-  <key>ProgramArguments</key><array><string>/usr/local/bin/lcb</string><string>start</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/lark-claudecode-bridge.log</string>
+   <key>Label</key><string>com.lark-claudecode-bridge</string>
+   <key>ProgramArguments</key><array><string>/usr/local/bin/lcb</string><string>start</string></array>
+   <key>RunAtLoad</key><true/>
+   <key>KeepAlive</key><true/>
+   <key>StandardOutPath</key><string>/tmp/lark-claudecode-bridge.log</string>
 </dict></plist>
 ```
 
