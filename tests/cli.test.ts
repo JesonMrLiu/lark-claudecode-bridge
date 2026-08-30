@@ -70,9 +70,8 @@ describe('setup 向导（纯逻辑）', () => {
 });
 
 describe('VERSION 单一来源', () => {
-  it('index re-export 与 version.ts 一致且为 0.2.0', async () => {
+  it('index re-export 与 version.ts 一致，且与 package.json 同步', async () => {
     const { VERSION: v } = await import('../src/version.js');
-    expect(VERSION).toBe('0.2.0');
     expect(VERSION).toBe(v);
     // dist/bin/lcb.js version 依赖同一来源；与 package.json 版本保持同步
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };

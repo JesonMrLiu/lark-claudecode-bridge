@@ -16,8 +16,9 @@ export interface FeishuAppConfig {
   /** 可选人格补充，直通 SDK options.appendSystemPrompt */
   appendSystemPrompt?: string;
   /** Claude Code 数据目录（会话存储/用户设置/插件，每个机器人一套）：
-   *  apps 里新配置的 app 缺省 <CONFIG_DIR>/claude/<appId>；旧 feishu 迁移的 app 沿用系统默认 ~/.claude（保存量会话 resume） */
-  claudeConfigDir?: string;
+   *  apps 里新配置的 app 缺省 <CONFIG_DIR>/claude/<appId>；旧 feishu 迁移的 app 沿用系统默认 ~/.claude（保存量会话 resume）。
+   *  loadConfig/normalizeApps 保证总有值（显式配置或缺省推导），类型上必填 */
+  claudeConfigDir: string;
   /** per-app 环境变量（如 ANTHROPIC_BASE_URL/ANTHROPIC_MODEL 凭证差异化），合并进 Claude Code 子进程环境 */
   env?: Record<string, string>;
   /** 触发词映射：按数组顺序首个命中生效；不配置 = 行为零变化。match 以 / 开头=首 token 精确匹配，否则=关键词包含 */

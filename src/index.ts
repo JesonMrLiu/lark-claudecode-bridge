@@ -9,6 +9,7 @@ import type {
   IncomingMessage, PermissionDecision, ProgressEvent,
 } from './types.js';
 import { CONFIG_DIR, CONFIG_PATH, loadConfig, sameApps } from './config.js';
+import { warnIfNoClaudeAuth } from './auth-precheck.js';
 import { AccessControl } from './access/access-control.js';
 import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard } from './gateway/progress-card.js';
@@ -88,6 +89,9 @@ export function createBridge(
     CLAUDE_CONFIG_DIR: app.claudeConfigDir,
     ...app.env,
   };
+  // 启动预检：认证来源全落空（env 无 token、独立配置目录无登录态）时提前 warn，
+  // 免得用户配好机器人才发现每条消息都报 Not logged in（真判定仍在 CLI 侧）
+  warnIfNoClaudeAuth(app.name, appEnv, app.claudeConfigDir);
   const runtimes = new Map<string, ChannelRuntime>();
   // 通道级权限闸：「本次会话不再询问」的记忆跨任务生效（spec：直至 /new），
   // 故 gate 归通道持有而非每任务新建——每任务新建会把授权缩成任务级，任务 B 又要重新确认
@@ -316,7 +320,12 @@ export function createBridge(
         for (const f of files) await deps.gateway.uploadAndSendFile(msg.chatId, f);
       }
     } catch (e) {
-      await progress.finish(`❌ 出错：${String(e).slice(0, 300)}`);
+      // 未登录错误附配置指引：该错多因 app 用独立空配置目录、认证只在 ~/.claude，
+      // 直接透传 CLI 原文用户无从下手
+      const hint = String(e).includes('Not logged in')
+        ? '\n\n💡 该机器人没有可用的 Claude Code 认证：请在 config.yaml 该 app 的 env 配置 ANTHROPIC_AUTH_TOKEN（第三方端点另配 ANTHROPIC_BASE_URL），或设 claude_config_dir 指向已登录目录，改完重启 bridge。'
+        : '';
+      await progress.finish(`❌ 出错：${String(e).slice(0, 300)}${hint}`);
       deps.transcript?.result({
         v: 1, ts: new Date().toISOString(), kind: 'result', app: app.appId,
         chatId: msg.chatId, userId: msg.userId, sessionId: '',
