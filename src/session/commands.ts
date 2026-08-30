@@ -1,5 +1,12 @@
-import type { BridgeConfig } from '../types.js';
+import type { BridgeConfig, SessionInventory } from '../types.js';
 import type { SessionStore } from './session-store.js';
+
+/**
+ * bridge 本地命令首 token 清单（去 / 后比对）。单一来源：commands.ts 的 switch、
+ * triggers.ts 的 RESERVED、index.ts 的透传说明均以此为准——本地命令永远优先，
+ * 不被触发词劫持、不透传给 Claude Code。新增本地命令务必同步此清单
+ */
+export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'skills', 'plugins', 'mcp'] as const;
 
 export interface CommandContext {
   channelKey: string;
@@ -11,6 +18,8 @@ export interface CommandContext {
   isAdmin: boolean;
   currentWorkspace(): string;
   stopCurrentTask(): boolean;
+  /** 本 app 当前工作区最近一次会话的加载清单（SDK init 消息缓存）；尚无会话时 undefined */
+  getInventory(): SessionInventory | undefined;
 }
 
 export interface CommandResult {
@@ -27,10 +36,32 @@ const HELP = `**可用命令**
 /status — 查看当前状态
 /ws list — 列出工作区
 /ws use <名字> — 切换工作区
-/help — 帮助`;
+/model — 查看/切换模型（/model <名字> 切换，/model reset 恢复默认）
+/skills — 查看已加载技能
+/plugins — 查看已加载插件
+/mcp — 查看已加载 MCP 服务
+/help — 帮助
+
+💡 其它 / 开头的消息将原文透传给 Claude Code（可触发其技能与插件命令，如 /superpowers:brainstorming）`;
+
+/** 清单类命令的空态提示（会话未初始化 → init 消息未到 → 无缓存） */
+const NO_INVENTORY_REPLY = '暂无加载清单——Claude Code 会话尚未初始化。\n先发一条任务消息（任意内容，如「你好」），完成后再查看。';
+
+/** 清单超过 30 项时截断展示 */
+function tail(items: string[]): string {
+  return items.length > 30 ? `${items.slice(0, 30).join('、')} …等 ${items.length} 个` : items.join('、');
+}
+
+/** 清单类回复共用的头部（工作区 + 加载时间） */
+function inventoryHeader(inv: SessionInventory): string {
+  return `<font color='grey'>工作区 ${inv.workspace} · ${inv.loadedAt.slice(0, 16).replace('T', ' ')} 加载</font>`;
+}
 
 /**
- * 斜杠命令处理。非 / 开头的文本返回 { handled: false, taskText } 交给任务链路。
+ * 斜杠命令处理。非 / 开头的文本返回 { handled: false, taskText } 交给任务链路；
+ * 本地命令之外的 / 开头消息也返回 { handled: false, taskText } 原文透传——
+ * SDK 会话可直接派发 prompt 里的斜杠命令（user skills / 插件命令等），
+ * Claude Code 侧不存在的命令会在任务结果里回报错误，比 bridge 拦截信息量更大。
  * 会话编号约定：列表按时间正序展示（1 = 最早归档）；
  * 内部存储为新→旧（sessions[0] 为当前），故编号 n 对应内部下标 length - n。
  */
@@ -44,8 +75,8 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
     case 'new': {
       const ws = ctx.currentWorkspace();
       const st = store.getChannelState(key);
-      // 显式清空历史（保留工作区归属），会话指针重置为空
-      store.setChannelState(key, { workspaceName: st?.workspaceName ?? ws, sessions: [] });
+      // 显式清空历史（保留工作区归属与通道级模型偏好），会话指针重置为空
+      store.setChannelState(key, { workspaceName: st?.workspaceName ?? ws, sessions: [], ...(st?.model ? { model: st.model } : {}) });
       return { handled: true, reply: `✅ 已开启新会话（工作区：${ws}）` };
     }
     case 'resume': {
@@ -78,7 +109,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       const st = store.getChannelState(key);
       return {
         handled: true,
-        reply: `机器人：**${ctx.appName}**\n工作区：**${st?.workspaceName ?? ctx.currentWorkspace()}**\n历史会话：${store.listSessions(key).length} 个`,
+        reply: `机器人：**${ctx.appName}**\n工作区：**${st?.workspaceName ?? ctx.currentWorkspace()}**\n模型：**${st?.model ?? '跟随全局'}**\n历史会话：${store.listSessions(key).length} 个`,
       };
     }
     case 'ws': {
@@ -92,13 +123,71 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
         const target = ctx.config.workspaces.find((w) => w.name === args[1]);
         if (!target) return { handled: true, reply: `工作区 "${args[1] ?? ''}" 不存在，/ws list 查看` };
         const st = store.getChannelState(key);
-        // 切换工作区保留历史会话记录
-        store.setChannelState(key, { workspaceName: target.name, sessions: st?.sessions ?? [] });
+        // 切换工作区保留历史会话记录与通道级模型偏好
+        store.setChannelState(key, {
+          workspaceName: target.name,
+          sessions: st?.sessions ?? [],
+          ...(st?.model ? { model: st.model } : {}),
+        });
         return { handled: true, reply: `✅ 已切换工作区：**${target.name}**（${target.path}）` };
       }
       return { handled: true, reply: '用法：/ws list | /ws use <名字>' };
     }
+    case 'model': {
+      const st = store.getChannelState(key);
+      const arg = args.join(' ').trim();
+      if (!arg) {
+        // 查看当前生效：通道覆盖 > 会话实测 > 跟随全局
+        const inv = ctx.getInventory();
+        const current = st?.model ?? inv?.model ?? '跟随全局';
+        const source = st?.model ? '通道覆盖' : inv ? '会话实测' : '未初始化';
+        return {
+          handled: true,
+          reply: `**模型设置**\n当前生效：**${current}**（来源：${source}）`
+            + `\n${st?.model ? '本通道已设置覆盖；' : '未设置通道覆盖时跟随 ~/.claude/settings.json；'}`
+            + `\n切换：/model <名字>（如 /model opus）；恢复默认：/model reset。下一条消息起生效，仅影响本通道`,
+        };
+      }
+      if (arg === 'reset' || arg === 'default') {
+        if (st) {
+          const { model: _drop, ...rest } = st;
+          store.setChannelState(key, rest);
+        }
+        return { handled: true, reply: '✅ 已恢复默认模型（跟随 ~/.claude/settings.json 全局配置）' };
+      }
+      if (st) {
+        store.setChannelState(key, { ...st, model: arg });
+      } else {
+        store.setChannelState(key, { workspaceName: ctx.currentWorkspace(), sessions: [], model: arg });
+      }
+      return { handled: true, reply: `✅ 已切换模型：**${arg}**（下一条消息起生效；/model reset 恢复默认）` };
+    }
+    case 'skills': {
+      const inv = ctx.getInventory();
+      if (!inv) return { handled: true, reply: NO_INVENTORY_REPLY };
+      return {
+        handled: true,
+        reply: `**已加载技能** ${inv.skills.length} 个 · ${inventoryHeader(inv)}\n${tail(inv.skills)}`
+          + `\n\n💡 技能若带斜杠命令可直接发 \`/命令名\` 触发（透传给 Claude Code）`,
+      };
+    }
+    case 'plugins': {
+      const inv = ctx.getInventory();
+      if (!inv) return { handled: true, reply: NO_INVENTORY_REPLY };
+      const list = inv.plugins.map((p) => `- **${p.name}**${p.version ? `（${p.version}）` : ''}`).join('\n');
+      return { handled: true, reply: `**已加载插件** ${inv.plugins.length} 个 · ${inventoryHeader(inv)}\n${list}` };
+    }
+    case 'mcp': {
+      const inv = ctx.getInventory();
+      if (!inv) return { handled: true, reply: NO_INVENTORY_REPLY };
+      const list = inv.mcpServers.map((s) => {
+        const ok = s.status === 'connected';
+        return `- ${ok ? '✅' : '⚠️'} **${s.name}**（${s.status}）`;
+      }).join('\n');
+      return { handled: true, reply: `**MCP 服务** ${inv.mcpServers.length} 个 · ${inventoryHeader(inv)}\n${list}` };
+    }
     default:
-      return { handled: true, reply: `未知命令 /${name}，/help 查看帮助` };
+      // 非本地命令的斜杠消息原文透传给 Claude Code（SDK 直接派发斜杠命令）
+      return { handled: false, taskText: text };
   }
 }

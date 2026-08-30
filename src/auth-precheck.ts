@@ -29,8 +29,8 @@ function hasSettingsAuth(claudeConfigDir: string): boolean {
 }
 
 /**
- * 检查单个 app 的 Claude Code 认证来源（与 CLI 侧判定顺序一致）：
- * 环境变量（进程透传或 apps[].env）→ 配置目录 OAuth 凭证 → 配置目录 settings.json 认证声明。
+ * 检查认证来源（与 CLI 侧判定顺序一致）：
+ * 环境变量（进程透传或 apps[].env）→ ~/.claude OAuth 凭证 → ~/.claude settings.json 认证声明。
  */
 export function hasClaudeAuth(appEnv: Record<string, string | undefined>, claudeConfigDir: string): boolean {
   return hasEnvAuth(appEnv)
@@ -38,7 +38,7 @@ export function hasClaudeAuth(appEnv: Record<string, string | undefined>, claude
     || hasSettingsAuth(claudeConfigDir);
 }
 
-/** 启动预检：无任何认证来源时 warn 三条出路；返回是否存在认证（测试断言用） */
+/** 启动预检：无任何认证来源时 warn 修复出路；返回是否存在认证（测试断言用） */
 export function warnIfNoClaudeAuth(
   appName: string,
   appEnv: Record<string, string | undefined>,
@@ -48,10 +48,9 @@ export function warnIfNoClaudeAuth(
   console.warn(
     `[app:${appName}] [配置] 未检测到 Claude Code 认证来源：环境变量无 ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY，`
     + `且 ${claudeConfigDir} 下无 .credentials.json，settings.json 也未声明认证。`
-    + `发消息将报「Not logged in · Please run /login」。三选一修复：`
-    + `① config.yaml 该 app 的 env 配置 ANTHROPIC_AUTH_TOKEN（第三方端点另配 ANTHROPIC_BASE_URL）；`
-    + `② 该 app 的 claude_config_dir 指向已登录的目录（如 ~/.claude）；`
-    + `③ 在该目录登录一次：CLAUDE_CONFIG_DIR=${claudeConfigDir} claude login`,
+    + `发消息将报「Not logged in · Please run /login」。二选一修复：`
+    + `① 在本机终端登录一次 claude login（登录态存于 ~/.claude，所有机器人共享）；`
+    + `② 在 ~/.claude/settings.json 的 env 配 ANTHROPIC_AUTH_TOKEN（第三方端点另配 ANTHROPIC_BASE_URL）`,
   );
   return false;
 }

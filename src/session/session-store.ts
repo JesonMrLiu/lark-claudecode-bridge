@@ -11,6 +11,9 @@ export interface SessionMeta {
 export interface ChannelState {
   workspaceName: string;
   sessions: SessionMeta[];
+  /** 通道级模型覆盖（/model 命令设置，跨重启持久；/new 不清除——它是通道偏好而非会话状态）。
+   *  缺省/undefined = 跟随 ~/.claude/settings.json 的 model */
+  model?: string;
 }
 
 /**

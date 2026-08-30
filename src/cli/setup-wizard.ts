@@ -2,10 +2,9 @@
 // 交互层（readline 问答）与序列化层（answersToConfig / toYamlDocument）分离：
 // 序列化层是纯函数，tests/cli.test.ts 直接单测；交互层留给手动冒烟
 import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { stringify } from 'yaml';
 import type { BridgeConfig } from '../types.js';
-import { CONFIG_DIR } from '../config.js';
 import { asker } from './asker.js';
 
 /** 向导收集到的原始答案（apps 支持多机器人） */
@@ -30,9 +29,6 @@ export function answersToConfig(a: SetupAnswers): BridgeConfig {
       name: app.name?.trim() || app.appId,
       appId: app.appId,
       appSecret: app.appSecret,
-      // 新配置 app 的缺省数据目录（与 loadConfig/normalizeApps 推导一致；
-      // toYamlDocument 不写此键，落盘后仍由 loadConfig 重新推导）
-      claudeConfigDir: join(CONFIG_DIR, 'claude', app.appId),
     })),
     workspaces: a.workspaces,
     defaults: { workspace: a.workspaces.some((w) => w.name === ws) ? ws : first },

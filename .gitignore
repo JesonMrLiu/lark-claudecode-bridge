@@ -7,3 +7,4 @@ dist/
 .superpowers
 docs/
 .claude
+tests

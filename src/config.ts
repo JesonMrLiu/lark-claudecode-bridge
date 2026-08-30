@@ -94,11 +94,14 @@ function normalizeApps(doc: Record<string, unknown>, workspaceNames: string[]): 
         throw new Error(`${where} 的 concurrency 必须为 1-100 的数字（当前值：${String(raw.concurrency)}），请检查 config.yaml`);
       }
     }
-    // Claude Code 数据目录：显式配置优先；旧 feishu 迁移的 app 沿用系统默认 ~/.claude（保存量会话 resume）；
-    // apps 里新配置的 app 缺省独立目录——每个机器人一套会话存储/设置/插件，物理隔离互不共享
-    const claudeConfigDir = typeof raw.claude_config_dir === 'string' && raw.claude_config_dir.trim()
-      ? raw.claude_config_dir
-      : isLegacy ? join(homedir(), '.claude') : join(CONFIG_DIR, 'claude', appId);
+    // claude_config_dir 已废弃：所有机器人一律共享本机 ~/.claude（模型设置/登录态/MCP/skills/插件），
+    // 机器人间仅靠 sessions.<appId>.json 做会话隔离。检测到旧键仅 warn 不报错，保证存量配置平滑升级
+    if (typeof raw.claude_config_dir === 'string' && raw.claude_config_dir.trim()) {
+      console.warn(
+        `[配置] ${where} 的 claude_config_dir 已废弃：本版起所有机器人一律使用 ~/.claude`
+        + `（共享本机模型设置/登录态/MCP/skills/插件，仅会话池隔离），该配置项将被忽略`,
+      );
+    }
     return {
       name,
       appId,
@@ -107,7 +110,6 @@ function normalizeApps(doc: Record<string, unknown>, workspaceNames: string[]): 
       defaultWorkspace: raw.default_workspace,
       concurrency,
       appendSystemPrompt: raw.append_system_prompt,
-      claudeConfigDir,
       env: raw.env && typeof raw.env === 'object' ? raw.env : undefined,
       triggers: normalizeTriggers(raw.triggers, where),
       plugins: normalizePlugins(raw.plugins, where),
@@ -166,7 +168,7 @@ export function sameApps(a: FeishuAppConfig[], b: FeishuAppConfig[]): boolean {
     const y = b[i];
     return x.appId === y.appId && x.appSecret === y.appSecret && x.name === y.name
       && x.domain === y.domain && x.defaultWorkspace === y.defaultWorkspace
-      && x.concurrency === y.concurrency && x.claudeConfigDir === y.claudeConfigDir
+      && x.concurrency === y.concurrency
       && x.appendSystemPrompt === y.appendSystemPrompt
       && JSON.stringify(x.env ?? {}) === JSON.stringify(y.env ?? {});
   });

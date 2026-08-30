@@ -1,12 +1,13 @@
 // 装配主流程：消息 → 访问控制 → 命令 → 通道队列 → 执行 → 确认卡片 → 回传
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { existsSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join, basename, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import type {
   BridgeConfig, CardActionEvent, CardActionResponse, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
-  IncomingMessage, PermissionDecision, ProgressEvent,
+  IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory,
 } from './types.js';
 import { CONFIG_DIR, CONFIG_PATH, loadConfig, sameApps } from './config.js';
 import { warnIfNoClaudeAuth } from './auth-precheck.js';
@@ -16,6 +17,7 @@ import { ProgressCard } from './gateway/progress-card.js';
 import { buildConfirmCard, buildConfirmResultCard, DECISION_TEXT } from './gateway/card-builder.js';
 import { runTask } from './executor/claude-executor.js';
 import { PermissionGate } from './executor/permission-gate.js';
+import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery.js';
 import { createGatewaySender, createNotifyServer, NOTIFY_SERVER_NAME } from './executor/notify-server.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
 import { handleCommand } from './session/commands.js';
@@ -28,6 +30,9 @@ export { VERSION } from './version.js';
 
 const execFileP = promisify(execFile);
 const MAX_FILES_BEFORE_ZIP = 10;
+// 全部机器人共享本机 ~/.claude（模型设置/登录态/user MCP/skills/插件；会话池仍 per-app 隔离）。
+// 显式注入 CLAUDE_CONFIG_DIR 而非依赖 CLI 缺省，防外部环境变量把数据目录带偏
+const SHARED_CLAUDE_DIR = join(homedir(), '.claude');
 // 任务总超时 4 小时（防挂死；确认等待、长编译均在正常范围）
 const TASK_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 // 确认等待窗：无人确认则自动拒绝。超时判定由 wiring 侧自管（ask 闭包内的定时器），
@@ -81,17 +86,20 @@ export function createBridge(
 ): GatewayHandlers {
   const sem = new Semaphore(app.concurrency ?? config.concurrency);
   const tag = `[app:${app.name}]`;
-  // per-app Claude Code 环境：每个机器人的子进程用各自的 CLAUDE_CONFIG_DIR
-  //（会话存储/用户设置/插件物理隔离），app.env 可覆盖模型凭证等变量；
+  // Claude Code 子进程环境：CLAUDE_CONFIG_DIR 固定指向共享的 ~/.claude（settingSources 含 user，
+  // 模型设置/登录态/user MCP/skills 自动继承），app.env 追加 settings.json 里没有的键；
   // process.env 先展开保证其余变量（ANTHROPIC_* 凭证、代理等）原样透传
   const appEnv: Record<string, string | undefined> = {
     ...process.env,
-    CLAUDE_CONFIG_DIR: app.claudeConfigDir,
+    CLAUDE_CONFIG_DIR: SHARED_CLAUDE_DIR,
     ...app.env,
   };
-  // 启动预检：认证来源全落空（env 无 token、独立配置目录无登录态）时提前 warn，
+  // 启动预检：认证来源全落空（env 无 token、~/.claude 无登录态）时提前 warn，
   // 免得用户配好机器人才发现每条消息都报 Not logged in（真判定仍在 CLI 侧）
-  warnIfNoClaudeAuth(app.name, appEnv, app.claudeConfigDir);
+  warnIfNoClaudeAuth(app.name, appEnv, SHARED_CLAUDE_DIR);
+  // 会话清单缓存（SDK init 消息）：按工作区键存——project 级 .mcp.json/skills 随工作区不同，
+  // 任一通道跑过一次该工作区即可供 /skills /plugins /mcp /model 渲染。进程内存，重启后清空
+  const inventories = new Map<string, SessionInventory>();
   const runtimes = new Map<string, ChannelRuntime>();
   // 通道级权限闸：「本次会话不再询问」的记忆跨任务生效（spec：直至 /new），
   // 故 gate 归通道持有而非每任务新建——每任务新建会把授权缩成任务级，任务 B 又要重新确认
@@ -159,6 +167,7 @@ export function createBridge(
       appName: app.name,
       isAdmin: deps.access.isAdmin(msg.userId),
       currentWorkspace: () => currentWorkspace,
+      getInventory: () => inventories.get(currentWorkspace),
       stopCurrentTask: () => {
         const rt = runtimes.get(key);
         if (rt?.abort) { rt.abort.abort(); return true; }
@@ -249,13 +258,22 @@ export function createBridge(
         signal: abort.signal,
         env: appEnv,
         appendSystemPrompt: app.appendSystemPrompt,
+        // 通道级模型覆盖（/model 设置，每任务现读——改完下一条消息即生效）；未设 = 跟随 ~/.claude 全局
+        ...(state?.model ? { model: state.model } : {}),
         // 进程内通知工具（send_text/send_image/send_file）：中间产物实时推给当前聊天。
         // server 实例按任务构造，chatId 在 sender 闭包内硬绑定——模型无法选择接收者
         mcpServers: { [NOTIFY_SERVER_NAME]: createNotifyServer(notifySender) },
-        // per-app 显式加载的本地插件（SDK 单次 query 不展开斜杠命令，技能经触发词改写后由此加载）
-        ...(app.plugins?.length ? { plugins: app.plugins.map((p) => ({ path: p.path })) } : {}),
+        // 插件：config.yaml 显式配置（开发期指源码目录）+ ~/.claude 已启用 marketplace 插件自动发现，
+        // 同名显式优先；SDK 对无效路径静默跳过，实际加载以 init 清单（/plugins 命令）为准
+        ...(() => {
+          const merged = resolvePluginPaths(app.plugins, discoverPlugins(SHARED_CLAUDE_DIR));
+          return merged.length ? { plugins: merged.map((p) => ({ path: p.path })) } : {};
+        })(),
         canUseTool: (toolName, input) => gate.decide(toolName, input, wsName),
       }, {
+        onInit: (inv) => {
+          inventories.set(wsName, { ...inv, workspace: wsName, loadedAt: new Date().toISOString() });
+        },
         onProgress: (e: ProgressEvent) => {
           if (e.kind === 'text') {
             progress.appendText(e.content);
@@ -320,12 +338,15 @@ export function createBridge(
         for (const f of files) await deps.gateway.uploadAndSendFile(msg.chatId, f);
       }
     } catch (e) {
-      // 未登录错误附配置指引：该错多因 app 用独立空配置目录、认证只在 ~/.claude，
-      // 直接透传 CLI 原文用户无从下手
-      const hint = String(e).includes('Not logged in')
-        ? '\n\n💡 该机器人没有可用的 Claude Code 认证：请在 config.yaml 该 app 的 env 配置 ANTHROPIC_AUTH_TOKEN（第三方端点另配 ANTHROPIC_BASE_URL），或设 claude_config_dir 指向已登录目录，改完重启 bridge。'
-        : '';
-      await progress.finish(`❌ 出错：${String(e).slice(0, 300)}${hint}`);
+      // 常见错误附配置指引：Not logged in 多因 ~/.claude 无登录态（本机跑一次 claude login 即可）；
+      // No conversation found 多因旧版独立目录里的会话（本版起统一 ~/.claude，旧会话无法跨目录 resume）
+      const errText = String(e);
+      const hint = errText.includes('Not logged in')
+        ? '\n\n💡 没有可用的 Claude Code 认证：在本机终端跑一次 claude login 登录（登录态存于 ~/.claude，所有机器人共享）；或在本机 ~/.claude/settings.json 的 env 配 ANTHROPIC_AUTH_TOKEN（第三方端点另配 ANTHROPIC_BASE_URL），改完重启 bridge。'
+        : /No conversation found|session not found/i.test(errText)
+          ? '\n\n💡 该会话可能已失效（或属于旧版独立配置目录）：发 /new 开启新会话即可。'
+          : '';
+      await progress.finish(`❌ 出错：${errText.slice(0, 300)}${hint}`);
       deps.transcript?.result({
         v: 1, ts: new Date().toISOString(), kind: 'result', app: app.appId,
         chatId: msg.chatId, userId: msg.userId, sessionId: '',
@@ -424,6 +445,17 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   }
   // reloader 共享：所有 bridge 持有同一 config 对象引用，mutate 一处全员可见
   const reloadConfig = createConfigReloader(config, configPath);
+  // 旧版（≤0.3.x）缺省独立目录的一次性迁移提示：目录还在则其中历史会话不再可 /resume
+  //（本版起所有机器人统一 ~/.claude，会话无法跨数据目录 resume）。不做自动迁移（双目录合并无安全做法）
+  for (const app of config.apps) {
+    const legacyDir = join(CONFIG_DIR, 'claude', app.appId);
+    if (existsSync(legacyDir)) {
+      console.warn(
+        `[app:${app.name}] 检测到旧版独立数据目录 ${legacyDir}：本版起统一使用 ~/.claude，`
+        + `该目录中的历史会话不再出现在 /resume（本机配置/登录态/插件已自动继承）。目录保留未动，确认无用后可手动删除`,
+      );
+    }
+  }
   // 每 app 一对 gateway+bridge：长连接/会话池/并发闸/Claude Code 环境/落盘目录全部 per-app 隔离
   const runners = config.apps.map((app) => {
     const tag = `[app:${app.name}]`;

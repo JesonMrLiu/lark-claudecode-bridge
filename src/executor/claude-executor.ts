@@ -2,20 +2,24 @@
 // 注意：不覆盖/清理任何 ANTHROPIC_* 环境变量，凭证与代理配置透传 process.env
 import { query, type McpServerConfig, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { OutputCollector } from './output-collector.js';
-import type { ProgressEvent, TaskOutcome } from '../types.js';
+import type { ProgressEvent, SessionInventory, TaskOutcome } from '../types.js';
 
 export interface ExecutorCallbacks {
   onProgress(event: ProgressEvent): Promise<void> | void;
+  /** SDK init(system/init) 消息到达时回调（每 query 仅一次）；提取本会话实际加载的模型/技能/插件/MCP 清单 */
+  onInit?(inventory: Omit<SessionInventory, 'workspace' | 'loadedAt'>): void;
 }
 
 export interface RunTaskOptions {
   cwd: string;
   resumeSessionId?: string;
   signal?: AbortSignal;
-  /** per-app 环境变量：至少含 CLAUDE_CONFIG_DIR（每个机器人独立的 Claude Code 数据目录）；可覆盖模型凭证等 */
+  /** per-app 环境变量：至少含 CLAUDE_CONFIG_DIR（~/.claude，全部机器人共享）；可追加 settings.json 里没有的键 */
   env?: Record<string, string | undefined>;
   /** per-app 人格补充，直通 SDK appendSystemPrompt */
   appendSystemPrompt?: string;
+  /** 通道级模型覆盖（/model 命令设置），直通 Options.model；未设 = 跟随 ~/.claude/settings.json 的 model */
+  model?: string;
   // 收窄签名：SDK 的 CanUseTool 还带第三参 options（signal/suggestions 等），此处仅暴露 (toolName, input)。
   // deny 分支 message 必填，与 SDK PermissionResult 判别联合结构兼容，可直接透传
   canUseTool?: (
@@ -58,6 +62,7 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
     ...(opts.signal ? { abortController: bridgeSignal(opts.signal) } : {}),
     ...(opts.env ? { env: opts.env } : {}),
     ...(opts.appendSystemPrompt ? { appendSystemPrompt: opts.appendSystemPrompt } : {}),
+    ...(opts.model ? { model: opts.model } : {}),
     ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
     ...(opts.plugins ? { plugins: opts.plugins.map((p) => ({ type: 'local' as const, path: p.path })) } : {}),
   };
@@ -65,9 +70,26 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
   let finalText = '';
   let sessionId = opts.resumeSessionId ?? '';
   let turns = 0;
+  // init 消息提取的会话清单（每 query 一次）；数组字段全部 ?? [] 兜底——SDK 升级字段改名时清单为空但不崩
+  let inventory: Omit<SessionInventory, 'workspace' | 'loadedAt'> | undefined;
   const toolNames = new Map<string, string>(); // tool_use_id → 工具名（tool_result 块本身不带 name）
   for await (const message of q as AsyncIterable<SDKMessage>) {
     switch (message.type) {
+      case 'system': {
+        if (message.subtype === 'init') {
+          inventory = {
+            model: message.model,
+            claudeCodeVersion: message.claude_code_version,
+            skills: message.skills ?? [],
+            slashCommands: message.slash_commands ?? [],
+            plugins: (message.plugins ?? []).map((p) => ({ name: p.name, path: p.path, version: p.version })),
+            mcpServers: message.mcp_servers ?? [],
+            agents: message.agents ?? [],
+          };
+          cb.onInit?.(inventory);
+        }
+        break;
+      }
       case 'assistant': {
         turns++;
         for (const block of message.message.content) {
@@ -100,5 +122,5 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
       }
     }
   }
-  return { sessionId, finalText, producedFiles: collector.files(), turns };
+  return { sessionId, finalText, producedFiles: collector.files(), turns, ...(inventory ? { inventory } : {}) };
 }

@@ -7,11 +7,13 @@
 ## 特性
 
 - 私聊 / 群聊 @机器人 触发；群聊多人可用（配对 + 白名单访问控制）
-- **多机器人**：一个进程同时跑 N 个飞书机器人，各自独立会话池、独立并发、独立 Claude Code 实例（会话存储/设置/插件/模型凭证互不共享）
+- **直接使用本机 Claude Code 全套配置**：模型设置（`~/.claude/settings.json`）、登录态、user 级 MCP、skills、marketplace 插件自动继承，无须二次配置；已启用插件自动加载
+- **斜杠透传**：飞书里直接发 `/superpowers:brainstorming` 等斜杠命令，原文透传给 Claude Code 展开（user skills / 插件命令均可触发）；配合飞书「机器人菜单」可做成输入框上方的快捷操作按钮
+- **多机器人**：一个进程同时跑 N 个飞书机器人，各自独立会话池、独立并发、独立人格（`append_system_prompt`）；共享同一套 `~/.claude` 配置
 - 写操作确认卡片：允许 / 拒绝 / 本次会话不再询问（仅任务发起人可点）
 - 流式进度卡片（打字机效果 + 工具调用 + 运行心跳，静默不等于卡死）
 - 结果文本 + 产出文件回传（图片预览、>10 文件自动 zip）
-- 多工作区切换（/ws）、会话管理（/new /resume）、/stop 打断
+- 多工作区切换（/ws）、会话管理（/new /resume）、/stop 打断、模型切换（/model）、加载清单查看（/skills /plugins /mcp）
 - **对话内容落盘**：用户消息与 Claude 回复全文存为 JSONL（`transcripts/`，为后续知识库挖掘打底；可选保留期）
 - 通道并发（默认 3），通道内串行
 
@@ -69,7 +71,12 @@ lcb start
 | /stop | 停止当前任务 |
 | /status | 当前状态 |
 | /ws list / /ws use \<名字\> | 工作区（切换仅 admin 可用） |
+| /model | 查看当前模型；`/model <名字>` 通道级切换；`/model reset` 恢复默认 |
+| /skills / /plugins / /mcp | 查看本会话实际加载的技能 / 插件 / MCP 服务 |
 | /help | 帮助 |
+| 其它 `/xxx` | **原文透传**给 Claude Code 派发斜杠命令（如 `/superpowers:brainstorming` 触发插件技能） |
+
+> 清单类命令（/skills 等）的数据来自最近一次会话的加载清单；刚启动还没跑过任务时，先发一条普通消息（如「你好」）再查。
 
 ## 配置文件 ~/.lark-claudecode-bridge/config.yaml
 
@@ -83,9 +90,10 @@ apps:                      # 多机器人：每个应用一条长连接
     # domain: lark          # 国际版 Lark 才需要
     # default_workspace: demo   # 该机器人的默认工作区
     # concurrency: 2        # 该机器人的并发上限
-    # append_system_prompt: '你是我的素材收集助手'   # 人格补充
-    # env:                  # per-app 环境变量（不同机器人用不同模型端点/密钥）
-    #   ANTHROPIC_BASE_URL: https://your-endpoint/
+    # append_system_prompt: '你是我的素材收集助手'   # 人格补充（多机器人差异化定位的主要手段）
+    # env:                  # per-app 环境变量（注意 ~/.claude/settings.json 的 env 优先级更高，
+    #                         此处适合放 settings.json 里没有的键）
+    #   SOME_PLUGIN_KEY: xxx
 workspaces:                # 工作区白名单（列表全局共享；「当前用哪个」per-app 隔离）
   - name: demo
     path: F:\workspace\demo
@@ -96,13 +104,38 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 #   retention_days: 90
 ```
 
-### 多机器人隔离语义（重要）
+### 配置继承（本机 ~/.claude 一处配置，全机器人共享）
+
+所有机器人共享本机 `~/.claude`，以下内容自动继承、无须在 config.yaml 重复配置：
+
+| 继承项 | 来源 | 说明 |
+|---|---|---|
+| 模型设置 | `~/.claude/settings.json` 的 `model` 与 `env` | 含 `ANTHROPIC_*`、第三方端点等全部环境变量 |
+| 登录态 | `~/.claude/.credentials.json` / settings.json 认证声明 | 本机 `claude login` 一次即可 |
+| user 级 MCP | `~/.claude.json` 的 `mcpServers` | 与本机 CLI 用同一批 MCP 服务 |
+| skills | `~/.claude/skills/` | 可直接在飞书发 `/技能名` 触发（透传） |
+| 插件 | `~/.claude/plugins/` 中已启用的 marketplace 插件 | 按 `installed_plugins.json` + `enabledPlugins` 自动加载 |
+| 会话记录 | `~/.claude/projects/` | 飞书跑过的会话，本机 `claude --resume` 也能接着看 |
+
+**插件自动发现**：随本机 CLI 的 `/plugin install` / `/plugin uninstall` 自动跟随（按文件 mtime 失效缓存）；`apps[].plugins` 显式配置用于开发期直指源码目录，与自动发现同名时显式优先。
+
+**多机器人隔离语义**：
 
 - **会话池**：每个机器人一份 `sessions.<app_id>.json`，历史会话绝不共享，`/resume` 只见自己的
-- **Claude Code 实例**：每个机器人一个独立的 `claude/<app_id>/` 数据目录（会话存储、用户设置、插件、登录态各自一套）；也可用 `claude_config_dir` 显式指定
-- **模型凭证**：`env` 可按机器人覆盖 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` 等（如对话机器人用高端模型、素材收集用便宜端点）
+- **人格**：`append_system_prompt` 按机器人定制（如对话助手 / 素材收集各一套）
 - **并发**：按机器人独立限额（缺省沿用全局 `concurrency`）；同时与多个机器人对话互不排队
-- **升级兼容**：旧版 `feishu:` 单应用配置无需改动即可启动（自动归一化，旧会话原样可 `/resume`）；首次 `lcb app add` 会把旧配置原地转为 `apps:` 格式，**转换后新增的机器人请追加在列表后面**（旧数据归属第一个应用）
+- **升级兼容**：旧版 `feishu:` 单应用配置无需改动即可启动（自动归一化）；首次 `lcb app add` 会把旧配置原地转为 `apps:` 格式，**转换后新增的机器人请追加在列表后面**（旧数据归属第一个应用）
+- ⚠️ **0.4 起废弃 `claude_config_dir`**：所有机器人统一用 `~/.claude（共享配置）`，机器人间仅会话池隔离。旧版独立目录 `~/.lark-claudecode-bridge/claude/<app_id>/` 中的历史会话不再可 `/resume`（启动时会提示目录位置，确认无用后可手动删除）
+
+### 快捷操作：飞书机器人菜单
+
+把常用技能做成聊天输入框上方的按钮（点击即发对应斜杠命令）：
+
+1. https://open.feishu.cn → 你的应用 → **应用功能 → 机器人 → 机器人菜单**
+2. 添加菜单项，如：菜单名 **「内容生成」**、动作类型选 **「发送消息」**、消息内容填 `/content-producer:content-producer`
+3. 发布新版本后，聊天窗口输入框上方即出现该按钮——点击 = 以你的身份发出该命令，经斜杠透传触发 content-producer 插件
+
+> 菜单命令的格式：`/<插件名>:<技能名>`（插件技能）或 `/<技能名>`（user skill）。可用命令清单发 `/skills` 查看。
 
 ### 对话落盘
 
@@ -168,6 +201,7 @@ WantedBy=default.target
 4. **多机器人同群的 @ 识别**：依赖每个机器人各自的 open_id 精确匹配；若某机器人的 open_id 拉取失败，多应用部署下该机器人的**群聊消息会被丢弃**（宁丢不猜，防止同群消息触发两个机器人重复执行）——私聊不受影响。
 5. **旧数据迁移归属**：升级多应用后，旧 `sessions.json` 归属 `apps` 列表的第一个应用；新增机器人请追加在列表末尾，否则历史会话会挂错机器人。
 6. **飞书 SDK 对非法 app_id 静默失败**：`ws.start()` 对形状不合法的 app_id 只打日志不报错，启动后请确认每条「✅ <应用名> 长连接已启动」状态行都出现了。
+7. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` 的同名键会被 `~/.claude/settings.json` 的 `env` 覆盖（优先级：CLI flags（/model）> settings.json env > apps[].env > 进程环境）。插件加载失败 SDK 会静默跳过，实际加载情况以 `/plugins` 清单为准。
 
 ## 开发
 

@@ -1,7 +1,5 @@
 // lcb app add/remove/list 的核心逻辑：对已有 config.yaml 做增量改写（保注释），模式复刻 ws-manager。
 // 纯逻辑，写盘由调用方（bin）负责，tests/app-manager.test.ts 直接单测。
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { parseDocument, type YAMLMap, type YAMLSeq } from 'yaml';
 
 export type AppResult = { ok: true; yaml: string } | { ok: false; error: string };
@@ -19,9 +17,8 @@ function appsSeq(raw: string): YAMLSeq<YAMLMap> | undefined {
 }
 
 /**
- * 添加应用。配置为旧 feishu 单应用格式时先原地转 apps 数组（首次 app 操作即完成格式升级）：
- * 旧 app 显式写 claude_config_dir=~/.claude——物理转成 apps 格式后 loadConfig 会按新规则
- * 推导独立目录，不显式钉住系统默认目录会丢存量会话的 resume 链。
+ * 添加应用。配置为旧 feishu 单应用格式时先原地转 apps 数组（首次 app 操作即完成格式升级）。
+ * Claude Code 数据目录一律为 ~/.claude（全机器人共享，无 per-app 配置项）。
  */
 export function addApp(raw: string, input: AppInput): AppResult {
   const appId = input.appId.trim();
@@ -41,8 +38,6 @@ export function addApp(raw: string, input: AppInput): AppResult {
         app_id: oldAppId,
         app_secret: oldSecret,
         ...(oldDomain ? { domain: String(oldDomain) } : {}),
-        // 存量会话在系统默认目录，显式钉住防止归一化按新 app 规则推导独立目录
-        claude_config_dir: join(homedir(), '.claude'),
       }]));
       doc.delete('feishu');
     } else {
