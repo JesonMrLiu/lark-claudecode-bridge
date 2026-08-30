@@ -7,14 +7,15 @@ import { DECISION_TEXT } from '../src/gateway/card-builder.js';
 import { loadConfig } from '../src/config.js';
 import { AccessControl } from '../src/access/access-control.js';
 import { SessionStore } from '../src/session/session-store.js';
-import type { BridgeConfig, CardActionEvent, IncomingMessage } from '../src/types.js';
+import type { BridgeConfig, CardActionEvent, FeishuAppConfig, IncomingMessage } from '../src/types.js';
 
 const cfg: BridgeConfig = {
-  feishu: { appId: 'a', appSecret: 's' },
+  apps: [{ name: 'a', appId: 'a', appSecret: 's', claudeConfigDir: 'D:/lcb/claude/a' }],
   workspaces: [{ name: 'demo', path: 'F:/demo' }],
   defaults: { workspace: 'demo' },
   concurrency: 3,
 };
+const appA = cfg.apps[0];
 
 // 临时目录收集：SessionStore/AccessControl 触发 save 时会写盘，必须落在临时目录而非仓库 cwd
 const tempDirs: string[] = [];
@@ -52,7 +53,7 @@ describe('createBridge 装配', () => {
   it('白名单用户发普通消息 → 首响卡片 + 执行器收到任务 + 结果回传', async () => {
     const executor = vi.fn().mockResolvedValue({ sessionId: 's1', finalText: '做好了', producedFiles: [], turns: 1 });
     const { deps, sent } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     await bridge.onMessage(msg('帮我干活'));
     await new Promise((r) => setTimeout(r, 50)); // 等队列
     expect(executor).toHaveBeenCalledOnce();
@@ -66,15 +67,83 @@ describe('createBridge 装配', () => {
   it('产出文件会上传', async () => {
     const executor = vi.fn().mockResolvedValue({ sessionId: 's1', finalText: 'ok', producedFiles: ['F:/demo/a.md'], turns: 1 });
     const { deps } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     await bridge.onMessage(msg('写文件'));
     await new Promise((r) => setTimeout(r, 50));
     expect(deps.gateway.uploadAndSendFile).toHaveBeenCalledWith('oc_1', 'F:/demo/a.md');
   });
+  it('lcb-notify：executor 注入进程内 mcpServers，通知工具经 canUseTool 直通不弹确认卡', async () => {
+    let decision: { behavior: string } | undefined;
+    let injected: { type?: string; name?: string } | undefined;
+    const executor = vi.fn().mockImplementation(async (_p: string, opts: { canUseTool?: (n: string, i: Record<string, unknown>) => Promise<{ behavior: string }>; mcpServers?: Record<string, { type?: string; name?: string }> }) => {
+      injected = opts.mcpServers?.['lcb-notify'];
+      decision = await opts.canUseTool!('mcp__lcb-notify__send_image', { path: 'F:/demo/1.png' });
+      return { sessionId: 's1', finalText: 'ok', producedFiles: [], turns: 1 };
+    });
+    const { deps, sent } = makeDeps(executor);
+    const bridge = createBridge(cfg, appA, deps);
+    await bridge.onMessage(msg('生图'));
+    await new Promise((r) => setTimeout(r, 50));
+    // 注入形状：进程内 sdk server
+    expect(injected?.type).toBe('sdk');
+    expect(injected?.name).toBe('lcb-notify');
+    // 通知工具直通：允许且全程无确认卡（对比：写操作会发「请求执行操作」卡）
+    expect(decision).toEqual({ behavior: 'allow' });
+    expect(JSON.stringify(sent)).not.toContain('请求执行操作');
+  });
+  it('触发词：/produce 改写后入队并提示；未命中的斜杠命令仍走未知命令回复', async () => {
+    const executor = vi.fn().mockResolvedValue({ sessionId: 's1', finalText: 'ok', producedFiles: [], turns: 1 });
+    const { deps, sent } = makeDeps(executor);
+    const appT: FeishuAppConfig = { ...appA, triggers: [{ match: '/produce', rewrite: '执行 content-producer 流程。任务参数：{args}' }] };
+    const bridge = createBridge(cfg, appT, deps);
+    await bridge.onMessage(msg('/produce https://x.com/a 公众号复刻'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(executor).toHaveBeenCalledOnce();
+    expect(executor.mock.calls[0][0]).toBe('执行 content-producer 流程。任务参数：https://x.com/a 公众号复刻');
+    expect(JSON.stringify(sent)).toContain('已按触发词');
+    // 未命中触发词的斜杠命令：保持「未知命令」防呆 UX，不入队
+    executor.mockClear();
+    await bridge.onMessage(msg('/whatever'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(executor).not.toHaveBeenCalled();
+    expect(JSON.stringify(sent)).toContain('未知命令');
+  });
+  it('per-app plugins 透传给 executor（{path} 数组；type:local 映射在 runTask 内完成）', async () => {
+    const executor = vi.fn().mockResolvedValue({ sessionId: 's1', finalText: 'ok', producedFiles: [], turns: 1 });
+    const { deps } = makeDeps(executor);
+    const appP: FeishuAppConfig = { ...appA, plugins: [{ name: 'content-producer', path: 'F:/workspace/plugins/content-producer/plugin' }] };
+    const bridge = createBridge(cfg, appP, deps);
+    await bridge.onMessage(msg('干活'));
+    await new Promise((r) => setTimeout(r, 50));
+    const opts = executor.mock.calls[0][1] as { plugins?: Array<{ path: string }> };
+    expect(opts.plugins).toEqual([{ path: 'F:/workspace/plugins/content-producer/plugin' }]);
+  });
+  it('触发词热重载：外部写盘后下一条消息即生效（无需重启）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lcb-wiring-'));
+    tempDirs.push(dir);
+    const cfgPath = join(dir, 'config.yaml');
+    const write = (triggers: string) => writeFileSync(cfgPath, `apps:\n  - name: a\n    app_id: a\n    app_secret: s\n${triggers}workspaces:\n  - name: demo\n    path: F:/demo\ndefaults:\n  workspace: demo\nconcurrency: 3\n`, 'utf8');
+    write('');
+    const live = loadConfig(cfgPath);
+    const executor = vi.fn().mockResolvedValue({ sessionId: 's1', finalText: 'ok', producedFiles: [], turns: 1 });
+    const { deps, sent } = makeDeps(executor);
+    const bridge = createBridge(live, live.apps[0], deps, { reloadConfig: createConfigReloader(live, cfgPath) });
+    // 初始无触发词：/produce 走未知命令回复
+    await bridge.onMessage(msg('/produce x'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(executor).not.toHaveBeenCalled();
+    expect(JSON.stringify(sent)).toContain('未知命令');
+    // 模拟外部进程写盘加触发词 → 桥内存不重启即生效
+    write('    triggers:\n      - match: /produce\n        rewrite: 技能流程：{args}\n');
+    await bridge.onMessage(msg('/produce 任务甲'));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(executor).toHaveBeenCalledOnce();
+    expect(executor.mock.calls[0][0]).toBe('技能流程：任务甲');
+  });
   it('白名单外用户收到配对码卡片，不执行', async () => {
     const executor = vi.fn();
     const { deps, sent } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     await bridge.onMessage({ ...msg('hi'), userId: 'ou_stranger' });
     await new Promise((r) => setTimeout(r, 50));
     expect(executor).not.toHaveBeenCalled();
@@ -87,7 +156,7 @@ describe('createBridge 装配', () => {
       return { sessionId: 's1', finalText: '', producedFiles: [], turns: 1 };
     });
     const { deps, sent } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     await bridge.onMessage(msg('删东西'));
     await new Promise((r) => setTimeout(r, 50));
     const confirmCard = sent.find((s) => JSON.stringify(s.card).includes('请求执行操作'));
@@ -121,7 +190,7 @@ describe('createBridge 装配', () => {
       return { sessionId: 's1', finalText: 'done', producedFiles: [], turns: 1 };
     });
     const { deps, sent } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps, { confirmTimeoutMs: 30 });
+    const bridge = createBridge(cfg, appA, deps, { confirmTimeoutMs: 30 });
     await bridge.onMessage(msg('删东西'));
     await new Promise((r) => setTimeout(r, 50)); // 确认卡片已发出并挂起等待
     await new Promise((r) => setTimeout(r, 100)); // 超时已触发，任务按 deny 继续并收尾
@@ -139,7 +208,7 @@ describe('createBridge 装配', () => {
   });
   it('已处理/过期的 requestId 返回提示 toast，不抛异常', async () => {
     const { deps } = makeDeps(vi.fn().mockResolvedValue({ sessionId: 's', finalText: '', producedFiles: [], turns: 1 }));
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     // 无 pending 的 requestId（已处理/过期/桥接器重启后的孤儿卡）：info toast 反馈，不 PATCH、不抛异常
     const ret = await bridge.onCardAction({ value: { requestId: 'nope', decision: 'allow' }, operatorId: 'ou_u', openMessageId: 'om_c' });
     expect(ret).toEqual({ toast: { type: 'info', content: '该确认已被处理或已过期，无需重复操作' } });
@@ -148,7 +217,7 @@ describe('createBridge 装配', () => {
   it('/help 命令直接回复不进执行器', async () => {
     const executor = vi.fn();
     const { deps, sent } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     await bridge.onMessage(msg('/help'));
     await new Promise((r) => setTimeout(r, 50));
     expect(executor).not.toHaveBeenCalled();
@@ -161,7 +230,7 @@ describe('createBridge 装配', () => {
       return { sessionId: 's1', finalText: '', producedFiles: [], turns: 1 };
     });
     const { deps, sent } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     await bridge.onMessage(msg('删东西'));
     await new Promise((r) => setTimeout(r, 50));
     const confirmCard = sent.find((s) => JSON.stringify(s.card).includes('请求执行操作'))!;
@@ -185,7 +254,7 @@ describe('createBridge 装配', () => {
       return { sessionId: 's' + executor.mock.calls.length, finalText: '', producedFiles: [], turns: 1 };
     });
     const { deps, sent } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     const confirmCardCount = () => sent.filter((s) => JSON.stringify(s.card).includes('请求执行操作')).length;
     const clickLatest = async (decision: 'allow' | 'deny' | 'allow-session') => {
       const confirmCard = [...sent].reverse().find((s) => JSON.stringify(s.card).includes('请求执行操作'))!;
@@ -221,7 +290,7 @@ describe('createBridge 装配', () => {
       return { sessionId: 's_stop', finalText: '', producedFiles: ['F:/demo/out.md'], turns: 1 };
     });
     const { deps, sent } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     await bridge.onMessage(msg('长任务'));
     await new Promise((r) => setTimeout(r, 50)); // 任务已启动并挂起
     await bridge.onMessage(msg('/stop'));
@@ -237,7 +306,7 @@ describe('createBridge 装配', () => {
   it('C1 回归：外部进程批准配对写盘后，桥在下一条消息即可识别（无需重启/不再死循环）', async () => {
     const executor = vi.fn().mockResolvedValue({ sessionId: 's1', finalText: 'ok', producedFiles: [], turns: 1 });
     const { deps } = makeDeps(executor);
-    const bridge = createBridge(cfg, deps);
+    const bridge = createBridge(cfg, appA, deps);
     const storePath = (deps.access as unknown as { storePath: string }).storePath;
     // 第 1 条消息：未知用户进配对分支（beginPairing 把内存态整盘落盘）
     await bridge.onMessage({ ...msg('hi'), userId: 'ou_new' });
@@ -270,7 +339,7 @@ describe('createBridge 装配', () => {
     writeCfg([{ name: 'demo', path: 'F:/demo' }]);
     const live = loadConfig(cfgPath); // 桥「启动时」加载的实例
     const { deps, sent } = makeDeps(vi.fn().mockResolvedValue({ sessionId: 's1', finalText: 'ok', producedFiles: [], turns: 1 }));
-    const bridge = createBridge(live, deps, { reloadConfig: createConfigReloader(live, cfgPath) });
+    const bridge = createBridge(live, live.apps[0], deps, { reloadConfig: createConfigReloader(live, cfgPath) });
     await bridge.onMessage(msg('/ws list'));
     await new Promise((r) => setTimeout(r, 50));
     expect(JSON.stringify(sent)).not.toContain('blog');
@@ -279,6 +348,167 @@ describe('createBridge 装配', () => {
     await bridge.onMessage(msg('/ws list'));
     await new Promise((r) => setTimeout(r, 50));
     expect(JSON.stringify(sent)).toContain('blog'); // 下一条消息即见新工作区，无需重启
+  });
+});
+
+describe('createBridge · per-app 多应用（隔离与差异化）', () => {
+  const appB: FeishuAppConfig = {
+    name: 'B机器人', appId: 'cli_b', appSecret: 'sb',
+    defaultWorkspace: 'two', concurrency: 1,
+    claudeConfigDir: 'D:/lcb/claude/b',
+    appendSystemPrompt: '你是素材收集助手',
+    env: { ANTHROPIC_MODEL: 'glm-4.6' },
+  };
+  const cfg2: BridgeConfig = {
+    apps: [appA, appB],
+    workspaces: [{ name: 'demo', path: 'F:/demo' }, { name: 'two', path: 'F:/two' }],
+    defaults: { workspace: 'demo' },
+    concurrency: 3,
+  };
+  const ok = () => ({ sessionId: 's1', finalText: 'ok', producedFiles: [], turns: 1 });
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it('per-app 默认工作区与环境：B 的任务落 B 默认工作区，注入 B 的 CLAUDE_CONFIG_DIR/env/人格', async () => {
+    const executor = vi.fn().mockResolvedValue(ok());
+    const { deps } = makeDeps(executor);
+    const bridge = createBridge(cfg2, appB, deps);
+    await bridge.onMessage(msg('收集素材'));
+    await wait(50);
+    const opts = executor.mock.calls[0][1] as { cwd: string; env?: Record<string, string | undefined>; appendSystemPrompt?: string };
+    expect(opts.cwd).toBe('F:/two');
+    expect(opts.env?.CLAUDE_CONFIG_DIR).toBe('D:/lcb/claude/b');
+    expect(opts.env?.ANTHROPIC_MODEL).toBe('glm-4.6');
+    expect(opts.appendSystemPrompt).toBe('你是素材收集助手');
+  });
+  it('A 实例注入 A 自己的环境，不受 B 配置影响', async () => {
+    const executor = vi.fn().mockResolvedValue(ok());
+    const { deps } = makeDeps(executor);
+    const bridge = createBridge(cfg2, appA, deps);
+    await bridge.onMessage(msg('干活'));
+    await wait(50);
+    const opts = executor.mock.calls[0][1] as { env?: Record<string, string | undefined> };
+    expect(opts.env?.CLAUDE_CONFIG_DIR).toBe('D:/lcb/claude/a');
+    // A 未配置 env 覆盖：B 的 ANTHROPIC_MODEL 不泄漏进来，process.env 原值照常透传
+    expect(opts.env?.ANTHROPIC_MODEL).toBe(process.env.ANTHROPIC_MODEL);
+    expect(opts.env?.ANTHROPIC_MODEL).not.toBe('glm-4.6');
+  });
+  it('会话池隔离：A 归档的会话与 /ws use 通道状态对 B 完全不可见（独立 store）', async () => {
+    const execA = vi.fn().mockResolvedValue(ok());
+    const execB = vi.fn().mockResolvedValue(ok());
+    const { deps: dA } = makeDeps(execA);
+    const { deps: dB } = makeDeps(execB);
+    const bridgeA = createBridge(cfg2, appA, dA);
+    const bridgeB = createBridge(cfg2, appB, dB);
+    await bridgeA.onMessage(msg('A 的任务'));
+    await wait(50);
+    expect(dA.store.listSessions('oc_1:ou_u')).toHaveLength(1);
+    expect(dB.store.listSessions('oc_1:ou_u')).toHaveLength(0); // B 看不到 A 的历史会话
+    await bridgeA.onMessage(msg('/ws use two'));
+    await wait(50);
+    expect(dA.store.getChannelState('oc_1:ou_u')?.workspaceName).toBe('two');
+    expect(dB.store.getChannelState('oc_1:ou_u')).toBeUndefined(); // A 的切换不污染 B 的通道状态
+    await bridgeB.onMessage(msg('B 的任务'));
+    await wait(50);
+    expect((execB.mock.calls[0][1] as { cwd: string }).cwd).toBe('F:/two'); // B 仍用自己的默认工作区
+  });
+  it('per-app 并发闸：A（concurrency=1）内两任务串行，B 同时不受阻', async () => {
+    let releaseA!: () => void;
+    const gate = new Promise<void>((r) => { releaseA = r; });
+    const execA = vi.fn().mockImplementation(async () => { await gate; return ok(); });
+    const execB = vi.fn().mockResolvedValue(ok());
+    const cfgSerial: BridgeConfig = { ...cfg2, apps: [{ ...appA, concurrency: 1 }, appB] };
+    const { deps: dA } = makeDeps(execA);
+    const { deps: dB } = makeDeps(execB);
+    const bridgeA = createBridge(cfgSerial, cfgSerial.apps[0], dA);
+    const bridgeB = createBridge(cfgSerial, appB, dB);
+    await bridgeA.onMessage({ ...msg('任务1'), chatId: 'oc_a1' }); // 不同 chatId：绕开通道串行，直击并发闸
+    await bridgeA.onMessage({ ...msg('任务2'), chatId: 'oc_a2' });
+    await wait(50);
+    expect(execA).toHaveBeenCalledTimes(1); // 第二个任务在 A 的闸外排队
+    await bridgeB.onMessage(msg('B 任务'));
+    await wait(50);
+    expect(execB).toHaveBeenCalledTimes(1); // B 的闸独立，不被 A 占用
+    releaseA();
+    await wait(100);
+    expect(execA).toHaveBeenCalledTimes(2); // 释放后 A 的第二个任务进入
+  });
+  it('transcript 落盘接线：user/assistant/tool/result 事件在对应写点触发，resume 带上轮 sessionId', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const transcript = {
+      user: (e: Record<string, unknown>) => events.push(e),
+      assistant: (e: Record<string, unknown>) => events.push(e),
+      tool: (e: Record<string, unknown>) => events.push(e),
+      result: (e: Record<string, unknown>) => events.push(e),
+    };
+    const executor = vi.fn().mockImplementation(async (_p: string, _o: unknown, cb: { onProgress(e: { kind: string; content: string; ok?: boolean }): Promise<void> }) => {
+      await cb.onProgress({ kind: 'text', content: '正在处理' });
+      await cb.onProgress({ kind: 'tool-start', content: 'Bash: ls' });
+      await cb.onProgress({ kind: 'tool-result', content: 'Bash', ok: true });
+      return { sessionId: 's9', finalText: '完成了', producedFiles: [], turns: 1 };
+    });
+    const { deps } = makeDeps(executor);
+    (deps as BridgeDeps & { transcript?: unknown }).transcript = transcript;
+    const bridge = createBridge(cfg2, appB, deps);
+    await bridge.onMessage(msg('帮我整理'));
+    await wait(50);
+    expect(events.map((e) => e.kind)).toEqual(['user', 'assistant', 'tool', 'tool', 'result']);
+    expect(events[0]).toMatchObject({ text: '帮我整理', app: 'cli_b', chatId: 'oc_1', userId: 'ou_u', workspace: 'two' });
+    expect(events[1]).toMatchObject({ text: '正在处理' });
+    expect(events[4]).toMatchObject({ sessionId: 's9', subtype: 'success', text: '完成了' });
+    // 第二轮任务：user 事件应带上轮 sessionId（resume 链路可见）
+    events.length = 0;
+    await bridge.onMessage(msg('再来一次'));
+    await wait(50);
+    expect(events[0]).toMatchObject({ kind: 'user', sessionId: 's9' });
+  });
+  it('executor 抛错 → transcript 记录 subtype error（错误串入 text）', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const transcript = {
+      user: (e: Record<string, unknown>) => events.push(e),
+      assistant: (e: Record<string, unknown>) => events.push(e),
+      tool: (e: Record<string, unknown>) => events.push(e),
+      result: (e: Record<string, unknown>) => events.push(e),
+    };
+    const executor = vi.fn().mockRejectedValue(new Error('boom'));
+    const { deps } = makeDeps(executor);
+    (deps as BridgeDeps & { transcript?: unknown }).transcript = transcript;
+    const bridge = createBridge(cfg2, appB, deps);
+    await bridge.onMessage(msg('坏任务'));
+    await wait(50);
+    expect(events.at(-1)).toMatchObject({ kind: 'result', subtype: 'error' });
+    expect(String(events.at(-1)?.text)).toContain('boom');
+  });
+  it('/stop 中止 → transcript 记录 subtype stopped', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const transcript = {
+      user: (e: Record<string, unknown>) => events.push(e),
+      assistant: (e: Record<string, unknown>) => events.push(e),
+      tool: (e: Record<string, unknown>) => events.push(e),
+      result: (e: Record<string, unknown>) => events.push(e),
+    };
+    let release!: () => void;
+    const blocked = new Promise<void>((r) => { release = r; });
+    const executor = vi.fn().mockImplementation(async () => {
+      await blocked;
+      return { sessionId: 's_stop', finalText: '', producedFiles: [], turns: 1 };
+    });
+    const { deps } = makeDeps(executor);
+    (deps as BridgeDeps & { transcript?: unknown }).transcript = transcript;
+    const bridge = createBridge(cfg2, appB, deps);
+    await bridge.onMessage(msg('长任务'));
+    await wait(50);
+    await bridge.onMessage(msg('/stop'));
+    await wait(50);
+    release();
+    await wait(50);
+    expect(events.at(-1)).toMatchObject({ kind: 'result', subtype: 'stopped' });
+  });
+  it('/status 显示机器人名称（多机器人同群时辨认对谁说话）', async () => {
+    const { deps, sent } = makeDeps(vi.fn());
+    const bridge = createBridge(cfg2, appB, deps);
+    await bridge.onMessage(msg('/status'));
+    await wait(50);
+    expect(JSON.stringify(sent)).toContain('B机器人');
   });
 });
 
@@ -298,8 +528,8 @@ describe('createConfigReloader', () => {
     createConfigReloader(live, cfgPath)();
     expect(live.workspaces.map((w) => w.name)).toEqual(['demo', 'blog']);
     expect(live.defaults.workspace).toBe('blog');
-    expect(live.concurrency).toBe(3);        // 保持启动值
-    expect(live.feishu.appId).toBe('a');     // 保持启动值
+    expect(live.concurrency).toBe(3);          // 保持启动值
+    expect(live.apps[0].appId).toBe('a');      // 保持启动值
   });
   it('读失败（文件写坏的中间态）沿用旧值不抛', () => {
     const { cfgPath, write, live } = fixture();

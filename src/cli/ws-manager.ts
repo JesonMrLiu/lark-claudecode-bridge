@@ -51,5 +51,13 @@ export function removeWorkspace(raw: string, name: string): WsResult {
     const fallback = existingNames(doc.get('workspaces') as YAMLSeq<YAMLMap>).find((n) => n !== name);
     doc.setIn(['defaults', 'workspace'], fallback);
   }
+  // 联动清理：apps[].default_workspace 指向被删工作区时一并删除，
+  // 否则下次 loadConfig（含热重载的每次读盘）都会抛「不在 workspaces 列表」错误
+  const appsSeq = doc.get('apps') as YAMLSeq<YAMLMap> | undefined;
+  if (appsSeq) {
+    for (const m of appsSeq.items) {
+      if (String(m.get('default_workspace')) === name) m.delete('default_workspace');
+    }
+  }
   return { ok: true, yaml: doc.toString() };
 }

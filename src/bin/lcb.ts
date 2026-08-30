@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-// lcb 命令行入口：setup / start / pair / version
+// lcb 命令行入口：setup / start / pair / app / ws / version
 import { createInterface } from 'node:readline/promises';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { runSetup, APP_ID_RE } from '../cli/setup-wizard.js';
 import { addWorkspace, removeWorkspace } from '../cli/ws-manager.js';
+import { addApp, removeApp, listApps } from '../cli/app-manager.js';
+import { asker } from '../cli/asker.js';
 import { approvePairingLine } from '../cli/stdin-pairing.js';
 import { startBridge } from '../index.js';
 import { loadConfig, CONFIG_PATH, CONFIG_DIR } from '../config.js';
@@ -25,8 +27,10 @@ async function main(): Promise<void> {
     case 'start': {
       const config = loadConfig(CONFIG_PATH); // 启动前校验：文件缺失/字段非法立即报错退出
       // Task 6 遗留建议：App ID 形状不符仅打警告，不阻止启动（形状非强约束，避免误杀合法 ID）
-      if (!APP_ID_RE.test(config.feishu.appId)) {
-        console.warn(`⚠️ App ID "${config.feishu.appId}" 不符合常见形状 cli_ + 16 位十六进制，启动继续；若后续连接失败请先核对`);
+      for (const app of config.apps) {
+        if (!APP_ID_RE.test(app.appId)) {
+          console.warn(`⚠️ 应用 ${app.name} 的 App ID "${app.appId}" 不符合常见形状 cli_ + 16 位十六进制，启动继续；若后续连接失败请先核对`);
+        }
       }
       await startBridge(CONFIG_PATH);
       // 前台监听 stdin：管理员可直接在运行终端输入配对码批准。
@@ -103,13 +107,72 @@ async function main(): Promise<void> {
     case 'version':
       console.log(VERSION);
       break;
+    case 'app': {
+      const sub = args[0];
+      const raw = readFileSync(CONFIG_PATH, 'utf8'); // 增量改写基于原文，保留注释
+      if (sub === 'list') {
+        const list = listApps(raw);
+        if (!list.length) {
+          console.log('暂无应用配置，请先运行 lcb setup');
+          break;
+        }
+        console.log(list.map((a) => `- ${a.name}${a.name !== a.appId ? ` (${a.appId})` : ''}${a.domain === 'lark' ? ' [lark]' : ''}${a.defaultWorkspace ? ` 默认工作区:${a.defaultWorkspace}` : ''}`).join('\n'));
+        break;
+      }
+      if (sub === 'add') {
+        const { ask, close } = asker(process.stdin, process.stdout);
+        const appId = await ask('App ID (cli_ 开头，形如 cli_aabbccddeeff0011)');
+        if (!appId) {
+          close();
+          console.log('App ID 不能为空，已取消');
+          break;
+        }
+        if (!APP_ID_RE.test(appId)) console.warn(`⚠️ App ID ${appId} 不符合常见形状 cli_ + 16 位十六进制，请确认（不阻止继续）`);
+        const name = await ask('应用名字（显示用，如「素材收集」，回车默认取 App ID）');
+        const appSecret = await ask('App Secret');
+        close();
+        if (!appSecret) {
+          console.log('App Secret 不能为空，已取消');
+          break;
+        }
+        const r = addApp(raw, { appId, appSecret, ...(name ? { name } : {}) });
+        if (!r.ok) {
+          console.error(`❌ ${r.error}`);
+          process.exit(1);
+        }
+        writeFileSync(CONFIG_PATH, r.yaml, 'utf8');
+        console.log(`✅ 已添加应用 ${name || appId}（重启桥接器后生效）`);
+        break;
+      }
+      if (sub === 'remove') {
+        const target = args[1];
+        if (!target) {
+          console.log('用法：lcb app remove <名字|app_id>');
+          process.exit(1);
+        }
+        const r = removeApp(raw, target);
+        if (!r.ok) {
+          console.error(`❌ ${r.error}`);
+          process.exit(1);
+        }
+        writeFileSync(CONFIG_PATH, r.yaml, 'utf8');
+        console.log(`✅ 已删除应用 ${target}（重启桥接器后生效）`);
+        console.log('注：该应用的会话分片（sessions.<appId>.json）与对话落盘（transcripts/<appId>/）保留未动，确认不再需要时可手工删除');
+        break;
+      }
+      console.log('用法：lcb app list | lcb app add | lcb app remove <名字|app_id>');
+      break;
+    }
     default:
       console.log(`lcb — 飞书 ↔ Claude Code 桥接器 v${VERSION}
 
 用法：
-  lcb setup              引导式配置
-  lcb start              启动桥接器（前台）
+  lcb setup              引导式配置（支持多个机器人应用）
+  lcb start              启动桥接器（前台，所有应用各建一条长连接）
   lcb pair <code>        批准配对码
+  lcb app list           列出机器人应用
+  lcb app add            添加机器人应用（重启后生效）
+  lcb app remove <名>    删除机器人应用
   lcb ws add <名> <路径>  添加工作区（运行中热生效）
   lcb ws remove <名>     删除工作区
   lcb ws list            列出工作区（* 为默认）

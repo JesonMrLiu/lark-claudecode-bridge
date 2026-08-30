@@ -5,6 +5,8 @@ export interface CommandContext {
   channelKey: string;
   store: SessionStore;
   config: BridgeConfig;
+  /** 本机器人显示名：多机器人同群/多会话时 /status 需要辨认对谁说话 */
+  appName: string;
   /** member 不能 /ws use 切换工作区（spec 权限分级） */
   isAdmin: boolean;
   currentWorkspace(): string;
@@ -76,7 +78,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       const st = store.getChannelState(key);
       return {
         handled: true,
-        reply: `工作区：**${st?.workspaceName ?? ctx.currentWorkspace()}**\n历史会话：${store.listSessions(key).length} 个`,
+        reply: `机器人：**${ctx.appName}**\n工作区：**${st?.workspaceName ?? ctx.currentWorkspace()}**\n历史会话：${store.listSessions(key).length} 个`,
       };
     }
     case 'ws': {

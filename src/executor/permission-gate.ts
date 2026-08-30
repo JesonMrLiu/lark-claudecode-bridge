@@ -1,6 +1,7 @@
 // 权限闸：只读工具直通，写操作经 ask 回调询问（飞书卡片确认），带超时自动拒绝与会话级记忆
 import { randomUUID } from 'node:crypto';
 import type { ConfirmationRequest, PermissionDecision } from '../types.js';
+import { NOTIFY_TOOL_PREFIX } from './notify-server.js';
 
 // 会话内免询问的只读工具白名单（不含任何写文件/执行类工具）
 export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
@@ -26,6 +27,10 @@ export class PermissionGate {
 
   async decide(toolName: string, input: Record<string, unknown>, workspaceName: string): Promise<GateDecision> {
     if (READ_ONLY_TOOLS.has(toolName)) return { behavior: 'allow' };
+    // lcb-notify 通知工具直通：server 实例由 executeTask 闭包构造，chatId 硬绑定，
+    // 模型无法选择接收者（只能发到当前任务发起的聊天），无破坏性，逐张发图不应逐次弹确认卡。
+    // 用前缀匹配：后续往 notify server 新增工具自动直通。
+    if (toolName.startsWith(NOTIFY_TOOL_PREFIX)) return { behavior: 'allow' };
     if (this.remembered.has(toolName)) return { behavior: 'allow' };
     const req: ConfirmationRequest = {
       requestId: randomUUID(),

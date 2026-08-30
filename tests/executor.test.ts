@@ -57,6 +57,19 @@ describe('runTask', () => {
     controller.abort();
     expect(ac.signal.aborted).toBe(true);
   });
+  it('mcpServers 原样透传，plugins 映射为 local 类型，缺省时不出现字段', async () => {
+    queryMock.mockReturnValue(fakeStream([{ type: 'result', subtype: 'success', result: 'r', session_id: 's' }]));
+    const mcpServers = { 'lcb-notify': { type: 'sdk', name: 'lcb-notify' } } as Record<string, never>;
+    await runTask('p', { cwd: 'F:/x', mcpServers, plugins: [{ path: 'F:/plugins/content-producer/plugin' }] }, { onProgress: () => {} });
+    let opts = (queryMock.mock.calls[0][0] as { options?: { mcpServers?: unknown; plugins?: unknown } }).options!;
+    expect(opts.mcpServers).toBe(mcpServers);
+    expect(opts.plugins).toEqual([{ type: 'local', path: 'F:/plugins/content-producer/plugin' }]);
+    // 缺省：两个字段均不出现（不影响既有 resume 链路）
+    await runTask('p2', { cwd: 'F:/x' }, { onProgress: () => {} });
+    opts = (queryMock.mock.calls[1][0] as { options?: { mcpServers?: unknown; plugins?: unknown } }).options!;
+    expect('mcpServers' in opts).toBe(false);
+    expect('plugins' in opts).toBe(false);
+  });
 });
 
 describe('OutputCollector', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildTextCard, buildProgressCard, buildConfirmCard, buildConfirmResultCard } from '../src/gateway/card-builder.js';
+import { buildTextCard, buildImageCard, buildProgressCard, buildConfirmCard, buildConfirmResultCard } from '../src/gateway/card-builder.js';
 import type { ConfirmationRequest } from '../src/types.js';
 
 const req: ConfirmationRequest = { requestId: 'r1', toolName: 'Bash', summary: 'git push origin main', workspaceName: 'demo' };
@@ -31,5 +31,17 @@ describe('card-builder', () => {
     const json = JSON.stringify(buildConfirmResultCard(req, 'allow', '张三'));
     expect(json).toContain('张三');
     expect(json).not.toContain('"tag":"button"');
+  });
+  it('图片卡片：caption 在上方 markdown，图片为 img 元素', () => {
+    const card = buildImageCard('【图 2/5】02-cover.png', 'img_key_1') as unknown as { schema: string; body: { elements: Array<Record<string, unknown>> } };
+    expect(card.schema).toBe('2.0');
+    const els = card.body.elements;
+    expect(els[0]).toEqual({ tag: 'markdown', content: '【图 2/5】02-cover.png' });
+    expect(els[1]).toMatchObject({ tag: 'img', img_key: 'img_key_1' });
+  });
+  it('图片卡片：无 caption 时只有 img 元素', () => {
+    const card = buildImageCard(undefined, 'k2') as { body: { elements: Array<Record<string, unknown>> } };
+    expect(card.body.elements).toHaveLength(1);
+    expect(card.body.elements[0]).toMatchObject({ tag: 'img', img_key: 'k2' });
   });
 });

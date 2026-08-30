@@ -1,6 +1,6 @@
 // Claude 执行器：封装 Agent SDK 的 query()，把流消息转成进度事件并收集产出
 // 注意：不覆盖/清理任何 ANTHROPIC_* 环境变量，凭证与代理配置透传 process.env
-import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type McpServerConfig, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import { OutputCollector } from './output-collector.js';
 import type { ProgressEvent, TaskOutcome } from '../types.js';
 
@@ -12,12 +12,20 @@ export interface RunTaskOptions {
   cwd: string;
   resumeSessionId?: string;
   signal?: AbortSignal;
+  /** per-app 环境变量：至少含 CLAUDE_CONFIG_DIR（每个机器人独立的 Claude Code 数据目录）；可覆盖模型凭证等 */
+  env?: Record<string, string | undefined>;
+  /** per-app 人格补充，直通 SDK appendSystemPrompt */
+  appendSystemPrompt?: string;
   // 收窄签名：SDK 的 CanUseTool 还带第三参 options（signal/suggestions 等），此处仅暴露 (toolName, input)。
   // deny 分支 message 必填，与 SDK PermissionResult 判别联合结构兼容，可直接透传
   canUseTool?: (
     toolName: string,
     input: Record<string, unknown>,
   ) => Promise<{ behavior: 'allow'; message?: string } | { behavior: 'deny'; message: string }>;
+  /** 额外注入的 MCP server（如 lcb-notify 进程内通知工具），直通 Options.mcpServers */
+  mcpServers?: Record<string, McpServerConfig>;
+  /** 显式加载的本地插件目录（含 .claude-plugin/plugin.json），映射为 SDK 的 {type:'local', path} */
+  plugins?: Array<{ path: string }>;
 }
 
 // SDK 选项只收 abortController（无 signal 项），把外部 signal 的中止转发给它
@@ -48,6 +56,10 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
     ...(opts.canUseTool ? { canUseTool: opts.canUseTool } : {}),
     ...(opts.signal ? { abortController: bridgeSignal(opts.signal) } : {}),
+    ...(opts.env ? { env: opts.env } : {}),
+    ...(opts.appendSystemPrompt ? { appendSystemPrompt: opts.appendSystemPrompt } : {}),
+    ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
+    ...(opts.plugins ? { plugins: opts.plugins.map((p) => ({ type: 'local' as const, path: p.path })) } : {}),
   };
   const q = query({ prompt, options });
   let finalText = '';

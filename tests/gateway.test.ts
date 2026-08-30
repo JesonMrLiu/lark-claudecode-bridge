@@ -278,6 +278,48 @@ describe('FeishuGateway 分发（注入假 SDK）', () => {
     expect(onCardAction).not.toHaveBeenCalled();
   });
 
+  it('strictGroupMention=true 时 botOpenId 拉取失败：群聊消息丢弃（宁丢不猜，防多机器人同群双触发），p2p 不受影响', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const onMessage = vi.fn();
+      const { fakeSdk, register } = makeFakeSdk();
+      fakeSdk.Client = class { request = vi.fn(async () => { throw new Error('network down'); }); };
+      const gw = new FeishuGateway(
+        { appId: 'cli_0123456789abcdef', appSecret: 's' },
+        { sdk: fakeSdk, strictGroupMention: true, log: { warn: () => {}, error: () => {} } },
+      );
+      await gw.start({ onMessage, onCardAction: vi.fn() });
+      const handlers = register.mock.results[0].value as Record<string, (d: unknown) => Promise<unknown>>;
+      // 群聊占位符 @（退化判定会命中）在严格模式下直接丢弃
+      await handlers['im.message.receive_v1']({
+        sender: feishuEvent.sender,
+        message: { ...feishuEvent.message, chat_type: 'group', content: JSON.stringify({ text: '@_user_1 帮我查' }) },
+      });
+      expect(onMessage).not.toHaveBeenCalled();
+      // p2p 不依赖 @ 检测，照常分发
+      await handlers['im.message.receive_v1'](feishuEvent);
+      expect(onMessage).toHaveBeenCalledOnce();
+      expect(onMessage.mock.calls[0][0]).toMatchObject({ chatType: 'p2p' });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('close() 调用 WSClient.close（优雅关闭长连接）；未 start 时 close 不抛', async () => {
+    const { fakeSdk } = makeFakeSdk();
+    let lastWs: { close: ReturnType<typeof vi.fn> } | undefined;
+    fakeSdk.WSClient = class {
+      close = vi.fn();
+      constructor() { lastWs = this as unknown as { close: ReturnType<typeof vi.fn> }; }
+      async start(): Promise<void> {}
+    };
+    const gw = new FeishuGateway({ appId: 'a', appSecret: 's' }, { sdk: fakeSdk });
+    expect(() => gw.close()).not.toThrow(); // 未 start：无连接可关
+    await gw.start({ onMessage: vi.fn(), onCardAction: vi.fn() });
+    gw.close();
+    expect(lastWs!.close).toHaveBeenCalledOnce();
+  });
+
   it('decision 非法（不在 allow/deny/allow-session 枚举内）不调用 onCardAction，仍返回 {}', async () => {
     const onCardAction = vi.fn();
     const { fakeSdk, register } = makeFakeSdk();
@@ -422,5 +464,56 @@ describe('FeishuGateway 收发（注入假 Client）', () => {
     const gw = new FeishuGateway({ appId: 'a', appSecret: 's' }, { sdk: fakeSdk });
     await expect(gw.uploadAndSendFile('oc_1', pngPath)).rejects.toThrow(/上传图片失败/);
     expect(create).not.toHaveBeenCalled();
+  });
+
+  it('sendImage：上传后发含 caption 与 img 元素的 interactive 卡', async () => {
+    const imageCreate = vi.fn(async (p: { data: { image: NodeJS.ReadableStream } }) => {
+      await new Promise<void>((resolve) => {
+        const s = p.data.image as NodeJS.ReadableStream & { resume(): void; once(ev: 'end' | 'error', cb: () => void): unknown };
+        s.once('end', () => resolve());
+        s.once('error', () => resolve());
+        s.resume();
+      });
+      return { image_key: 'img_card_key' };
+    });
+    const create = vi.fn(async () => ({ code: 0, data: { message_id: 'om_imgcard' } }));
+    const fakeSdk = fakeClientSdk({ message: { create }, image: { create: imageCreate } });
+    const gw = new FeishuGateway({ appId: 'a', appSecret: 's' }, { sdk: fakeSdk });
+    const id = await gw.sendImage('oc_1', pngPath, '【图 2/5】02-cover.png');
+    expect(id).toBe('om_imgcard');
+    expect(create).toHaveBeenCalledOnce();
+    const sent = create.mock.calls[0][0].data;
+    expect(sent.msg_type).toBe('interactive');
+    const card = JSON.parse(sent.content);
+    expect(card.body.elements[0]).toEqual({ tag: 'markdown', content: '【图 2/5】02-cover.png' });
+    expect(card.body.elements[1]).toMatchObject({ tag: 'img', img_key: 'img_card_key' });
+  });
+
+  it('sendImage：卡片发送失败时降级为「caption 文本卡 + 纯图片消息」两条', async () => {
+    const imageCreate = vi.fn(async (p: { data: { image: NodeJS.ReadableStream } }) => {
+      await new Promise<void>((resolve) => {
+        const s = p.data.image as NodeJS.ReadableStream & { resume(): void; once(ev: 'end' | 'error', cb: () => void): unknown };
+        s.once('end', () => resolve());
+        s.once('error', () => resolve());
+        s.resume();
+      });
+      return { image_key: 'img_fb_key' };
+    });
+    // 第 1 次（interactive 卡）业务级失败无 message_id → 触发降级；第 2、3 次成功
+    const create = vi.fn()
+      .mockResolvedValueOnce({ code: 230002, msg: 'card rejected' })
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_cap' } })
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_img' } });
+    const fakeSdk = fakeClientSdk({ message: { create }, image: { create: imageCreate } });
+    const gw = new FeishuGateway({ appId: 'a', appSecret: 's' }, { sdk: fakeSdk, log: { warn: () => {}, error: () => {} } });
+    const id = await gw.sendImage('oc_1', pngPath, '【图 1/5】01-cover.png');
+    expect(id).toBe('om_img');
+    expect(create).toHaveBeenCalledTimes(3);
+    // 第 2 条：caption 文本卡（interactive）
+    expect(create.mock.calls[1][0].data.msg_type).toBe('interactive');
+    expect(JSON.parse(create.mock.calls[1][0].data.content).body.elements[0].content).toBe('【图 1/5】01-cover.png');
+    // 第 3 条：纯图片消息
+    expect(create.mock.calls[2][0].data.msg_type).toBe('image');
+    expect(JSON.parse(create.mock.calls[2][0].data.content)).toEqual({ image_key: 'img_fb_key' });
   });
 });

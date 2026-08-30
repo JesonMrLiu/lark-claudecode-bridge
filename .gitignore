@@ -6,3 +6,4 @@ dist/
 .setting.local
 .superpowers
 docs/
+.claude

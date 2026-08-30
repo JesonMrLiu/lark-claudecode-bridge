@@ -22,6 +22,21 @@ describe('PermissionGate', () => {
     expect((await g.decide('Read', { file_path: 'a' }, 'ws')).behavior).toBe('allow');
     expect(ask).not.toHaveBeenCalled();
   });
+  it('lcb-notify 通知工具前缀直通（逐张发图不应逐次弹确认卡）', async () => {
+    const ask = vi.fn();
+    const g = new PermissionGate({ ask });
+    for (const name of ['mcp__lcb-notify__send_text', 'mcp__lcb-notify__send_image', 'mcp__lcb-notify__send_file']) {
+      expect((await g.decide(name, { path: 'F:/x/1.png' }, 'ws')).behavior).toBe('allow');
+    }
+    expect(ask).not.toHaveBeenCalled();
+  });
+  it('相似前缀的其它 server 工具不误放（仍走询问）', async () => {
+    const ask = vi.fn().mockResolvedValue('allow');
+    const g = new PermissionGate({ ask });
+    await g.decide('mcp__lcb-notify2__send_image', {}, 'ws');
+    await g.decide('mcp__other__send_text', {}, 'ws');
+    expect(ask).toHaveBeenCalledTimes(2);
+  });
   it('写操作询问并允许', async () => {
     const ask = vi.fn().mockResolvedValue('allow');
     const g = new PermissionGate({ ask });

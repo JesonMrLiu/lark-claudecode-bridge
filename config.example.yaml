@@ -1,10 +1,42 @@
-feishu:
-  app_id: cli_xxxx        # 飞书开放平台 → 凭证与基础信息
-  app_secret: xxxx
-  # domain: lark          # 国际版 Lark 才需要
-workspaces:                # 工作区白名单：名字 + 路径
+# 多机器人：apps 数组，每个应用一条独立长连接 + 独立会话池 + 独立 Claude Code 实例。
+# 升级提示：旧版单应用 feishu: 格式仍可直接使用（启动时自动归一化，首次 lcb app add 时原地转格式）。
+apps:
+  - name: 主力助手            # 显示名（日志前缀 / /status / lcb app list），缺省取 app_id
+    app_id: cli_xxxx          # 飞书开放平台 → 凭证与基础信息
+    app_secret: xxxx
+    # domain: lark            # 国际版 Lark 才需要
+    # default_workspace: demo # 该机器人的默认工作区（须在 workspaces 列表内），缺省用全局 defaults.workspace
+    # concurrency: 2          # 该机器人的并发上限（1-100），缺省用全局 concurrency
+    # claude_config_dir: 'C:\Users\you\.claude'  # Claude Code 数据目录（会话存储/设置/插件）
+    #                           缺省为 ~/.lark-claudecode-bridge/claude/<app_id>/——每个机器人一套；
+    #                           旧 feishu 格式迁移的应用自动沿用系统默认 ~/.claude（保存量会话）
+    # append_system_prompt: '你是我的素材收集助手'  # 可选人格补充（直通 Claude Code）
+    # env:                    # per-app 环境变量：不同机器人可用不同模型凭证
+    #   ANTHROPIC_BASE_URL: https://your-endpoint/
+    #   ANTHROPIC_MODEL: glm-4.6
+    # triggers:               # 触发词映射：命中即把消息改写为 rewrite 再入队（按序首个命中生效）。
+    #                          # SDK 单次会话不展开斜杠命令，飞书里触发技能必须经此改写；
+    #                          # match 以 / 开头 = 首 token 精确匹配（/produce 命中、/produced 不命中），
+    #                          # 否则 = 整条消息包含该关键词即命中；{text}=原文全文，{args}=去掉首 token 的剩余参数。
+    #                          # /stop /new /help 等本地命令永远优先，不会被劫持。改动写盘后下一条消息即热生效。
+    #   - match: /produce
+    #     rewrite: '调用 content-producer 插件的主技能（skills/content-producer/SKILL.md）执行内容生产流程，严格遵循其编排。任务参数：{args}'
+    #   - match: 写文章
+    #     rewrite: '调用 content-producer 插件的主技能（skills/content-producer/SKILL.md）执行内容生产流程，严格遵循其编排。任务描述：{text}'
+    # plugins:                # 显式加载的本地插件（path 指含 .claude-plugin/plugin.json 的目录）。
+    #                          # 新机器人的 claude_config_dir 独立于 ~/.claude，已安装插件对其不可见——
+    #                          # 直指源码目录改 SKILL.md 即生效，无需重装；插件的 MCP/hooks 随之加载，
+    #                          # MCP 凭证（IMAGE_GEN_API_KEY 等）经上方 env 传入。
+    #   - name: content-producer
+    #     path: F:/workspace/plugins/content-producer/plugin
+  # - name: 素材收集           # 再添一个机器人：复制上面的结构即可
+  #   app_id: cli_yyyy
+  #   app_secret: yyyy
+workspaces:                    # 工作区白名单：名字 + 路径（所有机器人共享列表，当前使用哪个 per-app 隔离）
   - name: demo
     path: F:\workspace\demo
 defaults:
   workspace: demo
-concurrency: 3             # 通道间并发上限
+concurrency: 3                 # 全局并发上限（未单独配置的 app 沿用此值）
+# transcripts:                # 对话落盘清理策略；缺省 = 永久保留
+#   retention_days: 90

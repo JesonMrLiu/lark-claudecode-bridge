@@ -11,6 +11,13 @@ function md(content: string): unknown {
 export function buildTextCard(markdown: string): unknown {
   return card([md(markdown)]);
 }
+/** 图片卡片：caption（可选）显示在图片上方——逐张发图时带编号说明用 */
+export function buildImageCard(caption: string | undefined, imgKey: string): unknown {
+  const elements: unknown[] = [];
+  if (caption) elements.push(md(caption));
+  elements.push({ tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: caption ?? '图片' } });
+  return card(elements);
+}
 export function buildProgressCard(state: ProgressState): unknown {
   const elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
   const lines = [`**${state.title}**`, ``, state.status, ``];

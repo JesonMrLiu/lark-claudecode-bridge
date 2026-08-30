@@ -12,8 +12,7 @@ import { VERSION } from '../src/index.js';
 describe('setup 向导（纯逻辑）', () => {
   it('answersToConfig：默认工作区不在列表时回退到第一个', () => {
     const cfg = answersToConfig({
-      appId: 'cli_aabbccddeeff0011',
-      appSecret: 'sec',
+      apps: [{ appId: 'cli_aabbccddeeff0011', appSecret: 'sec' }],
       workspaces: [
         { name: 'demo', path: 'F:\\demo' },
         { name: 'blog', path: 'F:\\blog' },
@@ -25,12 +24,14 @@ describe('setup 向导（纯逻辑）', () => {
     expect(cfg.workspaces).toHaveLength(2);
   });
 
-  it('往返：向导写盘的 YAML 能被 loadConfig 原样读回', () => {
-    // ⚠️ 关键回归：toYamlDocument 必须写 snake_case 键（app_id / app_secret），
-    // 若直接 stringify(camelCase BridgeConfig)，loadConfig 将抛「缺少 feishu.app_id」
+  it('往返：向导写盘的 YAML 能被 loadConfig 原样读回（多应用）', () => {
+    // ⚠️ 关键回归：toYamlDocument 必须写 snake_case 键（apps[].app_id / app_secret），
+    // 否则 loadConfig 读不到应用凭证
     const answers = {
-      appId: 'cli_aabbccddeeff0011',
-      appSecret: 'sec_test',
+      apps: [
+        { appId: 'cli_aabbccddeeff0011', appSecret: 'sec_test' },
+        { name: '素材', appId: 'cli_bbbbccccddddeeee', appSecret: 'sec2' },
+      ],
       workspaces: [{ name: 'demo', path: 'F:\\demo' }],
       defaultWorkspace: 'demo',
     };
@@ -38,8 +39,10 @@ describe('setup 向导（纯逻辑）', () => {
     const p = join(dir, 'config.yaml');
     writeFileSync(p, stringify(toYamlDocument(answersToConfig(answers))), 'utf8');
     const cfg = loadConfig(p);
-    expect(cfg.feishu.appId).toBe('cli_aabbccddeeff0011');
-    expect(cfg.feishu.appSecret).toBe('sec_test');
+    expect(cfg.apps).toHaveLength(2);
+    expect(cfg.apps[0].appId).toBe('cli_aabbccddeeff0011');
+    expect(cfg.apps[0].appSecret).toBe('sec_test');
+    expect(cfg.apps[1].name).toBe('素材');
     expect(cfg.workspaces[0]).toEqual({ name: 'demo', path: 'F:\\demo' });
     expect(cfg.defaults.workspace).toBe('demo');
     expect(cfg.concurrency).toBe(3);
@@ -47,13 +50,13 @@ describe('setup 向导（纯逻辑）', () => {
 
   it('toYamlDocument：domain 为 lark 时写入，feishu 默认省略', () => {
     const base = answersToConfig({
-      appId: 'cli_aabbccddeeff0011', appSecret: 's',
+      apps: [{ appId: 'cli_aabbccddeeff0011', appSecret: 's' }],
       workspaces: [{ name: 'a', path: '/a' }], defaultWorkspace: 'a',
     });
-    expect((toYamlDocument(base).feishu as Record<string, unknown>).domain).toBeUndefined();
+    expect(((toYamlDocument(base).apps as Array<Record<string, unknown>>)[0]).domain).toBeUndefined();
     const lark = structuredClone(base);
-    lark.feishu.domain = 'lark';
-    expect((toYamlDocument(lark).feishu as Record<string, unknown>).domain).toBe('lark');
+    lark.apps[0].domain = 'lark';
+    expect(((toYamlDocument(lark).apps as Array<Record<string, unknown>>)[0]).domain).toBe('lark');
   });
 
   it('APP_ID_RE：16 位十六进制通过，其他形状不通过', () => {
@@ -67,9 +70,9 @@ describe('setup 向导（纯逻辑）', () => {
 });
 
 describe('VERSION 单一来源', () => {
-  it('index re-export 与 version.ts 一致且为 0.1.0', async () => {
+  it('index re-export 与 version.ts 一致且为 0.2.0', async () => {
     const { VERSION: v } = await import('../src/version.js');
-    expect(VERSION).toBe('0.1.0');
+    expect(VERSION).toBe('0.2.0');
     expect(VERSION).toBe(v);
     // dist/bin/lcb.js version 依赖同一来源；与 package.json 版本保持同步
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };

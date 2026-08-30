@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 export interface SessionMeta {
   sessionId: string;
@@ -71,4 +71,31 @@ export class SessionStore {
   listSessions(key: string): SessionMeta[] {
     return this.data[key]?.sessions ?? [];
   }
+}
+
+/**
+ * 一次性迁移：旧单应用的 sessions.json → sessions.<appId>.json。
+ * 归一化保证旧 feishu 应用恒为 apps[0]，与「旧数据属于原单应用」语义吻合；
+ * channelKey 格式未变，纯文件改名即完成迁移（历史会话立即可 /resume）。
+ * - 旧文件不存在 → 'noop'
+ * - 旧文件存在且目标分片不存在 → 改名 → 'migrated'
+ * - 两者都存在 → 旧文件改名 .bak 保全（不覆盖新分片）；.bak 已存在则完全不动 → 'conflict-kept'
+ * 只应在 startBridge 装配前调用一次（单进程无竞态）。
+ */
+export function migrateLegacySessions(configDir: string, firstAppId: string): 'noop' | 'migrated' | 'conflict-kept' {
+  const legacyPath = join(configDir, 'sessions.json');
+  if (!existsSync(legacyPath)) return 'noop';
+  const shardedPath = join(configDir, `sessions.${firstAppId}.json`);
+  if (!existsSync(shardedPath)) {
+    renameSync(legacyPath, shardedPath);
+    return 'migrated';
+  }
+  const bakPath = join(configDir, 'sessions.json.bak');
+  if (!existsSync(bakPath)) {
+    renameSync(legacyPath, bakPath);
+    console.warn(`[迁移] sessions.json 与 sessions.${firstAppId}.json 并存，旧文件已保全为 sessions.json.bak（请人工确认归属）`);
+  } else {
+    console.warn('[迁移] sessions.json / 分片文件 / .bak 三者并存，保持原状不动（请人工处理）');
+  }
+  return 'conflict-kept';
 }

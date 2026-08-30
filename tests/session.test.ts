@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SessionStore } from '../src/session/session-store.js';
+import { SessionStore, migrateLegacySessions } from '../src/session/session-store.js';
 import { Semaphore, channelKey } from '../src/session/channel.js';
 import { handleCommand } from '../src/session/commands.js';
 import type { BridgeConfig } from '../src/types.js';
@@ -11,7 +11,7 @@ function freshStore(): SessionStore {
   return SessionStore.load(join(mkdtempSync(join(tmpdir(), 'lcb-s-')), 'sessions.json'));
 }
 const cfg: BridgeConfig = {
-  feishu: { appId: 'a', appSecret: 's' },
+  apps: [{ name: 'a', appId: 'a', appSecret: 's' }],
   workspaces: [{ name: 'demo', path: 'F:/demo' }, { name: 'two', path: 'F:/two' }],
   defaults: { workspace: 'demo' },
   concurrency: 3,
@@ -98,9 +98,45 @@ describe('channelKey', () => {
   it('拼接', () => expect(channelKey('oc', 'ou')).toBe('oc:ou'));
 });
 
+describe('migrateLegacySessions（旧单应用 sessions.json → sessions.<appId>.json）', () => {
+  const legacy = JSON.stringify({ 'oc_1:ou_u': { workspaceName: 'demo', sessions: [{ sessionId: 's1', summary: '旧会话', updatedAt: '2026-08-01T00:00:00.000Z' }] } });
+  function tmpConfigDir(): string {
+    return mkdtempSync(join(tmpdir(), 'lcb-mig-'));
+  }
+  it('sessions.json 不存在 → noop', () => {
+    const dir = tmpConfigDir();
+    expect(migrateLegacySessions(dir, 'cli_app1')).toBe('noop');
+  });
+  it('存在且目标分片不存在 → 纯改名迁移，历史会话立即可用', () => {
+    const dir = tmpConfigDir();
+    writeFileSync(join(dir, 'sessions.json'), legacy, 'utf8');
+    expect(migrateLegacySessions(dir, 'cli_app1')).toBe('migrated');
+    expect(existsSync(join(dir, 'sessions.json'))).toBe(false);
+    const moved = JSON.parse(readFileSync(join(dir, 'sessions.cli_app1.json'), 'utf8'));
+    expect(moved['oc_1:ou_u'].sessions[0].sessionId).toBe('s1'); // 键格式未变，纯改名即完成
+  });
+  it('目标分片已存在 → 旧文件改名 .bak 保全数据，不覆盖新分片', () => {
+    const dir = tmpConfigDir();
+    writeFileSync(join(dir, 'sessions.json'), legacy, 'utf8');
+    writeFileSync(join(dir, 'sessions.cli_app1.json'), '{}', 'utf8');
+    expect(migrateLegacySessions(dir, 'cli_app1')).toBe('conflict-kept');
+    expect(readFileSync(join(dir, 'sessions.cli_app1.json'), 'utf8')).toBe('{}'); // 新分片未被覆盖
+    expect(readFileSync(join(dir, 'sessions.json.bak'), 'utf8')).toBe(legacy);     // 旧数据保全
+  });
+  it('.bak 也已存在 → 原文件保持不动（数据不丢，人工处置）', () => {
+    const dir = tmpConfigDir();
+    writeFileSync(join(dir, 'sessions.json'), legacy, 'utf8');
+    writeFileSync(join(dir, 'sessions.cli_app1.json'), '{}', 'utf8');
+    writeFileSync(join(dir, 'sessions.json.bak'), '{"old":1}', 'utf8');
+    expect(migrateLegacySessions(dir, 'cli_app1')).toBe('conflict-kept');
+    expect(readFileSync(join(dir, 'sessions.json'), 'utf8')).toBe(legacy); // 不动
+    expect(readFileSync(join(dir, 'sessions.json.bak'), 'utf8')).toBe('{"old":1}'); // 已有 bak 不被覆盖
+  });
+});
+
 describe('handleCommand', () => {
   const baseCtx = (store: ReturnType<typeof freshStore>, extra: Partial<Parameters<typeof handleCommand>[1]> = {}) => ({
-    channelKey: 'k', store, config: cfg, isAdmin: true, currentWorkspace: () => 'demo', stopCurrentTask: () => false, ...extra,
+    channelKey: 'k', store, config: cfg, appName: '测试机器人', isAdmin: true, currentWorkspace: () => 'demo', stopCurrentTask: () => false, ...extra,
   });
   it('/help 返回帮助且不产生任务', async () => {
     const r = await handleCommand('/help', baseCtx(freshStore()));
@@ -142,6 +178,10 @@ describe('handleCommand', () => {
     const r = await handleCommand('/stop', baseCtx(freshStore(), { stopCurrentTask: stop }));
     expect(r.handled).toBe(true);
     expect((stop as { called?: boolean }).called).toBe(true);
+  });
+  it('/status 首行显示机器人名称', async () => {
+    const r = await handleCommand('/status', baseCtx(freshStore()));
+    expect(r.reply).toContain('测试机器人');
   });
   it('普通文本不处理', async () => {
     const r = await handleCommand('帮我写代码', baseCtx(freshStore()));

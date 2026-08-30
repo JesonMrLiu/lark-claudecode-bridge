@@ -2,7 +2,7 @@ import * as realSdk from '@larksuiteoapi/node-sdk';
 import { createReadStream } from 'node:fs';
 import { extname, basename } from 'node:path';
 import type { FeishuAppConfig, GatewayHandlers, IncomingMessage } from '../types.js';
-import { buildTextCard } from './card-builder.js';
+import { buildImageCard, buildTextCard } from './card-builder.js';
 
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 
@@ -10,6 +10,8 @@ const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 export interface FeishuSdk {
   WSClient: new (params: { appId: string; appSecret?: string; domain?: unknown; loggerLevel?: number }) => {
     start(params: { eventDispatcher: unknown }): Promise<void>;
+    /** 优雅关闭长连接（node-sdk 1.73.0 已实现：终止重连循环并关 socket） */
+    close(params?: { force?: boolean }): void;
   };
   EventDispatcher: new (params: Record<string, never>) => {
     register<T extends Record<string, (data: never) => unknown>>(handles: T): unknown;
@@ -54,7 +56,9 @@ interface RawMessagePayload {
  *
  * 群聊 @检测：botOpenId（机器人 open_id）可用时按 mentions 数组精确匹配——
  * 占位符/mentions 非空无法区分 @机器人 vs @普通人（群里 @任何人都命中，会被误当任务执行）；
- * botOpenId 缺失（获取失败/未提供）时退化为旧的占位符 + mentions 非空判定。
+ * botOpenId 缺失（获取失败/未提供）时退化为旧的占位符 + mentions 非空判定，
+ * 但 strictGroupMention=true（多机器人部署）时宁丢不猜——同群多机器人下占位符退化判定
+ * 会让每个机器人都被触发（重复执行），丢弃比误执行安全；p2p 不依赖 @ 检测不受影响。
  *
  * ⚠️ 数据结构说明（与 brief 参考实现不同）：node-sdk 的 EventDispatcher 回调收到的是
  * RequestHandle.parse() 展平后的数据——v2 事件 {schema, header, event} 被解包为
@@ -62,7 +66,7 @@ interface RawMessagePayload {
  * 本函数以展平结构为主，同时兼容 {event: {...}} 包裹形态（原始事件体直投）。
  * 结构不合法一律返回 null，绝不抛异常。
  */
-export function parseIncomingMessage(event: unknown, botOpenId?: string): IncomingMessage | null {
+export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: { strictGroupMention?: boolean } = {}): IncomingMessage | null {
   try {
     if (event === null || typeof event !== 'object') return null;
     const raw = event as { event?: RawMessagePayload } & RawMessagePayload;
@@ -77,6 +81,9 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string): Incomi
         // 精确判定：mentions 中存在 open_id === 机器人 open_id 的条目才算 @机器人
         const mentionsBot = (m.mentions ?? []).some((t) => t.id?.open_id === botOpenId);
         if (!mentionsBot) return null;
+      } else if (opts.strictGroupMention) {
+        // 严格模式：无法精确判定 @ 目标时直接丢弃（多机器人同群防双触发）
+        return null;
       } else {
         // 退化判定：文本里渲染为 @_user_N 占位；mentions 数组兜底
         //（部分客户端形态下占位符缺失但 mentions 存在）
@@ -131,10 +138,28 @@ export class FeishuGateway {
   private client: InstanceType<FeishuSdk['Client']>;
   private sdk: FeishuSdk;
   private cfg: FeishuAppConfig;
+  private ws?: InstanceType<FeishuSdk['WSClient']>;
+  private log: { warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void };
+  private strictGroupMention: boolean;
 
-  constructor(cfg: FeishuAppConfig, deps: { sdk?: FeishuSdk } = {}) {
+  constructor(
+    cfg: FeishuAppConfig,
+    deps: {
+      sdk?: FeishuSdk;
+      /** 日志出口（多 app 部署时注入带 [app:name] 前缀的 logger 以区分机器人） */
+      log?: { warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void };
+      /** 严格群聊 @ 模式：botOpenId 不可用时丢弃群消息而非退化猜测（多机器人同群防双触发） */
+      strictGroupMention?: boolean;
+    } = {},
+  ) {
     this.cfg = cfg;
     this.sdk = deps.sdk ?? (realSdk as unknown as FeishuSdk);
+    const tag = `[gateway:${cfg.name ?? cfg.appId}]`;
+    this.log = deps.log ?? {
+      warn: (...a: unknown[]) => console.warn(tag, ...a),
+      error: (...a: unknown[]) => console.error(tag, ...a),
+    };
+    this.strictGroupMention = deps.strictGroupMention ?? false;
     const domain = cfg.domain === 'lark' ? this.sdk.Domain.Lark : this.sdk.Domain.Feishu;
     this.client = new this.sdk.Client({ appId: cfg.appId, appSecret: cfg.appSecret, domain });
   }
@@ -143,16 +168,16 @@ export class FeishuGateway {
    * 拉取机器人 open_id：群聊 @检测的精确匹配依据。
    * SDK 1.73.0 未封装「获取机器人信息」接口（bot 命名空间仅 v4.bot.search），
    * 经通用 request() 调 GET /open-apis/bot/v3/info。失败不阻断启动，
-   * 仅 warn 一次并让群聊 @检测退化为占位符匹配。
+   * 仅 warn 一次并让群聊 @检测退化为占位符匹配（严格模式下群消息将被丢弃）。
    */
   private async fetchBotOpenId(): Promise<string | undefined> {
     try {
       const res = await this.client.request({ method: 'GET', url: '/open-apis/bot/v3/info' });
       const openId = res?.bot?.open_id;
       if (openId) return openId;
-      console.warn(`[gateway] 机器人信息未返回 open_id：${JSON.stringify(res)}，群聊 @检测退化为占位符匹配`);
+      this.log.warn(`机器人信息未返回 open_id：${JSON.stringify(res)}，群聊 @检测${this.strictGroupMention ? '严格模式：群消息将被丢弃' : '退化为占位符匹配'}`);
     } catch (e) {
-      console.warn('[gateway] 获取机器人 open_id 失败（不影响启动），群聊 @检测退化为占位符匹配：', e);
+      this.log.warn('获取机器人 open_id 失败（不影响启动），群聊 @检测' + (this.strictGroupMention ? '严格模式：群消息将被丢弃' : '退化为占位符匹配') + '：', e);
     }
     return undefined;
   }
@@ -161,9 +186,10 @@ export class FeishuGateway {
   async start(handlers: GatewayHandlers): Promise<void> {
     const botOpenId = await this.fetchBotOpenId();
     const ws = new this.sdk.WSClient({ appId: this.cfg.appId, appSecret: this.cfg.appSecret });
+    this.ws = ws;
     const dispatcher = new this.sdk.EventDispatcher({}).register({
       'im.message.receive_v1': async (data: never) => {
-        const msg = parseIncomingMessage(data, botOpenId);
+        const msg = parseIncomingMessage(data, botOpenId, { strictGroupMention: this.strictGroupMention });
         if (msg) await handlers.onMessage(msg);
       },
       // 卡片回调必须返回对象（飞书 SDK 契约：返回值经 WS 回传，undefined 会被当异常）；
@@ -176,6 +202,15 @@ export class FeishuGateway {
       },
     });
     await ws.start({ eventDispatcher: dispatcher });
+  }
+
+  /** 优雅关闭长连接（SIGINT/SIGTERM 时逐个 app 调用）；未 start 时为 no-op */
+  close(): void {
+    try {
+      this.ws?.close();
+    } catch {
+      // best effort：关闭失败不阻断其余连接的关闭
+    }
   }
 
   /** 发送卡片消息，返回 message_id */
@@ -196,6 +231,31 @@ export class FeishuGateway {
   /** 更新已发送卡片（流式进度刷新） */
   async updateCard(messageId: string, card: unknown): Promise<void> {
     await this.client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card) } });
+  }
+
+  /**
+   * 上传图片并发送带 caption 的卡片（caption 显示在图片上方，逐张发图带编号说明用）。
+   * 卡片形态发送失败时降级为「caption 文本卡 + 纯图片消息」两条，保证图片必达
+   * （img 卡片元素对 message 型 image_key 的兼容性异常兜底）。
+   */
+  async sendImage(chatId: string, filePath: string, caption?: string): Promise<string> {
+    const up = await this.client.im.image.create({
+      data: { image_type: 'message', image: createReadStream(filePath) },
+    });
+    const imageKey = up?.image_key;
+    if (!imageKey) throw new Error(`上传图片失败: ${JSON.stringify(up)}`);
+    try {
+      return await this.sendCard(chatId, buildImageCard(caption, imageKey));
+    } catch (e) {
+      this.log.warn('图片卡片发送失败，降级为说明文本 + 图片消息两条：', e);
+      if (caption) await this.sendText(chatId, caption).catch(() => {});
+      const res = await this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'image', content: JSON.stringify({ image_key: imageKey }) },
+      });
+      if (!res.data?.message_id) throw new Error(`发送图片消息失败: ${JSON.stringify(res)}`);
+      return res.data.message_id;
+    }
   }
 
   /**

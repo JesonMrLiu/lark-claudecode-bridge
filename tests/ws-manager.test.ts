@@ -155,4 +155,28 @@ describe('ws remove', () => {
     const r = removeWorkspace(rawConfig([{ name: 'demo', path: dir }], 'demo'), 'ghost');
     expect(r.ok).toBe(false);
   });
+
+  it('联动清理：删掉的工作区若被 apps[].default_workspace 引用，引用一并删除（防下次 loadConfig 抛错）', () => {
+    const dir = tmpDir();
+    const raw = [
+      'apps:',
+      '  - name: 主力',
+      '    app_id: cli_aaaaaaaaaaaaaaaa',
+      '    app_secret: s1',
+      '    default_workspace: two',
+      'workspaces:',
+      `  - name: demo`, `    path: ${join(dir, 'demo')}`,
+      `  - name: two`, `    path: ${join(dir, 'two')}`,
+      'defaults:',
+      '  workspace: demo',
+    ].join('\n') + '\n';
+    const r = removeWorkspace(raw, 'two');
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const p = join(dir, 'config.yaml');
+    writeFileSync(p, r.yaml, 'utf8');
+    const cfg = loadConfig(p); // 引用未清理时此处直接抛错（default_workspace 不在列表）
+    expect(cfg.apps[0].defaultWorkspace).toBeUndefined();
+    expect(cfg.workspaces.map((w) => w.name)).toEqual(['demo']);
+  });
 });
