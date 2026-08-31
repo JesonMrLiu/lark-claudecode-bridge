@@ -1,7 +1,7 @@
 import * as realSdk from '@larksuiteoapi/node-sdk';
 import { createReadStream } from 'node:fs';
 import { extname, basename } from 'node:path';
-import type { FeishuAppConfig, GatewayHandlers, IncomingMessage } from '../types.js';
+import type { CardDecision, FeishuAppConfig, GatewayHandlers, IncomingMessage } from '../types.js';
 import { buildImageCard, buildTextCard } from './card-builder.js';
 
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
@@ -107,25 +107,37 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
 }
 
 interface RawCardActionPayload {
-  action?: { value?: { requestId?: string; decision?: 'allow' | 'deny' | 'allow-session' } };
+  action?: {
+    value?: { requestId?: string; decision?: string; feedback?: string };
+    // 卡片 input 组件的值随按钮回调传回（plan 修改意见 name=feedback）；
+    // 不同飞书客户端/版本落点可能是 form_value 或并入 value，两处兜底
+    form_value?: Record<string, unknown>;
+  };
   operator?: { open_id?: string };
   // v2 卡片回调中 message/chat id 嵌套在 context 下；顶层 open_message_id 为兜底
   context?: { open_message_id?: string; open_chat_id?: string };
   open_message_id?: string;
 }
 
-const VALID_DECISIONS: ReadonlySet<string> = new Set(['allow', 'deny', 'allow-session']);
+const VALID_DECISIONS: ReadonlySet<string> = new Set([
+  'allow', 'deny', 'allow-session',
+  'plan-approve', 'plan-revise', 'plan-reject',
+]);
 
 /** 解析 card.action.trigger 回调；不完整或 decision 不在合法枚举内返回 null */
-function parseCardAction(data: unknown): { value: { requestId: string; decision: 'allow' | 'deny' | 'allow-session' }; operatorId: string; openMessageId: string } | null {
+function parseCardAction(data: unknown): { value: { requestId: string; decision: CardDecision; feedback?: string }; operatorId: string; openMessageId: string } | null {
   try {
     if (data === null || typeof data !== 'object') return null;
     const d = data as RawCardActionPayload;
     const value = d.action?.value;
     // decision 必须严格匹配枚举：畸形字符串（如 'ALLOW'）不能流入 CardActionValue.decision
     if (!value?.requestId || typeof value.decision !== 'string' || !VALID_DECISIONS.has(value.decision) || !d.operator?.open_id) return null;
+    // 修改意见：按钮自带 value.feedback 优先，其次卡片输入框 form_value.feedback
+    const fromValue = typeof value.feedback === 'string' && value.feedback ? value.feedback : undefined;
+    const fromForm = typeof d.action?.form_value?.feedback === 'string' ? (d.action.form_value.feedback as string) : undefined;
+    const feedback = fromValue ?? fromForm;
     return {
-      value: { requestId: value.requestId, decision: value.decision },
+      value: { requestId: value.requestId, decision: value.decision as CardDecision, ...(feedback ? { feedback } : {}) },
       operatorId: d.operator.open_id,
       openMessageId: d.context?.open_message_id ?? d.open_message_id ?? '',
     };

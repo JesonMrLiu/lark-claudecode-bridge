@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse, type YAMLParseError } from 'yaml';
-import type { BridgeConfig, FeishuAppConfig, PluginRef, TriggerRule } from './types.js';
+import type { BridgeConfig, FeishuAppConfig, PermissionsConfig, PluginRef, TriggerRule, Workspace, WorkspaceType } from './types.js';
 
 /** LCB_CONFIG_DIR 环境变量可覆盖配置根目录（多租户分进程场景用；正常用户无须设置） */
 export const CONFIG_DIR = join(process.env.LCB_CONFIG_DIR ?? homedir(), '.lark-claudecode-bridge');
@@ -54,6 +54,60 @@ function normalizePlugins(raw: RawApp['plugins'], where: string): PluginRef[] | 
     }
     return { name, path };
   });
+}
+
+const WORKSPACE_TYPES: ReadonlySet<string> = new Set(['code-dev', 'generic']);
+
+/** 归一化工作区列表：name/path 必须非空；type 严格枚举（code-dev = 统一 plan mode + diff 收尾，generic = 缺省） */
+function normalizeWorkspaces(raw: unknown): Workspace[] {
+  const list = (Array.isArray(raw) ? raw : []) as Array<{ name?: unknown; path?: unknown; type?: unknown }>;
+  if (list.length === 0) throw new Error('配置至少需要一个 workspaces 条目');
+  return list.map((w, i): Workspace => {
+    const name = typeof w?.name === 'string' ? w.name.trim() : '';
+    const path = typeof w?.path === 'string' ? w.path.trim() : '';
+    if (!name) throw new Error(`workspaces[${i}] 缺少 name，请检查 config.yaml`);
+    if (!path) throw new Error(`workspaces[${i}](${name}) 缺少 path，请检查 config.yaml`);
+    if (w.type === undefined || w.type === null) return { name, path };
+    if (typeof w.type !== 'string' || !WORKSPACE_TYPES.has(w.type)) {
+      throw new Error(`workspaces[${i}](${name}) 的 type 必须为 code-dev / generic（当前值：${String(w.type)}），请检查 config.yaml`);
+    }
+    return { name, path, type: w.type as WorkspaceType };
+  });
+}
+
+/**
+ * 归一化 permissions 白名单块（整体可选）：allow_tools 为免确认直通工具名（配置即整体替换内置默认，
+ * 不与默认合并）；dangerous_commands 为 Bash 危险命令正则源串（此处 new RegExp 预编译校验，
+ * 非法正则硬抛——带permissions[i]定位，运行期再抛会让所有 Bash 意外弹卡）。
+ */
+function normalizePermissions(doc: Record<string, unknown>): PermissionsConfig | undefined {
+  const raw = doc.permissions;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object') throw new Error('permissions 必须为对象（含 allow_tools / dangerous_commands），请检查 config.yaml');
+  const p = raw as { allow_tools?: unknown; dangerous_commands?: unknown };
+  const allowTools = p.allow_tools;
+  if (allowTools !== undefined) {
+    if (!Array.isArray(allowTools) || allowTools.some((t) => typeof t !== 'string' || !t.trim())) {
+      throw new Error('permissions.allow_tools 必须为非空字符串数组，请检查 config.yaml');
+    }
+  }
+  const dangerous = p.dangerous_commands;
+  let dangerousCommands: RegExp[] = [];
+  if (dangerous !== undefined) {
+    if (!Array.isArray(dangerous)) throw new Error('permissions.dangerous_commands 必须为正则字符串数组，请检查 config.yaml');
+    dangerousCommands = dangerous.map((s, i) => {
+      if (typeof s !== 'string' || !s.trim()) throw new Error(`permissions.dangerous_commands[${i}] 必须为非空正则字符串，请检查 config.yaml`);
+      try {
+        return new RegExp(s);
+      } catch (e) {
+        throw new Error(`permissions.dangerous_commands[${i}] 不是合法正则（"${s}"）：${(e as Error).message}`);
+      }
+    });
+  }
+  return {
+    ...(allowTools !== undefined ? { allowTools: allowTools as string[] } : {}),
+    ...(dangerous !== undefined ? { dangerousCommands } : {}),
+  };
 }
 
 /**
@@ -137,8 +191,7 @@ export function loadConfig(path: string = CONFIG_PATH): BridgeConfig {
   } catch (e) {
     throw new Error(`配置文件 YAML 语法错误：${(e as YAMLParseError).message}`);
   }
-  const workspaces = (doc.workspaces ?? []) as Array<{ name: string; path: string }>;
-  if (workspaces.length === 0) throw new Error('配置至少需要一个 workspaces 条目');
+  const workspaces = normalizeWorkspaces(doc.workspaces);
   const defaults = (doc.defaults ?? {}) as { workspace: string };
   if (!workspaces.some((w) => w.name === defaults.workspace)) {
     throw new Error(`defaults.workspace "${defaults.workspace}" 不在 workspaces 列表中`);
@@ -158,6 +211,11 @@ export function loadConfig(path: string = CONFIG_PATH): BridgeConfig {
     concurrency,
     // 缺省/0/非法 = 永久保留，不默认删用户数据
     transcripts: Number.isFinite(retentionDays) && retentionDays > 0 ? { retentionDays } : undefined,
+    // 权限白名单：未配置的字段由消费侧（permission-gate）回退内置默认
+    ...((() => {
+      const permissions = normalizePermissions(doc);
+      return permissions ? { permissions } : {};
+    })()),
   };
 }
 

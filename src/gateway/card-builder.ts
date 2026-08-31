@@ -1,4 +1,5 @@
-import type { ConfirmationRequest, PermissionDecision } from '../types.js';
+import type { CardDecision, ConfirmationRequest, PermissionDecision } from '../types.js';
+import { chunkText } from '../util/chunk-text.js';
 
 export interface ProgressState { title: string; status: string; textTail: string; toolLine: string; startedAt: number }
 
@@ -57,4 +58,70 @@ export const DECISION_TEXT: Record<PermissionDecision, string> = {
 export function buildConfirmResultCard(req: ConfirmationRequest, decision: PermissionDecision, byName: string): unknown {
   // 摘要截断与确认卡一致（1500）：点击瞬间回调响应内联换卡，摘要突然缩水会被用户看到
   return card([md(`**🔐 Claude 请求执行操作**\n\n工具: \`${req.toolName}\`　工作区: \`${req.workspaceName}\`\n\`\`\`\n${req.summary.slice(0, 1500)}\n\`\`\`\n\n${DECISION_TEXT[decision]}（由 ${byName} 操作）`)]);
+}
+
+// ---------- plan 确认卡片（code-dev 工作区的计划审批流） ----------
+
+export interface PlanCardRequest { requestId: string; plan: string; workspaceName: string }
+
+export type PlanCardDecision = Extract<CardDecision, `plan-${string}`>;
+
+function planButton(decision: PlanCardDecision, label: string, type: string, requestId: string): unknown {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: label },
+    type,
+    behaviors: [{ type: 'callback', value: { requestId, decision } }],
+  };
+}
+
+/**
+ * 计划确认卡片组：plan 超长时按 ~2800 字拆多张（首卡含输入框与按钮，其余为纯正文续篇）。
+ * 空白 plan 退化为单卡占位（模型未提交实质计划时用户只能放弃）。
+ */
+export function buildPlanCards(req: PlanCardRequest): unknown[] {
+  const chunks = chunkText(req.plan, 2800);
+  if (chunks.length === 0) chunks.push('（模型未提交计划正文）');
+  return chunks.map((chunk, i) => {
+    const header = chunks.length > 1
+      ? `**📋 Claude 提交执行计划（${i + 1}/${chunks.length}）**\n\n工作区: \`${req.workspaceName}\`\n`
+      : `**📋 Claude 提交执行计划**\n\n工作区: \`${req.workspaceName}\`\n`;
+    if (i === 0) {
+      return card([
+        md(`${header}${chunk}`),
+        // 修改意见输入框：plan-revise 点击时随回调 form_value 传回（name=feedback）
+        {
+          tag: 'input',
+          name: 'feedback',
+          placeholder: { tag: 'plain_text', content: '修改意见（点「按意见修改」时随意见重新出计划）' },
+        },
+        {
+          // 卡片 V2 已废弃 tag:'action'，与确认卡同款 column_set 分栏按钮
+          tag: 'column_set',
+          flex_mode: 'flow',
+          columns: [
+            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-approve', '✅ 批准执行', 'primary', req.requestId)] },
+            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-revise', '📝 按意见修改', 'default', req.requestId)] },
+            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-reject', '❌ 放弃计划', 'danger', req.requestId)] },
+          ],
+        },
+      ]);
+    }
+    return card([md(`${header}${chunk}`)]);
+  });
+}
+
+/** 计划决策结果卡（决策后由回调响应内联 + 兜底 PATCH 首卡） */
+export function buildPlanResultCard(req: PlanCardRequest, decision: PlanCardDecision, byName: string, feedback?: string): unknown {
+  const text = decision === 'plan-approve'
+    ? `✅ 计划已批准，开始执行（由 ${byName} 操作）`
+    : decision === 'plan-revise'
+      ? `📝 已提交修改意见，Claude 将修订计划后重新提交（由 ${byName} 操作）：\n${(feedback ?? '').slice(0, 500)}`
+      : `❌ 计划已放弃（由 ${byName} 操作）`;
+  return card([md(`**📋 Claude 提交执行计划**\n\n工作区: \`${req.workspaceName}\`\n\n${text}`)]);
+}
+
+/** 计划确认超时卡（此后迟到点击不再改写此卡片） */
+export function buildExpiredPlanCard(req: PlanCardRequest, timeoutMs: number): unknown {
+  return card([md(`**📋 Claude 提交执行计划**\n\n工作区: \`${req.workspaceName}\`\n\n⏰ 已超时自动放弃（${Math.round(timeoutMs / 60000)} 分钟未确认）`)]);
 }

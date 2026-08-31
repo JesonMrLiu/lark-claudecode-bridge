@@ -26,7 +26,12 @@ export interface FeishuAppConfig {
    *  显式配置用于开发期直指源码目录（同名时优先于自动发现） */
   plugins?: PluginRef[];
 }
-export interface Workspace { name: string; path: string }
+/** 工作区场景类型：code-dev = 代码开发（统一 plan mode + diff 收尾），generic = 通用（缺省） */
+export type WorkspaceType = 'code-dev' | 'generic';
+export interface Workspace { name: string; path: string; type?: WorkspaceType }
+/** 权限白名单配置：字段可选——未配置的字段回退内置默认（读工具 + Bash + 危险命令表，见 permission-gate）。
+ *  allowTools 配置即整体替换内置默认（不与默认合并）；dangerousCommands 为 Bash 危险命令正则（命中弹确认卡） */
+export interface PermissionsConfig { allowTools?: string[]; dangerousCommands?: RegExp[] }
 export interface BridgeConfig {
   /** 多飞书应用（多机器人）：每 app 一条独立 WS 长连接 + 独立会话池（sessions.<appId>.json）。
    *  全部 app 共享本机 ~/.claude：模型设置/登录态/user MCP/skills/插件统一继承，仅会话池隔离 */
@@ -36,11 +41,15 @@ export interface BridgeConfig {
   concurrency: number;
   /** 对话落盘清理策略；缺省/0 = 永久保留 */
   transcripts?: { retentionDays?: number };
+  /** 权限白名单；缺省用 permission-gate 的内置默认（读工具 + Bash + 危险命令表） */
+  permissions?: PermissionsConfig;
 }
 export interface IncomingMessage {
   chatId: string; chatType: 'p2p' | 'group'; userId: string; text: string; messageId: string;
 }
-export interface CardActionValue { requestId: string; decision: 'allow' | 'deny' | 'allow-session' }
+/** 卡片回调决策：allow/deny/allow-session 为写工具确认卡；plan-* 为计划确认卡（feedback = 按意见修改时的用户输入） */
+export type CardDecision = 'allow' | 'deny' | 'allow-session' | 'plan-approve' | 'plan-revise' | 'plan-reject';
+export interface CardActionValue { requestId: string; decision: CardDecision; feedback?: string }
 export interface CardActionEvent { value: CardActionValue; operatorId: string; openMessageId: string }
 /**
  * card.action.trigger 回调的返回体：非空时由 gateway 透传给飞书。

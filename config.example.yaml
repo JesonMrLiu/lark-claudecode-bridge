@@ -37,8 +37,31 @@ apps:
 workspaces:                    # 工作区白名单：名字 + 路径（所有机器人共享列表，当前使用哪个 per-app 隔离）
   - name: demo
     path: F:\workspace\demo
+    # type: code-dev           # 工作区类型：code-dev = 代码开发（每个任务先出计划 → 飞书卡片批准后自动执行；
+                               # 收尾发汇总 diff 卡片，不再整文件上传，git 仓库专属）；缺省 generic = 通用
+  # - name: my-project
+  #   path: F:\workspace\my-project
+  #   type: code-dev
 defaults:
   workspace: demo
 concurrency: 3                 # 全局并发上限（未单独配置的 app 沿用此值）
+# permissions:                # 工具白名单（整块可选；未配置的字段用内置默认）。改后重启 bridge 生效
+#   allow_tools:              # 免确认直通工具名。配置即整体替换内置默认（不与默认合并）！
+#                             # 内置默认 = Read/Glob/Grep/LS/TodoRead/TodoWrite/WebFetch/WebSearch/Bash
+#                             # （Bash 默认放行读命令；安全性由 dangerous_commands 黑名单兜底）
+#   - Read
+#   - Glob
+#   - Grep
+#   - LS
+#   - TodoRead
+#   - TodoWrite
+#   - WebFetch
+#   - WebSearch
+#   - Bash
+#   dangerous_commands:       # Bash 危险命令正则（对命令全文匹配，命中弹确认卡）；缺省内置
+#                             # rm -rf / sudo / git push --force / git reset --hard / mkfs /
+#                             # dd if= / chmod 777 / curl|wget 管道执行脚本 / shutdown|reboot
+#   - 'rm\s+-rf'
+#   - 'sudo\s'
 # transcripts:                # 对话落盘清理策略；缺省 = 永久保留
 #   retention_days: 90

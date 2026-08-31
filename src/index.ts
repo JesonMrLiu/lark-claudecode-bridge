@@ -6,7 +6,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, basename, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import type {
-  BridgeConfig, CardActionEvent, CardActionResponse, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
+  BridgeConfig, CardActionEvent, CardActionResponse, CardDecision, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
   IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory,
 } from './types.js';
 import { CONFIG_DIR, CONFIG_PATH, loadConfig, sameApps } from './config.js';
@@ -14,16 +14,22 @@ import { warnIfNoClaudeAuth } from './auth-precheck.js';
 import { AccessControl } from './access/access-control.js';
 import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard } from './gateway/progress-card.js';
-import { buildConfirmCard, buildConfirmResultCard, DECISION_TEXT } from './gateway/card-builder.js';
+import {
+  buildConfirmCard, buildConfirmResultCard, DECISION_TEXT,
+  buildPlanCards, buildPlanResultCard, buildExpiredPlanCard, type PlanCardRequest,
+} from './gateway/card-builder.js';
+import { buildDiffSummaryCards } from './gateway/diff-card.js';
 import { runTask } from './executor/claude-executor.js';
-import { PermissionGate } from './executor/permission-gate.js';
+import { PermissionGate, type PlanAskResult } from './executor/permission-gate.js';
 import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery.js';
 import { createGatewaySender, createNotifyServer, NOTIFY_SERVER_NAME } from './executor/notify-server.js';
+import { collectWorkspaceDiff } from './util/workspace-diff.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
 import { handleCommand } from './session/commands.js';
 import { rewriteByTrigger } from './session/triggers.js';
 import { Semaphore, channelKey } from './session/channel.js';
 import { TranscriptWriter, sweepTranscripts, type TranscriptRecorder } from './transcript/transcript-writer.js';
+import { nowBeijingISO } from './util/beijing-time.js';
 
 // 版本号收敛到 version.ts 单一来源（bin/lcb.ts 与 smoke 测试均引用）
 export { VERSION } from './version.js';
@@ -55,6 +61,13 @@ function expiredConfirmCard(req: ConfirmationRequest, timeoutMs: number): unknow
     },
   };
 }
+
+/** plan 卡片按钮文案（toast 用） */
+const PLAN_DECISION_TEXT: Record<Extract<CardDecision, `plan-${string}`>, string> = {
+  'plan-approve': '✅ 计划已批准，开始执行',
+  'plan-revise': '📝 修改意见已提交',
+  'plan-reject': '❌ 计划已放弃',
+};
 
 interface ChannelRuntime {
   queue: Promise<void>;
@@ -107,6 +120,13 @@ export function createBridge(
   const confirmPending = new Map<string, {
     resolve: (d: PermissionDecision) => void;
     req: ConfirmationRequest;
+    ownerId: string;
+    cardId: string;
+  }>();
+  // plan 确认挂起项：requestId → 等待中的计划决策（plan-approve/revise/reject）
+  const planPending = new Map<string, {
+    resolve: (r: PlanAskResult) => void;
+    req: PlanCardRequest;
     ownerId: string;
     cardId: string;
   }>();
@@ -198,10 +218,15 @@ export function createBridge(
       `任务 · ${wsName}`,
     );
     const confirmTimeoutMs = opts.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
-    // 通道级复用：已存在则沿用（allow-session 记忆跨任务），不存在才建
+    // 通道级复用：已存在则沿用（allow-session 记忆跨任务），不存在才建。
+    // 白名单每任务现读 config.permissions（热重载改配置下一条消息即生效——但 gate 是
+    // 通道级复用实例，decide 时才查 allowTools，故以构造时引用为准；改 permissions 后
+    // 新通道或重启即全量生效，README 注明）
     let gate = gates.get(key);
     if (!gate) {
       gate = new PermissionGate({
+        allowTools: config.permissions?.allowTools ? new Set(config.permissions.allowTools) : undefined,
+        dangerousCommands: config.permissions?.dangerousCommands,
         ask: async (req) => {
           // 发确认卡片并挂起，等待 onCardAction 按 requestId 唤醒；
           // 超时由本闭包自管：到点删除条目 + 卡片置为过期态 + 以 deny 继续——
@@ -221,6 +246,31 @@ export function createBridge(
                 resolve(d);
               },
               req,
+              ownerId: msg.userId,
+              cardId,
+            });
+          });
+        },
+        // plan 确认：发计划卡片组（首卡带按钮+输入框）挂起等待；超时自动放弃。
+        // chatId/userId 绑定构造时任务——通道 key = chatId+userId，同通道内固定，闭包安全
+        planAsk: async (req) => {
+          const planReq: PlanCardRequest = { requestId: randomUUID(), plan: req.plan, workspaceName: req.workspaceName };
+          const ids: string[] = [];
+          for (const c of buildPlanCards(planReq)) ids.push(await deps.gateway.sendCardTo(msg.chatId, c));
+          const cardId = ids[0];
+          return new Promise<PlanAskResult>((resolve) => {
+            const gc = setTimeout(() => {
+              planPending.delete(planReq.requestId);
+              void deps.gateway.updateCard(cardId, buildExpiredPlanCard(planReq, confirmTimeoutMs)).catch(() => {});
+              resolve({ action: 'reject' });
+            }, confirmTimeoutMs);
+            gc.unref();
+            planPending.set(planReq.requestId, {
+              resolve: (r) => {
+                clearTimeout(gc);
+                resolve(r);
+              },
+              req: planReq,
               ownerId: msg.userId,
               cardId,
             });
@@ -246,7 +296,7 @@ export function createBridge(
       await progress.start();
       const state = deps.store.getChannelState(key);
       const resumeId = state?.sessions?.[0]?.sessionId;
-      const now = () => new Date().toISOString();
+      const now = () => nowBeijingISO();
       // 落盘 · user：任务起点（prompt 全文 + resume 链上一轮 sessionId）
       deps.transcript?.user({
         v: 1, ts: now(), kind: 'user', app: app.appId,
@@ -258,6 +308,9 @@ export function createBridge(
         signal: abort.signal,
         env: appEnv,
         appendSystemPrompt: app.appendSystemPrompt,
+        // code-dev 工作区统一 plan mode：模型先出计划（ExitPlanMode → planAsk 飞书卡片），
+        // 用户批准后 SDK 自动切回可编辑模式继续执行
+        ...(config.workspaces.find((w) => w.name === wsName)?.type === 'code-dev' ? { permissionMode: 'plan' as const } : {}),
         // 通道级模型覆盖（/model 设置，每任务现读——改完下一条消息即生效）；未设 = 跟随 ~/.claude 全局
         ...(state?.model ? { model: state.model } : {}),
         // 进程内通知工具（send_text/send_image/send_file）：中间产物实时推给当前聊天。
@@ -323,19 +376,39 @@ export function createBridge(
       }
       // 结果回传（超长截断，防飞书消息体超限）
       if (outcome.finalText) await deps.gateway.sendTextTo(msg.chatId, outcome.finalText.slice(0, 4000));
-      // 产出文件回传：>10 个打 zip（Windows 10+ / macOS / Linux 均自带 tar），失败退化为逐个上传；
+      // 旧产出回传路径（generic 工作区 / code-dev 非 git 仓库回退）：
+      // >10 个打 zip（Windows 10+ / macOS / Linux 均自带 tar），失败退化为逐个上传；
       // 中途经 lcb-notify 已推送过的文件跳过（用户已收到，防重复轰炸）
-      const files = outcome.producedFiles.filter((f) => !sentPaths.has(resolve(f)));
-      if (files.length > MAX_FILES_BEFORE_ZIP) {
-        const zipPath = join(tmpdir(), `lcb-${randomUUID()}.zip`);
-        try {
-          await execFileP('tar', ['-a', '-cf', zipPath, ...files.map((f) => basename(f))], { cwd: workspacePath(wsName) });
-          await deps.gateway.uploadAndSendFile(msg.chatId, zipPath);
-        } catch {
+      const uploadProducedFiles = async (): Promise<void> => {
+        const files = outcome.producedFiles.filter((f) => !sentPaths.has(resolve(f)));
+        if (files.length > MAX_FILES_BEFORE_ZIP) {
+          const zipPath = join(tmpdir(), `lcb-${randomUUID()}.zip`);
+          try {
+            await execFileP('tar', ['-a', '-cf', zipPath, ...files.map((f) => basename(f))], { cwd: workspacePath(wsName) });
+            await deps.gateway.uploadAndSendFile(msg.chatId, zipPath);
+          } catch {
+            for (const f of files) await deps.gateway.uploadAndSendFile(msg.chatId, f);
+          }
+        } else {
           for (const f of files) await deps.gateway.uploadAndSendFile(msg.chatId, f);
         }
+      };
+      // 产出回传：code-dev 工作区发汇总 diff 卡片（只发「改了什么」，不再整文件轰炸）；
+      // generic 工作区保留旧的文件上传行为
+      const isCodeDev = config.workspaces.find((w) => w.name === wsName)?.type === 'code-dev';
+      if (isCodeDev) {
+        const wsDiff = await collectWorkspaceDiff(workspacePath(wsName));
+        if (wsDiff === null) {
+          // 非 git 仓库无法生成 diff：回退上传 + 提示 git init 可切换为 diff 模式
+          console.warn(tag, `[任务收尾] 工作区 ${wsName} 不是 git 仓库，回退为文件上传（git init 后可改用汇总 diff 卡片）`);
+          await uploadProducedFiles();
+        } else if (wsDiff.diff.trim()) {
+          for (const c of buildDiffSummaryCards(wsDiff.diff, { workspaceName: wsName, files: wsDiff.files })) {
+            await deps.gateway.sendCardTo(msg.chatId, c);
+          }
+        }
       } else {
-        for (const f of files) await deps.gateway.uploadAndSendFile(msg.chatId, f);
+        await uploadProducedFiles();
       }
     } catch (e) {
       // 常见错误附配置指引：Not logged in 多因 ~/.claude 无登录态（本机跑一次 claude login 即可）；
@@ -348,7 +421,7 @@ export function createBridge(
           : '';
       await progress.finish(`❌ 出错：${errText.slice(0, 300)}${hint}`);
       deps.transcript?.result({
-        v: 1, ts: new Date().toISOString(), kind: 'result', app: app.appId,
+        v: 1, ts: nowBeijingISO(), kind: 'result', app: app.appId,
         chatId: msg.chatId, userId: msg.userId, sessionId: '',
         subtype: 'error', text: String(e).slice(0, 300),
       });
@@ -367,6 +440,34 @@ export function createBridge(
    */
   async function handleCardAction(action: CardActionEvent): Promise<CardActionResponse | undefined> {
     try {
+      // plan 确认回调分流（requestId 唯一，planPending 与 confirmPending 不会同时命中）
+      const plan = planPending.get(action.value.requestId);
+      if (plan) {
+        if (action.operatorId !== plan.ownerId) {
+          console.log(tag, `[卡片回调] 非发起人 ${action.operatorId} 点击计划卡 ${action.value.requestId}，已忽略`);
+          return { toast: { type: 'info', content: '仅任务发起人可操作计划' } };
+        }
+        const decision = action.value.decision;
+        if (decision !== 'plan-approve' && decision !== 'plan-revise' && decision !== 'plan-reject') {
+          return { toast: { type: 'info', content: '该计划确认已被处理或已过期' } };
+        }
+        // revise 意见为空：不消耗本次决策（条目保留，卡片按钮仍可用），提示先填意见
+        const feedback = (action.value.feedback ?? '').trim();
+        if (decision === 'plan-revise' && !feedback) {
+          return { toast: { type: 'warning', content: '请先在输入框填写修改意见（或点「放弃计划」）' } };
+        }
+        planPending.delete(action.value.requestId);
+        plan.resolve(decision === 'plan-approve' ? { action: 'approve' }
+          : decision === 'plan-revise' ? { action: 'revise', feedback }
+          : { action: 'reject' });
+        const resultCard = buildPlanResultCard(plan.req, decision, '任务发起人', feedback);
+        void deps.gateway.updateCard(plan.cardId, resultCard)
+          .catch((e) => console.error('[计划卡兜底更新失败]', action.value.requestId, e));
+        return {
+          toast: { type: 'success', content: PLAN_DECISION_TEXT[decision] },
+          card: { type: 'raw', data: resultCard },
+        };
+      }
       const pending = confirmPending.get(action.value.requestId);
       if (!pending) {
         // 已处理/超时清理/桥接器重启后的孤儿卡：toast 提示后忽略，不重复决策
@@ -378,21 +479,25 @@ export function createBridge(
         console.log(tag, `[卡片回调] 非发起人 ${action.operatorId} 点击确认卡 ${action.value.requestId}，已忽略`);
         return { toast: { type: 'info', content: '仅任务发起人可确认' } };
       }
+      const decision = action.value.decision;
+      if (decision !== 'allow' && decision !== 'deny' && decision !== 'allow-session') {
+        return { toast: { type: 'info', content: '该确认已被处理或已过期，无需重复操作' } };
+      }
       confirmPending.delete(action.value.requestId);
-      pending.resolve(action.value.decision);
-      const resultCard = buildConfirmResultCard(pending.req, action.value.decision, '任务发起人');
+      pending.resolve(decision);
+      const resultCard = buildConfirmResultCard(pending.req, decision, '任务发起人');
       // 兜底 PATCH 不再 await：回调须在 3 秒内响应（协议 200341），且响应体已内联结果卡同步换卡，
       // PATCH 仅在 WS 回传响应丢失时保证最终一致（同时消掉 await PATCH 慢网络下拖垮响应窗口的隐患）
       void deps.gateway.updateCard(pending.cardId, resultCard)
         .catch((e) => console.error('[卡片兜底更新失败]', action.value.requestId, e));
       return {
-        toast: { type: 'success', content: DECISION_TEXT[action.value.decision] },
+        toast: { type: 'success', content: DECISION_TEXT[decision] },
         card: { type: 'raw', data: resultCard },
       };
     } catch (e) {
       console.error(tag, '[卡片回调异常]', action.value.requestId, e);
       // resolve 之后的代码理论不可抛；若未来插入可抛代码，按条目是否仍在区分决策是否已生效
-      const retryable = confirmPending.has(action.value.requestId);
+      const retryable = confirmPending.has(action.value.requestId) || planPending.has(action.value.requestId);
       return { toast: { type: 'error', content: retryable ? '处理失败，请重试' : '处理出现异常，决策可能已生效，请勿盲目重试' } };
     }
   }
@@ -423,6 +528,8 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     }
     config.workspaces = fresh.workspaces;
     config.defaults = fresh.defaults;
+    // 权限白名单热应用：gate 每任务现读 config.permissions（通道级 gate 虽复用，白名单在 decide 时取用）
+    config.permissions = fresh.permissions;
     // app 数量变化属需重启的变更（上面 sameApps 长度比较已警告），仅等长时逐位 mutate
     if (fresh.apps.length === config.apps.length) {
       fresh.apps.forEach((fa, i) => {

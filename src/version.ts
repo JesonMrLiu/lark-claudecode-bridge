@@ -1,2 +1,2 @@
 // 版本号单一来源：package.json / lcb version / smoke 测试均以此为准
-export const VERSION = '0.4.0';
+export const VERSION = '0.6.0';

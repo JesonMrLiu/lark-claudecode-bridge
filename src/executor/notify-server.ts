@@ -6,6 +6,10 @@ import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance, type Sdk
 import { stat } from 'node:fs/promises';
 import { basename, extname, resolve } from 'node:path';
 import { z } from 'zod';
+import { chunkText } from '../util/chunk-text.js';
+
+// 分块算法已抽到 util/chunk-text（gateway 卡片层复用）；此处 re-export 保持既有引用兼容
+export { chunkText };
 
 export const NOTIFY_SERVER_NAME = 'lcb-notify';
 /** canUseTool 收到的工具全名形态：mcp__lcb-notify__send_text */
@@ -18,53 +22,11 @@ export interface NotifySender {
   sendFile(path: string, note?: string): Promise<void>;
 }
 
-// 飞书 interactive 卡片 JSON 上限约 30KB，3000 个 CJK 字符 UTF-8 约 9KB，留足卡片包壳余量
-const CHUNK_MAX_CHARS = 3000;
 // 单块/单条失败重试一次的退避间隔（飞书偶发限流 / 网络抖动）
 const RETRY_DELAY_MS = 800;
 
 // 与 feishu-gateway 的 IMAGE_EXT 保持同一口径（此处独立声明，避免 executor 反向依赖 gateway）
 const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
-
-/**
- * 超长文本分块：按段落（\n\n+）贪心聚合，单段超长退化为按行聚合，行本身仍超长硬切兜底。
- * 空白文本返回 []（调用方据此跳过发送）。块边界只可能落在段落/行/字符处，不打断 markdown 结构的概率最高。
- */
-export function chunkText(text: string, maxChars = CHUNK_MAX_CHARS): string[] {
-  const src = text.trim();
-  if (!src) return [];
-  const chunks: string[] = [];
-  let cur = '';
-  const flush = () => {
-    const t = cur.trim();
-    if (t) chunks.push(t);
-    cur = '';
-  };
-  for (const para of src.split(/\n\n+/)) {
-    if (para.length > maxChars) {
-      // 超长段落：按行继续聚合（代码块/长表行常见此形态）
-      for (const line of para.split('\n')) {
-        if (line.length > maxChars) {
-          // 行本身超长（无换行的超长串）：收尾当前块后按 maxChars 硬切
-          flush();
-          for (let i = 0; i < line.length; i += maxChars) chunks.push(line.slice(i, i + maxChars));
-        } else if (cur.length + line.length + 1 > maxChars) {
-          flush();
-          cur = line;
-        } else {
-          cur = cur ? `${cur}\n${line}` : line;
-        }
-      }
-    } else if (cur.length + para.length + 2 > maxChars) {
-      flush();
-      cur = para;
-    } else {
-      cur = cur ? `${cur}\n\n${para}` : para;
-    }
-  }
-  flush();
-  return chunks;
-}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));

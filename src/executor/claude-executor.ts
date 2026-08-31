@@ -20,6 +20,8 @@ export interface RunTaskOptions {
   appendSystemPrompt?: string;
   /** 通道级模型覆盖（/model 命令设置），直通 Options.model；未设 = 跟随 ~/.claude/settings.json 的 model */
   model?: string;
+  /** SDK 权限模式：code-dev 工作区传 'plan'（先出计划 → 飞书卡片批准后自动切可编辑），缺省 'default' */
+  permissionMode?: 'default' | 'plan';
   // 收窄签名：SDK 的 CanUseTool 还带第三参 options（signal/suggestions 等），此处仅暴露 (toolName, input)。
   // deny 分支 message 必填，与 SDK PermissionResult 判别联合结构兼容，可直接透传
   canUseTool?: (
@@ -55,7 +57,7 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
   const options: Options = {
     cwd: opts.cwd,
     settingSources: ['user', 'project'],
-    permissionMode: 'default',
+    permissionMode: opts.permissionMode ?? 'default',
     includePartialMessages: false,
     ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
     ...(opts.canUseTool ? { canUseTool: opts.canUseTool } : {}),

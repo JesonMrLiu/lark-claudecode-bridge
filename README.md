@@ -10,9 +10,11 @@
 - **直接使用本机 Claude Code 全套配置**：模型设置（`~/.claude/settings.json`）、登录态、user 级 MCP、skills、marketplace 插件自动继承，无须二次配置；已启用插件自动加载
 - **斜杠透传**：飞书里直接发 `/superpowers:brainstorming` 等斜杠命令，原文透传给 Claude Code 展开（user skills / 插件命令均可触发）；配合飞书「机器人菜单」可做成输入框上方的快捷操作按钮
 - **多机器人**：一个进程同时跑 N 个飞书机器人，各自独立会话池、独立并发、独立人格（`append_system_prompt`）；共享同一套 `~/.claude` 配置
-- 写操作确认卡片：允许 / 拒绝 / 本次会话不再询问（仅任务发起人可点）
+- 写操作确认卡片：允许 / 拒绝 / 本次会话不再询问（仅任务发起人可点），Write/Edit 卡片直接展示红绿 diff
+- **读操作免确认**：读工具（Read/Grep/Glob 等）与 Bash 读命令默认直通，危险命令黑名单兜底；白名单可通过 `permissions.allow_tools` 自定义
+- **开发场景工作流（`type: code-dev`）**：统一 plan mode——先出计划 → 飞书卡片批准/按意见修改/放弃 → 批准后自动执行；任务收尾发汇总 diff 卡片（红绿着色），不再整文件刷屏
 - 流式进度卡片（打字机效果 + 工具调用 + 运行心跳，静默不等于卡死）
-- 结果文本 + 产出文件回传（图片预览、>10 文件自动 zip）
+- 结果文本 + 产出文件回传（图片预览、>10 文件自动 zip；generic 工作区）
 - 多工作区切换（/ws）、会话管理（/new /resume）、/stop 打断、模型切换（/model）、加载清单查看（/skills /plugins /mcp）
 - **对话内容落盘**：用户消息与 Claude 回复全文存为 JSONL（`transcripts/`，为后续知识库挖掘打底；可选保留期）
 - 通道并发（默认 3），通道内串行
@@ -104,25 +106,45 @@ curl --location --request POST 'https://open.feishu.cn/open-apis/application/v7/
 
 ```yaml
 apps:                      # 多机器人：每个应用一条长连接
-   - name: 主力助手          # 显示名，缺省取 app_id
-     app_id: cli_xxxx        # 飞书开放平台 → 凭证与基础信息
-     app_secret: xxxx
-      # domain: lark          # 国际版 Lark 才需要
-      # default_workspace: demo   # 该机器人的默认工作区
-      # concurrency: 2        # 该机器人的并发上限
-      # append_system_prompt: '你是我的素材收集助手'   # 人格补充（多机器人差异化定位的主要手段）
-      # env:                  # per-app 环境变量（注意 ~/.claude/settings.json 的 env 优先级更高，
-      #                         此处适合放 settings.json 里没有的键）
-      #   SOME_PLUGIN_KEY: xxx
+  - name: 主力助手          # 显示名，缺省取 app_id
+    app_id: cli_xxxx        # 飞书开放平台 → 凭证与基础信息
+    app_secret: xxxx
+    # domain: lark          # 国际版 Lark 才需要
+    # default_workspace: demo   # 该机器人的默认工作区
+    # concurrency: 2        # 该机器人的并发上限
+    # append_system_prompt: '你是我的素材收集助手'   # 人格补充（多机器人差异化定位的主要手段）
+    # env:                  # per-app 环境变量（注意 ~/.claude/settings.json 的 env 优先级更高，
+    #                         此处适合放 settings.json 里没有的键）
+    #   SOME_PLUGIN_KEY: xxx
 workspaces:                # 工作区白名单（列表全局共享；「当前用哪个」per-app 隔离）
-   - name: demo
-     path: F:\workspace\demo
+  - name: demo
+    path: F:\workspace\demo
+    # type: code-dev       # 代码开发工作区：统一 plan mode + 收尾汇总 diff 卡片；缺省 generic
 defaults:
-   workspace: demo
+  workspace: demo
 concurrency: 3             # 通道间并发上限（未单独配置的 app 沿用）
+# permissions:             # 工具白名单（整块可选，字段独立回退内置默认；改后重启生效）
+#   allow_tools:           # 免确认直通工具；配置即整体替换内置默认
+#                          # 内置默认：Read/Glob/Grep/LS/TodoRead/TodoWrite/WebFetch/WebSearch/Bash
+#   dangerous_commands:    # Bash 危险命令正则，命中弹确认卡（内置默认覆盖 rm -rf/sudo/git push --force/
+#   - 'rm\s+-rf'           #   git reset --hard/mkfs/dd if=/chmod 777/管道执行远程脚本/shutdown 等）
 # transcripts:             # 对话落盘清理策略；缺省 = 永久保留
 #   retention_days: 90
 ```
+
+### 开发场景工作流（`type: code-dev`）
+
+给代码开发类工作区设置 `type: code-dev` 后，每个任务自动走「先计划、后执行」：
+
+1. **计划审批**：任务以 plan mode 启动（期间只允许读操作），Claude 查阅代码后提交计划 → 飞书收到计划卡片：
+   - **✅ 批准执行**：SDK 自动切回可编辑模式，按计划开工（后续每次写文件仍会弹带红绿 diff 的确认卡）
+   - **📝 按意见修改**：在卡片输入框填修改意见后点击，Claude 修订计划重新提交（同一会话内循环，直到批准或放弃）
+   - **❌ 放弃计划**：任务终止；10 分钟无操作自动放弃
+2. **收尾汇总 diff**：任务完成后不再把改动文件逐个上传，而是发**汇总 diff 卡片**（标题含文件数与 +X/-Y 行统计，正文红绿着色，超长自动拆多张）。改动以 `git diff HEAD` + untracked 新文件为准，因此 **code-dev 工作区需要是 git 仓库**（非 git 仓库自动回退为旧的文件上传行为，并提示 `git init`）
+
+**读操作免确认**：读工具与 Bash 默认直通（`ls`/`cat`/`grep` 不再弹卡），命中 `dangerous_commands` 黑名单（`rm -rf`、`sudo`、`git push --force` 等）仍弹确认卡；「本次会话不再询问」的记忆同样绕不过黑名单。想放行其它工具（如 `Edit`）往 `permissions.allow_tools` 追加即可——注意配置即**整体替换**内置默认，需把内置读工具一并写上。
+
+> plan 卡片与 permissions 配置的改动需重启 bridge 进程生效（`workspaces[].type` 改动亦然）。
 
 ### 配置继承（本机 ~/.claude 一处配置，全机器人共享）
 
@@ -189,11 +211,11 @@ lcb start >> "%USERPROFILE%\.lark-claudecode-bridge\bridge.log" 2>&1
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-   <key>Label</key><string>com.lark-claudecode-bridge</string>
-   <key>ProgramArguments</key><array><string>/usr/local/bin/lcb</string><string>start</string></array>
-   <key>RunAtLoad</key><true/>
-   <key>KeepAlive</key><true/>
-   <key>StandardOutPath</key><string>/tmp/lark-claudecode-bridge.log</string>
+  <key>Label</key><string>com.lark-claudecode-bridge</string>
+  <key>ProgramArguments</key><array><string>/usr/local/bin/lcb</string><string>start</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/lark-claudecode-bridge.log</string>
 </dict></plist>
 ```
 
@@ -222,6 +244,8 @@ WantedBy=default.target
 5. **旧数据迁移归属**：升级多应用后，旧 `sessions.json` 归属 `apps` 列表的第一个应用；新增机器人请追加在列表末尾，否则历史会话会挂错机器人。
 6. **飞书 SDK 对非法 app_id 静默失败**：`ws.start()` 对形状不合法的 app_id 只打日志不报错，启动后请确认每条「✅ <应用名> 长连接已启动」状态行都出现了。
 7. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` 的同名键会被 `~/.claude/settings.json` 的 `env` 覆盖（优先级：CLI flags（/model）> settings.json env > apps[].env > 进程环境）。插件加载失败 SDK 会静默跳过，实际加载情况以 `/plugins` 清单为准。
+8. **plan 卡片的「按意见修改」依赖飞书卡片输入框回传**：修改意见经卡片 input 组件随按钮回调传回；若个别客户端版本不回传输入值，点「按意见修改」会提示先填写意见——此时可改用「放弃计划」后在会话里直接发修改要求重新起任务。
+9. **code-dev 工作区的收尾 diff 基于 git**：`type: code-dev` 的工作区需要是 git 仓库（含未提交改动即可，无需 commit）；非 git 仓库自动回退为旧的整文件上传行为。untracked 新文件按全新增 diff 展示（目录级 untracked 与超过 20 个的 untracked 文件不展开）。
 
 ## 开发
 

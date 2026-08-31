@@ -1,5 +1,6 @@
 import type { BridgeConfig, SessionInventory } from '../types.js';
 import type { SessionStore } from './session-store.js';
+import { formatBeijingTime } from '../util/beijing-time.js';
 
 /**
  * bridge 本地命令首 token 清单（去 / 后比对）。单一来源：commands.ts 的 switch、
@@ -54,7 +55,7 @@ function tail(items: string[]): string {
 
 /** 清单类回复共用的头部（工作区 + 加载时间） */
 function inventoryHeader(inv: SessionInventory): string {
-  return `<font color='grey'>工作区 ${inv.workspace} · ${inv.loadedAt.slice(0, 16).replace('T', ' ')} 加载</font>`;
+  return `<font color='grey'>工作区 ${inv.workspace} · ${formatBeijingTime(inv.loadedAt)} 加载</font>`;
 }
 
 /**
@@ -86,7 +87,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
         // 按时间正序展示：最早的排最前
         const chrono = [...sessions].reverse();
         const list = chrono
-          .map((s, i) => `${i + 1}. ${s.summary || '(无摘要)'} <font color='grey'>${s.updatedAt.slice(0, 16)}</font>`)
+          .map((s, i) => `${i + 1}. ${s.summary || '(无摘要)'} <font color='grey'>${formatBeijingTime(s.updatedAt)}</font>`)
           .join('\n');
         return { handled: true, reply: `**历史会话**（回复 /resume 编号 恢复）\n${list}` };
       }

@@ -10,7 +10,7 @@ import { asker } from './asker.js';
 /** 向导收集到的原始答案（apps 支持多机器人） */
 export interface SetupAnswers {
   apps: Array<{ name?: string; appId: string; appSecret: string }>;
-  workspaces: Array<{ name: string; path: string }>;
+  workspaces: Array<{ name: string; path: string; type?: 'code-dev' | 'generic' }>;
   defaultWorkspace: string;
 }
 
@@ -96,13 +96,16 @@ export async function runSetup(configPath: string): Promise<void> {
     const appSecret = await ask('App Secret');
     apps.push(name ? { name, appId, appSecret } : { appId, appSecret });
   }
-  const workspaces: Array<{ name: string; path: string }> = [];
+  const workspaces: SetupAnswers['workspaces'] = [];
   let defaultWorkspace = '';
   for (let i = 0; ; i++) {
     const name = await ask(i === 0 ? '第一个工作区名字（如 demo）' : '再添一个工作区名字（直接回车结束）');
     if (!name) break;
     const path = await ask(`工作区 ${name} 的本机路径`);
-    workspaces.push({ name, path });
+    // 类型决定开发工作流：code-dev = 统一 plan mode（先出计划→飞书批准）+ 收尾汇总 diff 卡片
+    const type = await ask(`工作区 ${name} 类型（code-dev=代码开发 / generic=通用，回车默认 generic）`, 'generic');
+    const normalized: 'code-dev' | 'generic' = type.trim() === 'code-dev' ? 'code-dev' : 'generic';
+    workspaces.push({ name, path, ...(normalized === 'code-dev' ? { type: normalized } : {}) });
     if (!defaultWorkspace) defaultWorkspace = name;
   }
   if (workspaces.length === 0) {
