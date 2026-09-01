@@ -1,10 +1,9 @@
 import * as realSdk from '@larksuiteoapi/node-sdk';
 import { createReadStream } from 'node:fs';
-import { extname, basename } from 'node:path';
+import { basename } from 'node:path';
 import type { CardDecision, FeishuAppConfig, GatewayHandlers, IncomingMessage } from '../types.js';
 import { buildImageCard, buildTextCard } from './card-builder.js';
-
-const IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+import { isImageFile } from '../util/file-types.js';
 
 /** SDK 形状：仅用到 WSClient/EventDispatcher/Client/Domain 四个导出，测试注入假对象时按此约束 */
 export interface FeishuSdk {
@@ -279,8 +278,7 @@ export class FeishuGateway {
    * 不校验会静默 resolve，用户收不到文件且无任何报错。
    */
   async uploadAndSendFile(chatId: string, filePath: string): Promise<void> {
-    const ext = extname(filePath).toLowerCase();
-    if (IMAGE_EXT.has(ext)) {
+    if (isImageFile(filePath)) {
       const up = await this.client.im.image.create({
         data: { image_type: 'message', image: createReadStream(filePath) },
       });

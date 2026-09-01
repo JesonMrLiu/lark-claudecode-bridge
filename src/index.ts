@@ -1,10 +1,8 @@
 // 装配主流程：消息 → 访问控制 → 命令 → 通道队列 → 执行 → 确认卡片 → 回传
 import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { join, basename, resolve } from 'node:path';
-import { promisify } from 'node:util';
+import { homedir } from 'node:os';
+import { basename, join, resolve } from 'node:path';
 import type {
   BridgeConfig, CardActionEvent, CardActionResponse, CardDecision, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
   IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory,
@@ -24,6 +22,8 @@ import { PermissionGate, type PlanAskResult } from './executor/permission-gate.j
 import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery.js';
 import { createGatewaySender, createNotifyServer, NOTIFY_SERVER_NAME } from './executor/notify-server.js';
 import { collectWorkspaceDiff } from './util/workspace-diff.js';
+import { isImageFile } from './util/file-types.js';
+import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
 import { handleCommand } from './session/commands.js';
 import { rewriteByTrigger } from './session/triggers.js';
@@ -34,8 +34,6 @@ import { nowBeijingISO } from './util/beijing-time.js';
 // 版本号收敛到 version.ts 单一来源（bin/lcb.ts 与 smoke 测试均引用）
 export { VERSION } from './version.js';
 
-const execFileP = promisify(execFile);
-const MAX_FILES_BEFORE_ZIP = 10;
 // 全部机器人共享本机 ~/.claude（模型设置/登录态/user MCP/skills/插件；会话池仍 per-app 隔离）。
 // 显式注入 CLAUDE_CONFIG_DIR 而非依赖 CLI 缺省，防外部环境变量把数据目录带偏
 const SHARED_CLAUDE_DIR = join(homedir(), '.claude');
@@ -117,6 +115,9 @@ export function createBridge(
   // 通道级权限闸：「本次会话不再询问」的记忆跨任务生效（spec：直至 /new），
   // 故 gate 归通道持有而非每任务新建——每任务新建会把授权缩成任务级，任务 B 又要重新确认
   const gates = new Map<string, PermissionGate>();
+  // 通道级非图片文件清单：任务收尾 record、用户消息命中 basename 后 clear，
+  // 用于实现「默认不发非图片文件，用户主动点名才发」的回传规则
+  const fileTracker = new FileTracker();
   const confirmPending = new Map<string, {
     resolve: (d: PermissionDecision) => void;
     req: ConfirmationRequest;
@@ -153,8 +154,34 @@ export function createBridge(
     }
   }
 
+  /**
+   * 用户主动拿文件：消息文本中包含本通道非图片文件清单的 basename（≥4 字符）即视为请求，
+   * 上传匹配文件 + ack，并把已发文件从清单中清除（重复要不再发）。
+   * 返回 true 表示已处理（processMessage 应拦截，不再交给 Claude Code）。
+   */
+  async function tryDeliverRequestedFiles(msg: IncomingMessage, key: string): Promise<boolean> {
+    const files = fileTracker.get(key);
+    if (files.length === 0) return false;
+    // 阈值过滤过短 basename（a.ts / b.js 等），避免消息中随便提到一两个字符就误命中
+    const matched = files.filter((f) => {
+      const bn = basename(f);
+      return bn.length >= 4 && msg.text.includes(bn);
+    });
+    if (matched.length === 0) return false;
+    for (const f of matched) {
+      await deps.gateway.uploadAndSendFile(msg.chatId, f);
+    }
+    const names = matched.map((f) => basename(f)).join('、 ');
+    await deps.gateway.sendTextTo(msg.chatId, `✅ 已发送 ${names}`);
+    fileTracker.clear(key, matched);
+    return true;
+  }
+
   async function processMessage(msg: IncomingMessage): Promise<void> {
     const key = channelKey(msg.chatId, msg.userId);
+    // 0. 用户主动拿文件：消息中包含本通道非图片文件清单的 basename 即发 + ack，
+    // 命中后拦截不再交给 Claude Code——避免模型重复 send_file 同一文件造成轰炸
+    if (await tryDeliverRequestedFiles(msg, key)) return;
     // 1. 访问控制：白名单外发配对码（首个配对成功者自动成为 admin，见 AccessControl）
     // 每条消息先重读 access.json：lcb pair / 运行终端等独立进程批准写盘后，
     // 长存的内存实例不 reload 会查到旧白名单 → 反复发配对码且整盘覆写抹掉新用户（死循环）
@@ -376,39 +403,39 @@ export function createBridge(
       }
       // 结果回传（超长截断，防飞书消息体超限）
       if (outcome.finalText) await deps.gateway.sendTextTo(msg.chatId, outcome.finalText.slice(0, 4000));
-      // 旧产出回传路径（generic 工作区 / code-dev 非 git 仓库回退）：
-      // >10 个打 zip（Windows 10+ / macOS / Linux 均自带 tar），失败退化为逐个上传；
-      // 中途经 lcb-notify 已推送过的文件跳过（用户已收到，防重复轰炸）
-      const uploadProducedFiles = async (): Promise<void> => {
-        const files = outcome.producedFiles.filter((f) => !sentPaths.has(resolve(f)));
-        if (files.length > MAX_FILES_BEFORE_ZIP) {
-          const zipPath = join(tmpdir(), `lcb-${randomUUID()}.zip`);
-          try {
-            await execFileP('tar', ['-a', '-cf', zipPath, ...files.map((f) => basename(f))], { cwd: workspacePath(wsName) });
-            await deps.gateway.uploadAndSendFile(msg.chatId, zipPath);
-          } catch {
-            for (const f of files) await deps.gateway.uploadAndSendFile(msg.chatId, f);
-          }
-        } else {
-          for (const f of files) await deps.gateway.uploadAndSendFile(msg.chatId, f);
+      // 图片自动发（im.image.create 通道），非图片文件不自动回传——
+      // 用户从下面的文件清单里看到改了哪些文件，主动点名 basename 后由 tryDeliverRequestedFiles 处理
+      const uploadProducedImages = async (): Promise<void> => {
+        const imageFiles = outcome.producedFiles
+          .filter((f) => !sentPaths.has(resolve(f)))
+          .filter(isImageFile);
+        for (const f of imageFiles) {
+          await deps.gateway.uploadAndSendFile(msg.chatId, f);
         }
       };
-      // 产出回传：code-dev 工作区发汇总 diff 卡片（只发「改了什么」，不再整文件轰炸）；
-      // generic 工作区保留旧的文件上传行为
+      // 把非图片文件记入通道，供后续用户消息按 basename 命中匹配（图片已自动发，不进 tracker）
+      fileTracker.record(
+        key,
+        outcome.producedFiles.filter((f) => !isImageFile(f)),
+      );
+      // 收尾文件清单（纯文本）：用户从这里知道改了哪些文件——含已自动发的图片与待主动拿的非图片
+      if (outcome.producedFiles.length > 0) {
+        const list = outcome.producedFiles.map((f) => `- ${f}`).join('\n');
+        await deps.gateway.sendTextTo(msg.chatId, `📁 本次修改/新增的文件（共 ${outcome.producedFiles.length} 个）：\n${list}`);
+      }
+      await uploadProducedImages();
+      // code-dev 工作区额外发汇总 diff 卡片（git diff 不是文件本身，不冲突）；
+      // 非 git 仓库 wsDiff===null 时只发图片、不再回退上传非图片
       const isCodeDev = config.workspaces.find((w) => w.name === wsName)?.type === 'code-dev';
       if (isCodeDev) {
         const wsDiff = await collectWorkspaceDiff(workspacePath(wsName));
         if (wsDiff === null) {
-          // 非 git 仓库无法生成 diff：回退上传 + 提示 git init 可切换为 diff 模式
-          console.warn(tag, `[任务收尾] 工作区 ${wsName} 不是 git 仓库，回退为文件上传（git init 后可改用汇总 diff 卡片）`);
-          await uploadProducedFiles();
+          console.warn(tag, `[任务收尾] 工作区 ${wsName} 不是 git 仓库，非图片文件不再自动发送（git init 后可改用汇总 diff 卡片）`);
         } else if (wsDiff.diff.trim()) {
           for (const c of buildDiffSummaryCards(wsDiff.diff, { workspaceName: wsName, files: wsDiff.files })) {
             await deps.gateway.sendCardTo(msg.chatId, c);
           }
         }
-      } else {
-        await uploadProducedFiles();
       }
     } catch (e) {
       // 常见错误附配置指引：Not logged in 多因 ~/.claude 无登录态（本机跑一次 claude login 即可）；
