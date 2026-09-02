@@ -105,6 +105,8 @@ async function main(): Promise<void> {
       break;
     }
     case 'version':
+    case '--version':
+    case '-v':
       console.log(VERSION);
       break;
     case 'app': {
