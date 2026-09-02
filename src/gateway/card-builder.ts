@@ -12,6 +12,8 @@ function md(content: string): unknown {
 export function buildTextCard(markdown: string): unknown {
   return card([md(markdown)]);
 }
+/** 进度卡正文尾部的字符上限（防爆卡片）；任务收尾据此判断短回复是否需要独立结果消息 */
+export const PROGRESS_TAIL_CHARS = 1200;
 /** 图片卡片：caption（可选）显示在图片上方——逐张发图时带编号说明用 */
 export function buildImageCard(caption: string | undefined, imgKey: string): unknown {
   const elements: unknown[] = [];
@@ -23,7 +25,7 @@ export function buildProgressCard(state: ProgressState): unknown {
   const elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
   const lines = [`**${state.title}**`, ``, state.status, ``];
   if (state.toolLine) lines.push(`🔧 ${state.toolLine}`, ``);
-  if (state.textTail) lines.push('---', state.textTail.slice(-1200)); // 只保留尾部，防爆卡片
+  if (state.textTail) lines.push('---', state.textTail.slice(-PROGRESS_TAIL_CHARS)); // 只保留尾部，防爆卡片
   lines.push(``, `<font color='grey'>⏱ 已运行 ${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒</font>`);
   return card([md(lines.join('\n'))]);
 }

@@ -14,6 +14,7 @@
 - **读操作免确认**：读工具（Read/Grep/Glob 等）与 Bash 读命令默认直通，危险命令黑名单兜底；白名单可通过 `permissions.allow_tools` 自定义
 - **开发场景工作流（`type: code-dev`）**：统一 plan mode——先出计划 → 飞书卡片批准/按意见修改/放弃 → 批准后自动执行；任务收尾发汇总 diff 卡片（红绿着色），不再整文件刷屏
 - 流式进度卡片（打字机效果 + 工具调用 + 运行心跳，静默不等于卡死）
+- **接收图片与富文本**：直接给机器人发图片（下载到 `~/.lark-claudecode-bridge/inbox/`，Claude 用 Read 工具识图）；粘贴的多行/带格式内容（post 富文本）自动拍平为多行文本；不支持的类型（语音等）私聊会回复提示；入站消息按 message_id 去重（WS 重投不会导致任务跑两遍）
 - 结果文本 + 产出文件回传（图片预览、>10 文件自动 zip；generic 工作区）
 - 多工作区切换（/ws）、会话管理（/new /resume）、/stop 打断、模型切换（/model）、加载清单查看（/skills /plugins /mcp）
 - **对话内容落盘**：用户消息与 Claude 回复全文存为 JSONL（`transcripts/`，为后续知识库挖掘打底；可选保留期）
@@ -36,7 +37,7 @@ lcb start
 ## 飞书应用配置（图文）
 
 1. https://open.feishu.cn → 创建企业自建应用 → 添加「机器人」能力
-2. 权限管理开通：`im:message`、`im:message:send_as_bot`、`im:resource`、`contact:user.base:readonly`、 `application:app_slash_command:write`(这里的目的是可以为飞书机器人增加斜杆命令。如：/help)
+2. 权限管理开通：`im:message`、`im:message:send_as_bot`、`im:resource`（**接收用户图片时下载消息资源用，不开则图片任务会提示下载失败**）、`contact:user.base:readonly`、 `application:app_slash_command:write`(这里的目的是可以为飞书机器人增加斜杆命令。如：/help)
 3. 事件与回调 → 事件配置 → 订阅方式选「使用长连接接收事件」→ 添加 `im.message.receive_v1`
 4. 事件与回调 → 回调配置 → 订阅方式选「使用长连接接收回调」→「已订阅的回调」点「添加回调」，添加「卡片回传交互」（`card.action.trigger`）
 5. 凭证与基础信息 → 复制 App ID / App Secret
@@ -246,6 +247,8 @@ WantedBy=default.target
 7. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` 的同名键会被 `~/.claude/settings.json` 的 `env` 覆盖（优先级：CLI flags（/model）> settings.json env > apps[].env > 进程环境）。插件加载失败 SDK 会静默跳过，实际加载情况以 `/plugins` 清单为准。
 8. **plan 卡片的「按意见修改」依赖飞书卡片输入框回传**：修改意见经卡片 input 组件随按钮回调传回；若个别客户端版本不回传输入值，点「按意见修改」会提示先填写意见——此时可改用「放弃计划」后在会话里直接发修改要求重新起任务。
 9. **code-dev 工作区的收尾 diff 基于 git**：`type: code-dev` 的工作区需要是 git 仓库（含未提交改动即可，无需 commit）；非 git 仓库自动回退为旧的整文件上传行为。untracked 新文件按全新增 diff 展示（目录级 untracked 与超过 20 个的 untracked 文件不展开）。
+10. **入站图片不清理**：用户发送的图片落盘 `~/.lark-claudecode-bridge/inbox/` 后不会自动删除（供会话内多次查看），长期使用可手动清理；Claude 是否能「看懂」图片取决于当前模型是否多模态（非多模态模型可配置识图 MCP 兜底）。富文本（post）中的超链接以 `[文字](链接)` 形式拍平进文本，@用户 被移除。
+11. **短回复不再单独发结果消息**：回复不超过进度卡正文上限（1200 字）时，结果就展示在进度卡终态里（避免同内容两条消息）；更长回复仍会单独发一条结果消息（进度卡只保留尾部）。
 
 ## 开发
 

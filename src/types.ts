@@ -46,6 +46,12 @@ export interface BridgeConfig {
 }
 export interface IncomingMessage {
   chatId: string; chatType: 'p2p' | 'group'; userId: string; text: string; messageId: string;
+  /** image 消息 / post 内嵌图片的 image_key（gateway 下载后把本地路径注记拼进 text，下游不再消费此字段） */
+  imageKeys?: string[];
+}
+/** parseIncomingMessage 对「明确发给机器人但不支持的消息类型」的拒绝信息（p2p 场景上层回提示；群聊保持静默 null） */
+export interface RejectedMessage {
+  rejected: { kind: 'unsupported-type'; chatId: string; chatType: 'p2p' | 'group'; messageType: string };
 }
 /** 卡片回调决策：allow/deny/allow-session 为写工具确认卡；plan-* 为计划确认卡（feedback = 按意见修改时的用户输入） */
 export type CardDecision = 'allow' | 'deny' | 'allow-session' | 'plan-approve' | 'plan-revise' | 'plan-reject';

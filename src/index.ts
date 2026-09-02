@@ -14,7 +14,7 @@ import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard } from './gateway/progress-card.js';
 import {
   buildConfirmCard, buildConfirmResultCard, DECISION_TEXT,
-  buildPlanCards, buildPlanResultCard, buildExpiredPlanCard, type PlanCardRequest,
+  buildPlanCards, buildPlanResultCard, buildExpiredPlanCard, PROGRESS_TAIL_CHARS, type PlanCardRequest,
 } from './gateway/card-builder.js';
 import { buildDiffSummaryCards } from './gateway/diff-card.js';
 import { runTask } from './executor/claude-executor.js';
@@ -401,8 +401,13 @@ export function createBridge(
       if (outcome.turns > 40) {
         await deps.gateway.sendTextTo(msg.chatId, '💡 本会话已较长，建议发送 /new 开启新会话（/resume 可随时切回）');
       }
-      // 结果回传（超长截断，防飞书消息体超限）
-      if (outcome.finalText) await deps.gateway.sendTextTo(msg.chatId, outcome.finalText.slice(0, 4000));
+      // 结果回传（超长截断，防飞书消息体超限）。
+      // 短回复（≤进度卡正文上限）跳过独立结果消息：finalText 是最后一个 assistant 消息的文本，
+      // 而 textTail 按序累积全部流式文本块、卡片取尾部 PROGRESS_TAIL_CHARS 字——finalText 不超上限时
+      // 必然完整落在进度卡终态里，再发一条就是内容几乎逐字相同的重复消息（0.11.0 修复的双推 bug）
+      if (outcome.finalText && outcome.finalText.length > PROGRESS_TAIL_CHARS) {
+        await deps.gateway.sendTextTo(msg.chatId, outcome.finalText.slice(0, 4000));
+      }
       // 图片自动发（im.image.create 通道），非图片文件不自动回传——
       // 用户从下面的文件清单里看到改了哪些文件，主动点名 basename 后由 tryDeliverRequestedFiles 处理
       const uploadProducedImages = async (): Promise<void> => {

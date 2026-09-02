@@ -1,7 +1,8 @@
 import * as realSdk from '@larksuiteoapi/node-sdk';
-import { createReadStream } from 'node:fs';
-import { basename } from 'node:path';
-import type { CardDecision, FeishuAppConfig, GatewayHandlers, IncomingMessage } from '../types.js';
+import { createReadStream, mkdirSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import type { CardDecision, FeishuAppConfig, GatewayHandlers, IncomingMessage, RejectedMessage } from '../types.js';
+import { CONFIG_DIR } from '../config.js';
 import { buildImageCard, buildTextCard } from './card-builder.js';
 import { isImageFile } from '../util/file-types.js';
 
@@ -25,6 +26,14 @@ export interface FeishuSdk {
       };
       image: { create(payload: { data: { image_type: 'message'; image: NodeJS.ReadableStream } }): Promise<{ image_key?: string } | null> };
       file: { create(payload: { data: { file_type: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream'; file_name: string; file: NodeJS.ReadableStream } }): Promise<{ file_key?: string } | null> };
+      // 下载消息内嵌资源（图片）：SDK 1.73.0 返回带 writeFile 落盘便捷方法
+      messageResource: {
+        get(payload: { params: { type: string }; path: { message_id: string; file_key: string } }): Promise<{
+          writeFile(filePath: string): Promise<unknown>;
+          getReadableStream(): NodeJS.ReadableStream;
+          headers: unknown;
+        }>;
+      };
     };
     // 通用请求口（SDK 1.73.0 未封装 bot info 接口，经此调 GET /open-apis/bot/v3/info 拿机器人 open_id）
     request(payload: { method: string; url: string }):
@@ -50,8 +59,44 @@ interface RawMessagePayload {
   sender?: { sender_id?: { open_id?: string } };
 }
 
+/** post 富文本节点（拍平时只取关心的 tag，其余跳过） */
+interface PostNode { tag?: string; text?: string; href?: string; image_key?: string }
+
+/**
+ * post 富文本拍平为纯文本 + 图片 key 列表：
+ * text→text 字段、a→[text](href)、img→收集 image_key、at 及其他 tag→跳过；
+ * title 非空作首行，行间 \n 连接（保留多行结构）。content 非法返回 null。
+ */
+function flattenPost(rawContent: string): { text: string; imageKeys: string[] } | null {
+  try {
+    const post = JSON.parse(rawContent) as { title?: string; content?: PostNode[][] };
+    if (!Array.isArray(post.content)) return null;
+    const imageKeys: string[] = [];
+    const lines: string[] = [];
+    if (typeof post.title === 'string' && post.title.trim()) lines.push(post.title);
+    for (const line of post.content) {
+      if (!Array.isArray(line)) continue;
+      const parts: string[] = [];
+      for (const node of line) {
+        if (node?.tag === 'text' && node.text) parts.push(node.text);
+        else if (node?.tag === 'a' && node.text) parts.push(node.href ? `[${node.text}](${node.href})` : node.text);
+        else if (node?.tag === 'img' && node.image_key) imageKeys.push(node.image_key);
+      }
+      lines.push(parts.join(''));
+    }
+    return { text: lines.join('\n'), imageKeys };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * 解析 im.message.receive_v1 事件为 IncomingMessage。
+ *
+ * 支持的消息类型：text（纯文本，含手打多行）、post（富文本——粘贴带格式内容会被客户端编码为
+ * 此类型，拍平为多行纯文本并提取内嵌图片）、image（纯图片，提取 image_key 供 gateway 下载）。
+ * 其余类型（audio/media/file 等）：p2p 返回 RejectedMessage 供上层回提示（不再静默蒸发），
+ * 群聊保持 null 静默（@ 判定对非常规类型无法可靠进行）。
  *
  * 群聊 @检测：botOpenId（机器人 open_id）可用时按 mentions 数组精确匹配——
  * 占位符/mentions 非空无法区分 @机器人 vs @普通人（群里 @任何人都命中，会被误当任务执行）；
@@ -65,15 +110,31 @@ interface RawMessagePayload {
  * 本函数以展平结构为主，同时兼容 {event: {...}} 包裹形态（原始事件体直投）。
  * 结构不合法一律返回 null，绝不抛异常。
  */
-export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: { strictGroupMention?: boolean } = {}): IncomingMessage | null {
+export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: { strictGroupMention?: boolean } = {}): IncomingMessage | RejectedMessage | null {
   try {
     if (event === null || typeof event !== 'object') return null;
     const raw = event as { event?: RawMessagePayload } & RawMessagePayload;
     const payload = raw.message || raw.sender ? raw : raw.event;
     const m = payload?.message;
-    if (!m?.chat_id || !m.message_id || m.message_type !== 'text') return null;
-    const text = (JSON.parse(m.content ?? '{}') as { text?: string }).text ?? '';
-    if (!text.trim()) return null;
+    if (!m?.chat_id || !m.message_id || !m.message_type) return null;
+    let text = '';
+    let imageKeys: string[] = [];
+    if (m.message_type === 'text') {
+      text = (JSON.parse(m.content ?? '{}') as { text?: string }).text ?? '';
+    } else if (m.message_type === 'post') {
+      const flat = flattenPost(m.content ?? '{}');
+      if (!flat) return null;
+      text = flat.text;
+      imageKeys = flat.imageKeys;
+    } else if (m.message_type === 'image') {
+      const key = (JSON.parse(m.content ?? '{}') as { image_key?: string }).image_key;
+      if (key) imageKeys.push(key);
+    } else {
+      return m.chat_type === 'p2p'
+        ? { rejected: { kind: 'unsupported-type', chatId: m.chat_id, chatType: 'p2p', messageType: m.message_type } }
+        : null;
+    }
+    if (!text.trim() && imageKeys.length === 0) return null;
     const isGroup = m.chat_type !== 'p2p';
     if (isGroup) {
       if (botOpenId) {
@@ -99,6 +160,7 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
       userId,
       text: stripMention(text),
       messageId: m.message_id,
+      ...(imageKeys.length > 0 ? { imageKeys } : {}),
     };
   } catch {
     return null;
@@ -152,6 +214,12 @@ export class FeishuGateway {
   private ws?: InstanceType<FeishuSdk['WSClient']>;
   private log: { warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void };
   private strictGroupMention: boolean;
+  /** 入站图片落盘目录（默认 ~/.lark-claudecode-bridge/inbox/，测试可注入临时目录） */
+  private inboxDir: string;
+  // 入站消息去重：飞书 WS 长连接 at-least-once 投递，重连窗口内同一消息可能重投——
+  // 不去重会导致整个任务跑两遍（两张进度卡 + 两条结果）。Map 迭代序即插入序，容量超限删最旧。
+  private seenMessageIds = new Map<string, number>();
+  private static readonly SEEN_MAX = 1000;
 
   constructor(
     cfg: FeishuAppConfig,
@@ -161,6 +229,8 @@ export class FeishuGateway {
       log?: { warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void };
       /** 严格群聊 @ 模式：botOpenId 不可用时丢弃群消息而非退化猜测（多机器人同群防双触发） */
       strictGroupMention?: boolean;
+      /** 入站图片下载目录，缺省 CONFIG_DIR/inbox */
+      inboxDir?: string;
     } = {},
   ) {
     this.cfg = cfg;
@@ -171,6 +241,7 @@ export class FeishuGateway {
       error: (...a: unknown[]) => console.error(tag, ...a),
     };
     this.strictGroupMention = deps.strictGroupMention ?? false;
+    this.inboxDir = deps.inboxDir ?? join(CONFIG_DIR, 'inbox');
     const domain = cfg.domain === 'lark' ? this.sdk.Domain.Lark : this.sdk.Domain.Feishu;
     this.client = new this.sdk.Client({ appId: cfg.appId, appSecret: cfg.appSecret, domain });
   }
@@ -193,6 +264,52 @@ export class FeishuGateway {
     return undefined;
   }
 
+  /** 记录 messageId 并返回是否首次出现（true=新消息，false=重复投递应忽略） */
+  private markSeen(messageId: string): boolean {
+    if (this.seenMessageIds.has(messageId)) return false;
+    this.seenMessageIds.set(messageId, Date.now());
+    if (this.seenMessageIds.size > FeishuGateway.SEEN_MAX) {
+      const oldest = this.seenMessageIds.keys().next().value;
+      if (oldest !== undefined) this.seenMessageIds.delete(oldest);
+    }
+    return true;
+  }
+
+  /** 响应头 content-type → 图片扩展名（未知兜底 .png） */
+  private static extFromHeaders(headers: unknown): string {
+    const ct = String((headers as Record<string, unknown> | undefined | null)?.['content-type'] ?? '');
+    if (ct.includes('jpeg') || ct.includes('jpg')) return '.jpg';
+    if (ct.includes('gif')) return '.gif';
+    if (ct.includes('webp')) return '.webp';
+    return '.png';
+  }
+
+  /**
+   * 下载消息内嵌图片到 inbox 目录（文件名 messageId_序号.扩展名）。
+   * 单张失败仅 warn 记录、不阻塞其余图片与消息转发（im:resource 权限缺失等场景文字任务照常）。
+   */
+  private async downloadImages(msg: IncomingMessage): Promise<{ paths: string[]; failures: string[] }> {
+    const paths: string[] = [];
+    const failures: string[] = [];
+    mkdirSync(this.inboxDir, { recursive: true });
+    for (let i = 0; i < (msg.imageKeys ?? []).length; i++) {
+      const key = msg.imageKeys![i];
+      try {
+        const res = await this.client.im.messageResource.get({
+          path: { message_id: msg.messageId, file_key: key },
+          params: { type: 'image' },
+        });
+        const filePath = join(this.inboxDir, `${msg.messageId}_${i + 1}${FeishuGateway.extFromHeaders(res?.headers)}`);
+        await res.writeFile(filePath);
+        paths.push(filePath);
+      } catch (e) {
+        this.log.warn(`[图片] 下载失败（${key}）：`, e);
+        failures.push(key);
+      }
+    }
+    return { paths, failures };
+  }
+
   /** 建立 WS 长连接并注册事件分发（im.message.receive_v1 / card.action.trigger） */
   async start(handlers: GatewayHandlers): Promise<void> {
     const botOpenId = await this.fetchBotOpenId();
@@ -200,8 +317,36 @@ export class FeishuGateway {
     this.ws = ws;
     const dispatcher = new this.sdk.EventDispatcher({}).register({
       'im.message.receive_v1': async (data: never) => {
-        const msg = parseIncomingMessage(data, botOpenId, { strictGroupMention: this.strictGroupMention });
-        if (msg) await handlers.onMessage(msg);
+        const parsed = parseIncomingMessage(data, botOpenId, { strictGroupMention: this.strictGroupMention });
+        if (parsed && 'rejected' in parsed) {
+          // 不支持的消息类型（p2p）：明确反馈而非静默蒸发；提示发送失败不影响主流程
+          if (parsed.rejected.chatType === 'p2p') {
+            await this.sendText(parsed.rejected.chatId, `🤖 暂不支持该消息类型（${parsed.rejected.messageType}），当前支持：文字、富文本（多行/粘贴）、图片`)
+              .catch((e) => this.log.warn('[类型提示] 发送失败：', e));
+          }
+          return;
+        }
+        if (parsed && !this.markSeen(parsed.messageId)) {
+          this.log.warn('[去重] 忽略重复投递的消息', parsed.messageId);
+          return;
+        }
+        if (parsed) {
+          // 图片消息：先下载落盘，再把本地路径注记拼进 text——下游（触发词/命令/执行器/transcript）
+          // 对注记形态无感知，Claude Code 侧用 Read 工具读取路径即可看到图片
+          if ((parsed.imageKeys?.length ?? 0) > 0) {
+            const { paths, failures } = await this.downloadImages(parsed);
+            const hasText = parsed.text.trim().length > 0;
+            const notes: string[] = [];
+            if (paths.length > 0) {
+              notes.push(`[用户${hasText ? '随消息' : ''}发送了 ${paths.length} 张图片${hasText ? '' : '（无文字说明）'}，已保存到本地：${paths.join('、')}。需要查看图片内容时用 Read 工具读取这些路径。]`);
+            }
+            if (failures.length > 0) {
+              notes.push(`[另有 ${failures.length} 张图片下载失败（${failures.join('、')}）——如需查看请让用户重发，或检查应用 im:resource 权限。]`);
+            }
+            parsed.text = hasText ? `${parsed.text}\n\n${notes.join('\n')}` : notes.join('\n');
+          }
+          await handlers.onMessage(parsed);
+        }
       },
       // 卡片回调必须返回对象（飞书 SDK 契约：返回值经 WS 回传，undefined 会被当异常）；
       // handler 返回了响应体（如 toast / 内联换卡 card）则透传，否则返回 {}。
