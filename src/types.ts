@@ -32,6 +32,29 @@ export interface Workspace { name: string; path: string; type?: WorkspaceType }
 /** 权限白名单配置：字段可选——未配置的字段回退内置默认（读工具 + Bash + 危险命令表，见 permission-gate）。
  *  allowTools 配置即整体替换内置默认（不与默认合并）；dangerousCommands 为 Bash 危险命令正则（命中弹确认卡） */
 export interface PermissionsConfig { allowTools?: string[]; dangerousCommands?: RegExp[] }
+/** Web 配置页服务器（lcb start / lcb ui 内嵌，node:http 零依赖）：enabled/host/port 均为启动时读取，改动需重启 */
+export interface ServerConfig { enabled?: boolean; host?: string; port?: number }
+export type ClaudeAuthMode = 'inherit' | 'managed';
+/**
+ * Claude 认证与模型配置。inherit = 共享本机 ~/.claude（0.4 起默认行为，登录态/settings 全继承）；
+ * managed = bridge 自管目录（~/.lark-claudecode-bridge/claude/），authToken/apiKey/baseUrl/model
+ * 写入该目录 settings.json 的 env 块——完全摆脱对本机 claude login 的依赖
+ */
+export interface ClaudeConfig {
+  mode?: ClaudeAuthMode;
+  /** ANTHROPIC_AUTH_TOKEN（Bearer，中转站常用）；与 apiKey 二选一 */
+  authToken?: string;
+  /** ANTHROPIC_API_KEY（x-api-key）；与 authToken 二选一 */
+  apiKey?: string;
+  /** ANTHROPIC_BASE_URL（第三方中转端点；官方 API 留空） */
+  baseUrl?: string;
+  /** 写 settings.json 顶层 model + env.ANTHROPIC_MODEL */
+  model?: string;
+}
+/** 飞书斜杠命令注册定义（同步到开放平台 app_slash_commands；command 不含 / 前缀） */
+export interface SlashCommandDef { command: string; description: string; icon?: string }
+/** 斜杠命令同步配置：extra 为用户自定义透传命令（内置命令集见 commands.SLASH_COMMAND_META，始终参与同步） */
+export interface SlashCommandsConfig { extra?: SlashCommandDef[] }
 export interface BridgeConfig {
   /** 多飞书应用（多机器人）：每 app 一条独立 WS 长连接 + 独立会话池（sessions.<appId>.json）。
    *  全部 app 共享本机 ~/.claude：模型设置/登录态/user MCP/skills/插件统一继承，仅会话池隔离 */
@@ -43,6 +66,12 @@ export interface BridgeConfig {
   transcripts?: { retentionDays?: number };
   /** 权限白名单；缺省用 permission-gate 的内置默认（读工具 + Bash + 危险命令表） */
   permissions?: PermissionsConfig;
+  /** Web 配置页服务器；缺省 enabled=true / 127.0.0.1:17317（随 lcb start 常驻） */
+  server?: ServerConfig;
+  /** Claude 认证模式；缺省 inherit（共享 ~/.claude） */
+  claude?: ClaudeConfig;
+  /** 飞书斜杠命令同步；缺省仅内置命令集 */
+  slashCommands?: SlashCommandsConfig;
 }
 export interface IncomingMessage {
   chatId: string; chatType: 'p2p' | 'group'; userId: string; text: string; messageId: string;

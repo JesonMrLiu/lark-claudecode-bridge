@@ -2,7 +2,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse, type YAMLParseError } from 'yaml';
-import type { BridgeConfig, FeishuAppConfig, PermissionsConfig, PluginRef, TriggerRule, Workspace, WorkspaceType } from './types.js';
+import type {
+  BridgeConfig, ClaudeAuthMode, ClaudeConfig, FeishuAppConfig, PermissionsConfig, PluginRef,
+  ServerConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace, WorkspaceType,
+} from './types.js';
 
 /** LCB_CONFIG_DIR 环境变量可覆盖配置根目录（多租户分进程场景用；正常用户无须设置） */
 export const CONFIG_DIR = join(process.env.LCB_CONFIG_DIR ?? homedir(), '.lark-claudecode-bridge');
@@ -98,7 +101,8 @@ function normalizePermissions(doc: Record<string, unknown>): PermissionsConfig |
     dangerousCommands = dangerous.map((s, i) => {
       if (typeof s !== 'string' || !s.trim()) throw new Error(`permissions.dangerous_commands[${i}] 必须为非空正则字符串，请检查 config.yaml`);
       try {
-        return new RegExp(s);
+        // 统一 i flag 与内置 DEFAULT_DANGEROUS_COMMANDS 一致（大小写变体的危险命令同样命中；黑名单扩大仅偏安全方向）
+        return new RegExp(s, 'i');
       } catch (e) {
         throw new Error(`permissions.dangerous_commands[${i}] 不是合法正则（"${s}"）：${(e as Error).message}`);
       }
@@ -108,6 +112,108 @@ function normalizePermissions(doc: Record<string, unknown>): PermissionsConfig |
     ...(allowTools !== undefined ? { allowTools: allowTools as string[] } : {}),
     ...(dangerous !== undefined ? { dangerousCommands } : {}),
   };
+}
+
+/** Web 配置页服务器段（整体可选）：host 缺省 127.0.0.1、port 硬校验（非法值会让 server 起不来） */
+function normalizeServer(doc: Record<string, unknown>): ServerConfig | undefined {
+  const raw = doc.server;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object') throw new Error('server 必须为对象（含 enabled / host / port），请检查 config.yaml');
+  const s = raw as { enabled?: unknown; host?: unknown; port?: unknown };
+  let enabled = true;
+  if (s.enabled !== undefined && s.enabled !== null) {
+    if (typeof s.enabled !== 'boolean') throw new Error('server.enabled 必须为布尔值，请检查 config.yaml');
+    enabled = s.enabled;
+  }
+  let host = '127.0.0.1';
+  if (s.host !== undefined && s.host !== null) {
+    if (typeof s.host !== 'string' || !s.host.trim()) throw new Error('server.host 必须为非空字符串，请检查 config.yaml');
+    host = s.host.trim();
+    // 默认只绑回环：放开到非回环地址意味着局域网可见（配置页能读写全部凭证），显式警示
+    if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+      console.warn(`[配置] server.host = ${host} 非回环地址：配置页将暴露给局域网（页面可读写 app_secret 等凭证），请确认网络环境可信`);
+    }
+  }
+  let port = 17317;
+  if (s.port !== undefined && s.port !== null) {
+    port = Number(s.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`server.port 必须为 1-65535 的整数（当前值：${String(s.port)}），请检查 config.yaml`);
+    }
+  }
+  return { enabled, host, port };
+}
+
+/** Claude 认证段（整体可选）：mode 缺省 inherit；managed 下两凭证并存硬抛（会被 API 拒绝且意图不明） */
+function normalizeClaude(doc: Record<string, unknown>): ClaudeConfig | undefined {
+  const raw = doc.claude;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object') throw new Error('claude 必须为对象（含 mode / auth_token / api_key / base_url / model），请检查 config.yaml');
+  const c = raw as { mode?: unknown; auth_token?: unknown; api_key?: unknown; base_url?: unknown; model?: unknown };
+  let mode: ClaudeAuthMode = 'inherit';
+  if (c.mode !== undefined && c.mode !== null) {
+    if (c.mode !== 'inherit' && c.mode !== 'managed') {
+      throw new Error(`claude.mode 必须为 inherit / managed（当前值：${String(c.mode)}），请检查 config.yaml`);
+    }
+    mode = c.mode;
+  }
+  const str = (v: unknown): string | undefined => {
+    if (v === undefined || v === null) return undefined;
+    if (typeof v !== 'string') throw new Error('claude 段的字段必须为字符串，请检查 config.yaml');
+    const t = v.trim();
+    return t ? t : undefined;
+  };
+  const authToken = str(c.auth_token);
+  const apiKey = str(c.api_key);
+  if (authToken && apiKey) {
+    throw new Error('claude.auth_token 与 claude.api_key 只能二选一（并存时 API 侧凭证歧义），请检查 config.yaml');
+  }
+  const baseUrl = str(c.base_url);
+  if (baseUrl && !/^https?:\/\//.test(baseUrl)) {
+    console.warn(`[配置] claude.base_url = ${baseUrl} 不以 http(s):// 开头，请确认是否漏写协议`);
+  }
+  // managed 无凭证：允许落盘（首次进配置页的中间态），启动时 auth-precheck 会再提示
+  if (mode === 'managed' && !authToken && !apiKey) {
+    console.warn('[配置] claude.mode = managed 但未配置 auth_token / api_key：请在 Web 配置页填写，否则 Claude 任务将无法认证');
+  }
+  const model = str(c.model);
+  return { mode, ...(authToken ? { authToken } : {}), ...(apiKey ? { apiKey } : {}), ...(baseUrl ? { baseUrl } : {}), ...(model ? { model } : {}) };
+}
+
+const SLASH_COMMAND_RE = /^[A-Za-z0-9_-]{1,32}$/;
+
+/** 斜杠命令同步段（整体可选）：extra 为自定义透传命令；与内置命令的重名在 expectedCommands 合并时处理（内置优先） */
+function normalizeSlashCommands(doc: Record<string, unknown>): SlashCommandsConfig | undefined {
+  const raw = doc.slash_commands;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object') throw new Error('slash_commands 必须为对象（含 extra 数组），请检查 config.yaml');
+  const extraRaw = (raw as { extra?: unknown }).extra;
+  if (extraRaw === undefined || extraRaw === null) return {};
+  if (!Array.isArray(extraRaw)) throw new Error('slash_commands.extra 必须为数组，请检查 config.yaml');
+  const seen = new Set<string>();
+  const extra: SlashCommandDef[] = [];
+  extraRaw.forEach((e, i) => {
+    const where = `slash_commands.extra[${i}]`;
+    let command = typeof e?.command === 'string' ? e.command.trim() : '';
+    const description = typeof e?.description === 'string' ? e.description.trim() : '';
+    if (!command) throw new Error(`${where} 缺少 command，请检查 config.yaml`);
+    if (command.startsWith('/')) {
+      command = command.slice(1); // 飞书侧注册用裸名，容错剥离
+      console.warn(`[配置] ${where} 的 command 不应带 / 前缀（飞书斜杠命令注册用裸名），已自动剥离`);
+    }
+    if (!SLASH_COMMAND_RE.test(command)) {
+      throw new Error(`${where} 的 command "${command}" 须为 1-32 位字母/数字/下划线/连字符`);
+    }
+    if (!description) throw new Error(`${where} 缺少 description（飞书指令面板展示用），请检查 config.yaml`);
+    if (seen.has(command)) {
+      console.warn(`[配置] ${where} 的 command "${command}" 重复，已忽略后条`);
+      return;
+    }
+    seen.add(command);
+    const icon = typeof e?.icon === 'string' && e.icon.trim() ? e.icon.trim() : undefined;
+    extra.push(icon ? { command, description, icon } : { command, description });
+  });
+  return { extra };
 }
 
 /**
@@ -185,11 +291,19 @@ export function loadConfig(path: string = CONFIG_PATH): BridgeConfig {
   } catch {
     throw new Error(`找不到配置文件 ${path}，请先运行 lcb setup`);
   }
+  return parseConfigText(raw, path);
+}
+
+/**
+ * 从 YAML 文本解析配置（loadConfig 的字符串版）：Web 配置页 PUT /api/config 写盘前
+ * 的内存校验复用同一套 normalize 逻辑，保证「页面能保存的」与「启动能加载的」完全一致。
+ */
+export function parseConfigText(raw: string, pathForError: string = CONFIG_PATH): BridgeConfig {
   let doc: Record<string, unknown>;
   try {
     doc = parse(raw) as Record<string, unknown>;
   } catch (e) {
-    throw new Error(`配置文件 YAML 语法错误：${(e as YAMLParseError).message}`);
+    throw new Error(`配置文件 YAML 语法错误：${(e as YAMLParseError).message}（${pathForError}）`);
   }
   const workspaces = normalizeWorkspaces(doc.workspaces);
   const defaults = (doc.defaults ?? {}) as { workspace: string };
@@ -204,6 +318,11 @@ export function loadConfig(path: string = CONFIG_PATH): BridgeConfig {
   const apps = normalizeApps(doc, workspaces.map((w) => w.name));
   const transcriptsRaw = (doc.transcripts ?? {}) as { retention_days?: unknown };
   const retentionDays = Number(transcriptsRaw.retention_days ?? 0);
+  // 可选段统一模式：normalize 返回 undefined = 段未配置，不落键
+  const section = <T>(v: T | undefined, key: string): Record<string, T> => (v === undefined ? {} : { [key]: v });
+  const server = normalizeServer(doc);
+  const claude = normalizeClaude(doc);
+  const slashCommands = normalizeSlashCommands(doc);
   return {
     apps,
     workspaces,
@@ -212,10 +331,10 @@ export function loadConfig(path: string = CONFIG_PATH): BridgeConfig {
     // 缺省/0/非法 = 永久保留，不默认删用户数据
     transcripts: Number.isFinite(retentionDays) && retentionDays > 0 ? { retentionDays } : undefined,
     // 权限白名单：未配置的字段由消费侧（permission-gate）回退内置默认
-    ...((() => {
-      const permissions = normalizePermissions(doc);
-      return permissions ? { permissions } : {};
-    })()),
+    ...section(normalizePermissions(doc), 'permissions'),
+    ...section(server, 'server'),
+    ...section(claude, 'claude'),
+    ...section(slashCommands, 'slashCommands'),
   };
 }
 

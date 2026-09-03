@@ -10,29 +10,38 @@ import { generateFileDiff } from '../util/diff.js';
  * 内置默认免确认工具白名单（config.yaml permissions.allow_tools 缺省值；配置即整体替换）。
  * Bash 默认放行是读场景（ls/cat/grep 等经 Bash 执行）不弹卡的前提，安全性由
  * DEFAULT_DANGEROUS_COMMANDS 黑名单兜底——命中仍弹确认卡。
+ * LIST 源列表供 config-defaults 预置写盘（lcb setup / web bootstrap），Set 由其派生，保单源。
  */
-export const DEFAULT_ALLOW_TOOLS: ReadonlySet<string> = new Set([
+export const DEFAULT_ALLOW_TOOLS_LIST: readonly string[] = [
   'Read', 'Glob', 'Grep', 'LS', 'TodoRead', 'TodoWrite', 'WebFetch', 'WebSearch', 'Bash',
-]);
+];
+export const DEFAULT_ALLOW_TOOLS: ReadonlySet<string> = new Set(DEFAULT_ALLOW_TOOLS_LIST);
 
 // 保留旧名导出（含只读子集、不含 Bash）：外部引用与测试的语义锚点
 export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'Read', 'Glob', 'Grep', 'LS', 'TodoRead', 'TodoWrite', 'WebFetch', 'WebSearch',
 ]);
 
-/** 内置 Bash 危险命令正则（permissions.dangerous_commands 缺省值）：对 command 全文匹配，命中弹确认卡 */
-export const DEFAULT_DANGEROUS_COMMANDS: readonly RegExp[] = [
-  /\brm\s+-[a-z]*r[a-z]*f/i,           // rm -rf / rm -fr / rm -Rf（递归强删）
-  /\brm\s+-[a-z]*f[a-z]*r/i,
-  /\bsudo\s/i,
-  /\bgit\s+push\b[^&|;]*--force/i,     // 强推覆盖远端
-  /\bgit\s+reset\s+--hard/i,           // 丢弃本地改动
-  /\bmkfs\b/i,
-  /\bdd\s+if=/i,
-  /\bchmod\s+777\b/i,
-  /\b(curl|wget)\b[^|;&]*\|\s*(ba|z)?sh\b/i, // 远程脚本管道执行
-  /\b(shutdown|reboot)\b/i,
+/**
+ * 内置 Bash 危险命令正则源串（permissions.dangerous_commands 缺省值；运行期统一 i flag 编译）。
+ * 源串形式供 config-defaults 预置写盘——写出的配置回读后与内置行为逐字一致。
+ */
+export const DEFAULT_DANGEROUS_COMMAND_SOURCES: readonly string[] = [
+  '\\brm\\s+-[a-z]*r[a-z]*f',           // rm -rf / rm -fr / rm -Rf（递归强删）
+  '\\brm\\s+-[a-z]*f[a-z]*r',
+  '\\bsudo\\s',
+  '\\bgit\\s+push\\b[^&|;]*--force',     // 强推覆盖远端
+  '\\bgit\\s+reset\\s+--hard',           // 丢弃本地改动
+  '\\bmkfs\\b',
+  '\\bdd\\s+if=',
+  '\\bchmod\\s+777\\b',
+  '\\b(curl|wget)\\b[^|;&]*\\|\\s*(ba|z)?sh\\b', // 远程脚本管道执行
+  '\\b(shutdown|reboot)\\b',
 ];
+
+/** 内置 Bash 危险命令正则：对 command 全文匹配（不区分大小写），命中弹确认卡 */
+export const DEFAULT_DANGEROUS_COMMANDS: readonly RegExp[] =
+  DEFAULT_DANGEROUS_COMMAND_SOURCES.map((s) => new RegExp(s, 'i'));
 
 // 超时默认 10 分钟：飞书端可能长时间无人点击卡片
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;

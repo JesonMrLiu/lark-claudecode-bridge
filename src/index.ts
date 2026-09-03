@@ -558,10 +558,19 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     if (!sameApps(fresh.apps, config.apps) || fresh.concurrency !== config.concurrency) {
       console.warn('[配置热重载] 检测到应用列表/凭证或 concurrency 变更，需重启后生效');
     }
+    // claude/server 段为启动时定妆照：CLAUDE_CONFIG_DIR 在 createBridge 构造 env 时注入、
+    // web server 在 startBridge 时监听——运行中变更只能提示重启，避免「以为已生效」
+    if (JSON.stringify(fresh.claude ?? {}) !== JSON.stringify(config.claude ?? {})
+      || JSON.stringify(fresh.server ?? {}) !== JSON.stringify(config.server ?? {})) {
+      console.warn('[配置热重载] 检测到 claude / server 段变更，需重启后生效');
+    }
     config.workspaces = fresh.workspaces;
     config.defaults = fresh.defaults;
     // 权限白名单热应用：gate 每任务现读 config.permissions（通道级 gate 虽复用，白名单在 decide 时取用）
     config.permissions = fresh.permissions;
+    config.claude = fresh.claude;
+    config.server = fresh.server;
+    config.slashCommands = fresh.slashCommands;
     // app 数量变化属需重启的变更（上面 sameApps 长度比较已警告），仅等长时逐位 mutate
     if (fresh.apps.length === config.apps.length) {
       fresh.apps.forEach((fa, i) => {

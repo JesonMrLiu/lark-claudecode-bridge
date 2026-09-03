@@ -6,6 +6,7 @@ import { dirname } from 'node:path';
 import { stringify } from 'yaml';
 import type { BridgeConfig } from '../types.js';
 import { asker } from './asker.js';
+import { defaultPermissionsDoc, defaultServerDoc } from '../config-defaults.js';
 
 /** 向导收集到的原始答案（apps 支持多机器人） */
 export interface SetupAnswers {
@@ -40,6 +41,7 @@ export function answersToConfig(a: SetupAnswers): BridgeConfig {
  * 配置 → 可写盘的 YAML 文档。
  * ⚠️ 键名必须用 snake_case（apps[].app_id / app_secret）——loadConfig 按此形状解析，
  * 直接 stringify(camelCase 的 BridgeConfig) 会写出 loadConfig 读不回的配置。
+ * permissions / server 段预置完整默认值（页面可增删），保证新用户开箱即得可调的白名单。
  */
 export function toYamlDocument(cfg: BridgeConfig): Record<string, unknown> {
   return {
@@ -52,6 +54,8 @@ export function toYamlDocument(cfg: BridgeConfig): Record<string, unknown> {
     workspaces: cfg.workspaces,
     defaults: { workspace: cfg.defaults.workspace },
     concurrency: cfg.concurrency,
+    permissions: defaultPermissionsDoc(),
+    server: defaultServerDoc(),
   };
 }
 
