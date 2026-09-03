@@ -38,13 +38,22 @@ export function hasClaudeAuth(appEnv: Record<string, string | undefined>, claude
     || hasSettingsAuth(claudeConfigDir);
 }
 
-/** 启动预检：无任何认证来源时 warn 修复出路；返回是否存在认证（测试断言用） */
+/** 启动预检：无任何认证来源时 warn 修复出路（managed 模式指向配置页，inherit 指向 claude login）；返回是否存在认证（测试断言用） */
 export function warnIfNoClaudeAuth(
   appName: string,
   appEnv: Record<string, string | undefined>,
   claudeConfigDir: string,
+  opts: { managed?: boolean; serverUrl?: string | null } = {},
 ): boolean {
   if (hasClaudeAuth(appEnv, claudeConfigDir)) return true;
+  if (opts.managed) {
+    console.warn(
+      `[app:${appName}] [配置] 未检测到 Claude Code 认证来源（managed 模式）：config.yaml 的 claude 段未配置 auth_token / api_key。`
+      + `发消息将报「Not logged in · Please run /login」。`
+      + `修复：${opts.serverUrl ? `打开 ${opts.serverUrl} 在「Claude 认证」区填写（中转站另配 base_url），保存并重启 bridge` : '在 config.yaml 的 claude 段配置 auth_token / api_key 后重启 bridge'}`,
+    );
+    return false;
+  }
   console.warn(
     `[app:${appName}] [配置] 未检测到 Claude Code 认证来源：环境变量无 ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY，`
     + `且 ${claudeConfigDir} 下无 .credentials.json，settings.json 也未声明认证。`

@@ -9,6 +9,7 @@ import { asker } from '../cli/asker.js';
 import { approvePairingLine } from '../cli/stdin-pairing.js';
 import { startBridge } from '../index.js';
 import { loadConfig, CONFIG_PATH, CONFIG_DIR } from '../config.js';
+import { initManagedClaudeDir } from '../claude-config.js';
 import { AccessControl } from '../access/access-control.js';
 import { VERSION } from '../version.js';
 import { join } from 'node:path';
@@ -32,6 +33,8 @@ async function main(): Promise<void> {
           console.warn(`⚠️ 应用 ${app.name} 的 App ID "${app.appId}" 不符合常见形状 cli_ + 16 位十六进制，启动继续；若后续连接失败请先核对`);
         }
       }
+      // managed 模式：把 claude 段最新认证/模型值合并进自管目录 settings.json（首条消息前就位）
+      initManagedClaudeDir(config);
       await startBridge(CONFIG_PATH);
       // 前台监听 stdin：管理员可直接在运行终端输入配对码批准。
       // 现读现批（每次 load 新实例再 approve）：桥运行中 beginPairing 写入的新 pending
