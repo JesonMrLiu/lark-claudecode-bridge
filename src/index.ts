@@ -218,6 +218,9 @@ export function createBridge(
       isAdmin: deps.access.isAdmin(msg.userId),
       currentWorkspace: () => currentWorkspace,
       getInventory: () => inventories.get(currentWorkspace),
+      // /plugin 插件管理依赖：安装目标 = 双模式解析的 Claude 配置目录；结果回传 = 当前聊天
+      claudeConfigDir: claudeDir,
+      send: async (md) => { await deps.gateway.sendTextTo(msg.chatId, md); },
       stopCurrentTask: () => {
         const rt = runtimes.get(key);
         if (rt?.abort) { rt.abort.abort(); return true; }

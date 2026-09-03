@@ -568,15 +568,70 @@ function renderSlash(el) {
   };
 }
 
-// ============ 插件（C5 扩展；先占位） ============
-function renderPlugins(el) {
+// ============ 插件 ============
+async function renderPlugins(el) {
   el.innerHTML = `
   <div class="card">
     <h3>Claude Code 插件</h3>
-    <div class="desc">插件随 Claude 配置目录自动发现加载（marketplace 安装的、已启用的）。飞书端可用 <code>/plugin list</code> 查看、<code>/plugin install xxx@marketplace</code> 安装（仅管理员）。</div>
-    <div id="pluginArea"><div class="hint">插件管理功能加载中…</div></div>
+    <div class="desc">安装到当前认证模式对应的 Claude 配置目录：<code id="pluginDir">…</code>。装好后下一条消息自动加载。飞书端同样可用 <code>/plugin install xxx@marketplace</code>（仅管理员）。</div>
+    <table><thead><tr><th>插件</th><th>市场</th><th>版本</th><th style="width:90px">状态</th><th style="width:200px">操作</th></tr></thead>
+    <tbody id="plBody"><tr><td colspan="5" class="hint">加载中…</td></tr></tbody></table>
+  </div>
+  <div class="card">
+    <h3>安装 / 市场</h3>
+    <div class="row" style="max-width:560px">
+      <input type="text" id="plInstall" placeholder="name 或 name@marketplace">
+      <button class="btn primary" id="plDoInstall" style="flex:0">安装</button>
+    </div>
+    <div class="row" style="max-width:560px;margin-top:10px">
+      <input type="text" id="plMarket" placeholder="marketplace git 地址或本机路径">
+      <button class="btn" id="plDoMarketAdd" style="flex:0">添加市场</button>
+      <button class="btn" id="plDoMarketUpdate" style="flex:0">全部更新</button>
+    </div>
+    <pre class="report" id="plReport" style="display:none;margin-top:12px"></pre>
   </div>`;
-  if (typeof renderPluginMgr === 'function') renderPluginMgr(el);
+  const report = (title, text) => {
+    $('#plReport').style.display = '';
+    $('#plReport').textContent = `${title}\n${text}`;
+  };
+  const load = async () => {
+    try {
+      const r = await api('GET', '/api/plugins');
+      $('#pluginDir').textContent = r.configDir;
+      const body = $('#plBody');
+      if (!r.plugins.length) {
+        body.innerHTML = '<tr><td colspan="5" class="hint">尚未安装任何插件</td></tr>';
+        return;
+      }
+      body.innerHTML = r.plugins.map((p) => `
+        <tr>
+          <td><b>${esc(p.name)}</b></td>
+          <td>${esc(p.marketplace || '-')}</td>
+          <td class="hint">${esc(p.version || '-')}</td>
+          <td>${p.enabled ? '<span class="tag ok">已启用</span>' : '<span class="tag off">未启用</span>'}</td>
+          <td>
+            <button class="btn sm" data-op="${p.enabled ? 'disable' : 'enable'}" data-arg="${esc(p.key)}">${p.enabled ? '停用' : '启用'}</button>
+            <button class="btn sm danger" data-op="uninstall" data-arg="${esc(p.key)}">卸载</button>
+          </td>
+        </tr>`).join('');
+      body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = () => act(b.dataset.op, b.dataset.arg));
+    } catch (e) {
+      $('#plBody').innerHTML = `<tr><td colspan="5" class="hint">加载失败：${esc(e.message)}</td></tr>`;
+    }
+  };
+  const act = async (op, arg) => {
+    report(`执行中：${op} ${arg}`, '…（安装/更新可能需要拉取仓库，请稍候）');
+    try {
+      const r = await api('POST', '/api/plugins/action', { op, arg });
+      report(r.ok ? `✅ ${op} 完成` : `❌ ${op} 失败`, r.text);
+      if (r.ok) { await load(); toast(`${op} 完成`); }
+      else toast(`${op} 失败：${r.text.slice(0, 120)}`, true);
+    } catch (e) { report(`❌ ${op} 失败`, e.message); toast(e.message, true); }
+  };
+  $('#plDoInstall').onclick = () => act('install', $('#plInstall').value.trim());
+  $('#plDoMarketAdd').onclick = () => act('marketplace-add', $('#plMarket').value.trim());
+  $('#plDoMarketUpdate').onclick = () => act('marketplace-update', '');
+  await load();
 }
 
 // ============ 保存 ============

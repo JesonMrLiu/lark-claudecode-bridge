@@ -1,13 +1,14 @@
 import type { BridgeConfig, SessionInventory } from '../types.js';
 import type { SessionStore } from './session-store.js';
 import { formatBeijingTime } from '../util/beijing-time.js';
+import { handlePluginCommand } from './plugin-command.js';
 
 /**
  * bridge 本地命令首 token 清单（去 / 后比对）。单一来源：commands.ts 的 switch、
  * triggers.ts 的 RESERVED、index.ts 的透传说明均以此为准——本地命令永远优先，
  * 不被触发词劫持、不透传给 Claude Code。新增本地命令务必同步此清单
  */
-export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'skills', 'plugins', 'mcp'] as const;
+export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'skills', 'plugins', 'mcp', 'plugin'] as const;
 
 /**
  * 内置命令的飞书 Slash Command 注册元信息（icon 为飞书 icon_key，见开放平台文档可选列表）。
@@ -25,6 +26,7 @@ export const SLASH_COMMAND_META: Record<string, { description: string; icon: str
   skills: { description: '查看已加载技能', icon: 'skill_outlined' },
   plugins: { description: '查看已加载插件', icon: 'plugin_outlined' },
   mcp: { description: '查看已加载 MCP 服务', icon: 'ai-functions_outlined' },
+  plugin: { description: '插件管理：安装/启停/市场（管理员）', icon: 'plugin_outlined' },
 };
 
 export interface CommandContext {
@@ -39,6 +41,10 @@ export interface CommandContext {
   stopCurrentTask(): boolean;
   /** 本 app 当前工作区最近一次会话的加载清单（SDK init 消息缓存）；尚无会话时 undefined */
   getInventory(): SessionInventory | undefined;
+  /** Claude 配置目录（/plugin 安装目标）。wiring 注入；未注入时 /plugin 回复不可用 */
+  claudeConfigDir?: string;
+  /** 异步消息通道：/plugin 长操作 ack 后异步推送结果。wiring 注入 gateway.sendTextTo */
+  send?: (markdown: string) => Promise<void>;
 }
 
 export interface CommandResult {
@@ -59,6 +65,7 @@ const HELP = `**可用命令**
 /skills — 查看已加载技能
 /plugins — 查看已加载插件
 /mcp — 查看已加载 MCP 服务
+/plugin — 插件管理（安装/启停/市场，管理员）
 /help — 帮助
 
 💡 其它 / 开头的消息将原文透传给 Claude Code（可触发其技能与插件命令，如 /superpowers:brainstorming）`;
@@ -204,6 +211,17 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
         return `- ${ok ? '✅' : '⚠️'} **${s.name}**（${s.status}）`;
       }).join('\n');
       return { handled: true, reply: `**MCP 服务** ${inv.mcpServers.length} 个 · ${inventoryHeader(inv)}\n${list}` };
+    }
+    case 'plugin': {
+      // 飞书端插件管理（安装/启停/市场）：本地接管，不再透传给 Claude Code 会话
+      if (!ctx.claudeConfigDir || !ctx.send) {
+        return { handled: true, reply: '⛔ 插件管理在当前部署下不可用（缺少运行环境注入）' };
+      }
+      return { handled: true, reply: await handlePluginCommand(args, {
+        isAdmin: ctx.isAdmin,
+        claudeConfigDir: ctx.claudeConfigDir,
+        send: ctx.send,
+      }) };
     }
     default:
       // 非本地命令的斜杠消息原文透传给 Claude Code（SDK 直接派发斜杠命令）

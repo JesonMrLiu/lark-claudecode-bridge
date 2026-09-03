@@ -74,6 +74,36 @@ export function discoverPlugins(claudeConfigDir: string): DiscoveredPlugin[] {
   return result;
 }
 
+/** 主动清缓存：/plugin install 等操作后调用，消除粗粒度文件系统 mtime 同秒不变化的风险 */
+export function invalidatePluginCache(claudeConfigDir: string): void {
+  cache.delete(claudeConfigDir);
+}
+
+/** 已安装插件全量清单（含未启用项；Web 配置页 /api/plugins 用）。文件缺失返回空 */
+export function listInstalledPlugins(claudeConfigDir: string): Array<{
+  key: string; name: string; marketplace?: string; enabled: boolean; path?: string; version?: string;
+}> {
+  const installed = readJson<InstalledPluginsDoc>(join(claudeConfigDir, 'plugins', 'installed_plugins.json'));
+  if (!installed.ok || installed.doc.version !== 2) return [];
+  const settings = readJson<SettingsDoc>(join(claudeConfigDir, 'settings.json'));
+  const enabledMap = settings.ok ? (settings.doc.enabledPlugins ?? {}) : {};
+  const out: Array<{ key: string; name: string; marketplace?: string; enabled: boolean; path?: string; version?: string }> = [];
+  for (const [key, list] of Object.entries(installed.doc.plugins ?? {})) {
+    if (!Array.isArray(list)) continue;
+    const item = list.find((it) => it.scope === 'user') ?? list[0];
+    const at = key.indexOf('@');
+    out.push({
+      key,
+      name: at > 0 ? key.slice(0, at) : key,
+      marketplace: at > 0 ? key.slice(at + 1) : undefined,
+      enabled: enabledMap[key] === true,
+      ...(typeof item?.installPath === 'string' && item.installPath ? { path: item.installPath } : {}),
+      ...(typeof item?.version === 'string' ? { version: item.version } : {}),
+    });
+  }
+  return out;
+}
+
 function parseInstalled(dir: string, installedPath: string, settingsPath: string): DiscoveredPlugin[] {
   const installed = readJson<InstalledPluginsDoc>(installedPath);
   if (!installed.ok) {

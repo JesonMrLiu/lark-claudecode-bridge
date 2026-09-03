@@ -14,6 +14,8 @@ import type { BridgeConfig, ServerConfig } from '../types.js';
 import { appStatusSummary, applySecrets, computeRestartRequired, docForClient, isAllowedHost, isAllowedOrigin } from './config-api.js';
 import { openBrowser } from '../util/open-browser.js';
 import { createSlashApiClient, expectedCommands, syncSlashCommands } from '../feishu/slash-commands.js';
+import { runPluginCli } from '../executor/plugin-manager.js';
+import { invalidatePluginCache, listInstalledPlugins } from '../executor/plugin-discovery.js';
 
 /** PUT /api/config 参与整段替换的顶级键；body 未携带的键保持磁盘原文（含注释） */
 const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'server', 'claude', 'slash_commands', 'transcripts'] as const;
@@ -258,6 +260,39 @@ async function handle(
     } catch (e) {
       // API 原文透传（缺 scope 等场景页面直接展示开放平台错误）
       return json(res, 502, { error: `飞书 API 调用失败：${e instanceof Error ? e.message : String(e)}（请确认已开通 application:app_slash_command 读写权限并发布版本）` });
+    }
+  }
+  // ---- 插件管理（本机页面即可操作；与飞书端 /plugin 命令同一执行器） ----
+  if (path.startsWith('/api/plugins')) {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件，请先完成 bootstrap' });
+    let config: BridgeConfig;
+    try {
+      config = loadConfig(ctx.configPath);
+    } catch (e) {
+      return json(res, 500, { error: `配置加载失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+    const dir = resolveClaudeDir(config);
+    if (path === '/api/plugins' && req.method === 'GET') {
+      return json(res, 200, { configDir: dir, plugins: listInstalledPlugins(dir) });
+    }
+    if (path === '/api/plugins/action' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const arg = String(body.arg ?? '').trim();
+      const op = String(body.op ?? '');
+      const argsTable: Record<string, string[]> = {
+        install: arg ? ['install', arg] : [],
+        uninstall: arg ? ['uninstall', arg] : [],
+        enable: arg ? ['enable', arg] : [],
+        disable: arg ? ['disable', arg] : [],
+        'marketplace-add': arg ? ['marketplace', 'add', arg] : [],
+        'marketplace-remove': arg ? ['marketplace', 'remove', arg] : [],
+        'marketplace-update': ['marketplace', 'update', ...(arg ? [arg] : [])],
+      };
+      const args = argsTable[op];
+      if (!args || args.length === 0) return json(res, 400, { error: `操作 ${op || '(空)'} 需要参数或未知` });
+      const r = await runPluginCli(args, { claudeConfigDir: dir });
+      invalidatePluginCache(dir);
+      return json(res, 200, r);
     }
   }
   return json(res, 404, { error: `未知端点 ${req.method} ${path}` });
