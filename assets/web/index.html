@@ -491,22 +491,27 @@ function renderPermissions(el) {
   };
 }
 
-// ============ 斜杠命令（C4 扩展同步；本页先支持 extras 编辑） ============
+// ============ 斜杠命令（extras 编辑 + 一键同步） ============
 function renderSlash(el) {
   const sc = S.doc.slash_commands || (S.doc.slash_commands = {});
   sc.extra = sc.extra || [];
   el.innerHTML = `
   <div class="card">
     <h3>飞书斜杠命令</h3>
-    <div class="desc">同步后在飞书聊天输入 <code>/</code> 弹出指令面板，选中后命令留在输入框可继续输入描述再发送。<b>内置命令</b>（help/new/resume/stop/status/ws/model/skills/plugins/mcp/plugin）始终参与同步；下表为自定义透传命令。</div>
+    <div class="desc">同步后在飞书聊天输入 <code>/</code> 弹出指令面板，选中后命令留在输入框可继续输入描述再发送。<b>内置命令</b>（help/new/resume/stop/status/ws/model/skills/plugins/mcp）始终参与同步；下表为自定义透传命令。</div>
     <table><thead><tr><th style="width:160px">命令（不带 /）</th><th>描述</th><th style="width:150px">图标 icon_key（可空）</th><th style="width:50px"></th></tr></thead>
     <tbody id="scBody"></tbody></table>
     <button class="btn sm" id="scAdd" style="margin-top:10px">+ 添加命令</button>
   </div>
-  <div class="card" id="syncCard" style="display:none">
+  <div class="card">
     <h3>一键同步到飞书</h3>
-    <div class="desc">需在飞书开放平台给应用开通 <code>application:app_slash_command:write/read</code> 权限并发布版本。同步为全量对齐（远端多余命令会被删除）；生效约 5 分钟，PC 端需 7.70+。</div>
-    <div id="syncArea"></div>
+    <div class="desc">需在飞书开放平台给应用开通 <code>application:app_slash_command:write/read</code> 权限并发布版本。同步为全量对齐（远端多余命令会被删除）；生效约 5 分钟，PC 端需 7.70+。<b>表格改动请先保存再同步</b>。</div>
+    <div class="row" style="align-items:end;max-width:560px">
+      <div><label>目标应用</label><select id="syncApp"></select></div>
+      <button class="btn" id="btnRemote" style="flex:0">查看远端</button>
+      <button class="btn primary" id="btnSync" style="flex:0">一键同步</button>
+    </div>
+    <div id="syncReport" style="margin-top:12px"></div>
   </div>`;
   const body = $('#scBody');
   const renderRow = (item, idx) => {
@@ -526,7 +531,41 @@ function renderSlash(el) {
   };
   sc.extra.forEach(renderRow);
   $('#scAdd').onclick = () => { sc.extra.push({ command: '', description: '' }); markDirty(); renderSlash(el); };
-  if (typeof renderSlashSync === 'function') renderSlashSync(el); // C4 注入同步区块
+  // 同步区块
+  const appSel = $('#syncApp');
+  (S.status?.apps || []).forEach((a) => {
+    const opt = document.createElement('option');
+    opt.value = a.name;
+    opt.textContent = `${a.name}（${a.appId}）`;
+    appSel.appendChild(opt);
+  });
+  const showReport = (title, content, isErr) => {
+    $('#syncReport').innerHTML = `<div class="hint" style="margin-bottom:6px">${title}</div><pre class="report">${esc(content)}</pre>${isErr ? '' : ''}`;
+  };
+  $('#btnRemote').onclick = async () => {
+    try {
+      showReport('查询中…', '');
+      const r = await api('GET', `/api/slash-commands/remote?app=${encodeURIComponent(appSel.value)}`);
+      showReport(`远端已注册 ${r.remote.length} 条`, r.remote.map((x) => `/${x.command} — ${x.description?.default_value || ''}`).join('\n') || '（空）', false);
+    } catch (e) { showReport('查询失败', e.message, true); toast(e.message, true); }
+  };
+  $('#btnSync').onclick = async () => {
+    if (S.dirty) return toast('有未保存的修改，请先保存再同步', true);
+    $('#btnSync').disabled = true;
+    try {
+      const r = await api('POST', '/api/slash-commands/sync', { app: appSel.value });
+      const lines = [
+        r.created.length ? `✅ 新建 ${r.created.length}：${r.created.join('、')}` : '· 无新建',
+        r.updated.length ? `🔄 更新 ${r.updated.length}：${r.updated.join('、')}` : '· 无更新',
+        r.deleted.length ? `🗑️ 删除 ${r.deleted.length}：${r.deleted.join('、')}` : '· 无删除',
+        `✔️ 未变 ${r.unchanged.length} 条`,
+        ...(r.errors.length ? [`⚠️ 失败 ${r.errors.length}：`, ...r.errors.map((e) => `  ${e.command}: ${e.error}`)] : []),
+      ];
+      showReport(`同步完成（约 5 分钟后飞书客户端生效）`, lines.join('\n'), r.errors.length > 0);
+      toast(r.errors.length ? `同步完成，但有 ${r.errors.length} 条失败（详见报告）` : '✅ 同步完成，约 5 分钟后生效');
+    } catch (e) { showReport('同步失败', e.message, true); toast(e.message, true); }
+    $('#btnSync').disabled = false;
+  };
 }
 
 // ============ 插件（C5 扩展；先占位） ============

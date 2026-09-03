@@ -9,6 +9,24 @@ import { formatBeijingTime } from '../util/beijing-time.js';
  */
 export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'skills', 'plugins', 'mcp'] as const;
 
+/**
+ * 内置命令的飞书 Slash Command 注册元信息（icon 为飞书 icon_key，见开放平台文档可选列表）。
+ * 斜杠命令同步（feishu/slash-commands）的默认期望集 = 本表的全部键 + config.slash_commands.extra。
+ * 新增本地命令须同步：BRIDGE_LOCAL_COMMANDS、handleCommand case、HELP 文案、本表（测试断言清单⊆本表）。
+ */
+export const SLASH_COMMAND_META: Record<string, { description: string; icon: string }> = {
+  help: { description: '查看全部命令', icon: 'slash-ai_outlined' },
+  new: { description: '开启新会话', icon: 'add-chat-ai_outlined' },
+  resume: { description: '列出/恢复历史会话', icon: 'update-ai_outlined' },
+  stop: { description: '停止当前任务', icon: 'clear_outlined' },
+  status: { description: '查看当前状态', icon: 'diagnosis-ai_outlined' },
+  ws: { description: '切换工作区（/ws list 列出）', icon: 'folder_outlined' },
+  model: { description: '查看/切换模型', icon: 'ai-style_outlined' },
+  skills: { description: '查看已加载技能', icon: 'skill_outlined' },
+  plugins: { description: '查看已加载插件', icon: 'plugin_outlined' },
+  mcp: { description: '查看已加载 MCP 服务', icon: 'ai-functions_outlined' },
+};
+
 export interface CommandContext {
   channelKey: string;
   store: SessionStore;

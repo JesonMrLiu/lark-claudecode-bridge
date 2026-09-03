@@ -13,6 +13,7 @@ import { VERSION } from '../version.js';
 import type { BridgeConfig, ServerConfig } from '../types.js';
 import { appStatusSummary, applySecrets, computeRestartRequired, docForClient, isAllowedHost, isAllowedOrigin } from './config-api.js';
 import { openBrowser } from '../util/open-browser.js';
+import { createSlashApiClient, expectedCommands, syncSlashCommands } from '../feishu/slash-commands.js';
 
 /** PUT /api/config 参与整段替换的顶级键；body 未携带的键保持磁盘原文（含注释） */
 const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'server', 'claude', 'slash_commands', 'transcripts'] as const;
@@ -202,8 +203,7 @@ async function handle(
     return json(res, 200, { ok: true, restartRequired });
   }
   if (path === '/api/bootstrap' && req.method === 'POST') {
-    if (!firstRun) return json(res, 409, { error: '配置文件已存在（bootstrap 仅用于首次安装），请改用配置页编辑' });
-    const body = await readJsonBody(req);
+    if (!firstRun) return json(res, 409, { error: '配置文件已存在（bootstrap 仅用于首次安装），请改用配置页编辑' });    const body = await readJsonBody(req);
     const apps = Array.isArray(body.apps) ? body.apps : [];
     const ws = body.workspace && typeof body.workspace === 'object' ? body.workspace as Record<string, unknown> : null;
     if (apps.length === 0 || !ws?.name || !ws?.path) {
@@ -228,6 +228,37 @@ async function handle(
     writeAtomic(ctx.configPath, text);
     syncManagedClaude(config);
     return json(res, 200, { ok: true, message: '配置已写入。请启动/重启 lcb start 开始使用' });
+  }
+  // ---- 斜杠命令（需已配置 app 凭证；lcb ui 独立进程同样可用） ----
+  if (path.startsWith('/api/slash-commands')) {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件，请先完成 bootstrap' });
+    let config: BridgeConfig;
+    try {
+      config = loadConfig(ctx.configPath);
+    } catch (e) {
+      return json(res, 500, { error: `配置加载失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+    if (path === '/api/slash-commands/expected' && req.method === 'GET') {
+      return json(res, 200, { expected: expectedCommands(config) });
+    }
+    const appName = path === '/api/slash-commands/remote'
+      ? url.searchParams.get('app')
+      : String((await readJsonBody(req).catch(() => ({} as Record<string, unknown>))).app ?? '');
+    const app = config.apps.find((a) => a.name === appName || a.appId === appName);
+    if (!app) return json(res, 400, { error: `应用 "${String(appName)}" 不存在，可用：${config.apps.map((a) => a.name).join('、')}` });
+    const client = createSlashApiClient(app);
+    try {
+      if (path === '/api/slash-commands/remote' && req.method === 'GET') {
+        return json(res, 200, { remote: await client.list() });
+      }
+      if (path === '/api/slash-commands/sync' && req.method === 'POST') {
+        const report = await syncSlashCommands(client, expectedCommands(config));
+        return json(res, 200, report);
+      }
+    } catch (e) {
+      // API 原文透传（缺 scope 等场景页面直接展示开放平台错误）
+      return json(res, 502, { error: `飞书 API 调用失败：${e instanceof Error ? e.message : String(e)}（请确认已开通 application:app_slash_command 读写权限并发布版本）` });
+    }
   }
   return json(res, 404, { error: `未知端点 ${req.method} ${path}` });
 }
