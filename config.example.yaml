@@ -2,8 +2,8 @@
 # 所有机器人共用本机 ~/.claude：模型设置(settings.json)、登录态、user 级 MCP、skills、
 # 已启用的 marketplace 插件全部自动继承，无须在此重复配置认证/模型。
 # 升级提示：旧版单应用 feishu: 格式仍可直接使用（启动时自动归一化，首次 lcb app add 时原地转格式）。
-# 快捷操作：在飞书开放平台后台「应用功能 → 机器人 → 机器人菜单」配置菜单项
-#   （如「内容生成」→ 发送消息 /content-producer:content-producer），点击即触发对应技能/插件。
+# 快捷操作：推荐用「斜杠命令」（配置页一键同步，输入 / 选择后可继续输入描述）；
+#   备选机器人菜单（开放平台后台配置，点击即发送）：如「内容生成」→ 发送消息 /content-producer:content-producer。
 apps:
   - name: 主力助手            # 显示名（日志前缀 / /status / lcb app list），缺省取 app_id
     app_id: cli_xxxx          # 飞书开放平台 → 凭证与基础信息
@@ -63,5 +63,25 @@ concurrency: 3                 # 全局并发上限（未单独配置的 app 沿
 #                             # dd if= / chmod 777 / curl|wget 管道执行脚本 / shutdown|reboot
 #   - 'rm\s+-rf'
 #   - 'sudo\s'
+# server:                     # Web 配置页（随 lcb start 常驻，浏览器打开 http://127.0.0.1:17317 随时改配置；
+#                              # 也可 lcb ui 单独启动。整块可选，缺省 enabled/127.0.0.1/17317）
+#   enabled: true             # false = 不启动配置页
+#   host: 127.0.0.1           # 仅本机可访问；改非回环地址 = 局域网可见（页面可读写全部凭证，慎用）
+#   port: 17317
+# claude:                     # Claude 认证双模式（整块可选）。缺省/inherit = 共享本机 ~/.claude
+#                             # （登录态/模型/MCP/skills/插件全部自动继承，见 README「配置继承」）；
+#                             # managed = bridge 托管（无需本机 claude login，一键安装开箱即用）
+#   mode: managed
+#   auth_token: sk-xxx        # ANTHROPIC_AUTH_TOKEN（中转站常用，Bearer）；与 api_key 二选一
+#   # api_key: sk-ant-xxx     # ANTHROPIC_API_KEY（官方，x-api-key）
+#   base_url: https://relay.example    # 中转站端点（ANTHROPIC_BASE_URL）；官方 API 留空
+#   model: claude-sonnet-5    # 模型（写入托管目录 ~/.lark-claudecode-bridge/claude/settings.json）
+# slash_commands:             # 飞书斜杠命令同步（配置页「斜杠命令」tab 一键同步到开放平台；
+#                             # 内置命令 help/new/resume/stop/status/ws/model/skills/plugins/mcp/plugin 恒参与，
+#                             # 此处仅配置自定义透传命令；需开通 application:app_slash_command 读写权限）
+#   extra:
+#     - command: produce      # 不带 / 前缀，1-32 位字母/数字/下划线/连字符
+#       description: 内容生产流程   # 指令面板展示文案
+#       icon: skill_outlined  # 图标（可选，icon_key 列表见飞书文档）
 # transcripts:                # 对话落盘清理策略；缺省 = 永久保留
 #   retention_days: 90
