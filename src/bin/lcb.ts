@@ -10,6 +10,7 @@ import { approvePairingLine } from '../cli/stdin-pairing.js';
 import { startBridge } from '../index.js';
 import { loadConfig, CONFIG_PATH, CONFIG_DIR } from '../config.js';
 import { initManagedClaudeDir } from '../claude-config.js';
+import { startWebServer } from '../web/server.js';
 import { AccessControl } from '../access/access-control.js';
 import { VERSION } from '../version.js';
 import { join } from 'node:path';
@@ -26,7 +27,23 @@ async function main(): Promise<void> {
       await runSetup(CONFIG_PATH);
       break;
     case 'start': {
-      const config = loadConfig(CONFIG_PATH); // 启动前校验：文件缺失/字段非法立即报错退出
+      let config;
+      try {
+        config = loadConfig(CONFIG_PATH); // 启动前校验：文件缺失/字段非法立即报错退出
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        // 首次安装（无配置文件）：不报错退出，起配置页引导用户在浏览器完成全部配置
+        if (msg.includes('找不到配置文件')) {
+          console.log('📦 检测到首次安装（尚无 config.yaml），正在打开配置页…');
+          const handle = await startWebServer({ autoOpen: !args.includes('--no-open') });
+          if (handle) {
+            console.log(`   在浏览器完成配置后，重新运行 lcb start 即可启动桥接器（Ctrl+C 退出本页）`);
+            return;
+          }
+          throw e; // server.enabled 默认开，理论上不会走到；保持兜底
+        }
+        throw e;
+      }
       // Task 6 遗留建议：App ID 形状不符仅打警告，不阻止启动（形状非强约束，避免误杀合法 ID）
       for (const app of config.apps) {
         if (!APP_ID_RE.test(app.appId)) {
@@ -42,6 +59,13 @@ async function main(): Promise<void> {
       // 抹掉桥内新 pending。与独立进程 lcb pair 走同一条现读路径
       const rl = createInterface({ input: process.stdin });
       rl.on('line', (line) => approvePairingLine(line, join(CONFIG_DIR, 'access.json')));
+      break;
+    }
+    case 'ui': {
+      // 仅起 Web 配置页（不启动桥接器）：可与运行中的 bridge 共存——
+      // 页面写盘后，bridge 的热重载器下一条消息拾取可热字段；需重启字段由页面提示
+      await startWebServer({ autoOpen: !args.includes('--no-open') });
+      console.log('按 Ctrl+C 退出配置页');
       break;
     }
     case 'pair': {
@@ -172,8 +196,9 @@ async function main(): Promise<void> {
       console.log(`lcb — 飞书 ↔ Claude Code 桥接器 v${VERSION}
 
 用法：
-  lcb setup              引导式配置（支持多个机器人应用）
-  lcb start              启动桥接器（前台，所有应用各建一条长连接）
+  lcb setup              引导式配置（命令行问答，支持多个机器人应用）
+  lcb start              启动桥接器（前台；含 Web 配置页，首次安装自动进入引导）
+  lcb ui                 仅启动 Web 配置页（可与运行中的桥接器共存）
   lcb pair <code>        批准配对码
   lcb app list           列出机器人应用
   lcb app add            添加机器人应用（重启后生效）

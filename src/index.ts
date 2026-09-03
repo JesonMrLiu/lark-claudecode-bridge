@@ -10,6 +10,7 @@ import { CONFIG_DIR, CONFIG_PATH, loadConfig, sameApps } from './config.js';
 import { resolveClaudeDir } from './claude-config.js';
 import { warnIfNoClaudeAuth } from './auth-precheck.js';
 import { serverUrl } from './util/server-url.js';
+import { startWebServer } from './web/server.js';
 import { AccessControl } from './access/access-control.js';
 import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard } from './gateway/progress-card.js';
@@ -588,6 +589,7 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
 
 export async function startBridge(configPath: string = CONFIG_PATH): Promise<void> {
   const config = loadConfig(configPath);
+  let webHandle: { close(): void } | null = null;
   // access 全局共享：个人场景同一人对所有机器人，N 个 bridge 注入同一实例（单进程无竞态）
   const access = AccessControl.load(join(CONFIG_DIR, 'access.json'));
   // 旧单应用 sessions.json 一次性迁移到 apps[0] 的分片（键格式未变，纯改名）
@@ -643,9 +645,24 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   for (const f of results) if (f.status === 'rejected') console.error('❌ 应用启动失败：', f.reason);
   if (results.every((r) => r.status === 'rejected')) throw new Error('所有应用均启动失败，请检查 config.yaml 中的 apps 配置');
   console.log(`🚀 lark-claudecode-bridge 已启动（${results.length - results.filter((r) => r.status === 'rejected').length}/${results.length} 个应用，长连接模式，无需公网 IP）`);
+  // Web 配置页（server.enabled 缺省 true）：随 bridge 常驻，浏览器可随时查看/修改配置；
+  // 启动失败只 warn 不阻断机器人服务（端口冲突等场景桥接器本体仍可用）
+  if (config.server?.enabled !== false) {
+    try {
+      webHandle = await startWebServer({
+        server: config.server,
+        configPath,
+        embedded: true,
+        appsStarted: runners.map((r, i) => ({ name: r.app.name, started: results[i].status === 'fulfilled' })),
+      });
+    } catch (e) {
+      console.warn(`[配置页] 启动失败（桥接器继续运行）：${e instanceof Error ? e.message : String(e)}；可通过 config.yaml 的 server.port 换端口`);
+    }
+  }
   // 优雅关闭：SIGINT/SIGTERM 时逐个关闭全部长连接
   const shutdown = (sig: string) => {
     console.log(`\n收到 ${sig}，正在关闭 ${runners.length} 条长连接…`);
+    webHandle?.close();
     for (const r of runners) r.gateway.close();
     process.exit(0);
   };
