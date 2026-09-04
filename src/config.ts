@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse, type YAMLParseError } from 'yaml';
 import type {
-  BridgeConfig, ClaudeAuthMode, ClaudeConfig, FeishuAppConfig, PermissionsConfig, PluginRef,
+  BridgeConfig, ClaudeAuthMode, ClaudeConfig, ClaudeProfile, FeishuAppConfig, PermissionsConfig, PluginRef,
   ServerConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace, WorkspaceType,
 } from './types.js';
 
@@ -177,10 +177,62 @@ function normalizeClaude(doc: Record<string, unknown>): ClaudeConfig | undefined
     console.warn('[配置] claude.mode = managed 但未配置 auth_token / api_key：请在 Web 配置页填写，否则 Claude 任务将无法认证');
   }
   const model = str(c.model);
-  return { mode, ...(authToken ? { authToken } : {}), ...(apiKey ? { apiKey } : {}), ...(baseUrl ? { baseUrl } : {}), ...(model ? { model } : {}) };
+  // 多厂商档案库（不直接生效；Web 页「设为当前」拷贝到顶层）。校验与顶层同则：凭证二选一、http(s) 协议
+  const profilesRaw = (raw as { profiles?: unknown }).profiles;
+  let profiles: ClaudeProfile[] | undefined;
+  if (profilesRaw !== undefined && profilesRaw !== null) {
+    if (!Array.isArray(profilesRaw)) throw new Error('claude.profiles 必须为数组，请检查 config.yaml');
+    const seenNames = new Set<string>();
+    profiles = [];
+    profilesRaw.forEach((e, i) => {
+      const where = `claude.profiles[${i}]`;
+      if (typeof e !== 'object' || e === null || Array.isArray(e)) throw new Error(`${where} 必须为对象（name + 凭证/BaseUrl/模型），请检查 config.yaml`);
+      const p = e as Record<string, unknown>;
+      const name = str(p.name);
+      if (!name) throw new Error(`${where} 缺少 name（档案名，显示用），请检查 config.yaml`);
+      const pAuthToken = str(p.auth_token);
+      const pApiKey = str(p.api_key);
+      if (pAuthToken && pApiKey) {
+        throw new Error(`${where}（${name}）的 auth_token 与 api_key 只能二选一，请检查 config.yaml`);
+      }
+      const pBaseUrl = str(p.base_url);
+      if (pBaseUrl && !/^https?:\/\//.test(pBaseUrl)) {
+        console.warn(`[配置] ${where}（${name}）的 base_url = ${pBaseUrl} 不以 http(s):// 开头，请确认是否漏写协议`);
+      }
+      const pModel = str(p.model);
+      // 候选模型集：字符串数组，trim 去空去重（页面点选切换用，不直接生效）
+      const pModelsRaw = p.models;
+      let pModels: string[] | undefined;
+      if (pModelsRaw !== undefined && pModelsRaw !== null) {
+        if (!Array.isArray(pModelsRaw)) throw new Error(`${where}（${name}）的 models 必须为字符串数组，请检查 config.yaml`);
+        const seenModels = new Set<string>();
+        for (const m of pModelsRaw) {
+          if (typeof m !== 'string') throw new Error(`${where}（${name}）的 models 必须为字符串数组，请检查 config.yaml`);
+          const t = m.trim();
+          if (t) seenModels.add(t);
+        }
+        pModels = seenModels.size ? [...seenModels] : undefined;
+      }
+      if (!pAuthToken && !pApiKey && !pBaseUrl && !pModel && !pModels) {
+        console.warn(`[配置] ${where}（${name}）除名字外全为空，已剔除`);
+        return;
+      }
+      if (seenNames.has(name)) {
+        console.warn(`[配置] ${where} 档案名 "${name}" 重复，已忽略后条`);
+        return;
+      }
+      seenNames.add(name);
+      profiles!.push({ name, ...(pAuthToken ? { authToken: pAuthToken } : {}), ...(pApiKey ? { apiKey: pApiKey } : {}),
+        ...(pBaseUrl ? { baseUrl: pBaseUrl } : {}), ...(pModel ? { model: pModel } : {}), ...(pModels ? { models: pModels } : {}) });
+    });
+    if (!profiles.length) profiles = undefined;
+  }
+  return { mode, ...(authToken ? { authToken } : {}), ...(apiKey ? { apiKey } : {}), ...(baseUrl ? { baseUrl } : {}), ...(model ? { model } : {}),
+    ...(profiles ? { profiles } : {}) };
 }
 
-const SLASH_COMMAND_RE = /^[A-Za-z0-9_-]{1,32}$/;
+/** 斜杠命令名合法性（飞书侧注册约束）：1-32 位字母/数字/下划线/连字符。extra 解析与 Web 远端 create 端点共用 */
+export const SLASH_COMMAND_RE = /^[A-Za-z0-9_-]{1,32}$/;
 
 /** 斜杠命令同步段（整体可选）：extra 为自定义透传命令；与内置命令的重名在 expectedCommands 合并时处理（内置优先） */
 function normalizeSlashCommands(doc: Record<string, unknown>): SlashCommandsConfig | undefined {

@@ -7,10 +7,11 @@ import type {
   IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory,
 } from './types.js';
 import { CONFIG_DIR, CONFIG_PATH, loadConfig, sameApps } from './config.js';
-import { resolveClaudeDir } from './claude-config.js';
+import { DEFAULT_CLAUDE_DIR, resolveClaudeDir } from './claude-config.js';
 import { warnIfNoClaudeAuth } from './auth-precheck.js';
 import { serverUrl } from './util/server-url.js';
 import { startWebServer } from './web/server.js';
+import { clearPidFile, writePidFile, stopExistingBridgeAndWait } from './web/lifecycle.js';
 import { AccessControl } from './access/access-control.js';
 import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard } from './gateway/progress-card.js';
@@ -218,8 +219,10 @@ export function createBridge(
       isAdmin: deps.access.isAdmin(msg.userId),
       currentWorkspace: () => currentWorkspace,
       getInventory: () => inventories.get(currentWorkspace),
-      // /plugin 插件管理依赖：安装目标 = 双模式解析的 Claude 配置目录；结果回传 = 当前聊天
+      // /plugin 插件管理依赖：claudeConfigDir = 双模式解析的当前生效目录；userClaudeDir = 本机
+      // ~/.claude（managed 模式下作为第二来源 + install 默认目标）；结果回传 = 当前聊天
       claudeConfigDir: claudeDir,
+      userClaudeDir: DEFAULT_CLAUDE_DIR,
       send: async (md) => { await deps.gateway.sendTextTo(msg.chatId, md); },
       stopCurrentTask: () => {
         const rt = runtimes.get(key);
@@ -350,9 +353,14 @@ export function createBridge(
         // server 实例按任务构造，chatId 在 sender 闭包内硬绑定——模型无法选择接收者
         mcpServers: { [NOTIFY_SERVER_NAME]: createNotifyServer(notifySender) },
         // 插件：config.yaml 显式配置（开发期指源码目录）+ Claude 配置目录已启用的 marketplace
-        // 插件自动发现，同名显式优先；SDK 对无效路径静默跳过，实际加载以 init 清单（/plugins 命令）为准
+        // 插件自动发现，同名显式优先；SDK 对无效路径静默跳过，实际加载以 init 清单（/plugins 命令）为准。
+        // managed 模式合并发现两处目录（自管 + 本机 ~/.claude）：按绝对 installPath 传 SDK，
+        // 用户本机已装插件无须重装；resolvePluginPaths 按 name 去重，当前生效目录优先
         ...(() => {
-          const merged = resolvePluginPaths(app.plugins, discoverPlugins(claudeDir));
+          const discovered = claudeDir === DEFAULT_CLAUDE_DIR
+            ? discoverPlugins(claudeDir)
+            : [...discoverPlugins(claudeDir), ...discoverPlugins(DEFAULT_CLAUDE_DIR)];
+          const merged = resolvePluginPaths(app.plugins, discovered);
           return merged.length ? { plugins: merged.map((p) => ({ path: p.path })) } : {};
         })(),
         canUseTool: (toolName, input) => gate.decide(toolName, input, wsName),
@@ -592,6 +600,11 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
 
 export async function startBridge(configPath: string = CONFIG_PATH): Promise<void> {
   const config = loadConfig(configPath);
+  // 双实例治理：旧实例占着 Web 配置页端口会让本进程配置页静默失联（浏览器仍打到旧进程），启动先接管
+  const oldBridge = await stopExistingBridgeAndWait();
+  if (oldBridge.pid) console.log(oldBridge.stopped
+    ? `🔁 检测到旧桥接器实例（PID ${oldBridge.pid}），已停止，继续启动…`
+    : `⚠️ 旧桥接器实例（PID ${oldBridge.pid}）停止超时/失败，继续启动（配置页端口可能仍被其占用）`);
   let webHandle: { close(): void } | null = null;
   // access 全局共享：个人场景同一人对所有机器人，N 个 bridge 注入同一实例（单进程无竞态）
   const access = AccessControl.load(join(CONFIG_DIR, 'access.json'));
@@ -648,6 +661,16 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   for (const f of results) if (f.status === 'rejected') console.error('❌ 应用启动失败：', f.reason);
   if (results.every((r) => r.status === 'rejected')) throw new Error('所有应用均启动失败，请检查 config.yaml 中的 apps 配置');
   console.log(`🚀 lark-claudecode-bridge 已启动（${results.length - results.filter((r) => r.status === 'rejected').length}/${results.length} 个应用，长连接模式，无需公网 IP）`);
+  // 页面托管启停的探活依据：进程存活期间持有 PID 文件（崩溃/被硬杀时由读取方清理陈旧文件）
+  writePidFile();
+  // 优雅关闭：SIGINT/SIGTERM（或页面 stop/restart 经 selfStop 注入）时逐个关闭全部长连接
+  const shutdown = (sig: string) => {
+    console.log(`\n收到 ${sig}，正在关闭 ${runners.length} 条长连接…`);
+    webHandle?.close();
+    for (const r of runners) r.gateway.close();
+    clearPidFile();
+    process.exit(0);
+  };
   // Web 配置页（server.enabled 缺省 true）：随 bridge 常驻，浏览器可随时查看/修改配置；
   // 启动失败只 warn 不阻断机器人服务（端口冲突等场景桥接器本体仍可用）
   if (config.server?.enabled !== false) {
@@ -657,18 +680,20 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
         configPath,
         embedded: true,
         appsStarted: runners.map((r, i) => ({ name: r.app.name, started: results[i].status === 'fulfilled' })),
+        selfStop: () => shutdown('web-stop'),
       });
     } catch (e) {
-      console.warn(`[配置页] 启动失败（桥接器继续运行）：${e instanceof Error ? e.message : String(e)}；可通过 config.yaml 的 server.port 换端口`);
+      const msg = e instanceof Error ? e.message : String(e);
+      if ((e as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+        // 兜底 pid 登记不到的占用者（如旧版本进程不写 pid 文件、或他程序占端口）
+        const port = config.server?.port ?? 17317;
+        console.warn(`[配置页] 端口 ${port} 已被占用（可能是未登记 pid 的旧 lcb 进程）。` +
+          `排查：netstat -ano | findstr :${port} 查 PID、taskkill /F /PID <pid> 停止（macOS: lsof -i :${port}）；或修改 config.yaml 的 server.port`);
+      } else {
+        console.warn(`[配置页] 启动失败（桥接器继续运行）：${msg}；可通过 config.yaml 的 server.port 换端口`);
+      }
     }
   }
-  // 优雅关闭：SIGINT/SIGTERM 时逐个关闭全部长连接
-  const shutdown = (sig: string) => {
-    console.log(`\n收到 ${sig}，正在关闭 ${runners.length} 条长连接…`);
-    webHandle?.close();
-    for (const r of runners) r.gateway.close();
-    process.exit(0);
-  };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }

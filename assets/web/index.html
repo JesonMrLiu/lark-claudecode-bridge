@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>lark-claudecode-bridge 配置</title>
+<title>飞书ClaudeCode桥接器</title>
 <style>
   :root {
     --bg: #f5f6f8; --card: #fff; --border: #e2e5ea; --text: #1f2329; --muted: #646a73;
@@ -12,15 +12,21 @@
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
   header { background: var(--card); border-bottom: 1px solid var(--border); padding: 14px 24px; display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 10; }
-  header h1 { font-size: 17px; margin: 0; }
+  header h1 { font-size: 17px; margin: 0; display: flex; align-items: center; gap: 9px; }
   header .meta { color: var(--muted); font-size: 12px; }
   header .spacer { flex: 1; }
   .layout { display: flex; min-height: calc(100vh - 61px); }
   nav { width: 170px; padding: 16px 8px; background: var(--card); border-right: 1px solid var(--border); }
-  nav button { display: block; width: 100%; text-align: left; padding: 9px 14px; margin: 2px 0; border: 0; background: none; border-radius: 8px; cursor: pointer; font-size: 14px; color: var(--text); }
+  nav button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 14px; margin: 2px 0; border: 0; background: none; border-radius: 8px; cursor: pointer; font-size: 14px; color: var(--text); }
+  nav button .ico { display: flex; align-items: center; }
   nav button:hover { background: var(--bg); }
   nav button.active { background: #eef3ff; color: var(--primary); font-weight: 600; }
-  main { flex: 1; padding: 20px 28px; max-width: 980px; }
+  main { flex: 1; padding: 20px 32px; }
+  @media (min-width: 1800px) { main { max-width: 1560px; } }
+  @media (max-width: 860px) {
+    .layout { flex-direction: column; }
+    nav { width: auto; display: flex; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--border); }
+  }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; margin-bottom: 16px; }
   .card h3 { margin: 0 0 4px; font-size: 15px; }
   .card .desc { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
@@ -30,7 +36,11 @@
   }
   input:focus, select:focus, textarea:focus { outline: 2px solid #c9d8ff; border-color: var(--primary); }
   textarea { font-family: Consolas, monospace; font-size: 12.5px; min-height: 90px; resize: vertical; }
-  .row { display: flex; gap: 12px; } .row > * { flex: 1; }
+  .row { display: flex; gap: 12px; } .row > * { flex: 1; min-width: 0; }
+  /* .row 内按钮按内容宽：内联 flex:0 展开为 0 1 0% 会把按钮压到单字宽（一字一行），一律走类规则 */
+  .row > .btn, .row > .btn-wrap { flex: 0 0 auto; align-self: end; }
+  .btn-wrap { display: flex; }
+  .btn, nav button, .savebar .btn, .subtabs button, .chip { white-space: nowrap; }
   .btn { padding: 7px 16px; border-radius: 7px; border: 1px solid var(--border); background: var(--card); cursor: pointer; font: inherit; }
   .btn:hover { border-color: var(--primary); color: var(--primary); }
   .btn.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
@@ -48,39 +58,64 @@
   .tag.warn { background: #fff3e0; color: var(--warn); } .tag.err { background: #fee; color: var(--danger); }
   .radio-row { display: flex; gap: 20px; margin: 8px 0; }
   .radio-row label { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--text); font-size: 13.5px; cursor: pointer; }
-  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #2b2f36; color: #fff; padding: 10px 22px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; max-width: 80vw; }
+  #toast { position: fixed; top: 24px; left: 50%; transform: translateX(-50%); background: #2b2f36; color: #fff; padding: 10px 22px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; max-width: 80vw; z-index: 100; }
   #toast.show { opacity: .95; }
   #toast.err { background: var(--danger); }
+  /* 桥接器重启/已离线全页遮罩 */
+  .br-mask { position: fixed; inset: 0; background: rgba(15,19,24,.5); z-index: 90; display: flex; align-items: center; justify-content: center; }
+  .br-mask-card { background: var(--card); border-radius: 12px; padding: 24px 32px; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,.18); max-width: 440px; font-size: 14px; }
+  .br-spin { width: 26px; height: 26px; margin: 0 auto 12px; border: 3px solid #d9e2f5; border-top-color: var(--primary); border-radius: 50%; animation: brspin .9s linear infinite; }
+  @keyframes brspin { to { transform: rotate(360deg); } }
   .app-card { border: 1px solid var(--border); border-radius: 8px; padding: 4px 16px 14px; margin-bottom: 12px; position: relative; }
   .app-card .del { position: absolute; top: 10px; right: 12px; }
   .hint { font-size: 12px; color: var(--muted); }
   .footer-note { color: var(--muted); font-size: 12px; margin-top: 8px; }
   pre.report { background: #f7f8fa; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 12px; overflow: auto; white-space: pre-wrap; }
-  .savebar { position: fixed; right: 24px; bottom: 24px; display: flex; gap: 10px; align-items: center; background: var(--card); border: 1px solid var(--border); border-radius: 999px; padding: 8px 10px 8px 18px; box-shadow: 0 4px 16px rgba(0,0,0,.08); }
-  .savebar .state { font-size: 12px; color: var(--muted); }
+  .savebar { display: flex; gap: 10px; margin-top: 12px; align-items: center; }
+  .savebar .state { font-size: 12px; color: var(--warn); }
+  .card h3 .dirty-dot { display: none; margin-left: 6px; font-size: 11.5px; color: var(--warn); font-weight: 500; }
+  .stale-bar { background: #fff3e0; color: var(--warn); padding: 8px 24px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  .stale-bar[hidden] { display: none; }
+  /* 右侧抽屉：应用编辑 / 斜杆命令编辑 / 档案编辑共用 */
+  .drawer-mask { position: fixed; inset: 0; background: rgba(15,19,24,.36); z-index: 50; display: flex; justify-content: flex-end; }
+  .drawer-mask[hidden] { display: none; }
+  .drawer { width: min(980px, 94vw); height: 100%; background: var(--card); border-left: 1px solid var(--border); display: flex; flex-direction: column; box-shadow: -8px 0 24px rgba(0,0,0,.08); }
+  .drawer > header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid var(--border); }
+  .drawer > header h3 { margin: 0; font-size: 15px; }
+  .drawer-body { flex: 1; overflow-y: auto; padding: 16px 20px; }
+  .drawer-foot { padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 10px; align-items: center; }
+  .drawer-foot .spacer { flex: 1; }
+  .subtabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .subtabs button { padding: 6px 14px; border-radius: 999px; border: 1px solid var(--border); background: none; cursor: pointer; font: inherit; color: var(--text); }
+  .subtabs button.active { background: #eef3ff; color: var(--primary); border-color: var(--primary); font-weight: 600; }
 </style>
 </head>
 <body>
 <header>
-  <h1>🛵 lark-claudecode-bridge</h1>
+  <h1><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="#3370ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg>飞书ClaudeCode桥接器</h1>
   <span class="meta" id="hMeta">加载中…</span>
   <span class="spacer"></span>
   <span class="meta" id="hFirstRun"></span>
 </header>
+<div class="stale-bar" id="staleBar" hidden>⚠️ 配置页服务进程为旧版本（页面文件已更新）：进程启停 / 重启 / 一键更新需重启桥接器（<code>lcb start</code> 或页面所在进程）后可用。</div>
 <div class="layout">
   <nav id="nav"></nav>
   <main id="main"></main>
 </div>
-<div class="savebar" id="savebar" style="display:none">
-  <span class="state" id="saveState">有未保存的修改</span>
-  <button class="btn" id="btnReload">放弃修改</button>
-  <button class="btn primary" id="btnSave">保存</button>
+<div class="drawer-mask" id="drawerMask" hidden>
+  <aside class="drawer" role="dialog" aria-modal="true">
+    <header><h3 id="drawerTitle"></h3><button class="btn" id="drawerClose">✕ 关闭</button></header>
+    <div class="drawer-body" id="drawerBody"></div>
+    <footer class="drawer-foot" id="drawerFoot"></footer>
+  </aside>
 </div>
 <div id="toast"></div>
 <script>
 'use strict';
 // ============ 全局状态 ============
-const S = { status: null, doc: null, firstRun: false, dirty: false };
+// 一步保存：无全局 savebar。抽屉编辑自带「保存/取消」（打开前拍快照）；页内表单卡各自带
+// 保存按钮（dirtyCards 跟踪未保存卡）；行内低风险操作（权限增删）直接落盘
+const S = { status: null, doc: null, firstRun: false, dirtyCards: new Set() };
 const $ = (sel, el = document) => el.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -101,32 +136,111 @@ async function api(method, path, body) {
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
-function markDirty() {
-  S.dirty = true;
-  $('#savebar').style.display = 'flex';
+/** doc 深拷贝快照（抽屉取消回滚 / 打开前留存） */
+const snapDoc = () => JSON.parse(JSON.stringify(S.doc));
+/** 页内表单卡未保存标记：cardDirty('ws', true) 显示卡头「未保存」小标 + 卡底保存行，并记入集合 */
+function cardDirty(id, on) {
+  if (on) S.dirtyCards.add(id); else S.dirtyCards.delete(id);
+  const dot = $(`#dirty-${id}`);
+  if (dot) dot.style.display = on ? 'inline' : 'none'; // '' 会回落到 CSS 默认 display:none，圆点永不显示
+  const bar = $(`#bar-${id}`);
+  if (bar) bar.style.display = on ? 'flex' : 'none';
 }
-function clearDirty() {
-  S.dirty = false;
-  $('#savebar').style.display = 'none';
+/** 整卡重渲染（innerHTML 重建）后回放各卡 dirty 可见性：集合是真相源，新建的 bar/dot 默认隐藏 */
+function applyDirty() { for (const id of S.dirtyCards) cardDirty(id, true); }
+/** 卡级保存行（页内表单卡通用）：保存 = saveDoc 落盘；还原 = 重拉磁盘配置 */
+const saveBarHtml = (id) => `<div class="savebar" id="bar-${id}" style="display:none"><span class="state">有未保存的修改</span><span style="flex:1"></span><button class="btn" data-discard="${id}">还原</button><button class="btn primary" data-save="${id}">保存</button></div>`;
+const dirtyDotHtml = (id) => `<span class="dirty-dot" id="dirty-${id}">· 未保存</span>`;
+function bindSaveBar(el, id) {
+  el.querySelector(`[data-save="${id}"]`)?.addEventListener('click', () => void saveDoc());
+  el.querySelector(`[data-discard="${id}"]`)?.addEventListener('click', async () => {
+    await refresh();
+    toast('已还原为磁盘配置');
+  });
+}
+/** 全量 PUT 落盘（所有保存路径共用）；返回是否成功（失败保持当前编辑态） */
+async function saveDoc() {
+  if (S.firstRun) return false;
+  try {
+    const r = await api('PUT', '/api/config', S.doc);
+    if (r.restartRequired?.length) toast(`已保存。注意：${r.restartRequired.join('、')} 段改动需重启 lcb start 后生效`, true);
+    else toast('已保存（运行中的桥接器下一条消息自动生效）');
+    S.dirtyCards.clear();
+    await refresh();
+    return true;
+  } catch (e) { toast(`保存失败：${e.message}`, true); return false; }
 }
 
 // ============ Tab 注册 ============
+// 菜单图标：内联 SVG 线性图标（Lucide 风格，stroke:currentColor 自动跟随选中态配色）
+const ico = (inner) => `<span class="ico"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg></span>`;
+const ICONS = {
+  overview: '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+  apps: '<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>',
+  workspaces: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  claude: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/>',
+  permissions: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>',
+  slash: '<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>',
+  plugins: '<path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/>',
+};
 const TABS = [
-  { key: 'overview', title: '概览' },
-  { key: 'apps', title: '应用' },
-  { key: 'workspaces', title: '工作区' },
-  { key: 'claude', title: 'Claude 认证' },
-  { key: 'permissions', title: '权限' },
-  { key: 'slash', title: '斜杠命令' },
-  { key: 'plugins', title: '插件' },
+  { key: 'overview', title: '概览', icon: 'overview' },
+  { key: 'apps', title: '飞书应用', icon: 'apps' },
+  { key: 'workspaces', title: '工作区', icon: 'workspaces' },
+  { key: 'claude', title: 'Claude 认证', icon: 'claude' },
+  { key: 'permissions', title: '权限', icon: 'permissions' },
+  { key: 'slash', title: '斜杠命令', icon: 'slash' },
+  { key: 'plugins', title: '插件', icon: 'plugins' },
 ];
 let activeTab = 'overview';
 function renderNav() {
   $('#nav').innerHTML = TABS.map((t) =>
-    `<button data-k="${t.key}" class="${t.key === activeTab ? 'active' : ''}">${t.title}</button>`).join('');
+    `<button data-k="${t.key}" class="${t.key === activeTab ? 'active' : ''}">${ico(ICONS[t.icon])}<span>${t.title}</span></button>`).join('');
   $('#nav').querySelectorAll('button').forEach((b) =>
-    b.onclick = () => { activeTab = b.dataset.k; render(); });
+    b.onclick = () => {
+      // 未保存保护：抽屉编辑中 / 页内表单卡有未保存改动 → 确认后才切换（切走即丢弃）
+      if (!$('#drawerMask').hidden) {
+        if (!window.confirm('编辑抽屉尚未保存，确定放弃修改并切换页面？')) return;
+        cancelDrawer();
+      } else if (S.dirtyCards.size) {
+        if (!window.confirm(`有 ${S.dirtyCards.size} 处未保存的修改，切换页面将丢弃。确定切换？`)) return;
+        S.dirtyCards.clear();
+      }
+      activeTab = b.dataset.k;
+      render();
+    });
 }
+
+// ============ 通用右侧抽屉 ============
+let drawerOnMount = null;
+let drawerSnap = null; // 抽屉打开前的 doc 快照（取消回滚用；远端 CRUD 抽屉不传 snap 则不回滚）
+/** 打开抽屉：snap = 调用方在 mutate doc 之前拍的快照；onMount({body, foot}) 里绑定事件 */
+function openDrawer({ title, bodyHtml, footHtml, onMount, snap }) {
+  $('#drawerTitle').textContent = title;
+  $('#drawerBody').innerHTML = bodyHtml;
+  $('#drawerFoot').innerHTML = footHtml || '';
+  $('#drawerMask').hidden = false;
+  drawerSnap = snap ?? null;
+  drawerOnMount = onMount || null;
+  drawerOnMount?.({ body: $('#drawerBody'), foot: $('#drawerFoot') });
+}
+function closeDrawer() {
+  if ($('#drawerMask').hidden) return;
+  $('#drawerMask').hidden = true;
+  drawerOnMount = null;
+  drawerSnap = null;
+}
+/** 抽屉取消：回滚到打开前快照（含「新增未保存」行一并撤销）并重渲染 */
+function cancelDrawer() {
+  if (drawerSnap) S.doc = JSON.parse(JSON.stringify(drawerSnap));
+  closeDrawer();
+  render();
+}
+// X / ESC / 点遮罩 = 取消：本地编辑抽屉（有快照）回滚未保存修改；远端 CRUD 抽屉直接关闭
+const dismissDrawer = () => (drawerSnap ? cancelDrawer() : closeDrawer());
+$('#drawerClose').onclick = dismissDrawer;
+$('#drawerMask').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) dismissDrawer(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') dismissDrawer(); });
 function render() {
   renderNav();
   if (S.firstRun) return renderBootstrap();
@@ -141,7 +255,7 @@ function renderBootstrap() {
   $('#main').innerHTML = `
   <div class="card">
     <h3>👋 欢迎使用 lark-claudecode-bridge</h3>
-    <div class="desc">首次安装：完成下面三步即可开始使用。需要先在 <a href="https://open.feishu.cn/app" target="_blank">飞书开放平台</a> 创建应用并启用机器人能力（详见 README）。</div>
+    <div class="desc">首次安装：完成下面三步即可开始使用。需要先在 <a href="https://open.feishu.cn/app" target="_blank">飞书开放平台</a> 创建应用并启用机器人能力（详见 README）。建议为每个应用填写名字——概览页与飞书 /status 将显示该名字，缺省显示 App ID。</div>
     <h3 style="margin-top:16px">① 飞书应用凭证</h3>
     <div id="bsApps"></div>
     <button class="btn sm" id="bsAddApp">+ 再添一个应用（多机器人）</button>
@@ -178,9 +292,9 @@ function renderBootstrap() {
     div.style.marginBottom = '8px';
     div.innerHTML = `
       <div><label>App ID（cli_ 开头）</label><input type="text" class="bs-appid" placeholder="cli_aabbccddeeff0011"></div>
-      <div><label>应用名字（可空）</label><input type="text" class="bs-name" placeholder="素材收集"></div>
+      <div><label>应用名字（建议填写）</label><input type="text" class="bs-name" placeholder="如：素材收集（概览/状态页显示用）"></div>
       <div><label>App Secret</label><input type="password" class="bs-secret" placeholder=""></div>
-      <div style="flex:0;align-self:end"><button class="btn sm danger bs-del">删除</button></div>`;
+      <div class="btn-wrap"><button class="btn sm danger bs-del">删除</button></div>`;
     div.querySelector('.bs-del').onclick = () => div.remove();
     appsBox.appendChild(div);
   };
@@ -223,21 +337,185 @@ function renderBootstrap() {
 }
 
 // ============ 概览 ============
+// 桥接器启停 / 版本更新（宿主进程管理：embedded 页面随进程生死，独立页面经 PID 跨进程操作）
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const UPD = { checkedAt: 0, data: null };
+
+function showMask(inner) {
+  let m = $('#brMask');
+  if (!m) {
+    m = document.createElement('div');
+    m.id = 'brMask'; m.className = 'br-mask';
+    document.body.appendChild(m);
+  }
+  m.innerHTML = `<div class="br-mask-card">${inner}</div>`;
+  m.style.display = 'flex';
+}
+function hideMask() { const m = $('#brMask'); if (m) m.style.display = 'none'; }
+
+/** 启停请求的容错：embedded 停止/重启时进程退出可能先于响应到达，网络断开视为已受理 */
+async function bridgeActionSafe(op) {
+  try { return await api('POST', '/api/bridge/action', { op }); }
+  catch (e) {
+    if (/fetch|network|load failed/i.test(e.message)) return { ok: true, message: '已提交（连接关闭属预期）' };
+    throw e;
+  }
+}
+
+/** 等配置页服务恢复（重启轮询）：连续两次成功才确认，排除旧进程残影 */
+async function waitServerBack(timeoutMs = 45000) {
+  const t0 = Date.now();
+  await sleep(2500); // 留给旧进程退场：立刻探测可能命中尚未退出的旧 server
+  while (Date.now() - t0 < timeoutMs) {
+    try {
+      await api('GET', '/api/status');
+      await sleep(1000);
+      await api('GET', '/api/status');
+      return;
+    } catch {}
+    await sleep(1500);
+  }
+  throw new Error('重启超时：请手动刷新页面查看状态');
+}
+
+async function startFlow() {
+  try {
+    const r = await bridgeActionSafe('start');
+    toast(r.message || '✅ 已在后台启动');
+    setTimeout(() => refresh(), 2500); // 后台进程写 PID / 起长连接需数秒
+    setTimeout(() => refresh(), 7000);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function stopFlow() {
+  const embedded = !!S.status?.embedded;
+  const msg = embedded
+    ? '停止后本配置页将随桥接器进程一同关闭。\n之后可运行 lcb ui 重开配置页（并在其中重新启动桥接器）。确定停止？'
+    : '停止后机器人将不再响应消息。确定停止桥接器进程？';
+  if (!confirm(msg)) return;
+  try {
+    const r = await bridgeActionSafe('stop');
+    if (embedded) {
+      toast(r.message || '正在停止…');
+      await sleep(2500);
+      try { await api('GET', '/api/status'); await refresh(); } // 进程仍在（异常场景）：正常刷新
+      catch { showMask('<b>桥接器已停止</b><div class="hint" style="margin-top:8px">本配置页已随进程离线。重新打开请运行 lcb ui；启动桥接器请运行 lcb start。</div>'); }
+    } else {
+      toast(r.message || '已发送停止信号');
+      setTimeout(() => refresh(), 1500); // 硬终止无 PID 清理：陈旧文件由探活兜底删除
+      setTimeout(() => refresh(), 4000);
+    }
+  } catch (e) { toast(e.message, true); }
+}
+
+async function restartFlow() {
+  if (S.status?.embedded) {
+    showMask('<div class="br-spin"></div>正在重启桥接器，页面将自动恢复…');
+    try { await bridgeActionSafe('restart'); } catch (e) { hideMask(); toast(e.message, true); return; }
+    try { await waitServerBack(); hideMask(); toast('✅ 桥接器已重启'); await refresh(); }
+    catch (e) { hideMask(); toast(e.message, true); }
+  } else {
+    try { const r = await bridgeActionSafe('restart'); toast(r.message || '正在重启…'); }
+    catch (e) { toast(e.message, true); return; }
+    setTimeout(() => refresh(), 4000);
+    setTimeout(() => refresh(), 10000);
+  }
+}
+
+function renderUpdateResult() {
+  const el = $('#updLatest');
+  const r = UPD.data;
+  if (!el) return;
+  if (!r) { el.innerHTML = '<span class="hint">未检查</span>'; return; }
+  el.innerHTML = r.hasUpdate
+    ? `<span class="tag warn">有新版本</span> <span class="chip">v${esc(r.latest)}</span>`
+    : `<span class="tag ok">已是最新</span> <span class="chip">v${esc(r.latest)}</span>`;
+  const area = $('#updArea');
+  if (!area) return;
+  if (r.hasUpdate && r.mode === 'global') {
+    area.innerHTML = '<button class="btn primary" id="btnUpdRun">一键更新</button>';
+    $('#btnUpdRun').onclick = runUpdateFlow;
+  } else if (r.hasUpdate) {
+    area.innerHTML = '<span class="hint">当前非 npm 全局安装运行，请手动更新</span>';
+  } else area.innerHTML = '';
+}
+
+async function doCheckUpdate() {
+  const el = $('#updLatest'); if (!el) return;
+  el.innerHTML = '<span class="hint">检查中…</span>';
+  try {
+    UPD.data = await api('GET', '/api/update/check');
+    UPD.checkedAt = Date.now();
+    renderUpdateResult();
+  } catch (e) {
+    el.innerHTML = `<span class="hint">检查失败：${esc(e.message)}</span>`;
+  }
+}
+
+async function runUpdateFlow() {
+  const running = S.status?.embedded || S.status?.bridge?.running;
+  const extra = running ? '，完成后自动重启桥接器（页面将短暂失联后自动恢复）' : '（桥接器未在运行，下次启动生效）';
+  if (!confirm(`将通过 npm 安装最新版本${extra}，可能需要 1-2 分钟。继续？`)) return;
+  const btn = $('#btnUpdRun');
+  if (btn) { btn.disabled = true; btn.textContent = '更新中…'; }
+  try {
+    await api('POST', '/api/update/run');
+    UPD.checkedAt = 0;
+    if (running) await restartFlow();
+    else toast('✅ 更新完成，下次启动生效');
+    await refresh();
+  } catch (e) {
+    toast(`更新失败：${e.message}`, true);
+    renderUpdateResult(); // 恢复按钮
+  }
+}
+
 async function renderOverview(el) {
   const st = S.status || {};
   const claudeTag = st.claude?.hasAuth === null ? '<span class="tag off">未知</span>'
     : st.claude?.hasAuth ? '<span class="tag ok">已就绪</span>' : '<span class="tag err">未认证</span>';
+  const stale = !st.bridge; // 旧版本进程（API 无 bridge 字段）：进程托管功能整体不可用
+  const br = stale ? { running: st.embedded === true, pid: null, spawnable: false } : st.bridge;
+  const ctl = stale
+    ? '<div class="hint" style="margin-top:10px">⚠️ 配置页服务进程为旧版本，页面启停 / 重启 / 更新不可用：请重启桥接器（lcb start）后刷新本页。</div>'
+    : br.spawnable === false
+    ? '<div class="hint" style="margin-top:10px">当前运行方式不支持页面托管启停（如源码运行），请在服务器上手动运行 lcb start。</div>'
+    : `<div style="display:flex; gap:10px; margin-top:12px">${
+        br.running
+          ? '<button class="btn" id="btnBrRestart">重启</button><button class="btn danger" id="btnBrStop">停止</button>'
+          : '<button class="btn primary" id="btnBrStart">启动</button>'
+      }</div>
+      <div class="hint" style="margin-top:8px">${st.embedded
+        ? '本页随桥接器进程运行：停止后页面将离线（可运行 lcb ui 重开）；重启会短暂失联后自动恢复。'
+        : '本页独立运行（lcb ui）：在此启动的桥接器为后台进程，运行日志见 ~/.lark-claudecode-bridge/bridge.log。'}</div>`;
   el.innerHTML = `
   <div class="card">
     <h3>运行状态</h3>
     <table>
       <tr><td>版本</td><td>v${esc(st.version)}</td></tr>
       <tr><td>模式</td><td>${st.embedded ? '随 lcb start 常驻' : 'lcb ui 独立（桥接器未随本页启动）'}</td></tr>
+      <tr><td>桥接器进程</td><td>${stale
+        ? (st.embedded ? '<span class="tag warn">运行中（旧版本进程）</span>' : '<span class="tag off">状态未知（旧版本进程）</span>')
+        : br.running
+          ? `<span class="tag ok">运行中</span> <span class="hint">PID ${esc(br.pid)}</span>`
+          : '<span class="tag off">未运行</span>'}</td></tr>
       <tr><td>配置文件</td><td><code>${esc(st.configPath)}</code></td></tr>
       <tr><td>配置页</td><td><code>${esc(location.host)}</code></td></tr>
       <tr><td>Claude 认证</td><td>${claudeTag}（模式：${esc(st.claude?.mode || 'inherit')}）</td></tr>
     </table>
+    ${ctl}
     <div class="desc" style="margin-top:10px">${st.claude?.hasAuth === false ? '⚠️ 未检测到认证：到「Claude 认证」页填写，或在配置页所在机器执行 claude login。' : ''}</div>
+  </div>
+  <div class="card">
+    <h3>版本与更新</h3>
+    <table>
+      <tr><td>当前版本</td><td><span class="chip">v${esc(st.version)}</span></td></tr>
+      <tr><td>最新版本</td><td id="updLatest"><span class="hint">未检查</span></td></tr>
+    </table>
+    <div style="display:flex; gap:10px; margin-top:12px; align-items:center">
+      <button class="btn" id="btnUpdCheck">检查更新</button>
+      <span id="updArea"></span>
+    </div>
   </div>
   <div class="card">
     <h3>机器人应用</h3>
@@ -248,110 +526,257 @@ async function renderOverview(el) {
     </tbody></table>
   </div>
   <div class="card">
+    <h3>常用命令</h3>
+    <div class="desc">在飞书聊天框输入 <code>/</code> 触发；其它 / 开头消息原文透传给 Claude Code。斜杠面板需先到「斜杠命令」页注册（补齐内置命令）。</div>
+    <table><thead><tr><th style="width:150px">命令</th><th>说明</th></tr></thead><tbody>
+    ${(st.commands || []).map((c) => `<tr><td><code>/${esc(c.command)}</code></td><td>${esc(c.description)}</td></tr>`).join('') || '<tr><td colspan="2" class="hint">无</td></tr>'}
+    </tbody></table>
+  </div>
+  <div class="card">
     <h3>常用指引</h3>
     <div class="desc">飞书端与机器人对话即可使用；<code>/help</code> 查看全部命令。配置修改后：<b>应用 / 认证 / server 段需重启 lcb start</b>，工作区 / 权限 / 触发词下一条消息自动生效。</div>
   </div>`;
+  // 启停按钮 + 版本更新；自动检查 30s 节流（切回概览 tab 不重复打 npm）
+  const bind = (id, fn) => { const b = $(id); if (b) b.onclick = fn; };
+  bind('#btnBrStart', startFlow); bind('#btnBrStop', stopFlow); bind('#btnBrRestart', restartFlow);
+  bind('#btnUpdCheck', doCheckUpdate);
+  if (UPD.data && Date.now() - UPD.checkedAt < 30000) renderUpdateResult();
+  else doCheckUpdate();
 }
 
-// ============ 应用 ============
+// ============ 应用（列表 + 抽屉编辑；输入实时写回 S.doc.apps，抽屉「保存」一次落盘） ============
 function renderApps(el) {
   const apps = S.doc.apps || (S.doc.apps = []);
   el.innerHTML = `
   <div class="card">
     <h3>飞书应用（机器人）</h3>
-    <div class="desc">每个应用一条独立长连接与会话池。App Secret 已脱敏，留空 = 保持不变。triggers / plugins / env 用 JSON 编辑（可留空）。</div>
-    <div id="appsBox"></div>
-    <button class="btn sm" id="addApp">+ 添加应用</button>
-    <div class="footer-note">⚠️ 应用凭证修改需重启 lcb start 后生效。</div>
+    <div class="desc">每个应用一条独立长连接与会话池。点击行或「编辑」在抽屉中配置；App Secret 已脱敏，留空 = 保持不变。凭证 / 名称 / 域名 / 默认工作区 / 并发 / 人格 / 环境变量改动需重启 lcb start；触发词与显式插件热生效。</div>
+    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+      <button class="btn primary" id="addApp">+ 新增应用</button>
+    </div>
+    <table>
+      <thead><tr><th>名称</th><th>App ID</th><th style="width:80px">域名</th><th>默认工作区</th><th style="width:110px">状态</th><th style="width:64px"></th></tr></thead>
+      <tbody id="appsBody"></tbody>
+    </table>
+    <div class="footer-note">⚠️ 应用段改动需重启 lcb start 后生效（触发词 / 显式插件除外，下一条消息自动生效）。</div>
   </div>`;
-  const box = $('#appsBox');
-  const renderOne = (app, idx) => {
-    const secret = app.app_secret || {};
-    const div = document.createElement('div');
-    div.className = 'app-card';
-    div.innerHTML = `
-      <button class="btn sm danger del">删除应用</button>
+  const statusTag = (app) => {
+    const st = S.status?.apps?.find((s) => s.name === (app.name || app.app_id))?.started;
+    return st === true ? '<span class="tag ok">运行中</span>'
+      : st === false ? '<span class="tag err">启动失败</span>'
+      : '<span class="tag off">未随本页启动</span>';
+  };
+  $('#appsBody').innerHTML = apps.map((app, i) => `
+    <tr data-i="${i}" style="cursor:pointer">
+      <td><b>${esc(app.name || app.app_id || '（未命名）')}</b></td>
+      <td><code>${esc(app.app_id || '')}</code></td>
+      <td>${esc(app.domain === 'lark' ? 'lark' : 'feishu')}</td>
+      <td>${esc(app.default_workspace || '（全局默认）')}</td>
+      <td>${statusTag(app)}</td>
+      <td><button class="btn sm">编辑</button></td>
+    </tr>`).join('');
+  $('#appsBody').querySelectorAll('tr').forEach((tr) =>
+    tr.onclick = () => openAppDrawer(apps, Number(tr.dataset.i), el));
+  $('#addApp').onclick = () => {
+    const snap = snapDoc(); // 快照先于 push：取消时连同新增空行一起回滚
+    apps.push({ app_id: '', app_secret: '' });
+    renderApps(el);
+    openAppDrawer(apps, apps.length - 1, el, snap);
+  };
+}
+
+/**
+ * 应用编辑抽屉：输入实时 mutate app 对象，「保存」PUT 落盘（applySecrets / 注文保护链路零改动）。
+ * secret 语义逐字保留：非空 = 明文写入；空 = 保持脱敏对象（PUT 端按 app_id 回填磁盘现值）。
+ * 「取消」/ X / ESC = 回滚到打开前快照（新增未保存的应用行一并撤销）。
+ */
+function openAppDrawer(apps, idx, el, snap) {
+  const app = apps[idx];
+  const secret = app.app_secret || {};
+  const wsNames = (S.doc.workspaces || []).map((w) => w.name || '').filter(Boolean);
+  const globalDef = S.doc.defaults?.workspace || '';
+  openDrawer({
+    title: `应用：${app.name || app.app_id || '（新应用）'}`,
+    snap: snap ?? snapDoc(),
+    bodyHtml: `
       <div class="row">
-        <div><label>应用名字（显示用）</label><input type="text" data-f="name" value="${esc(app.name || '')}" placeholder="缺省取 App ID"></div>
-        <div><label>App ID</label><input type="text" data-f="app_id" value="${esc(app.app_id || '')}" placeholder="cli_…"></div>
-        <div><label>App Secret ${secret.secretSet ? `（已设置 ${esc(secret.secretHint)}，留空不改）` : ''}</label>
-          <input type="password" data-f="app_secret" value="" placeholder="${secret.secretSet ? '••••••••（留空保持不变）' : '未设置'}"></div>
+        <div><label>应用名字（概览页与飞书 /status 显示用，缺省取 App ID）</label>
+          <input type="text" data-f="name" value="${esc(app.name || '')}" placeholder="素材收集"></div>
+        <div><label>App ID</label>
+          <input type="text" data-f="app_id" value="${esc(app.app_id || '')}" placeholder="cli_…"></div>
       </div>
+      <label>App Secret ${secret.secretSet ? `（已设置 ${esc(secret.secretHint)}，留空不改）` : ''}</label>
+      <input type="password" data-f="app_secret" placeholder="${secret.secretSet ? '••••••••（留空保持不变）' : '未设置'}">
       <div class="row">
         <div><label>域名</label><select data-f="domain">
           <option value="" ${!app.domain || app.domain === 'feishu' ? 'selected' : ''}>feishu（国内）</option>
           <option value="lark" ${app.domain === 'lark' ? 'selected' : ''}>lark（国际）</option>
         </select></div>
-        <div><label>默认工作区</label><input type="text" data-f="default_workspace" value="${esc(app.default_workspace || '')}" placeholder="缺省用全局默认"></div>
-        <div><label>并发上限（1-100）</label><input type="number" data-f="concurrency" value="${esc(app.concurrency ?? '')}" placeholder="缺省用全局"></div>
+        <div><label>默认工作区${globalDef ? `（缺省用全局默认：${esc(globalDef)}）` : '（缺省用全局默认）'}</label>
+          <select data-f="default_workspace">
+            <option value="" ${!app.default_workspace ? 'selected' : ''}>（全局默认）</option>
+            ${wsNames.map((n) => `<option value="${esc(n)}" ${app.default_workspace === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}
+          </select></div>
+        <div><label>并发上限（1-100）</label>
+          <input type="number" data-f="concurrency" min="1" max="100" value="${esc(app.concurrency ?? '')}" placeholder="缺省用全局"></div>
       </div>
-      <label>人格补充（append_system_prompt，可空）</label>
+      <label>人格补充（追加到该机器人每个会话的 system prompt，多机器人差异化定位；改动需重启生效）</label>
       <textarea data-f="append_system_prompt" placeholder="你是一个素材收集助手…">${esc(app.append_system_prompt || '')}</textarea>
-      <div class="row">
-        <div><label>触发词 triggers（JSON，可空）</label><textarea data-f="triggers" class="json" placeholder='[{"match":"/produce","rewrite":"…{args}"}]'>${esc(app.triggers ? JSON.stringify(app.triggers, null, 1) : '')}</textarea></div>
-        <div><label>显式插件 plugins（JSON，可空）</label><textarea data-f="plugins" class="json" placeholder='[{"name":"x","path":"F:/…"}]'>${esc(app.plugins ? JSON.stringify(app.plugins, null, 1) : '')}</textarea></div>
-      </div>
-      <label>环境变量 env（JSON，可空）</label>
-      <textarea data-f="env" class="json" placeholder='{"KEY":"value"}'>${esc(app.env ? JSON.stringify(app.env, null, 1) : '')}</textarea>`;
-    div.querySelector('.del').onclick = () => {
-      if (apps.length <= 1) return toast('至少保留一个应用', true);
-      apps.splice(idx, 1);
-      markDirty();
-      renderApps(el);
-    };
-    div.querySelectorAll('[data-f]').forEach((input) => {
-      input.oninput = () => {
-        const f = input.dataset.f;
-        if (input.classList.contains('json')) {
-          if (!input.value.trim()) { delete app[f]; markDirty(); return; }
-          try {
-            const v = JSON.parse(input.value);
-            if (Array.isArray(v) ? v.length : Object.keys(v).length) app[f] = v; else delete app[f];
-            markDirty();
-          } catch { /* JSON 未写完，暂不标记 */ }
-        } else if (f === 'app_secret') {
-          if (input.value.trim()) { app.app_secret = input.value; markDirty(); }
-          else { app.app_secret = { secretSet: secret.secretSet }; markDirty(); } // 空串=不修改（后端回填）
-        } else if (f === 'concurrency') {
-          if (input.value.trim()) app.concurrency = Number(input.value); else delete app.concurrency;
-          markDirty();
-        } else if (input.value.trim()) {
-          app[f] = input.value; markDirty();
-        } else if (f !== 'name' && f !== 'app_id') {
-          delete app[f]; markDirty();
-        } else { app[f] = input.value; markDirty(); }
+      <h4 style="margin:18px 0 2px;font-size:13.5px">触发词（命中即改写消息后再发给 Claude；下一条消息热生效）</h4>
+      <div class="hint" style="margin-bottom:6px">match 以 <code>/</code> 开头 = 消息首词精确匹配，否则 = 关键词包含；rewrite 可用 <code>{text}</code>=原文全文、<code>{args}</code>=首词后的参数；本地命令（/stop 等）不受影响；按序首个命中生效。</div>
+      <table><thead><tr><th style="width:42%">match</th><th>rewrite</th><th style="width:44px"></th></tr></thead><tbody data-list="triggers"></tbody></table>
+      <button class="btn sm" data-add="triggers" style="margin-top:6px">+ 添加规则</button>
+      <h4 style="margin:18px 0 2px;font-size:13.5px">显式插件（本地插件源码目录；同名优先于 ~/.claude 自动发现；热生效）</h4>
+      <div class="hint" style="margin-bottom:6px">须为包含 <code>.claude-plugin/plugin.json</code> 的目录；一般用户无须配置，多用于开发期直指源码。</div>
+      <table><thead><tr><th style="width:30%">name</th><th>path</th><th style="width:44px"></th></tr></thead><tbody data-list="plugins"></tbody></table>
+      <button class="btn sm" data-add="plugins" style="margin-top:6px">+ 添加插件</button>
+      <h4 style="margin:18px 0 2px;font-size:13.5px">环境变量（注入该机器人 Claude 子进程，覆盖本机同名值；改动需重启生效）</h4>
+      <div class="hint" style="margin-bottom:6px">~/.claude/settings.json 已配置的键会被 CLI 自身应用且优先，无须在此重复。</div>
+      <table><thead><tr><th style="width:38%">KEY</th><th>VALUE</th><th style="width:44px"></th></tr></thead><tbody data-list="env"></tbody></table>
+      <button class="btn sm" data-add="env" style="margin-top:6px">+ 添加变量</button>`,
+    footHtml: `<button class="btn danger" id="dwDel">删除应用</button><span class="spacer"></span><button class="btn" id="dwCancel">取消</button><button class="btn primary" id="dwSave">保存</button>`,
+    onMount: ({ body, foot }) => {
+      // ---- 普通字段（语义与旧卡片版逐字一致；改动只进内存，抽屉「保存」落盘） ----
+      body.querySelectorAll('[data-f]').forEach((input) => {
+        input.oninput = input.onchange = () => {
+          const f = input.dataset.f;
+          if (f === 'default_workspace') {
+            if (input.value) app.default_workspace = input.value; else delete app.default_workspace;
+            return;
+          }
+          if (f === 'app_secret') {
+            if (input.value.trim()) { app.app_secret = input.value; }
+            else if (typeof app.app_secret === 'string') { app.app_secret = { secretSet: secret.secretSet }; }
+            return;
+          }
+          if (f === 'concurrency') {
+            if (input.value.trim()) app.concurrency = Number(input.value); else delete app.concurrency;
+            return;
+          }
+          if (input.value.trim() || f === 'name' || f === 'app_id') { app[f] = input.value; }
+          else { delete app[f]; }
+        };
+      });
+      // ---- 触发词 / 显式插件：数组行编辑，实时写回 ----
+      const LIST_DEFS = {
+        triggers: { key: 'triggers', cols: [['match', '/produce 或 关键词'], ['rewrite', '请执行内容生产流程：{args}']] },
+        plugins: { key: 'plugins', cols: [['name', 'my-plugin'], ['path', 'F:/dev/my-plugin']] },
       };
-    });
-    box.appendChild(div);
-  };
-  apps.forEach(renderOne);
-  $('#addApp').onclick = () => {
-    apps.push({ app_id: '', app_secret: '' });
-    markDirty();
-    renderApps(el);
-  };
+      const renderPairList = (name) => {
+        const def = LIST_DEFS[name];
+        const list = app[def.key] || [];
+        const tb = body.querySelector(`[data-list="${name}"]`);
+        tb.innerHTML = list.map((item, i) => `
+          <tr>
+            ${def.cols.map(([col, ph]) => `<td><input type="text" data-l="${i}" data-c="${col}" value="${esc(item?.[col] ?? '')}" placeholder="${esc(ph)}"></td>`).join('')}
+            <td><button class="btn sm danger" data-rm="${i}">删</button></td>
+          </tr>`).join('');
+        tb.querySelectorAll('input[data-l]').forEach((input) => input.oninput = () => {
+          app[def.key][Number(input.dataset.l)][input.dataset.c] = input.value;
+        });
+        tb.querySelectorAll('button[data-rm]').forEach((b) => b.onclick = () => {
+          app[def.key].splice(Number(b.dataset.rm), 1);
+          if (!app[def.key].length) delete app[def.key];
+          renderPairList(name);
+        });
+      };
+      for (const name of Object.keys(LIST_DEFS)) renderPairList(name);
+      // ---- 环境变量：对象 ↔ 行数组同步（key 改名 / 删除即时生效到 app.env） ----
+      const envRows = Object.entries(app.env || {}).map(([key, value]) => ({ key, value: String(value) }));
+      const syncEnv = () => {
+        const obj = {};
+        for (const r of envRows) if (r.key.trim()) obj[r.key.trim()] = r.value;
+        if (Object.keys(obj).length) app.env = obj; else delete app.env;
+      };
+      const renderEnv = () => {
+        const tb = body.querySelector('[data-list="env"]');
+        tb.innerHTML = envRows.map((r, i) => `
+          <tr>
+            <td><input type="text" data-ei="${i}" data-c="key" value="${esc(r.key)}" placeholder="SOME_KEY"></td>
+            <td><input type="text" data-ei="${i}" data-c="value" value="${esc(r.value)}" placeholder="some-value"></td>
+            <td><button class="btn sm danger" data-rm="${i}">删</button></td>
+          </tr>`).join('');
+        tb.querySelectorAll('input[data-ei]').forEach((input) => input.oninput = () => {
+          envRows[Number(input.dataset.ei)][input.dataset.c] = input.value;
+          syncEnv();
+        });
+        tb.querySelectorAll('button[data-rm]').forEach((b) => b.onclick = () => {
+          envRows.splice(Number(b.dataset.rm), 1);
+          syncEnv();
+          renderEnv();
+        });
+      };
+      renderEnv();
+      // ---- 添加行 ----
+      body.querySelectorAll('[data-add]').forEach((b) => b.onclick = () => {
+        const name = b.dataset.add;
+        if (name === 'env') { envRows.push({ key: '', value: '' }); renderEnv(); return; }
+        const def = LIST_DEFS[name];
+        (app[def.key] = app[def.key] || []).push({ [def.cols[0][0]]: '', [def.cols[1][0]]: '' });
+        renderPairList(name);
+        body.querySelector(`[data-list="${name}"] tbody input`)?.focus();
+      });
+      // ---- 删除 / 保存 / 取消 ----
+      foot.querySelector('#dwDel').onclick = async () => {
+        if (apps.length <= 1) return toast('至少保留一个应用', true);
+        if (!window.confirm(`确认删除应用「${app.name || app.app_id || '未命名'}」？删除将立即保存生效。`)) return;
+        apps.splice(idx, 1);
+        if (await saveDoc()) closeDrawer();
+        else cancelDrawer(); // 落盘失败：回滚删除，保留编辑现场让用户重试
+      };
+      foot.querySelector('#dwCancel').onclick = cancelDrawer;
+      foot.querySelector('#dwSave').onclick = async () => {
+        // 清理半填的空行：triggers/plugins 行两列全空剔除；env 以 key 非空为准（syncEnv 已过滤）。数组空则整键删除
+        for (const name of Object.keys(LIST_DEFS)) {
+          const def = LIST_DEFS[name];
+          const list = app[def.key];
+          if (!Array.isArray(list)) continue;
+          const filtered = list.filter((item) => def.cols.some(([col]) => String(item?.[col] ?? '').trim()));
+          if (filtered.length) app[def.key] = filtered;
+          else delete app[def.key];
+        }
+        if (await saveDoc()) closeDrawer();
+      };
+    },
+  });
 }
 
-// ============ 工作区 ============
+// ============ 工作区（行内编辑 + 卡级保存；改动落盘后热生效） ============
 function renderWorkspaces(el) {
   const doc = S.doc;
   doc.workspaces = doc.workspaces || [];
   el.innerHTML = `
   <div class="card">
-    <h3>工作区</h3>
-    <div class="desc">Claude 的工作目录白名单。type=code-dev 的开发工作流：先出计划（飞书批准）+ 收尾汇总 diff。</div>
-    <table><thead><tr><th style="width:180px">名字</th><th>路径</th><th style="width:120px">类型</th><th style="width:50px"></th></tr></thead>
+    <h3>工作区${dirtyDotHtml('ws')}</h3>
+    <div class="desc">Claude 的工作目录白名单。「开发工作流（code-dev）」类型：先出计划（飞书批准）+ 收尾汇总 diff。</div>
+    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+      <button class="btn sm" id="wsAdd">+ 添加工作区</button>
+    </div>
+    <table><thead><tr><th style="width:180px">名字</th><th>路径</th><th style="width:170px">类型</th><th style="width:50px"></th></tr></thead>
     <tbody id="wsBody"></tbody></table>
-    <button class="btn sm" id="wsAdd" style="margin-top:10px">+ 添加工作区</button>
+    ${saveBarHtml('ws')}
     <div class="footer-note">运行中的桥接器下一条消息自动生效，无需重启。</div>
   </div>
   <div class="card">
-    <h3>全局默认</h3>
+    <h3>全局默认${dirtyDotHtml('def')}</h3>
     <div class="row">
-      <div><label>默认工作区（defaults.workspace）</label><input type="text" id="defWs"></div>
+      <div><label>默认工作区（defaults.workspace）</label><select id="defWs"></select></div>
       <div><label>全局并发（concurrency）</label><input type="number" id="globalCc" min="1" max="100"></div>
     </div>
+    ${saveBarHtml('def')}
   </div>`;
+  bindSaveBar(el, 'ws');
+  bindSaveBar(el, 'def');
+  /** 重建默认工作区下拉选项：保留当前选中；现值不在工作区列表（手工编辑过的脏配置）时注入该值本身，防静默丢数据 */
+  const syncDefWsOptions = () => {
+    const sel = $('#defWs');
+    if (!sel) return;
+    const cur = doc.defaults?.workspace || '';
+    const names = doc.workspaces.map((w) => w.name || '').filter(Boolean);
+    const extra = cur && !names.includes(cur) ? [cur] : [];
+    sel.innerHTML = ['', ...names, ...extra].map((n) =>
+      `<option value="${esc(n)}"${n === cur ? ' selected' : ''}>${n === '' ? '（未设置）' : esc(n)}${extra.includes(n) ? '（配置中不存在）' : ''}</option>`).join('');
+  };
   const body = $('#wsBody');
   const renderRow = (ws, idx) => {
     const tr = document.createElement('tr');
@@ -359,213 +784,533 @@ function renderWorkspaces(el) {
       <td><input type="text" data-f="name" value="${esc(ws.name || '')}"></td>
       <td><input type="text" data-f="path" value="${esc(ws.path || '')}"></td>
       <td><select data-f="type">
-        <option value="generic" ${ws.type !== 'code-dev' ? 'selected' : ''}>generic</option>
-        <option value="code-dev" ${ws.type === 'code-dev' ? 'selected' : ''}>code-dev</option>
+        <option value="generic" ${ws.type !== 'code-dev' ? 'selected' : ''}>通用（generic）</option>
+        <option value="code-dev" ${ws.type === 'code-dev' ? 'selected' : ''}>开发工作流（code-dev）</option>
       </select></td>
       <td><button class="btn sm danger">删</button></td>`;
     tr.querySelectorAll('[data-f]').forEach((input) => {
       input.oninput = input.onchange = () => {
-        if (input.dataset.f === 'type') { if (input.value === 'code-dev') ws.type = 'code-dev'; else delete ws.type; }
-        else ws[input.dataset.f] = input.value;
-        markDirty();
+        const f = input.dataset.f;
+        if (f === 'type') { if (input.value === 'code-dev') ws.type = 'code-dev'; else delete ws.type; }
+        else if (f === 'name') {
+          // 改名联动：全局默认指向旧名时同步，否则保存会因 defaults.workspace 不在工作区列表报错
+          if (doc.defaults?.workspace && doc.defaults.workspace === ws.name) {
+            doc.defaults = { ...(doc.defaults || {}), workspace: input.value };
+          }
+          ws.name = input.value;
+          syncDefWsOptions();
+        }
+        else ws[f] = input.value;
+        cardDirty('ws', true);
       };
     });
     tr.querySelector('.btn').onclick = () => {
       if (doc.workspaces.length <= 1) return toast('至少保留一个工作区', true);
       doc.workspaces.splice(idx, 1);
-      markDirty();
+      cardDirty('ws', true);
       renderWorkspaces(el);
     };
     body.appendChild(tr);
   };
   doc.workspaces.forEach(renderRow);
-  $('#wsAdd').onclick = () => { doc.workspaces.push({ name: '', path: '' }); markDirty(); renderWorkspaces(el); };
-  $('#defWs').value = doc.defaults?.workspace || '';
-  $('#defWs').oninput = () => { doc.defaults = { workspace: $('#defWs').value }; markDirty(); };
+  $('#wsAdd').onclick = () => { doc.workspaces.push({ name: '', path: '' }); cardDirty('ws', true); renderWorkspaces(el); };
+  syncDefWsOptions();
+  $('#defWs').onchange = () => { doc.defaults = { ...(doc.defaults || {}), workspace: $('#defWs').value }; cardDirty('def', true); };
   $('#globalCc').value = doc.concurrency ?? 3;
-  $('#globalCc').oninput = () => { doc.concurrency = Number($('#globalCc').value) || 3; markDirty(); };
+  $('#globalCc').oninput = () => { doc.concurrency = Number($('#globalCc').value) || 3; cardDirty('def', true); };
+  applyDirty(); // 增删行等操作先 cardDirty 再整卡重渲染：回放防止保存条/圆点随重建丢失
 }
 
 // ============ Claude 认证 ============
+/** 模型拉取公共逻辑：getBody() 组请求体（凭证仅携带本次输入的明文，空则不带给后端回落磁盘值） */
+async function pullModels(getBody, btn, datalistId) {
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '拉取中…';
+  try {
+    const r = await api('POST', '/api/models/fetch', getBody());
+    const dl = document.getElementById(datalistId);
+    if (dl) dl.innerHTML = (r.models || []).map((m) => `<option value="${esc(m)}"></option>`).join('');
+    toast(`获取到 ${(r.models || []).length} 个模型：在模型框下拉选择，或继续手动输入`);
+  } catch (e) { toast(e.message, true); }
+  btn.disabled = false;
+  btn.textContent = old;
+}
+
 function renderClaude(el) {
   const c = S.doc.claude || (S.doc.claude = {});
+  c.profiles = c.profiles || [];
   const mode = c.mode || 'inherit';
   const hasToken = c.auth_token?.secretSet, hasKey = c.api_key?.secretSet;
   const credType = hasToken ? 'auth_token' : 'api_key';
+  const cur = S.status?.claude?.current || {};
+  const hint = (h) => h?.secretSet ? `已设置（${esc(h.secretHint)}）` : '未设置';
   el.innerHTML = `
   <div class="card">
-    <h3>认证模式</h3>
+    <h3>当前生效配置</h3>
+    <div class="desc">认证模式与实际生效的值（凭证脱敏显示）。managed 模式改动保存后对后续任务即生效；模式切换需重启。</div>
+    <table>
+      <tr><td style="width:150px">认证模式</td><td>${mode === 'managed' ? 'bridge 托管（managed）' : '继承本机 ~/.claude（inherit）'}</td></tr>
+      <tr><td>BASE_URL</td><td>${cur.baseUrl ? `<code>${esc(cur.baseUrl)}</code>` : '<span class="hint">官方默认（api.anthropic.com）</span>'}</td></tr>
+      <tr><td>模型</td><td>${cur.model ? `<code>${esc(cur.model)}</code>` : '<span class="hint">未设置（CLI 默认）</span>'}</td></tr>
+      <tr><td>Auth Token</td><td>${hint(cur.authToken)}</td></tr>
+      <tr><td>API Key</td><td>${hint(cur.apiKey)}</td></tr>
+      <tr><td>settings.json</td><td><code>${esc(S.status?.claude?.settingsPath || '—')}</code></td></tr>
+    </table>
+    ${mode !== 'managed' ? '<div class="desc" style="margin-top:8px">inherit 模式上表为本机 ~/.claude 实际状态，本页不修改本机登录。要管理多厂商档案并一键切换，请切到 bridge 托管。</div>' : ''}
+  </div>
+  <div class="card">
+    <h3>认证模式${dirtyDotHtml('claude')}</h3>
     <div class="radio-row">
       <label><input type="radio" name="mode" value="inherit" ${mode === 'inherit' ? 'checked' : ''}> 继承本机 ~/.claude（已在本机 claude login）</label>
       <label><input type="radio" name="mode" value="managed" ${mode === 'managed' ? 'checked' : ''}> bridge 托管（填 API Key / Token，无需本机登录）</label>
     </div>
     <div id="managedBox" style="${mode === 'managed' ? '' : 'display:none'}">
-      <div class="radio-row">
-        <label><input type="radio" name="cred" value="auth_token" ${credType === 'auth_token' ? 'checked' : ''}> AUTH_TOKEN（中转站常用，Bearer）</label>
-        <label><input type="radio" name="cred" value="api_key" ${credType === 'api_key' ? 'checked' : ''}> API_KEY（官方，x-api-key）</label>
-      </div>
-      <div class="row">
-        <div><label id="credLabel">Auth Token ${hasToken ? `（已设置 ${esc(c.auth_token.secretHint)}，留空不改）` : ''}</label>
-          <input type="password" id="credVal" placeholder="${hasToken || hasKey ? '留空保持不变' : 'sk-…'}"></div>
-        <div><label>BASE_URL（中转站端点，官方留空）</label><input type="text" id="baseUrl" value="${esc(c.base_url || '')}" placeholder="https://relay.example.com"></div>
-      </div>
-      <label>模型（写入 settings.json，如 claude-sonnet-5，可留空）</label>
-      <input type="text" id="model" value="${esc(c.model || '')}" placeholder="claude-sonnet-5">
+      <div class="desc" style="margin:6px 0 2px">常规用法：在下方「厂商档案」保存凭证后点「设为当前」即可，无须手动填写。</div>
+      <details style="margin-top:4px">
+        <summary style="cursor:pointer;font-size:13px;color:var(--muted)">高级：手动编辑当前生效凭证</summary>
+        <div style="margin-top:10px">
+          <div class="radio-row">
+            <label><input type="radio" name="cred" value="auth_token" ${credType === 'auth_token' ? 'checked' : ''}> AUTH_TOKEN（中转站常用，Bearer）</label>
+            <label><input type="radio" name="cred" value="api_key" ${credType === 'api_key' ? 'checked' : ''}> API_KEY（官方，x-api-key）</label>
+          </div>
+          <div class="row">
+            <div><label id="credLabel">Auth Token ${hasToken ? `（已设置 ${esc(c.auth_token.secretHint)}，留空不改）` : ''}</label>
+              <input type="password" id="credVal" placeholder="${hasToken || hasKey ? '留空保持不变' : 'sk-…'}"></div>
+            <div><label>BASE_URL（中转站端点，官方留空）</label><input type="text" id="baseUrl" value="${esc(c.base_url || '')}" placeholder="https://relay.example.com"></div>
+          </div>
+          <div class="row" style="align-items:end">
+            <div style="flex:1"><label>模型（写入 settings.json，可留空）</label>
+              <input type="text" id="model" list="modelList" value="${esc(c.model || '')}" placeholder="claude-sonnet-5 或任意厂商模型名">
+              <datalist id="modelList"></datalist></div>
+            <button class="btn" id="btnModels">拉取模型</button>
+          </div>
+          <div class="hint" style="margin-top:6px">「拉取模型」用当前表单的 BASE_URL 与凭证（未填则用已保存值）请求模型列表：自动兼容带 / 不带 /v1 的地址与 Bearer / x-api-key 认证；失败可手动填写。</div>
+        </div>
+      </details>
+      ${saveBarHtml('claude')}
     </div>
     <div class="footer-note">managed 模式把认证写入 <code>~/.lark-claudecode-bridge/claude/settings.json</code>，与本机 ~/.claude 完全隔离；认证/模型改动保存后对后续任务即生效，模式切换需重启。</div>
+  </div>
+  <div class="card" id="pfCard" style="${mode === 'managed' ? '' : 'display:none'}">
+    <h3>厂商档案</h3>
+    <div class="desc">保存多套厂商 / 中转站凭证，每个档案可维护多个候选模型（如 fable / opus / sonnet / haiku）。「设为当前」整套切换；点候选模型即时切换当前模型。档案在抽屉「保存」后即可切换。</div>
+    <div style="display:flex;justify-content:flex-end;margin-bottom:10px"><button class="btn sm primary" id="pfAdd">+ 新增档案</button></div>
+    <table><thead><tr><th style="width:120px">名称</th><th style="width:100px">凭证类型</th><th>BASE_URL</th><th>模型（点击切换）</th><th style="width:190px">操作</th></tr></thead>
+    <tbody id="pfBody"></tbody></table>
   </div>`;
   document.querySelectorAll('input[name=mode]').forEach((r) => r.onchange = () => {
-    c.mode = $('[name=mode]:checked').value;
-    $('#managedBox').style.display = c.mode === 'managed' ? '' : 'none';
-    markDirty();
+    c.mode = document.querySelector('input[name=mode]:checked').value;
+    cardDirty('claude', c.mode === 'managed'); // inherit 无 managed 表单语义：不标记未保存
+    renderClaude(el); // 模式切换影响多卡显隐，整页重渲染（radio 状态由 c.mode 驱动）
   });
+  bindSaveBar(el, 'claude');
   const updCredLabel = () => {
-    const v = $('[name=cred]:checked').value;
+    const v = document.querySelector('input[name=cred]:checked').value;
     $('#credLabel').innerHTML = (v === 'api_key' ? 'API Key' : 'Auth Token')
       + (v === 'auth_token' && hasToken ? `（已设置 ${esc(c.auth_token.secretHint)}，留空不改）` : '')
       + (v === 'api_key' && hasKey ? `（已设置 ${esc(c.api_key.secretHint)}，留空不改）` : '');
   };
-  document.querySelectorAll('input[name=cred]').forEach((r) => r.onchange = () => { updCredLabel(); markDirty(); });
+  document.querySelectorAll('input[name=cred]').forEach((r) => r.onchange = () => { updCredLabel(); cardDirty('claude', true); });
   $('#credVal').oninput = () => {
     const v = $('#credVal').value.trim();
-    const key = $('[name=cred]:checked').value;
+    const key = document.querySelector('input[name=cred]:checked').value;
     const other = key === 'auth_token' ? 'api_key' : 'auth_token';
     if (v) { c[key] = v; c[other] = ''; } else { c[key] = { secretSet: key === 'auth_token' ? hasToken : hasKey }; }
-    markDirty();
+    cardDirty('claude', true);
   };
-  $('#baseUrl').oninput = () => { c.base_url = $('#baseUrl').value.trim() || undefined; markDirty(); };
-  $('#model').oninput = () => { c.model = $('#model').value.trim() || undefined; markDirty(); };
+  $('#baseUrl').oninput = () => { c.base_url = $('#baseUrl').value.trim() || undefined; cardDirty('claude', true); };
+  $('#model').oninput = () => { c.model = $('#model').value.trim() || undefined; cardDirty('claude', true); };
+  $('#btnModels').onclick = () => {
+    const typed = $('#credVal').value.trim();
+    const key = document.querySelector('input[name=cred]:checked').value;
+    pullModels(() => ({ base_url: $('#baseUrl').value.trim(), ...(typed ? { [key]: typed } : {}) }), $('#btnModels'), 'modelList');
+  };
+  // ---- 厂商档案列表 ----
+  const renderProfiles = () => {
+    const body = $('#pfBody');
+    if (!body) return;
+    if (!c.profiles.length) { body.innerHTML = '<tr><td colspan="5" class="hint">尚无档案，点右上「+ 新增档案」创建</td></tr>'; return; }
+    const inUse = (p) => {
+      // 前端无凭证明文，用尾 4 位提示 + baseUrl 近似判断「使用中」（当前模型在 chips 上单独高亮）
+      const credSame = (p.auth_token?.secretHint && cur.authToken?.secretHint === p.auth_token.secretHint)
+        || (p.api_key?.secretHint && cur.apiKey?.secretHint === p.api_key.secretHint);
+      return credSame && (p.base_url || '') === (cur.baseUrl || '');
+    };
+    const modelChips = (p, active, i) => {
+      const list = [...(p.models || []), ...(p.model && !(p.models || []).includes(p.model) ? [p.model] : [])];
+      return list.map((m) => `<button class="btn sm${active && cur.model === m ? ' primary' : ''}" data-op="usemodel" data-i="${i}" data-m="${esc(m)}" title="点击切换为当前模型">${esc(m)}${active && cur.model === m ? ' ✓' : ''}</button>`).join(' ')
+        || '<span class="hint">—</span>';
+    };
+    body.innerHTML = c.profiles.map((p, i) => {
+      const active = inUse(p);
+      return `
+      <tr>
+        <td><b>${esc(p.name)}</b>${active ? '<br><span class="tag ok">使用中</span>' : ''}</td>
+        <td>${p.auth_token?.secretSet ? 'AUTH_TOKEN' : p.api_key?.secretSet ? 'API_KEY' : '<span class="hint">未设凭证</span>'}</td>
+        <td>${p.base_url ? `<code>${esc(p.base_url)}</code>` : '<span class="hint">官方</span>'}</td>
+        <td>${modelChips(p, active, i)}</td>
+        <td>
+          <button class="btn sm" data-op="use" data-i="${i}">设为当前</button>
+          <button class="btn sm" data-op="edit" data-i="${i}">编辑</button>
+          <button class="btn sm danger" data-op="del" data-i="${i}">删除</button>
+        </td>
+      </tr>`;
+    }).join('');
+    body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = async () => {
+      const i = Number(b.dataset.i);
+      const p = c.profiles[i];
+      if (b.dataset.op === 'use' || b.dataset.op === 'usemodel') {
+        // 切换走后端端点（档案凭证明文不出进程）；编辑中先收尾，未保存改动自动落盘再切（如认证模式切换）
+        if (!$('#drawerMask').hidden) return toast('请先完成档案编辑（保存或取消）', true);
+        if (S.dirtyCards.size && !(await saveDoc())) return; // 保存失败已 toast 原因，保持编辑态不切换
+        try {
+          const reqBody = { name: p.name };
+          if (b.dataset.op === 'usemodel') reqBody.model = b.dataset.m;
+          else if (p.model || (p.models || [])[0]) reqBody.model = p.model || p.models[0];
+          const r = await api('POST', '/api/claude/use-profile', reqBody);
+          toast(r.message || '已切换');
+          await refresh();
+        } catch (e) { toast(e.message, true); }
+        return;
+      }
+      if (b.dataset.op === 'del') {
+        if (!window.confirm(`确认删除档案「${p.name || '未命名'}」？删除将立即保存生效。`)) return;
+        c.profiles.splice(i, 1);
+        await saveDoc();
+        return;
+      }
+      openProfileDrawer(c, i, el);
+    });
+  };
+  renderProfiles();
+  $('#pfAdd').onclick = () => {
+    const snap = snapDoc(); // 快照先于 push：取消时连同新增空档案一并回滚
+    c.profiles.push({ name: '' });
+    renderClaude(el);
+    openProfileDrawer(c, c.profiles.length - 1, el, snap);
+  };
+  applyDirty(); // 模式切换等 handler 先 cardDirty 再整卡重渲染：回放防止保存条/圆点随重建丢失
+}
+
+/** 档案编辑抽屉：实时 mutate profile 对象，「保存」一次落盘；凭证留空 = 保持不变（PUT 按 name 对齐回填）。
+ * 模型候选 chips：手输 / 「拉取模型」下拉添加，点 × 删除；默认模型（「设为当前」用）从候选中选 */
+function openProfileDrawer(c, i, el, snap) {
+  const p = c.profiles[i];
+  const hasT = p.auth_token?.secretSet, hasK = p.api_key?.secretSet;
+  const ctype = hasT ? 'auth_token' : 'api_key';
+  openDrawer({
+    title: `厂商档案${p.name ? `：${p.name}` : '（新档案）'}`,
+    snap: snap ?? snapDoc(),
+    bodyHtml: `
+      <label>档案名（显示用，如「官方」「中转站A」）</label>
+      <input type="text" id="dwPfName" value="${esc(p.name || '')}" placeholder="中转站A">
+      <div class="radio-row">
+        <label><input type="radio" name="dwCred" value="auth_token" ${ctype === 'auth_token' ? 'checked' : ''}> AUTH_TOKEN（Bearer，中转站常用）</label>
+        <label><input type="radio" name="dwCred" value="api_key" ${ctype === 'api_key' ? 'checked' : ''}> API_KEY（官方，x-api-key）</label>
+      </div>
+      <label id="dwPfCredLabel">${ctype === 'api_key' ? 'API Key' : 'Auth Token'} ${hasT || hasK ? '（已设置，留空不改）' : ''}</label>
+      <input type="password" id="dwPfCred" placeholder="${hasT || hasK ? '留空保持不变' : 'sk-…'}">
+      <label>BASE_URL（中转站端点，官方留空）</label>
+      <input type="text" id="dwPfBase" value="${esc(p.base_url || '')}" placeholder="https://relay.example.com">
+      <h4 style="margin:18px 0 4px;font-size:13.5px">候选模型（fable / opus / sonnet / haiku 等，各存一条；列表页点击即切换当前模型）</h4>
+      <div class="chips" id="dwPfModels"></div>
+      <div class="row" style="align-items:end;max-width:600px">
+        <div style="flex:1"><input type="text" id="dwPfNewModel" list="dwPfModelList" placeholder="输入或下拉选择后点「添加」">
+          <datalist id="dwPfModelList"></datalist></div>
+        <div class="btn-wrap"><button class="btn" id="dwPfAddModel">添加</button></div>
+        <div class="btn-wrap"><button class="btn" id="dwPfPull">拉取模型</button></div>
+      </div>
+      <div class="row" style="align-items:end;margin-top:12px;max-width:600px">
+        <div style="flex:1"><label>默认模型（点「设为当前」时使用，通常为候选之一）</label>
+          <input type="text" id="dwPfModel" list="dwPfModelsList" value="${esc(p.model || '')}" placeholder="留空 = 切换时不指定">
+          <datalist id="dwPfModelsList"></datalist></div>
+      </div>`,
+    footHtml: `<button class="btn danger" id="dwPfDel">删除档案</button><span class="spacer"></span><button class="btn" id="dwPfCancel">取消</button><button class="btn primary" id="dwPfSave">保存</button>`,
+    onMount: () => {
+      document.querySelectorAll('input[name=dwCred]').forEach((r) => r.onchange = () => {
+        const v = document.querySelector('input[name=dwCred]:checked').value;
+        const t = v === 'auth_token' && hasT ? `（已设置 ${esc(p.auth_token.secretHint)}，留空不改）` : '';
+        const k = v === 'api_key' && hasK ? `（已设置 ${esc(p.api_key.secretHint)}，留空不改）` : '';
+        document.getElementById('dwPfCredLabel').textContent = `${v === 'api_key' ? 'API Key' : 'Auth Token'}${t || k}`;
+      });
+      document.getElementById('dwPfName').oninput = (e) => { p.name = e.target.value.trim(); };
+      document.getElementById('dwPfCred').oninput = (e) => {
+        const v = e.target.value.trim();
+        const key = document.querySelector('input[name=dwCred]:checked').value;
+        const other = key === 'auth_token' ? 'api_key' : 'auth_token';
+        if (v) { p[key] = v; delete p[other]; }
+        else if (!(p[key] && typeof p[key] === 'object')) delete p[key]; // 空输入：保留原脱敏对象（未修改语义）
+      };
+      document.getElementById('dwPfBase').oninput = (e) => { p.base_url = e.target.value.trim() || undefined; };
+      // ---- 候选模型 chips：本地数组编辑，同步 p.models ----
+      const models = [...(p.models || [])];
+      const syncModels = () => {
+        if (models.length) p.models = [...models];
+        else delete p.models;
+        const box = document.getElementById('dwPfModels');
+        box.innerHTML = models.map((m, mi) =>
+          `<span class="chip">${esc(m)}<button type="button" data-rm="${mi}" title="移除">×</button></span>`).join('')
+          || '<span class="hint">尚无候选模型（不影响使用，可随时添加）</span>';
+        box.querySelectorAll('button[data-rm]').forEach((b) => b.onclick = () => {
+          models.splice(Number(b.dataset.rm), 1);
+          syncModels();
+        });
+        document.getElementById('dwPfModelsList').innerHTML = models.map((m) => `<option value="${esc(m)}"></option>`).join('');
+      };
+      syncModels();
+      const addModel = () => {
+        const inp = document.getElementById('dwPfNewModel');
+        const v = inp.value.trim();
+        if (!v) return;
+        if (!models.includes(v)) models.push(v);
+        inp.value = '';
+        syncModels();
+      };
+      document.getElementById('dwPfAddModel').onclick = addModel;
+      document.getElementById('dwPfNewModel').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); addModel(); } };
+      document.getElementById('dwPfModel').oninput = (e) => { p.model = e.target.value.trim() || undefined; };
+      document.getElementById('dwPfPull').onclick = () => {
+        const typed = document.getElementById('dwPfCred').value.trim();
+        const key = document.querySelector('input[name=dwCred]:checked').value;
+        pullModels(() => ({
+          base_url: document.getElementById('dwPfBase').value.trim(),
+          ...(p.name ? { profile_name: p.name } : {}),
+          ...(typed ? { [key]: typed } : {}),
+        }), document.getElementById('dwPfPull'), 'dwPfModelList');
+      };
+      document.getElementById('dwPfDel').onclick = async () => {
+        if (!window.confirm(`确认删除档案「${p.name || '未命名'}」？删除将立即保存生效。`)) return;
+        c.profiles.splice(i, 1);
+        if (await saveDoc()) closeDrawer();
+        else cancelDrawer();
+      };
+      document.getElementById('dwPfCancel').onclick = cancelDrawer;
+      document.getElementById('dwPfSave').onclick = async () => {
+        if (await saveDoc()) closeDrawer();
+      };
+    },
+  });
 }
 
 // ============ 权限 ============
+let permTab = 'allow'; // 页内子 tab 状态：免确认工具 / 危险命令黑名单（重渲染保持）
 function renderPermissions(el) {
   const p = S.doc.permissions || (S.doc.permissions = {});
   p.allow_tools = p.allow_tools || [];
   p.dangerous_commands = p.dangerous_commands || [];
   el.innerHTML = `
   <div class="card">
-    <h3>免确认工具白名单（allow_tools）</h3>
-    <div class="desc">名单内工具直接放行不弹确认卡（配置即整体替换内置默认）。Bash 仍受危险命令黑名单约束。</div>
-    <div class="chips" id="toolChips"></div>
-    <div class="row" style="max-width:420px">
-      <input type="text" id="newTool" placeholder="工具名，如 Write">
-      <button class="btn sm" id="addTool" style="flex:0">添加</button>
+    <div class="subtabs">
+      <button data-t="allow" class="${permTab === 'allow' ? 'active' : ''}">免确认工具</button>
+      <button data-t="danger" class="${permTab === 'danger' ? 'active' : ''}">危险命令黑名单</button>
     </div>
-  </div>
-  <div class="card">
-    <h3>Bash 危险命令黑名单（dangerous_commands）</h3>
-    <div class="desc">正则源串（不区分大小写），命中即弹确认卡。删除正则 = 放宽对应命令为直通，请谨慎。</div>
-    <table><tbody id="dcBody"></tbody></table>
-    <div class="row" style="max-width:640px;margin-top:8px">
-      <input type="text" id="newDc" placeholder="正则源串，如 \\bgit\\s+push\\b.*--force">
-      <button class="btn sm" id="addDc" style="flex:0">添加</button>
-    </div>
-    <div class="footer-note">权限改动经热重载对下一条消息生效（新通道/重启后全量生效）。</div>
+    <div id="permPanel"></div>
   </div>`;
-  const renderChips = () => {
-    $('#toolChips').innerHTML = p.allow_tools.map((t, i) =>
-      `<span class="chip">${esc(t)}<button data-i="${i}">✕</button></span>`).join('');
-    $('#toolChips').querySelectorAll('button').forEach((b) =>
-      b.onclick = () => { p.allow_tools.splice(Number(b.dataset.i), 1); markDirty(); renderPermissions(el); });
-  };
-  renderChips();
-  $('#addTool').onclick = () => {
+  el.querySelectorAll('.subtabs button').forEach((b) =>
+    b.onclick = () => { permTab = b.dataset.t; renderPermissions(el); });
+  const panel = $('#permPanel');
+  if (permTab === 'danger') renderDangerTab(panel, p, el);
+  else renderAllowTab(panel, p, el);
+}
+
+function renderAllowTab(panel, p, el) {
+  const defaults = S.status?.permissionDefaults?.allowTools || [];
+  const isDefault = defaults.length > 0 && JSON.stringify(p.allow_tools) === JSON.stringify(defaults);
+  panel.innerHTML = `
+    <div class="desc">名单内工具直接放行不弹确认卡（配置即整体替换内置默认）。Bash 仍受危险命令黑名单约束。</div>
+    <div class="row" style="max-width:480px;margin:8px 0 10px">
+      <input type="text" id="newTool" placeholder="工具名，如 Write">
+      <div class="btn-wrap"><button class="btn sm" id="addTool">添加</button></div>
+      <div class="btn-wrap"><button class="btn sm" id="resetTools" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button></div>
+    </div>
+    ${p.allow_tools.length === 0 ? '<div style="background:#fff3e0;color:var(--warn);border-radius:7px;padding:7px 12px;margin:8px 0">⚠️ 名单为空：所有工具（含 Write/Edit）都会弹确认卡</div>' : ''}
+    ${isDefault ? '<div class="hint" style="margin:8px 0"><span class="tag off">与内置默认一致</span></div>' : ''}
+    <table><tbody id="toolBody"></tbody></table>
+    <div class="footer-note">权限改动即时保存并经热重载对下一条消息生效（新通道/重启后全量生效）。</div>`;
+  $('#toolBody').innerHTML = p.allow_tools.map((t, i) =>
+    `<tr><td><code>${esc(t)}</code></td><td style="width:80px"><button class="btn sm danger" data-i="${i}">删除</button></td></tr>`).join('')
+    || '<tr><td colspan="2" class="hint">（空）</td></tr>';
+  // 即时保存：低风险高频操作，免去「改完再点保存」两步；失败回滚内存保持一致
+  $('#toolBody').querySelectorAll('button').forEach((b) =>
+    b.onclick = async () => {
+      const old = [...p.allow_tools];
+      p.allow_tools.splice(Number(b.dataset.i), 1);
+      if (!await saveDoc()) p.allow_tools = old;
+    });
+  $('#addTool').onclick = async () => {
     const v = $('#newTool').value.trim();
-    if (!v) return;
-    if (!p.allow_tools.includes(v)) p.allow_tools.push(v);
-    markDirty(); renderPermissions(el);
+    if (!v || p.allow_tools.includes(v)) return;
+    p.allow_tools.push(v);
+    if (!await saveDoc()) p.allow_tools.splice(p.allow_tools.indexOf(v), 1);
+    else if ($('#newTool')) $('#newTool').value = '';
   };
-  const renderDc = () => {
-    $('#dcBody').innerHTML = p.dangerous_commands.map((s, i) => `
-      <tr><td style="width:90%"><code>${esc(s)}</code></td><td><button class="btn sm danger" data-i="${i}">删除</button></td></tr>`).join('');
-    $('#dcBody').querySelectorAll('button').forEach((b) =>
-      b.onclick = () => { p.dangerous_commands.splice(Number(b.dataset.i), 1); markDirty(); renderPermissions(el); });
+  $('#resetTools').onclick = async () => {
+    if (!defaults.length) return;
+    if (!window.confirm('恢复为内置默认名单？当前自定义项将被覆盖（立即保存生效）。')) return;
+    const old = [...p.allow_tools];
+    p.allow_tools = [...defaults];
+    if (!await saveDoc()) p.allow_tools = old;
   };
-  renderDc();
-  $('#addDc').onclick = () => {
+}
+
+function renderDangerTab(panel, p, el) {
+  const defaults = S.status?.permissionDefaults?.dangerousCommands || [];
+  const isDefault = defaults.length > 0 && JSON.stringify(p.dangerous_commands) === JSON.stringify(defaults);
+  panel.innerHTML = `
+    <div class="desc">正则源串（不区分大小写），命中即弹确认卡。删除正则 = 放宽对应命令为直通，请谨慎。</div>
+    <div class="row" style="max-width:680px;margin:8px 0 10px">
+      <input type="text" id="newDc" placeholder="正则源串，如 \\bgit\\s+push\\b.*--force">
+      <div class="btn-wrap"><button class="btn sm" id="addDc">添加</button></div>
+      <div class="btn-wrap"><button class="btn sm" id="resetDc" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button></div>
+    </div>
+    ${p.dangerous_commands.length === 0 ? '<div style="background:#fee;color:var(--danger);border-radius:7px;padding:7px 12px;margin:8px 0">⚠️ 黑名单为空：所有 Bash 命令（含 rm -rf、sudo）将免确认直通，请确认有意为之</div>' : ''}
+    ${isDefault ? '<div class="hint" style="margin:8px 0"><span class="tag off">与内置默认一致</span></div>' : ''}
+    <table><tbody id="dcBody"></tbody></table>
+    <div class="footer-note">权限改动即时保存并经热重载对下一条消息生效（新通道/重启后全量生效）。</div>`;
+  $('#dcBody').innerHTML = p.dangerous_commands.map((s, i) =>
+    `<tr><td style="width:90%"><code>${esc(s)}</code></td><td><button class="btn sm danger" data-i="${i}">删除</button></td></tr>`).join('')
+    || '<tr><td colspan="2" class="hint">（空）</td></tr>';
+  $('#dcBody').querySelectorAll('button').forEach((b) =>
+    b.onclick = async () => {
+      const old = [...p.dangerous_commands];
+      p.dangerous_commands.splice(Number(b.dataset.i), 1);
+      if (!await saveDoc()) p.dangerous_commands = old;
+    });
+  $('#addDc').onclick = async () => {
     const v = $('#newDc').value.trim();
     if (!v) return;
     try { new RegExp(v, 'i'); } catch (e) { return toast(`正则无效：${e.message}`, true); }
     p.dangerous_commands.push(v);
-    markDirty(); renderPermissions(el);
+    if (!await saveDoc()) p.dangerous_commands.splice(p.dangerous_commands.indexOf(v), 1);
+    else if ($('#newDc')) $('#newDc').value = '';
+  };
+  $('#resetDc').onclick = async () => {
+    if (!defaults.length) return;
+    if (!window.confirm('恢复为内置默认黑名单？当前自定义项将被覆盖（立即保存生效）。')) return;
+    const old = [...p.dangerous_commands];
+    p.dangerous_commands = [...defaults];
+    if (!await saveDoc()) p.dangerous_commands = old;
   };
 }
 
-// ============ 斜杠命令（extras 编辑 + 一键同步） ============
+// ============ 斜杠命令（远端直操作飞书 API；本页与 config.yaml / 保存按钮无关） ============
 function renderSlash(el) {
-  const sc = S.doc.slash_commands || (S.doc.slash_commands = {});
-  sc.extra = sc.extra || [];
   el.innerHTML = `
   <div class="card">
-    <h3>飞书斜杠命令</h3>
-    <div class="desc">同步后在飞书聊天输入 <code>/</code> 弹出指令面板，选中后命令留在输入框可继续输入描述再发送。<b>内置命令</b>（help/new/resume/stop/status/ws/model/skills/plugins/mcp）始终参与同步；下表为自定义透传命令。</div>
-    <table><thead><tr><th style="width:160px">命令（不带 /）</th><th>描述</th><th style="width:150px">图标 icon_key（可空）</th><th style="width:50px"></th></tr></thead>
-    <tbody id="scBody"></tbody></table>
-    <button class="btn sm" id="scAdd" style="margin-top:10px">+ 添加命令</button>
-  </div>
-  <div class="card">
-    <h3>一键同步到飞书</h3>
-    <div class="desc">需在飞书开放平台给应用开通 <code>application:app_slash_command:write/read</code> 权限并发布版本。同步为全量对齐（远端多余命令会被删除）；生效约 5 分钟，PC 端需 7.70+。<b>表格改动请先保存再同步</b>。</div>
-    <div class="row" style="align-items:end;max-width:560px">
-      <div><label>目标应用</label><select id="syncApp"></select></div>
-      <button class="btn" id="btnRemote" style="flex:0">查看远端</button>
-      <button class="btn primary" id="btnSync" style="flex:0">一键同步</button>
+    <h3>飞书斜杠命令（远端管理）</h3>
+    <div class="desc">直接读写飞书开放平台已注册的斜杠命令；聊天输入 <code>/</code> 弹出指令面板，选中后可继续输入描述再发送。需给应用开通 <code>application:app_slash_command</code> 读写权限并发布版本；改动约 5 分钟后生效（PC 端 7.70+）。<b>本页操作即时提交飞书，与底部「保存」按钮无关。</b></div>
+    <div class="row" style="align-items:end">
+      <div style="max-width:320px"><label>目标应用</label><select id="scApp"></select></div>
+      <button class="btn" id="scReload">刷新列表</button>
+      <button class="btn primary" id="scAdd">+ 新增命令</button>
+      <button class="btn" id="scBuiltins">补齐内置命令</button>
     </div>
-    <div id="syncReport" style="margin-top:12px"></div>
+    <table style="margin-top:12px"><thead><tr><th style="width:170px">命令</th><th>描述</th><th style="width:150px">图标</th><th style="width:130px">操作</th></tr></thead>
+    <tbody id="scBody"><tr><td colspan="4" class="hint">加载中…</td></tr></tbody></table>
+    <pre class="report" id="scReport" style="display:none;margin-top:12px"></pre>
   </div>`;
-  const body = $('#scBody');
-  const renderRow = (item, idx) => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td><input type="text" data-f="command" value="${esc(item.command || '')}" placeholder="produce"></td>
-      <td><input type="text" data-f="description" value="${esc(item.description || '')}" placeholder="内容生产流程"></td>
-      <td><input type="text" data-f="icon" value="${esc(item.icon || '')}" placeholder="skill_outlined"></td>
-      <td><button class="btn sm danger">删</button></td>`;
-    tr.querySelectorAll('[data-f]').forEach((input) => input.oninput = () => {
-      if (input.dataset.f === 'icon') { if (input.value.trim()) item.icon = input.value.trim(); else delete item.icon; }
-      else item[input.dataset.f] = input.value.trim();
-      markDirty();
-    });
-    tr.querySelector('.btn').onclick = () => { sc.extra.splice(idx, 1); markDirty(); renderSlash(el); };
-    body.appendChild(tr);
-  };
-  sc.extra.forEach(renderRow);
-  $('#scAdd').onclick = () => { sc.extra.push({ command: '', description: '' }); markDirty(); renderSlash(el); };
-  // 同步区块
-  const appSel = $('#syncApp');
+  const appSel = $('#scApp');
   (S.status?.apps || []).forEach((a) => {
     const opt = document.createElement('option');
     opt.value = a.name;
     opt.textContent = `${a.name}（${a.appId}）`;
     appSel.appendChild(opt);
   });
-  const showReport = (title, content, isErr) => {
-    $('#syncReport').innerHTML = `<div class="hint" style="margin-bottom:6px">${title}</div><pre class="report">${esc(content)}</pre>${isErr ? '' : ''}`;
+  const showReport = (title, content) => {
+    $('#scReport').style.display = '';
+    $('#scReport').textContent = `${title}\n${content}`;
   };
-  $('#btnRemote').onclick = async () => {
+  const loadRemote = async () => {
+    if (!appSel.value) { $('#scBody').innerHTML = '<tr><td colspan="4" class="hint">无可用应用（先到「飞书应用」页配置并保存）</td></tr>'; return; }
+    $('#scBody').innerHTML = '<tr><td colspan="4" class="hint">加载中…</td></tr>';
     try {
-      showReport('查询中…', '');
       const r = await api('GET', `/api/slash-commands/remote?app=${encodeURIComponent(appSel.value)}`);
-      showReport(`远端已注册 ${r.remote.length} 条`, r.remote.map((x) => `/${x.command} — ${x.description?.default_value || ''}`).join('\n') || '（空）', false);
-    } catch (e) { showReport('查询失败', e.message, true); toast(e.message, true); }
+      $('#scBody').innerHTML = r.remote.map((x) => `
+        <tr data-cid="${esc(x.command_id)}" data-cmd="${esc(x.command)}">
+          <td><code>/${esc(x.command)}</code></td>
+          <td>${esc(x.description?.default_value || '')}</td>
+          <td class="hint">${esc(x.description?.icon?.icon_key || '—')}</td>
+          <td>
+            <button class="btn sm" data-op="edit">编辑</button>
+            <button class="btn sm danger" data-op="del">删除</button>
+          </td>
+        </tr>`).join('') || '<tr><td colspan="4" class="hint">远端暂无命令；点「补齐内置命令」一键注册 bridge 内置指令</td></tr>';
+      $('#scBody').querySelectorAll('button[data-op]').forEach((b) => b.onclick = () => {
+        const tr = b.closest('tr');
+        if (b.dataset.op === 'del') return delRemote(tr.dataset.cid, tr.dataset.cmd);
+        openSlashDrawer({
+          commandId: tr.dataset.cid,
+          command: tr.dataset.cmd,
+          description: tr.children[1].textContent,
+          icon: tr.children[2].textContent === '—' ? '' : tr.children[2].textContent,
+        });
+      });
+    } catch (e) {
+      $('#scBody').innerHTML = `<tr><td colspan="4" class="hint">加载失败：${esc(e.message)}（确认已开通斜杠命令权限后点「刷新列表」重试）</td></tr>`;
+    }
   };
-  $('#btnSync').onclick = async () => {
-    if (S.dirty) return toast('有未保存的修改，请先保存再同步', true);
-    $('#btnSync').disabled = true;
+  const delRemote = async (cid, cmd) => {
+    if (!window.confirm(`确认删除远端命令 /${cmd}？（约 5 分钟后从飞书面板消失，不可恢复）`)) return;
     try {
-      const r = await api('POST', '/api/slash-commands/sync', { app: appSel.value });
-      const lines = [
-        r.created.length ? `✅ 新建 ${r.created.length}：${r.created.join('、')}` : '· 无新建',
-        r.updated.length ? `🔄 更新 ${r.updated.length}：${r.updated.join('、')}` : '· 无更新',
-        r.deleted.length ? `🗑️ 删除 ${r.deleted.length}：${r.deleted.join('、')}` : '· 无删除',
-        `✔️ 未变 ${r.unchanged.length} 条`,
-        ...(r.errors.length ? [`⚠️ 失败 ${r.errors.length}：`, ...r.errors.map((e) => `  ${e.command}: ${e.error}`)] : []),
-      ];
-      showReport(`同步完成（约 5 分钟后飞书客户端生效）`, lines.join('\n'), r.errors.length > 0);
-      toast(r.errors.length ? `同步完成，但有 ${r.errors.length} 条失败（详见报告）` : '✅ 同步完成，约 5 分钟后生效');
-    } catch (e) { showReport('同步失败', e.message, true); toast(e.message, true); }
-    $('#btnSync').disabled = false;
+      await api('POST', '/api/slash-commands/action', { op: 'delete', app: appSel.value, commandId: cid });
+      toast(`已删除 /${cmd}`);
+      loadRemote();
+    } catch (e) { toast(e.message, true); }
   };
+  const openSlashDrawer = ({ commandId, command, description, icon }) => {
+    const isCreate = !commandId;
+    openDrawer({
+      title: isCreate ? '新增斜杠命令' : `编辑 /${command}`,
+      bodyHtml: `
+        <label>命令（不带 /）</label>
+        <input type="text" id="dcCmd" ${isCreate ? '' : 'disabled title="飞书侧命令名不可修改（如需改名请删除后重建）"'} value="${esc(command || '')}" placeholder="produce">
+        <label>描述（指令面板展示）</label>
+        <input type="text" id="dcDesc" value="${esc(description || '')}" placeholder="内容生产流程">
+        <label>图标 icon_key（可空，取值见飞书开放平台图标列表）</label>
+        <input type="text" id="dcIcon" value="${esc(icon || '')}" placeholder="skill_outlined">`,
+      footHtml: `<button class="btn primary" id="dcSave">${isCreate ? '创建（即时提交飞书）' : '保存（即时提交飞书）'}</button>`,
+      onMount: () => {
+        document.getElementById('dcSave').onclick = async () => {
+          const cmd = document.getElementById('dcCmd').value.trim();
+          const desc = document.getElementById('dcDesc').value.trim();
+          const ic = document.getElementById('dcIcon').value.trim();
+          if (!desc) return toast('描述不能为空', true);
+          try {
+            if (isCreate) {
+              if (!cmd) return toast('命令名不能为空', true);
+              await api('POST', '/api/slash-commands/action', { op: 'create', app: appSel.value, command: cmd, description: desc, icon: ic });
+            } else {
+              await api('POST', '/api/slash-commands/action', { op: 'update', app: appSel.value, commandId, description: desc, icon: ic });
+            }
+            toast(isCreate ? `已创建 /${cmd}` : '已保存');
+            closeDrawer();
+            loadRemote();
+          } catch (e) { toast(e.message, true); }
+        };
+      },
+    });
+  };
+  appSel.onchange = loadRemote;
+  $('#scReload').onclick = loadRemote;
+  $('#scAdd').onclick = () => openSlashDrawer({ command: '', description: '', icon: '' });
+  $('#scBuiltins').onclick = async () => {
+    if (!appSel.value) return;
+    $('#scBuiltins').disabled = true;
+    try {
+      const r = await api('POST', '/api/slash-commands/sync', { app: appSel.value, mode: 'builtins-only' });
+      const lines = [
+        r.created.length ? `✅ 新建 ${r.created.length}：${r.created.join('、')}` : '· 内置命令已齐全（无新建）',
+        ...(r.errors.length ? [`⚠️ 失败 ${r.errors.length}：`, ...r.errors.map((e) => `  ${e.command}: ${e.error}`)] : []),
+        '（只补缺失的内置命令，不会删除或修改远端已有命令）',
+      ];
+      showReport('补齐内置命令完成（约 5 分钟后飞书生效）', lines.join('\n'));
+      toast(r.errors.length ? `补齐完成，但 ${r.errors.length} 条失败（详见报告）` : '✅ 内置命令已补齐，约 5 分钟后生效');
+      loadRemote();
+    } catch (e) { showReport('补齐失败', e.message); toast(e.message, true); }
+    $('#scBuiltins').disabled = false;
+  };
+  loadRemote();
 }
 
 // ============ 插件 ============
@@ -573,20 +1318,29 @@ async function renderPlugins(el) {
   el.innerHTML = `
   <div class="card">
     <h3>Claude Code 插件</h3>
-    <div class="desc">安装到当前认证模式对应的 Claude 配置目录：<code id="pluginDir">…</code>。装好后下一条消息自动加载。飞书端同样可用 <code>/plugin install xxx@marketplace</code>（仅管理员）。</div>
-    <table><thead><tr><th>插件</th><th>市场</th><th>版本</th><th style="width:90px">状态</th><th style="width:200px">操作</th></tr></thead>
-    <tbody id="plBody"><tr><td colspan="5" class="hint">加载中…</td></tr></tbody></table>
+    <div class="desc">两处目录的已启用插件都会自动加载（managed 托管目录优先）：本机 <code>~/.claude</code>（来源「本机」，与本机 claude CLI 共用）与 bridge 托管目录 <code id="pluginDir">…</code>。装好后下一条消息自动加载。飞书端同样可用 <code>/plugin install xxx@marketplace</code>（仅管理员）。</div>
+    <table><thead><tr><th>插件</th><th>市场</th><th>来源</th><th>版本</th><th style="width:90px">状态</th><th style="width:200px">操作</th></tr></thead>
+    <tbody id="plBody"><tr><td colspan="6" class="hint">加载中…</td></tr></tbody></table>
   </div>
   <div class="card">
     <h3>安装 / 市场</h3>
-    <div class="row" style="max-width:560px">
+    <div class="row" style="max-width:680px">
       <input type="text" id="plInstall" placeholder="name 或 name@marketplace">
-      <button class="btn primary" id="plDoInstall" style="flex:0">安装</button>
+      <select id="plDir" style="max-width:170px">
+        <option value="user" selected>装到本机 ~/.claude</option>
+        <option value="bridge">装到 bridge 托管目录</option>
+      </select>
+      <button class="btn primary" id="plDoInstall">安装</button>
     </div>
-    <div class="row" style="max-width:560px;margin-top:10px">
+    <div class="hint" style="margin:6px 0">默认装本机 ~/.claude：本机 claude CLI 与桥接器两处共用一份，无须安装两次。</div>
+    <div class="row" style="max-width:680px;margin-top:10px">
       <input type="text" id="plMarket" placeholder="marketplace git 地址或本机路径">
-      <button class="btn" id="plDoMarketAdd" style="flex:0">添加市场</button>
-      <button class="btn" id="plDoMarketUpdate" style="flex:0">全部更新</button>
+      <select id="plMarketDir" style="max-width:170px">
+        <option value="user" selected>本机 ~/.claude</option>
+        <option value="bridge">bridge 托管目录</option>
+      </select>
+      <button class="btn" id="plDoMarketAdd">添加市场</button>
+      <button class="btn" id="plDoMarketUpdate">全部更新</button>
     </div>
     <pre class="report" id="plReport" style="display:none;margin-top:12px"></pre>
   </div>`;
@@ -600,53 +1354,39 @@ async function renderPlugins(el) {
       $('#pluginDir').textContent = r.configDir;
       const body = $('#plBody');
       if (!r.plugins.length) {
-        body.innerHTML = '<tr><td colspan="5" class="hint">尚未安装任何插件</td></tr>';
+        body.innerHTML = '<tr><td colspan="6" class="hint">尚未安装任何插件</td></tr>';
         return;
       }
       body.innerHTML = r.plugins.map((p) => `
         <tr>
           <td><b>${esc(p.name)}</b></td>
           <td>${esc(p.marketplace || '-')}</td>
+          <td>${p.source === 'bridge' ? '<span class="tag warn">bridge 托管</span>' : '<span class="tag off">本机 ~/.claude</span>'}</td>
           <td class="hint">${esc(p.version || '-')}</td>
           <td>${p.enabled ? '<span class="tag ok">已启用</span>' : '<span class="tag off">未启用</span>'}</td>
           <td>
-            <button class="btn sm" data-op="${p.enabled ? 'disable' : 'enable'}" data-arg="${esc(p.key)}">${p.enabled ? '停用' : '启用'}</button>
-            <button class="btn sm danger" data-op="uninstall" data-arg="${esc(p.key)}">卸载</button>
+            <button class="btn sm" data-op="${p.enabled ? 'disable' : 'enable'}" data-arg="${esc(p.key)}" data-dir="${p.source}">${p.enabled ? '停用' : '启用'}</button>
+            <button class="btn sm danger" data-op="uninstall" data-arg="${esc(p.key)}" data-dir="${p.source}">卸载</button>
           </td>
         </tr>`).join('');
-      body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = () => act(b.dataset.op, b.dataset.arg));
+      body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = () => act(b.dataset.op, b.dataset.arg, b.dataset.dir));
     } catch (e) {
-      $('#plBody').innerHTML = `<tr><td colspan="5" class="hint">加载失败：${esc(e.message)}</td></tr>`;
+      $('#plBody').innerHTML = `<tr><td colspan="6" class="hint">加载失败：${esc(e.message)}</td></tr>`;
     }
   };
-  const act = async (op, arg) => {
-    report(`执行中：${op} ${arg}`, '…（安装/更新可能需要拉取仓库，请稍候）');
+  const act = async (op, arg, dir) => {
+    report(`执行中：${op} ${arg}${dir ? `（${dir === 'bridge' ? 'bridge 托管目录' : '本机 ~/.claude'}）` : ''}`, '…（安装/更新可能需要拉取仓库，请稍候）');
     try {
-      const r = await api('POST', '/api/plugins/action', { op, arg });
+      const r = await api('POST', '/api/plugins/action', { op, arg, ...(dir ? { dir } : {}) });
       report(r.ok ? `✅ ${op} 完成` : `❌ ${op} 失败`, r.text);
       if (r.ok) { await load(); toast(`${op} 完成`); }
       else toast(`${op} 失败：${r.text.slice(0, 120)}`, true);
     } catch (e) { report(`❌ ${op} 失败`, e.message); toast(e.message, true); }
   };
-  $('#plDoInstall').onclick = () => act('install', $('#plInstall').value.trim());
-  $('#plDoMarketAdd').onclick = () => act('marketplace-add', $('#plMarket').value.trim());
-  $('#plDoMarketUpdate').onclick = () => act('marketplace-update', '');
+  $('#plDoInstall').onclick = () => act('install', $('#plInstall').value.trim(), $('#plDir').value);
+  $('#plDoMarketAdd').onclick = () => act('marketplace-add', $('#plMarket').value.trim(), $('#plMarketDir').value);
+  $('#plDoMarketUpdate').onclick = () => act('marketplace-update', '', $('#plMarketDir').value);
   await load();
-}
-
-// ============ 保存 ============
-async function save() {
-  if (S.firstRun) return;
-  try {
-    const r = await api('PUT', '/api/config', S.doc);
-    clearDirty();
-    if (r.restartRequired?.length) {
-      toast(`已保存。注意：${r.restartRequired.join('、')} 段改动需重启 lcb start 后生效`, true);
-    } else {
-      toast('已保存（运行中的桥接器下一条消息自动生效）');
-    }
-    await refresh();
-  } catch (e) { toast(`保存失败：${e.message}`, true); }
 }
 
 // ============ 初始化 ============
@@ -665,10 +1405,11 @@ async function refresh() {
   }
   const st = S.status || {};
   $('#hMeta').textContent = `v${st.version || '?'} · ${location.host}`;
+  // 版本错位检测：静态页每次现读磁盘（新），API 属于运行中进程（旧）——status 无 bridge
+  // 字段说明进程早于「页面托管启停」功能，提示重启而非让用户撞「未知端点」
+  $('#staleBar').hidden = !(S.status && S.status.bridge === undefined);
   render();
 }
-$('#btnSave').onclick = save;
-$('#btnReload').onclick = async () => { await refresh(); clearDirty(); toast('已还原为磁盘配置'); };
 refresh().catch((e) => { $('#main').innerHTML = `<div class="card"><h3>加载失败</h3><div class="desc">${esc(e.message)}</div></div>`; });
 </script>
 </body>

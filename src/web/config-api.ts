@@ -2,6 +2,7 @@
 // 无 IO（读写盘在 server.ts），tests/web/config-api.test.ts 直接单测
 import type { BridgeConfig, FeishuAppConfig } from '../types.js';
 import { sameApps } from '../config.js';
+import { DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMAND_SOURCES } from '../executor/permission-gate.js';
 
 /** secret 字段的脱敏回显形状（真实值永不离开本机进程） */
 export interface SecretHint { secretSet: boolean; secretHint?: string }
@@ -42,6 +43,22 @@ export function applySecrets(newDoc: Record<string, unknown>, oldDoc: Record<str
     for (const key of ['auth_token', 'api_key'] as const) {
       if (isUnchangedSecret(newClaude[key])) newClaude[key] = oldClaude[key];
     }
+    // 多厂商档案（0.13）：按 name 对齐回填未修改的凭证（同 apps 按 app_id 对齐的考虑）
+    if (Array.isArray(newClaude.profiles)) {
+      const oldByName = new Map(
+        (Array.isArray(oldClaude.profiles) ? oldClaude.profiles as Array<Record<string, unknown>> : [])
+          .map((p) => [String(p?.name ?? ''), p]),
+      );
+      newClaude.profiles = (newClaude.profiles as Array<Record<string, unknown>>).map((p) => {
+        const old = oldByName.get(String(p?.name ?? ''));
+        if (!old) return p; // 新档案：提交值即最终值（无凭证无内容会被 normalizeClaude 剔除）
+        const merged = { ...p };
+        for (const key of ['auth_token', 'api_key'] as const) {
+          if (isUnchangedSecret(merged[key])) merged[key] = old[key];
+        }
+        return merged;
+      });
+    }
     doc.claude = newClaude;
   }
   return doc;
@@ -60,6 +77,13 @@ export function docForClient(doc: Record<string, unknown>): Record<string, unkno
     const c = { ...(out.claude as Record<string, unknown>) };
     for (const key of ['auth_token', 'api_key'] as const) {
       c[key] = maskSecret(typeof c[key] === 'string' ? c[key] as string : undefined);
+    }
+    if (Array.isArray(c.profiles)) {
+      c.profiles = (c.profiles as Array<Record<string, unknown>>).map((p) => ({
+        ...p,
+        auth_token: maskSecret(typeof p?.auth_token === 'string' ? p.auth_token : undefined),
+        api_key: maskSecret(typeof p?.api_key === 'string' ? p.api_key : undefined),
+      }));
     }
     out.claude = c;
   }
@@ -114,4 +138,51 @@ export function appStatusSummary(apps: FeishuAppConfig[], started?: Array<{ name
     appId: a.appId,
     started: started?.find((s) => s.name === a.name)?.started ?? 'unknown',
   }));
+}
+
+/**
+ * GET /api/config 显示层权限默认回填：permissions 键缺失（undefined/null，多见于老版本升级配置）时
+ * 回显运行时默认，让用户「打开页面就能看到/编辑默认值」；键存在但为空数组 = 用户有意清空，原样返回。
+ * PUT 整段替换语义下「回显 → 保存 → 固化写盘」为预期行为（老配置保存会把该段固化为默认并重写，
+ * 丢段内手写注释；bootstrap 出身的配置磁盘已有相同默认，走「值未变跳过重写」不受影响）。
+ */
+export function applyPermissionDisplayDefaults(doc: Record<string, unknown>): Record<string, unknown> {
+  const p = doc.permissions;
+  if (p === undefined || p === null) {
+    return { ...doc, permissions: { allow_tools: [...DEFAULT_ALLOW_TOOLS_LIST], dangerous_commands: [...DEFAULT_DANGEROUS_COMMAND_SOURCES] } };
+  }
+  if (typeof p !== 'object' || Array.isArray(p)) return doc; // 脏形状：loadConfig/parseConfigText 会拦，GET 原样透出
+  const np = { ...(p as Record<string, unknown>) };
+  let changed = false;
+  if (np.allow_tools === undefined || np.allow_tools === null) { np.allow_tools = [...DEFAULT_ALLOW_TOOLS_LIST]; changed = true; }
+  if (np.dangerous_commands === undefined || np.dangerous_commands === null) { np.dangerous_commands = [...DEFAULT_DANGEROUS_COMMAND_SOURCES]; changed = true; }
+  return changed ? { ...doc, permissions: np } : doc;
+}
+
+/** 当前生效 Claude 配置摘要（GET /api/status 展示用）：settings.json 内容 → 凭证脱敏。inherit/managed 均适用 */
+export interface ClaudeCurrentSummary {
+  baseUrl?: string;
+  model?: string;
+  authToken: SecretHint;
+  apiKey: SecretHint;
+}
+
+/** 纯函数：解析 settings.json（顶层 model + env 块 ANTHROPIC_*），凭证过 maskSecret，明文永不离开本机 */
+export function claudeSettingsSummary(settings: unknown): ClaudeCurrentSummary {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    return { authToken: maskSecret(undefined), apiKey: maskSecret(undefined) };
+  }
+  const doc = settings as Record<string, unknown>;
+  const env = doc.env && typeof doc.env === 'object' && !Array.isArray(doc.env)
+    ? doc.env as Record<string, unknown>
+    : {};
+  const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v : undefined);
+  const baseUrl = str(env.ANTHROPIC_BASE_URL);
+  const model = str(env.ANTHROPIC_MODEL) ?? str(doc.model);
+  return {
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(model ? { model } : {}),
+    authToken: maskSecret(str(env.ANTHROPIC_AUTH_TOKEN)),
+    apiKey: maskSecret(str(env.ANTHROPIC_API_KEY)),
+  };
 }

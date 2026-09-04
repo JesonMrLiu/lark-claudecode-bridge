@@ -9,7 +9,8 @@ import { CONFIG_DIR } from './config.js';
 import type { BridgeConfig, ClaudeConfig } from './types.js';
 
 export const MANAGED_CLAUDE_DIR = join(CONFIG_DIR, 'claude');
-const DEFAULT_CLAUDE_DIR = join(homedir(), '.claude');
+/** 本机默认 ~/.claude（inherit 模式生效目录；managed 模式下作为插件第二来源目录） */
+export const DEFAULT_CLAUDE_DIR = join(homedir(), '.claude');
 
 /** 双模式目录解析：managed → bridge 自管目录；其余（含缺省）→ 共享 ~/.claude */
 export function resolveClaudeDir(config: BridgeConfig): string {

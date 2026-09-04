@@ -1,0 +1,7 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - heading "飞书ClaudeCode桥接器" [level=1] [ref=e3]
+    - generic [ref=e7]: 加载中…
+  - generic [ref=e8]:
+    - navigation [ref=e9]
+    - main [ref=e10]

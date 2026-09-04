@@ -43,6 +43,8 @@ export interface CommandContext {
   getInventory(): SessionInventory | undefined;
   /** Claude 配置目录（/plugin 安装目标）。wiring 注入；未注入时 /plugin 回复不可用 */
   claudeConfigDir?: string;
+  /** 本机 ~/.claude（managed 模式下作为插件第二来源与默认安装目标） */
+  userClaudeDir?: string;
   /** 异步消息通道：/plugin 长操作 ack 后异步推送结果。wiring 注入 gateway.sendTextTo */
   send?: (markdown: string) => Promise<void>;
 }
@@ -220,6 +222,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       return { handled: true, reply: await handlePluginCommand(args, {
         isAdmin: ctx.isAdmin,
         claudeConfigDir: ctx.claudeConfigDir,
+        userClaudeDir: ctx.userClaudeDir,
         send: ctx.send,
       }) };
     }

@@ -22,11 +22,16 @@ export interface SlashApiClient {
   remove(commandId: string): Promise<void>;
 }
 
-/** 期望集 = 内置命令（SLASH_COMMAND_META 全量）+ config extras；与内置重名的 extra 跳过（内置优先） */
-export function expectedCommands(config: BridgeConfig): SlashCommandDef[] {
-  const out: SlashCommandDef[] = Object.entries(SLASH_COMMAND_META).map(([command, meta]) => ({
+/** 内置命令集（SLASH_COMMAND_META 全量映射为注册定义）——expectedCommands 与 ensureBuiltins 共用 */
+export function builtinCommands(): SlashCommandDef[] {
+  return Object.entries(SLASH_COMMAND_META).map(([command, meta]) => ({
     command, description: meta.description, icon: meta.icon,
   }));
+}
+
+/** 期望集 = 内置命令（SLASH_COMMAND_META 全量）+ config extras；与内置重名的 extra 跳过（内置优先） */
+export function expectedCommands(config: BridgeConfig): SlashCommandDef[] {
+  const out = builtinCommands();
   const seen = new Set(out.map((d) => d.command));
   for (const extra of config.slashCommands?.extra ?? []) {
     if (seen.has(extra.command)) {
@@ -124,6 +129,34 @@ export async function syncSlashCommands(client: SlashApiClient, expected: SlashC
       report.deleted.push(command);
     } catch (e) {
       report.errors.push({ command, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  return report;
+}
+
+/**
+ * 只补齐远端缺失的内置命令（0.13 Web 页「补齐内置命令」按钮）：
+ * list → 内置差集 → 逐条 create，**绝不 delete/update 远端已有命令**（用户手动注册的命令不受影响）。
+ * deleted/updated 恒空；already-exists（并发残留）计 unchanged。
+ */
+export async function ensureBuiltins(client: SlashApiClient, builtins: SlashCommandDef[]): Promise<SyncReport> {
+  const report: SyncReport = { created: [], updated: [], deleted: [], unchanged: [], errors: [] };
+  let remote: RemoteSlashCommand[];
+  try {
+    remote = await client.list();
+  } catch (e) {
+    report.errors.push({ command: '(list)', error: e instanceof Error ? e.message : String(e) });
+    return report;
+  }
+  const names = new Set(remote.map((r) => r.command));
+  for (const def of builtins) {
+    if (names.has(def.command)) { report.unchanged.push(def.command); continue; }
+    try {
+      await client.create(def);
+      report.created.push(def.command);
+    } catch (e) {
+      if (isAlreadyExists(e)) { report.unchanged.push(def.command); continue; }
+      report.errors.push({ command: def.command, error: e instanceof Error ? e.message : String(e) });
     }
   }
   return report;

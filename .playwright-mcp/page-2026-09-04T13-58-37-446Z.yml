@@ -1,0 +1,96 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - heading "飞书ClaudeCode桥接器" [level=1] [ref=e3]
+    - generic [ref=e7]: v0.13.0 · 127.0.0.1:17317
+  - generic [ref=e8]:
+    - navigation [ref=e9]:
+      - button "概览" [ref=e170] [cursor=pointer]
+      - button "飞书应用" [ref=e178] [cursor=pointer]
+      - button "工作区" [ref=e184] [cursor=pointer]
+      - button "Claude 认证" [ref=e189] [cursor=pointer]
+      - button "权限" [ref=e196] [cursor=pointer]
+      - button "斜杠命令" [ref=e201] [cursor=pointer]
+      - button "插件" [ref=e206] [cursor=pointer]
+    - main [ref=e10]:
+      - generic [ref=e247]:
+        - heading "当前生效配置" [level=3] [ref=e248]
+        - generic [ref=e249]: 认证模式与实际生效的值（凭证脱敏显示）。managed 模式改动保存后对后续任务即生效；模式切换需重启。
+        - table [ref=e250]:
+          - rowgroup [ref=e251]:
+            - row [ref=e252]:
+              - cell "认证模式" [ref=e253]
+              - cell "bridge 托管（managed）" [ref=e254]
+            - row [ref=e255]:
+              - cell "BASE_URL" [ref=e256]
+              - cell [ref=e257]:
+                - code [ref=e258]: https://open.bigmodel.cn/api/anthropic
+            - row [ref=e259]:
+              - cell "模型" [ref=e260]
+              - cell [ref=e261]:
+                - code [ref=e262]: glm-5.3[1M]
+            - row [ref=e263]:
+              - cell "Auth Token" [ref=e264]
+              - cell "已设置（••••n3l2）" [ref=e265]
+            - row [ref=e266]:
+              - cell "API Key" [ref=e267]
+              - cell "未设置" [ref=e268]
+            - row [ref=e269]:
+              - cell "settings.json" [ref=e270]
+              - cell [ref=e271]:
+                - code [ref=e272]: C:\Users\mailj\.claude\settings.json
+      - generic [ref=e273]:
+        - heading "认证模式· 未保存" [level=3] [ref=e274]
+        - generic [ref=e275]:
+          - generic [ref=e276] [cursor=pointer]:
+            - radio "继承本机 ~/.claude（已在本机 claude login）" [ref=e277]
+            - text: 继承本机 ~/.claude（已在本机 claude login）
+          - generic [ref=e278] [cursor=pointer]:
+            - radio "bridge 托管（填 API Key / Token，无需本机登录）" [checked] [ref=e279]
+            - text: bridge 托管（填 API Key / Token，无需本机登录）
+        - generic [ref=e280]:
+          - generic [ref=e281]: 常规用法：在下方「厂商档案」保存凭证后点「设为当前」即可，无须手动填写。
+          - group [ref=e282]:
+            - generic "高级：手动编辑当前生效凭证" [ref=e283] [cursor=pointer]
+          - generic [ref=e284]:
+            - generic [ref=e285]: 有未保存的修改
+            - button "还原" [ref=e286] [cursor=pointer]
+            - button "保存" [ref=e287] [cursor=pointer]
+        - generic [ref=e288]:
+          - text: managed 模式把认证写入
+          - code [ref=e289]: ~/.lark-claudecode-bridge/claude/settings.json
+          - text: ，与本机 ~/.claude 完全隔离；认证/模型改动保存后对后续任务即生效，模式切换需重启。
+      - generic [ref=e290]:
+        - heading "厂商档案" [level=3] [ref=e291]
+        - generic [ref=e292]: 保存多套厂商 / 中转站凭证，每个档案可维护多个候选模型（如 fable / opus / sonnet / haiku）。「设为当前」整套切换；点候选模型即时切换当前模型。档案在抽屉「保存」后即可切换。
+        - button "+ 新增档案" [ref=e294] [cursor=pointer]
+        - table [ref=e295]:
+          - rowgroup [ref=e296]:
+            - row [ref=e297]:
+              - columnheader "名称" [ref=e298]
+              - columnheader "凭证类型" [ref=e299]
+              - columnheader "BASE_URL" [ref=e300]
+              - columnheader "模型（点击切换）" [ref=e301]
+              - columnheader "操作" [ref=e302]
+          - rowgroup [ref=e303]:
+            - row [ref=e304]:
+              - cell "智谱GLM" [ref=e305]
+              - cell "API_KEY" [ref=e306]
+              - cell [ref=e307]:
+                - code [ref=e308]: https://open.bigmodel.cn/api/anthropic
+              - cell [ref=e309]:
+                - button "glm-5.3" [ref=e310] [cursor=pointer]
+              - cell [ref=e311]:
+                - button "设为当前" [ref=e312] [cursor=pointer]
+                - button "编辑" [ref=e313] [cursor=pointer]
+                - button "删除" [ref=e314] [cursor=pointer]
+            - row [ref=e315]:
+              - cell "MiniMax" [ref=e316]
+              - cell "API_KEY" [ref=e317]
+              - cell [ref=e318]:
+                - code [ref=e319]: https://api.minimaxi.com/anthropic
+              - cell [ref=e320]:
+                - button "MiniMax-M3" [ref=e321] [cursor=pointer]
+              - cell [ref=e322]:
+                - button "设为当前" [ref=e323] [cursor=pointer]
+                - button "编辑" [ref=e324] [cursor=pointer]
+                - button "删除" [ref=e325] [cursor=pointer]

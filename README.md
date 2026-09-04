@@ -82,6 +82,14 @@ lcb start
 
 > **热生效**：桥接器运行中执行 `lcb ws add / remove`，下一条消息到达时自动重读配置，无需重启（apps 应用列表、凭证与 `concurrency` 改动除外，需重启）。
 
+## 配置页进程管理与自动更新
+
+配置页「概览」支持托管桥接器进程与自更新（源码 tsx 运行模式下自动降级为手动指引）：
+
+- **启停/重启**：概览「运行状态」卡显示桥接器进程状态（PID），可一键启动（后台守护进程）/ 停止 / 重启。`lcb start` 内嵌页面停止/重启时页面随进程短暂失联后自动恢复；`lcb ui` 独立页面则跨进程操作（Windows 下停止为硬终止，会话逐消息落盘不受影响）。
+- **后台运行日志**：经页面启动/重启的桥接器，输出落 `~/.lark-claudecode-bridge/bridge.log`（超 5MB 自动截断）；进程 PID 记录于同目录 `bridge.pid`（进程消亡后自动清理）。
+- **版本更新**：概览「版本与更新」卡自动对比 npm registry（跟随本机 `.npmrc` 镜像配置）与当前版本；有新版时一键更新（`npm install -g`）并自动重启生效。
+
 ## 命令速查（飞书里发给机器人）
 
 | 命令 | 说明 |
@@ -93,7 +101,7 @@ lcb start
 | /ws list / /ws use \<名字\> | 工作区（切换仅 admin 可用） |
 | /model | 查看当前模型；`/model <名字>` 通道级切换；`/model reset` 恢复默认 |
 | /skills / /plugins / /mcp | 查看本会话实际加载的技能 / 插件 / MCP 服务 |
-| /plugin | 插件管理：`/plugin list`（全员）；`install/uninstall/enable/disable/marketplace …`（仅 admin），装好下一条消息自动加载 |
+| /plugin | 插件管理：`/plugin list`（全员，含本机 ~/.claude 与托管目录两处清单）；`install/uninstall/enable/disable/marketplace …`（仅 admin，默认装 ~/.claude，`--dir=managed` 装托管目录），装好下一条消息自动加载 |
 | /help | 帮助 |
 | 其它 `/xxx` | **原文透传**给 Claude Code 派发斜杠命令（如 `/superpowers:brainstorming` 触发插件技能） |
 
@@ -153,10 +161,13 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 |---|---|---|
 | 认证来源 | 本机 `~/.claude`（`claude login` 或其 settings.json） | config.yaml `claude` 段 → 写入 `~/.lark-claudecode-bridge/claude/settings.json` |
 | 适用 | 本机已在用 Claude Code 的用户 | 干净机器 / 不想动本机配置；配 API Key 或中转站 Token |
-| 模型/MCP/skills/插件 | 继承 `~/.claude` 全套 | 全部落在托管目录，与本机 `~/.claude` 完全隔离 |
+| 模型/MCP/skills | 继承 `~/.claude` 全套 | 全部落在托管目录，与本机 `~/.claude` 完全隔离 |
+| 插件 | `~/.claude` 已启用插件自动加载 | **双目录合并加载**：托管目录 + 本机 `~/.claude` 已启用插件（同名托管目录优先），本机已装插件无须重装 |
 | 切换 | 改 `claude.mode` 后**重启**生效 | 同 |
 
 配置页「Claude 认证」tab 可视化切换；managed 模式下认证/模型改动保存后即对后续任务生效（无需重启）。
+
+**插件双目录（managed 模式）**：新装插件默认装到本机 `~/.claude`（与本机 claude CLI 共用一份），`/plugin install xxx --dir=managed` 或配置页安装框选「bridge 托管目录」可装到托管目录；启停/卸载自动按插件所在目录执行，两处清单在配置页「插件」tab 与 `/plugin list` 中均带来源标记。
 
 ### 开发场景工作流（`type: code-dev`）
 

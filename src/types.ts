@@ -36,6 +36,23 @@ export interface PermissionsConfig { allowTools?: string[]; dangerousCommands?: 
 export interface ServerConfig { enabled?: boolean; host?: string; port?: number }
 export type ClaudeAuthMode = 'inherit' | 'managed';
 /**
+ * 多厂商认证档案（Web 配置页「Claude 认证」管理，0.13 起）。档案仅是配置库：
+ * 当前生效配置始终是 ClaudeConfig 顶层四字段（写入 settings.json 的就是它），
+ * 「设为当前」= 把档案字段拷贝到顶层（互斥凭证同步清理），与 cc-switch 同款切换语义。
+ */
+export interface ClaudeProfile {
+  /** 档案名（显示用，如「官方」「中转站A」「GLM」） */
+  name: string;
+  /** 与 apiKey 二选一 */
+  authToken?: string;
+  /** 与 authToken 二选一 */
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  /** 候选模型集（fable/opus/sonnet/haiku 等各存一条，页面点选即切换当前模型）；model 仍为「设为当前」时的默认模型 */
+  models?: string[];
+}
+/**
  * Claude 认证与模型配置。inherit = 共享本机 ~/.claude（0.4 起默认行为，登录态/settings 全继承）；
  * managed = bridge 自管目录（~/.lark-claudecode-bridge/claude/），authToken/apiKey/baseUrl/model
  * 写入该目录 settings.json 的 env 块——完全摆脱对本机 claude login 的依赖
@@ -50,6 +67,8 @@ export interface ClaudeConfig {
   baseUrl?: string;
   /** 写 settings.json 顶层 model + env.ANTHROPIC_MODEL */
   model?: string;
+  /** 多厂商档案库（不直接生效；Web 页「设为当前」拷贝到顶层） */
+  profiles?: ClaudeProfile[];
 }
 /** 飞书斜杠命令注册定义（同步到开放平台 app_slash_commands；command 不含 / 前缀） */
 export interface SlashCommandDef { command: string; description: string; icon?: string }

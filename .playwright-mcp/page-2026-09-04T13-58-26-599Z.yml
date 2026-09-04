@@ -1,0 +1,54 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - heading "飞书ClaudeCode桥接器" [level=1] [ref=e3]
+    - generic [ref=e7]: v0.13.0 · 127.0.0.1:17317
+  - generic [ref=e8]:
+    - navigation [ref=e9]:
+      - button "概览" [ref=e170] [cursor=pointer]
+      - button "飞书应用" [ref=e178] [cursor=pointer]
+      - button "工作区" [ref=e184] [cursor=pointer]
+      - button "Claude 认证" [ref=e189] [cursor=pointer]
+      - button "权限" [ref=e196] [cursor=pointer]
+      - button "斜杠命令" [ref=e201] [cursor=pointer]
+      - button "插件" [ref=e206] [cursor=pointer]
+    - main [ref=e10]:
+      - generic [ref=e211]:
+        - heading "当前生效配置" [level=3] [ref=e212]
+        - generic [ref=e213]: 认证模式与实际生效的值（凭证脱敏显示）。managed 模式改动保存后对后续任务即生效；模式切换需重启。
+        - table [ref=e214]:
+          - rowgroup [ref=e215]:
+            - row [ref=e216]:
+              - cell "认证模式" [ref=e217]
+              - cell "继承本机 ~/.claude（inherit）" [ref=e218]
+            - row [ref=e219]:
+              - cell "BASE_URL" [ref=e220]
+              - cell [ref=e221]:
+                - code [ref=e222]: https://open.bigmodel.cn/api/anthropic
+            - row [ref=e223]:
+              - cell "模型" [ref=e224]
+              - cell [ref=e225]:
+                - code [ref=e226]: glm-5.3[1M]
+            - row [ref=e227]:
+              - cell "Auth Token" [ref=e228]
+              - cell "已设置（••••n3l2）" [ref=e229]
+            - row [ref=e230]:
+              - cell "API Key" [ref=e231]
+              - cell "未设置" [ref=e232]
+            - row [ref=e233]:
+              - cell "settings.json" [ref=e234]
+              - cell [ref=e235]:
+                - code [ref=e236]: C:\Users\mailj\.claude\settings.json
+        - generic [ref=e237]: inherit 模式上表为本机 ~/.claude 实际状态，本页不修改本机登录。要管理多厂商档案并一键切换，请切到 bridge 托管。
+      - generic [ref=e238]:
+        - heading "认证模式" [level=3] [ref=e239]
+        - generic [ref=e240]:
+          - generic [ref=e241] [cursor=pointer]:
+            - radio "继承本机 ~/.claude（已在本机 claude login）" [checked] [ref=e242]
+            - text: 继承本机 ~/.claude（已在本机 claude login）
+          - generic [ref=e243] [cursor=pointer]:
+            - radio "bridge 托管（填 API Key / Token，无需本机登录）" [ref=e244]
+            - text: bridge 托管（填 API Key / Token，无需本机登录）
+        - generic [ref=e245]:
+          - text: managed 模式把认证写入
+          - code [ref=e246]: ~/.lark-claudecode-bridge/claude/settings.json
+          - text: ，与本机 ~/.claude 完全隔离；认证/模型改动保存后对后续任务即生效，模式切换需重启。
