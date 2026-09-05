@@ -65,6 +65,8 @@
   .br-mask { position: fixed; inset: 0; background: rgba(15,19,24,.5); z-index: 90; display: flex; align-items: center; justify-content: center; }
   .br-mask-card { background: var(--card); border-radius: 12px; padding: 24px 32px; text-align: center; box-shadow: 0 8px 30px rgba(0,0,0,.18); max-width: 440px; font-size: 14px; }
   .br-spin { width: 26px; height: 26px; margin: 0 auto 12px; border: 3px solid #d9e2f5; border-top-color: var(--primary); border-radius: 50%; animation: brspin .9s linear infinite; }
+  /* 表格内小号 spinner（斜杠命令远端拉取等异步加载占位） */
+  .br-spin-sm { width: 18px; height: 18px; margin: 0 auto 10px; border: 2px solid #d9e2f5; border-top-color: var(--primary); border-radius: 50%; animation: brspin .9s linear infinite; }
   @keyframes brspin { to { transform: rotate(360deg); } }
   .app-card { border: 1px solid var(--border); border-radius: 8px; padding: 4px 16px 14px; margin-bottom: 12px; position: relative; }
   .app-card .del { position: absolute; top: 10px; right: 12px; }
@@ -1368,7 +1370,7 @@ function renderSlash(el) {
       <button class="btn" id="scBuiltins">补齐内置命令</button>
     </div>
     <table style="margin-top:12px"><thead><tr><th style="width:170px">命令</th><th>描述</th><th style="width:150px">图标</th><th style="width:130px">操作</th></tr></thead>
-    <tbody id="scBody"><tr><td colspan="4" class="hint">加载中…</td></tr></tbody></table>
+    <tbody id="scBody"><tr><td colspan="4" style="padding:36px 0"><div class="br-spin-sm"></div><div class="hint" style="text-align:center">正在从飞书拉取斜杆命令…</div></td></tr></tbody></table>
     <pre class="report" id="scReport" style="display:none;margin-top:12px"></pre>
   </div>`;
   const appSel = $('#scApp');
@@ -1384,7 +1386,7 @@ function renderSlash(el) {
   };
   const loadRemote = async () => {
     if (!appSel.value) { $('#scBody').innerHTML = '<tr><td colspan="4" class="hint">无可用应用（先到「飞书应用」页配置并保存）</td></tr>'; return; }
-    $('#scBody').innerHTML = '<tr><td colspan="4" class="hint">加载中…</td></tr>';
+    $('#scBody').innerHTML = '<tr><td colspan="4" style="padding:36px 0"><div class="br-spin-sm"></div><div class="hint" style="text-align:center">正在从飞书拉取斜杆命令…</div></td></tr>';
     try {
       const r = await api('GET', `/api/slash-commands/remote?app=${encodeURIComponent(appSel.value)}`);
       $('#scBody').innerHTML = r.remote.map((x) => `

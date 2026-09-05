@@ -1,6 +1,6 @@
 {
   "name": "@jesonliu/lark-claudecode-bridge",
-  "version": "0.14.1",
+  "version": "0.14.2",
   "description": "飞书 ↔ Claude Code 桥接器：卡片确认走长连接，免公网 IP",
   "main": "dist/index.js",
   "scripts": {
