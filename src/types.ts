@@ -67,6 +67,13 @@ export interface ClaudeConfig {
   baseUrl?: string;
   /** 写 settings.json 顶层 model + env.ANTHROPIC_MODEL */
   model?: string;
+  /**
+   * managed 模式显式环境变量（写入托管 settings.json 的 env 块，MCP 工具依赖的
+   * IMAGE_GEN_* / API_HOST 等自定义变量在此配置）。优先级：本键 > 本机 ~/.claude
+   * settings env 自动继承 > 托管目录既有值。认证 4 键（ANTHROPIC_AUTH_TOKEN/API_KEY/
+   * BASE_URL/MODEL）不在此生效——永远以认证表单为准（入口过滤，防绕过）。
+   */
+  env?: Record<string, string>;
   /** 多厂商档案库（不直接生效；Web 页「设为当前」拷贝到顶层） */
   profiles?: ClaudeProfile[];
 }
@@ -102,8 +109,14 @@ export interface RejectedMessage {
   rejected: { kind: 'unsupported-type'; chatId: string; chatType: 'p2p' | 'group'; messageType: string };
 }
 /** 卡片回调决策：allow/deny/allow-session 为写工具确认卡；plan-* 为计划确认卡（feedback = 按意见修改时的用户输入） */
-export type CardDecision = 'allow' | 'deny' | 'allow-session' | 'plan-approve' | 'plan-revise' | 'plan-reject';
-export interface CardActionValue { requestId: string; decision: CardDecision; feedback?: string }
+export type CardDecision = 'allow' | 'deny' | 'allow-session'
+  | 'plan-approve' | 'plan-revise' | 'plan-reject'
+  | 'qa-pick' | 'qa-submit';
+export interface CardActionValue {
+  requestId: string; decision: CardDecision; feedback?: string;
+  /** qa-pick：问题下标与选项 label */
+  qIndex?: number; option?: string;
+}
 export interface CardActionEvent { value: CardActionValue; operatorId: string; openMessageId: string }
 /**
  * card.action.trigger 回调的返回体：非空时由 gateway 透传给飞书。

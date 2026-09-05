@@ -177,6 +177,20 @@ function normalizeClaude(doc: Record<string, unknown>): ClaudeConfig | undefined
     console.warn('[配置] claude.mode = managed 但未配置 auth_token / api_key：请在 Web 配置页填写，否则 Claude 任务将无法认证');
   }
   const model = str(c.model);
+  // managed 模式显式环境变量（MCP 工具依赖的自定义变量；领土 4 键不在此生效，buildManagedSettings 入口过滤）
+  const envRaw = (raw as { env?: unknown }).env;
+  let env: Record<string, string> | undefined;
+  if (envRaw !== undefined && envRaw !== null) {
+    if (typeof envRaw !== 'object' || Array.isArray(envRaw)) {
+      throw new Error('claude.env 必须为「KEY: 值」映射对象，请检查 config.yaml');
+    }
+    const picked: Record<string, string> = {};
+    for (const [k, v] of Object.entries(envRaw as Record<string, unknown>)) {
+      if (typeof v !== 'string') throw new Error(`claude.env.${k} 的值必须为字符串，请检查 config.yaml`);
+      if (v.trim()) picked[k] = v;
+    }
+    if (Object.keys(picked).length) env = picked;
+  }
   // 多厂商档案库（不直接生效；Web 页「设为当前」拷贝到顶层）。校验与顶层同则：凭证二选一、http(s) 协议
   const profilesRaw = (raw as { profiles?: unknown }).profiles;
   let profiles: ClaudeProfile[] | undefined;
@@ -228,7 +242,7 @@ function normalizeClaude(doc: Record<string, unknown>): ClaudeConfig | undefined
     if (!profiles.length) profiles = undefined;
   }
   return { mode, ...(authToken ? { authToken } : {}), ...(apiKey ? { apiKey } : {}), ...(baseUrl ? { baseUrl } : {}), ...(model ? { model } : {}),
-    ...(profiles ? { profiles } : {}) };
+    ...(env ? { env } : {}), ...(profiles ? { profiles } : {}) };
 }
 
 /** 斜杠命令名合法性（飞书侧注册约束）：1-32 位字母/数字/下划线/连字符。extra 解析与 Web 远端 create 端点共用 */

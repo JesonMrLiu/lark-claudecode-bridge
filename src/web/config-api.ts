@@ -165,6 +165,8 @@ export interface ClaudeCurrentSummary {
   model?: string;
   authToken: SecretHint;
   apiKey: SecretHint;
+  /** env 块中非 ANTHROPIC_* 键数量（managed 模式自定义环境变量生效情况的可观测口径） */
+  envCount?: number;
 }
 
 /** 纯函数：解析 settings.json（顶层 model + env 块 ANTHROPIC_*），凭证过 maskSecret，明文永不离开本机 */
@@ -179,10 +181,12 @@ export function claudeSettingsSummary(settings: unknown): ClaudeCurrentSummary {
   const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v : undefined);
   const baseUrl = str(env.ANTHROPIC_BASE_URL);
   const model = str(env.ANTHROPIC_MODEL) ?? str(doc.model);
+  const envCount = Object.keys(env).filter((k) => !k.startsWith('ANTHROPIC_')).length;
   return {
     ...(baseUrl ? { baseUrl } : {}),
     ...(model ? { model } : {}),
     authToken: maskSecret(str(env.ANTHROPIC_AUTH_TOKEN)),
     apiKey: maskSecret(str(env.ANTHROPIC_API_KEY)),
+    ...(envCount > 0 ? { envCount } : {}),
   };
 }

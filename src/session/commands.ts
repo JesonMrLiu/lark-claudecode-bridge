@@ -2,13 +2,14 @@ import type { BridgeConfig, SessionInventory } from '../types.js';
 import type { SessionStore } from './session-store.js';
 import { formatBeijingTime } from '../util/beijing-time.js';
 import { handlePluginCommand } from './plugin-command.js';
+import { invalidatePluginCache } from '../executor/plugin-discovery.js';
 
 /**
  * bridge 本地命令首 token 清单（去 / 后比对）。单一来源：commands.ts 的 switch、
  * triggers.ts 的 RESERVED、index.ts 的透传说明均以此为准——本地命令永远优先，
  * 不被触发词劫持、不透传给 Claude Code。新增本地命令务必同步此清单
  */
-export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'skills', 'plugins', 'mcp', 'plugin'] as const;
+export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'skills', 'plugins', 'mcp', 'plugin', 'reload-plugins'] as const;
 
 /**
  * 内置命令的飞书 Slash Command 注册元信息（icon 为飞书 icon_key，见开放平台文档可选列表）。
@@ -27,6 +28,7 @@ export const SLASH_COMMAND_META: Record<string, { description: string; icon: str
   plugins: { description: '查看已加载插件', icon: 'plugin_outlined' },
   mcp: { description: '查看已加载 MCP 服务', icon: 'ai-functions_outlined' },
   plugin: { description: '插件管理：安装/启停/市场（管理员）', icon: 'plugin_outlined' },
+  'reload-plugins': { description: '重载插件（清缓存，下条消息生效）', icon: 'restart_outlined' },
 };
 
 export interface CommandContext {
@@ -68,6 +70,7 @@ const HELP = `**可用命令**
 /plugins — 查看已加载插件
 /mcp — 查看已加载 MCP 服务
 /plugin — 插件管理（安装/启停/市场，管理员）
+/reload-plugins — 重载插件（清缓存，下一条消息重新加载）
 /help — 帮助
 
 💡 其它 / 开头的消息将原文透传给 Claude Code（可触发其技能与插件命令，如 /superpowers:brainstorming）`;
@@ -103,33 +106,32 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
     case 'new': {
       const ws = ctx.currentWorkspace();
       const st = store.getChannelState(key);
-      // 显式清空历史（保留工作区归属与通道级模型偏好），会话指针重置为空
-      store.setChannelState(key, { workspaceName: st?.workspaceName ?? ws, sessions: [], ...(st?.model ? { model: st.model } : {}) });
-      return { handled: true, reply: `✅ 已开启新会话（工作区：${ws}）` };
+      // 仅清除「当前续接指针」，历史会话列表保留（/resume 仍可切回）——
+      // 旧版清空整个 sessions 导致开新会话后历史「消失」，列表永远积累不起来
+      store.setCurrentSession(key, null, st?.workspaceName ?? ws);
+      return { handled: true, reply: `✅ 已开启新会话（工作区：${ws}）。历史会话未清空，/resume 可随时切回` };
     }
     case 'resume': {
       const sessions = store.listSessions(key);
       if (args.length === 0) {
         if (sessions.length === 0) return { handled: true, reply: '暂无历史会话' };
-        // 按时间正序展示：最早的排最前
+        // 按时间正序展示：最早的排最前；当前续接的会话打标（一眼看出下条消息会接到哪）
+        const current = store.getChannelState(key)?.currentSessionId;
         const chrono = [...sessions].reverse();
         const list = chrono
-          .map((s, i) => `${i + 1}. ${s.summary || '(无摘要)'} <font color='grey'>${formatBeijingTime(s.updatedAt)}</font>`)
+          .map((s, i) => `${i + 1}. ${s.summary || '(无摘要)'} <font color='grey'>${formatBeijingTime(s.updatedAt)}</font>${s.sessionId === current ? ' ← 当前' : ''}`)
           .join('\n');
-        return { handled: true, reply: `**历史会话**（回复 /resume 编号 恢复）\n${list}` };
+        return { handled: true, reply: `**历史会话**（回复 /resume 编号 恢复；/new 另起一支，历史保留）\n${list}` };
       }
       const n = Number(args[0]);
       if (!Number.isInteger(n) || n < 1 || n > sessions.length) {
         return { handled: true, reply: `编号无效，范围 1-${sessions.length}` };
       }
       const target = sessions[sessions.length - n]; // 编号 n → 时间正序第 n 个
-      const st = store.getChannelState(key);
-      if (st) {
-        // 恢复 = 将选中会话移到头部（当前）
-        st.sessions = [target, ...st.sessions.filter((s) => s.sessionId !== target.sessionId)];
-        store.setChannelState(key, st);
-      }
-      return { handled: true, reply: `↩️ 已恢复会话：${target.summary || target.sessionId}` };
+      // 恢复 = 当前续接指针指向选中会话（列表顺序不动，历史保持时间序）
+      store.setCurrentSession(key, target.sessionId);
+      // 标注当前指针，方便 /resume 列表辨认正在续接哪条
+      return { handled: true, reply: `↩️ 已恢复会话：${target.summary || target.sessionId}\n下一条任务将从该会话继续` };
     }
     case 'stop':
       return { handled: true, reply: ctx.stopCurrentTask() ? '🛑 已发送停止信号' : '当前没有运行中的任务' };
@@ -151,13 +153,15 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
         const target = ctx.config.workspaces.find((w) => w.name === args[1]);
         if (!target) return { handled: true, reply: `工作区 "${args[1] ?? ''}" 不存在，/ws list 查看` };
         const st = store.getChannelState(key);
-        // 切换工作区保留历史会话记录与通道级模型偏好
+        // 切换工作区保留历史会话记录与通道级模型偏好，但清除续接指针——
+        // 旧会话的上下文绑定原工作区目录，跨工作区自动续接容易答非所问
         store.setChannelState(key, {
           workspaceName: target.name,
           sessions: st?.sessions ?? [],
           ...(st?.model ? { model: st.model } : {}),
         });
-        return { handled: true, reply: `✅ 已切换工作区：**${target.name}**（${target.path}）` };
+        store.setCurrentSession(key, null, target.name);
+        return { handled: true, reply: `✅ 已切换工作区：**${target.name}**（${target.path}）。已自动开启新会话（/resume 可切回历史）` };
       }
       return { handled: true, reply: '用法：/ws list | /ws use <名字>' };
     }
@@ -226,8 +230,29 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
         send: ctx.send,
       }) };
     }
-    default:
+    case 'reload-plugins': {
+      // 终端 /reload-plugins 的 bridge 等价物：插件由每任务启动时现扫描加载（mtime 缓存），
+      // 清缓存即「重载」——下一条消息重新发现并传入 SDK（managed 模式双目录都清）
+      const dirs = ctx.claudeConfigDir ? [ctx.claudeConfigDir, ...(ctx.userClaudeDir && ctx.userClaudeDir !== ctx.claudeConfigDir ? [ctx.userClaudeDir] : [])] : [];
+      if (dirs.length === 0) return { handled: true, reply: '⛔ 当前部署未注入 Claude 配置目录，无法重载' };
+      for (const d of dirs) invalidatePluginCache(d);
+      return { handled: true, reply: '🔄 插件缓存已清，下一条消息起重新加载插件清单（等效终端 /reload-plugins；可用 /plugins 查看结果）' };
+    }
+    default: {
+      // Claude Code 终端 REPL 专属命令：headless 会话里透传只会得到 CLI 的
+      // "isn't available in this environment" 报错，不如本地直接给可操作的指引。
+      // （/reload-plugins 已实现为本地命令：清插件缓存，见上方 case）
+      const TERMINAL_ONLY: Record<string, string> = {
+        'plugin-dev': '插件开发向导是 Claude Code 终端交互命令，机器人侧不可用。请在本地终端运行。',
+        'vim': 'vim 模式是 Claude Code 终端按键绑定，机器人侧无意义。',
+        'terminal-setup': '终端按键绑定安装是 Claude Code 终端命令，机器人侧无意义。',
+        'bashes': '查看后台 shell 是 Claude Code 终端命令，机器人侧不可用。任务中的命令执行状态会实时显示在进度卡上。',
+        'usage': '用量统计是 Claude Code 终端命令，机器人侧不可用。',
+        'bug': '问题反馈是 Claude Code 终端命令，机器人侧不可用。',
+      };
+      if (name in TERMINAL_ONLY) return { handled: true, reply: `⛔ /${name}：${TERMINAL_ONLY[name]}` };
       // 非本地命令的斜杠消息原文透传给 Claude Code（SDK 直接派发斜杠命令）
       return { handled: false, taskText: text };
+    }
   }
 }

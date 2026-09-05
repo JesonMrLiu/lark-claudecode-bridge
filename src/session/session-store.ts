@@ -7,10 +7,17 @@ export interface SessionMeta {
   updatedAt: string;
 }
 
-/** 通道状态：sessions[0] 为当前会话，其余按新→旧排列 */
+/** 通道状态：sessions 为历史会话列表（新→旧）；currentSessionId 为当前续接指针 */
 export interface ChannelState {
   workspaceName: string;
   sessions: SessionMeta[];
+  /**
+   * 当前续接的会话指针：executeTask 每任务 resume 它；/new 置空（下个任务新开会话），
+   * /resume <n> 指向选中会话。缺省时回退 sessions[0]（兼容旧数据：旧版 sessions[0] 即当前）。
+   * 与历史列表分离是 /new 语义的关键：开新会话 ≠ 清空历史（0.13.x 前清空导致
+   * /resume 列表永远只剩一条、重启后看似「丢了」全部历史）。
+   */
+  currentSessionId?: string;
   /** 通道级模型覆盖（/model 命令设置，跨重启持久；/new 不清除——它是通道偏好而非会话状态）。
    *  缺省/undefined = 跟随 ~/.claude/settings.json 的 model */
   model?: string;
@@ -57,6 +64,20 @@ export class SessionStore {
     const st = this.data[key] ?? { workspaceName: '', sessions: [] };
     const rest = st.sessions.filter((s) => s.sessionId !== sessionId);
     st.sessions = [{ sessionId, summary: summary.slice(0, 60), updatedAt: new Date().toISOString() }, ...rest];
+    st.currentSessionId = sessionId;
+    this.data[key] = st;
+    this.save();
+  }
+
+  /**
+   * 设置/清除当前续接指针（不动历史列表）：
+   * /new 传 null（下个任务新开会话，历史保留）；/resume <n> 传选中 sessionId。
+   * channel 不存在时以 defaultWorkspace 初始化后设置。
+   */
+  setCurrentSession(key: string, sessionId: string | null, defaultWorkspace = ''): void {
+    const st = this.data[key] ?? { workspaceName: defaultWorkspace, sessions: [] };
+    if (sessionId === null) delete st.currentSessionId;
+    else st.currentSessionId = sessionId;
     this.data[key] = st;
     this.save();
   }

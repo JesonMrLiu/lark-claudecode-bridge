@@ -94,14 +94,15 @@ lcb start
 
 | 命令 | 说明 |
 |---|---|
-| /new | 开新会话 |
-| /resume | 列出/恢复历史会话（`/resume <编号>` 恢复指定会话） |
+| /new | 开新会话（历史保留，`/resume` 可随时切回） |
+| /resume | 列出/恢复历史会话（`/resume <编号>` 恢复指定会话；列表标注当前续接的会话） |
 | /stop | 停止当前任务 |
 | /status | 当前状态 |
 | /ws list / /ws use \<名字\> | 工作区（切换仅 admin 可用） |
 | /model | 查看当前模型；`/model <名字>` 通道级切换；`/model reset` 恢复默认 |
 | /skills / /plugins / /mcp | 查看本会话实际加载的技能 / 插件 / MCP 服务 |
 | /plugin | 插件管理：`/plugin list`（全员，含本机 ~/.claude 与托管目录两处清单）；`install/uninstall/enable/disable/marketplace …`（仅 admin，默认装 ~/.claude，`--dir=managed` 装托管目录），装好下一条消息自动加载 |
+| /reload-plugins | 重载插件：清插件发现缓存，下一条消息重新扫描加载（终端命令的 bridge 等价物） |
 | /help | 帮助 |
 | 其它 `/xxx` | **原文透传**给 Claude Code 派发斜杠命令（如 `/superpowers:brainstorming` 触发插件技能） |
 
@@ -167,6 +168,8 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 
 配置页「Claude 认证」tab 可视化切换；managed 模式下认证/模型改动保存后即对后续任务生效（无需重启）。
 
+**managed 模式的 MCP 与环境继承**（0.14.0 起，`lcb start` 时自动完成）：本机 `~/.claude.json` 的全局 `mcpServers` 单向同步到托管目录（CLI 读 `$CLAUDE_CONFIG_DIR/.claude.json`，不同步则托管会话丢掉全部 user 级 MCP）；本机 `~/.claude/settings.json` env 块中的**非认证键**（MCP 工具依赖的 `IMAGE_GEN_*`、`API_HOST` 等自定义变量）并入托管 settings.json。需要覆盖继承值或本机没有这些配置时，用**显式配置**：配置页「Claude 认证」→「环境变量」行编辑器（或 config.yaml 的 `claude.env` 键值对），优先级 `claude.env` > 本机继承 > 托管目录既有值；认证与模型 4 键（`ANTHROPIC_AUTH_TOKEN/API_KEY/BASE_URL/MODEL`）不在此生效——永远以认证表单为准。
+
 **插件双目录（managed 模式）**：新装插件默认装到本机 `~/.claude`（与本机 claude CLI 共用一份），`/plugin install xxx --dir=managed` 或配置页安装框选「bridge 托管目录」可装到托管目录；启停/卸载自动按插件所在目录执行，两处清单在配置页「插件」tab 与 `/plugin list` 中均带来源标记。
 
 ### 开发场景工作流（`type: code-dev`）
@@ -174,10 +177,12 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 给代码开发类工作区设置 `type: code-dev` 后，每个任务自动走「先计划、后执行」：
 
 1. **计划审批**：任务以 plan mode 启动（期间只允许读操作），Claude 查阅代码后提交计划 → 飞书收到计划卡片：
-   - **✅ 批准执行**：SDK 自动切回可编辑模式，按计划开工（后续每次写文件仍会弹带红绿 diff 的确认卡）
+   - **✅ 批准执行**：批准即授权——Claude 自动切入 acceptEdits 模式按计划开工，**后续写文件不再逐次弹确认卡**（对齐本机 CLI「批准计划 → accept edits on」语义；Bash 危险命令黑名单仍生效，命中照弹确认）
    - **📝 按意见修改**：在卡片输入框填修改意见后点击，Claude 修订计划重新提交（同一会话内循环，直到批准或放弃）
    - **❌ 放弃计划**：任务终止；10 分钟无操作自动放弃
 2. **收尾汇总 diff**：任务完成后不再把改动文件逐个上传，而是发**汇总 diff 卡片**（标题含文件数与 +X/-Y 行统计，正文红绿着色，超长自动拆多张）。改动以 `git diff HEAD` + untracked 新文件为准，因此 **code-dev 工作区需要是 git 仓库**（非 git 仓库自动回退为旧的文件上传行为，并提示 `git init`）
+
+**执行器为 Streaming Input 模式**（0.14.0 起）：prompt 经持久输入流送入 CLI，stdin 全程保持打开——这是计划审批与提问卡片能稳定工作的前提（旧版单轮模式在轮次边界会触发 CLI 的 "Stream closed" 中断，属 Agent SDK 已知问题）。**提问卡片**：Claude 调用 AskUserQuestion 时飞书收到问题选项卡，点选项作答（多选题可多选）、全部作答后「提交答案」——答案直接回传模型继续任务。
 
 **读操作免确认**：读工具与 Bash 默认直通（`ls`/`cat`/`grep` 不再弹卡），命中 `dangerous_commands` 黑名单（`rm -rf`、`sudo`、`git push --force` 等）仍弹确认卡；「本次会话不再询问」的记忆同样绕不过黑名单。想放行其它工具（如 `Edit`）往 `permissions.allow_tools` 追加即可——注意配置即**整体替换**内置默认，需把内置读工具一并写上。
 

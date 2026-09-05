@@ -1,7 +1,8 @@
 import type { CardDecision, ConfirmationRequest, PermissionDecision } from '../types.js';
+import type { AskQuestionRequest } from '../executor/permission-gate.js';
 import { chunkText } from '../util/chunk-text.js';
 
-export interface ProgressState { title: string; status: string; textTail: string; toolLine: string; startedAt: number }
+export interface ProgressState { title: string; status: string; textTail: string; toolLine: string; startedAt: number; done?: boolean }
 
 function card(elements: unknown[]): unknown {
   return { schema: '2.0', config: { update_multi: true }, body: { elements } };
@@ -23,10 +24,15 @@ export function buildImageCard(caption: string | undefined, imgKey: string): unk
 }
 export function buildProgressCard(state: ProgressState): unknown {
   const elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
+  const duration = `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒`;
   const lines = [`**${state.title}**`, ``, state.status, ``];
   if (state.toolLine) lines.push(`🔧 ${state.toolLine}`, ``);
   if (state.textTail) lines.push('---', state.textTail.slice(-PROGRESS_TAIL_CHARS)); // 只保留尾部，防爆卡片
-  lines.push(``, `<font color='grey'>⏱ 已运行 ${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒</font>`);
+  // 终态改为「总耗时」+ 完成时刻：运行中的「已运行」在停止刷新后读起来仍像在计时，任务
+  // 是否结束必须一眼可辨（用户分不清计时停了是完成还是卡死）
+  lines.push(``, state.done
+    ? `<font color='grey'>⏱ 总耗时 ${duration} · 已结束于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}</font>`
+    : `<font color='grey'>⏱ 已运行 ${duration}</font>`);
   return card([md(lines.join('\n'))]);
 }
 export function buildConfirmCard(req: ConfirmationRequest): unknown {
@@ -126,4 +132,74 @@ export function buildPlanResultCard(req: PlanCardRequest, decision: PlanCardDeci
 /** 计划确认超时卡（此后迟到点击不再改写此卡片） */
 export function buildExpiredPlanCard(req: PlanCardRequest, timeoutMs: number): unknown {
   return card([md(`**📋 Claude 提交执行计划**\n\n工作区: \`${req.workspaceName}\`\n\n⏰ 已超时自动放弃（${Math.round(timeoutMs / 60000)} 分钟未确认）`)]);
+}
+
+// ---------- 提问卡片（AskUserQuestion 的问题选项卡） ----------
+
+export interface QuestionCardRequest {
+  requestId: string;
+  questions: AskQuestionRequest['questions'];
+  workspaceName: string;
+}
+
+/** 已选答案的中间态（wiring 侧维护）：问题下标 → 选中的 option label（multiSelect 为数组） */
+export type QuestionCardAnswers = Record<number, string | string[]>;
+
+function qaOptionButton(reqId: string, qIndex: number, label: string, selected: boolean): unknown {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: selected ? `✓ ${label}` : label },
+    type: selected ? 'primary' : 'default',
+    behaviors: [{ type: 'callback', value: { requestId: reqId, decision: 'qa-pick' as const, qIndex, option: label } }],
+  };
+}
+
+/**
+ * 提问卡片：每个问题一节（问题文本 + 选项按钮行，选中态打 ✓），底部「提交答案」按钮。
+ * 选项点击仅更新选中态（PATCH 重渲染），全部问题有答案后提交才有效。
+ */
+export function buildQuestionCard(req: QuestionCardRequest, answers: QuestionCardAnswers): unknown {
+  const elements: unknown[] = [md(`**❓ Claude 需要你确认**\n\n工作区: \`${req.workspaceName}\``)];
+  req.questions.forEach((q, qIndex) => {
+    const sel = answers[qIndex];
+    const picked = Array.isArray(sel) ? sel : sel !== undefined ? [sel] : [];
+    elements.push(md(`**${qIndex + 1}. ${q.question}**${q.multiSelect ? '（可多选）' : ''}`));
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'flow',
+      columns: q.options.map((o) => ({
+        tag: 'column', width: 'auto', weight: 1, vertical_align: 'top',
+        elements: [qaOptionButton(req.requestId, qIndex, o.label, picked.includes(o.label))],
+      })),
+    });
+  });
+  elements.push({
+    tag: 'column_set',
+    flex_mode: 'flow',
+    columns: [{
+      tag: 'column', width: 'auto', weight: 1, vertical_align: 'top',
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '✅ 提交答案' },
+        type: 'primary',
+        behaviors: [{ type: 'callback', value: { requestId: req.requestId, decision: 'qa-submit' as const } }],
+      }],
+    }],
+  });
+  return card(elements);
+}
+
+/** 提交后的结果卡（展示每问的最终答案） */
+export function buildQuestionResultCard(req: QuestionCardRequest, answers: QuestionCardAnswers, byName: string): unknown {
+  const lines = req.questions.map((q, i) => {
+    const a = answers[i];
+    const ans = a === undefined ? '（未作答）' : Array.isArray(a) ? a.join('、') : a;
+    return `- ${q.question} → **${ans}**`;
+  });
+  return card([md(`**❓ Claude 需要你确认**\n\n工作区: \`${req.workspaceName}\`\n\n${lines.join('\n')}\n\n✅ 答案已提交（由 ${byName} 操作）`)]);
+}
+
+/** 提问超时卡（此后迟到点击不再改写此卡片） */
+export function buildExpiredQuestionCard(req: QuestionCardRequest, timeoutMs: number): unknown {
+  return card([md(`**❓ Claude 需要你确认**\n\n工作区: \`${req.workspaceName}\`\n\n⏰ 已超时自动跳过（${Math.round(timeoutMs / 60000)} 分钟未响应），Claude 将自行决策继续`)]);
 }

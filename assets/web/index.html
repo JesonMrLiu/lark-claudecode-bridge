@@ -855,6 +855,7 @@ function renderClaude(el) {
       <tr><td>模型</td><td>${cur.model ? `<code>${esc(cur.model)}</code>` : '<span class="hint">未设置（CLI 默认）</span>'}</td></tr>
       <tr><td>Auth Token</td><td>${hint(cur.authToken)}</td></tr>
       <tr><td>API Key</td><td>${hint(cur.apiKey)}</td></tr>
+      <tr><td>自定义环境变量</td><td>${cur.envCount ? `${cur.envCount} 个（写入托管 settings.json env 块，MCP 工具可用）` : '<span class="hint">无</span>'}</td></tr>
       <tr><td>settings.json</td><td><code>${esc(S.status?.claude?.settingsPath || '—')}</code></td></tr>
     </table>
     ${mode !== 'managed' ? '<div class="desc" style="margin-top:8px">inherit 模式上表为本机 ~/.claude 实际状态，本页不修改本机登录。要管理多厂商档案并一键切换，请切到 bridge 托管。</div>' : ''}
@@ -888,6 +889,10 @@ function renderClaude(el) {
           <div class="hint" style="margin-top:6px">「拉取模型」用当前表单的 BASE_URL 与凭证（未填则用已保存值）请求模型列表：自动兼容带 / 不带 /v1 的地址与 Bearer / x-api-key 认证；失败可手动填写。</div>
         </div>
       </details>
+      <h4 style="margin:14px 0 2px;font-size:13.5px">环境变量（写入托管 settings.json，MCP 工具依赖的自定义变量在此配置）</h4>
+      <div class="hint" style="margin-bottom:6px">本机 ~/.claude/settings.json 已有的非认证键会自动继承；此处配置的键<b>优先级更高</b>（覆盖继承值）。认证相关（ANTHROPIC_AUTH_TOKEN / API_KEY / BASE_URL / MODEL）不在此生效，请用上方认证表单。</div>
+      <table><thead><tr><th style="width:38%">KEY</th><th>VALUE</th><th style="width:44px"></th></tr></thead><tbody id="claudeEnvBody"></tbody></table>
+      <button class="btn sm" id="claudeEnvAdd" style="margin-top:6px">+ 添加变量</button>
       ${saveBarHtml('claude')}
     </div>
     <div class="footer-note">managed 模式把认证写入 <code>~/.lark-claudecode-bridge/claude/settings.json</code>，与本机 ~/.claude 完全隔离；认证/模型改动保存后对后续任务即生效，模式切换需重启。</div>
@@ -921,6 +926,42 @@ function renderClaude(el) {
   };
   $('#baseUrl').oninput = () => { c.base_url = $('#baseUrl').value.trim() || undefined; cardDirty('claude', true); };
   $('#model').oninput = () => { c.model = $('#model').value.trim() || undefined; cardDirty('claude', true); };
+  // ---- 环境变量行编辑（claude.env）：对象 ↔ 行数组，KEY/VALUE 实时写回（同 apps 抽屉 env 模式） ----
+  const cEnvRows = Object.entries(c.env || {}).map(([key, value]) => ({ key, value: String(value) }));
+  const syncClaudeEnv = () => {
+    const obj = {};
+    for (const r of cEnvRows) if (r.key.trim()) obj[r.key.trim()] = r.value;
+    if (Object.keys(obj).length) c.env = obj; else delete c.env;
+  };
+  const renderClaudeEnv = () => {
+    const tb = $('#claudeEnvBody');
+    if (!tb) return;
+    tb.innerHTML = cEnvRows.length ? cEnvRows.map((r, i) => `
+      <tr>
+        <td><input type="text" data-cei="${i}" data-col="key" value="${esc(r.key)}" placeholder="SOME_KEY"></td>
+        <td><input type="text" data-cei="${i}" data-col="value" value="${esc(r.value)}" placeholder="some-value"></td>
+        <td><button class="btn sm danger" data-crm="${i}">删</button></td>
+      </tr>`).join('') : '<tr><td colspan="3" class="hint">未配置（本机 ~/.claude 的非认证键自动继承）</td></tr>';
+    tb.querySelectorAll('input[data-cei]').forEach((input) => input.oninput = () => {
+      cEnvRows[Number(input.dataset.cei)][input.dataset.col] = input.value;
+      syncClaudeEnv();
+      cardDirty('claude', true);
+    });
+    tb.querySelectorAll('button[data-crm]').forEach((b) => b.onclick = () => {
+      cEnvRows.splice(Number(b.dataset.crm), 1);
+      syncClaudeEnv();
+      cardDirty('claude', true);
+      renderClaudeEnv();
+    });
+  };
+  const envAdd = $('#claudeEnvAdd');
+  if (envAdd) envAdd.onclick = () => { cEnvRows.push({ key: '', value: '' }); renderClaudeEnv(); tbFocusLastKey(); };
+  const tbFocusLastKey = () => {
+    const inputs = document.querySelectorAll('#claudeEnvBody input[data-col=key]');
+    const last = inputs[inputs.length - 1];
+    if (last) last.focus();
+  };
+  renderClaudeEnv();
   $('#btnModels').onclick = () => {
     const typed = $('#credVal').value.trim();
     const key = document.querySelector('input[name=cred]:checked').value;

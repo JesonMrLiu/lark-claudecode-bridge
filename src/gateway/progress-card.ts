@@ -3,6 +3,8 @@ import { buildProgressCard, type ProgressState } from './card-builder.js';
 export interface CardSender {
   sendCard(card: unknown): Promise<string>;        // 返回 messageId
   updateCard(messageId: string, card: unknown): Promise<void>;
+  /** 撤回消息（进度卡沉底用）；缺省（旧 gateway/测试 mock）时沉底退化为仅重刷 */
+  deleteCard?(messageId: string): Promise<void>;
 }
 
 const FLUSH_CHARS = 200;
@@ -71,11 +73,26 @@ export class ProgressCard {
 
   async finish(summary: string): Promise<void> {
     this.done = true;
+    this.state.done = true;
     clearInterval(this.flushTimer);
     clearInterval(this.heartbeatTimer);
     this.state.status = summary;
     this.state.toolLine = '';
     await this.flush(); // 经由同一串行链落地，保证是最后一张（终态不被旧 flush 覆盖）
+  }
+
+  /**
+   * 沉底：撤回当前进度卡并在会话底部重发（确认卡/计划卡/提问卡/中途推送都会把进度卡
+   * 顶上去，用户看不出任务是否还在跑）。删除失败（权限/网络）时降级为仅重发——
+   * 极端情况出现两张进度卡，任务照常。终态后不再沉底。
+   */
+  async sinkToBottom(): Promise<void> {
+    if (this.done || !this.messageId) return;
+    const old = this.messageId;
+    this.messageId = undefined; // 期间 flush 自动跳过，避免 PATCH 打到已删除的旧卡
+    if (this.sender.deleteCard) await this.sender.deleteCard(old).catch(() => {});
+    this.messageId = await this.sender.sendCard(buildProgressCard(this.state));
+    void this.flush();
   }
 
   /**

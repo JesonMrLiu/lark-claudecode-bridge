@@ -23,6 +23,8 @@ export interface FeishuSdk {
           Promise<{ code?: number; msg?: string; data?: { message_id?: string } }>;
         patch(payload: { path: { message_id: string }; data: { content: string } }):
           Promise<{ code?: number; msg?: string }>;
+        delete(payload: { path: { message_id: string } }):
+          Promise<{ code?: number; msg?: string }>;
       };
       image: { create(payload: { data: { image_type: 'message'; image: NodeJS.ReadableStream } }): Promise<{ image_key?: string } | null> };
       file: { create(payload: { data: { file_type: 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream'; file_name: string; file: NodeJS.ReadableStream } }): Promise<{ file_key?: string } | null> };
@@ -387,6 +389,11 @@ export class FeishuGateway {
   /** 更新已发送卡片（流式进度刷新） */
   async updateCard(messageId: string, card: unknown): Promise<void> {
     await this.client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card) } });
+  }
+
+  /** 撤回消息（进度卡沉底用：删旧卡后重发，保持进度卡始终在会话最底部） */
+  async deleteCard(messageId: string): Promise<void> {
+    await this.client.im.message.delete({ path: { message_id: messageId } });
   }
 
   /**
