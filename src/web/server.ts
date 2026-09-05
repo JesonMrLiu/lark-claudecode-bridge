@@ -2,8 +2,8 @@
 // 安全基线：默认只绑 127.0.0.1；Host/Origin 校验防 DNS rebinding；body ≤1MB；
 // secret 永不出进程（GET 脱敏回显，PUT 空值=不修改）。改动写盘后由现有热重载器/重启消费
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, parse, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument, stringify } from 'yaml';
 import { CONFIG_PATH, SLASH_COMMAND_RE, loadConfig, parseConfigText } from '../config.js';
@@ -18,8 +18,8 @@ import { SLASH_COMMAND_META } from '../session/commands.js';
 import { DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMAND_SOURCES } from '../executor/permission-gate.js';
 import { openBrowser } from '../util/open-browser.js';
 import { builtinCommands, createSlashApiClient, ensureBuiltins, expectedCommands, syncSlashCommands } from '../feishu/slash-commands.js';
-import { runPluginCli } from '../executor/plugin-manager.js';
-import { invalidatePluginCache, listInstalledPlugins } from '../executor/plugin-discovery.js';
+import { runPluginCli, updateAllPlugins } from '../executor/plugin-manager.js';
+import { invalidatePluginCache, listAvailablePlugins, listInstalledPlugins } from '../executor/plugin-discovery.js';
 import { bridgeStatus, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDetached, stopBridgeByPid } from './lifecycle.js';
 import { checkUpdate, installMode, runUpdate } from './update.js';
 
@@ -83,6 +83,48 @@ function writeAtomic(path: string, text: string): void {
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, text, 'utf8');
   renameSync(tmp, path);
+}
+
+/** 盘符根（C:\）/ posix 根（/）无上级 → null（前端据此回到根/盘符列表层） */
+function parentOf(abs: string): string | null {
+  return parse(abs).root === abs ? null : dirname(abs);
+}
+
+/**
+ * 目录浏览（工作区路径选择弹层数据源）：列出某路径下的子目录与上级导航。
+ * 只返回目录名不返回文件。手输路径跳转是浏览常态操作，出错（不存在/不是目录/
+ * 无权限）不打断弹层——200 + error 字段内联展示；盘符根之上的「此电脑」层用
+ * drives（Windows 专属，逐盘符 existsSync 探测）。
+ */
+function listSubdirs(input: string): {
+  path: string; parent: string | null; dirs: string[]; drives?: string[]; error?: string;
+} {
+  if (!input.trim()) {
+    if (process.platform === 'win32') {
+      const drives = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map((d) => `${d}:\\`).filter((d) => existsSync(d));
+      return { path: '', parent: null, dirs: [], drives };
+    }
+    return listSubdirs('/');
+  }
+  const abs = resolve(input);
+  let st;
+  try {
+    st = statSync(abs);
+  } catch {
+    return { path: abs, parent: parentOf(abs), dirs: [], error: '路径不存在' };
+  }
+  if (!st.isDirectory()) {
+    return { path: abs, parent: parentOf(abs), dirs: [], error: '该路径不是目录' };
+  }
+  try {
+    const dirs = readdirSync(abs, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort((a, b) => a.localeCompare(b));
+    return { path: abs, parent: parentOf(abs), dirs };
+  } catch (e) {
+    return { path: abs, parent: parentOf(abs), dirs: [], error: `无法读取：${e instanceof Error ? e.message : String(e)}` };
+  }
 }
 
 /** 读 Claude 配置目录下 settings.json（不存在/损坏 → undefined；内容仅供脱敏摘要） */
@@ -201,6 +243,10 @@ async function handle(
         dangerousCommands: [...DEFAULT_DANGEROUS_COMMAND_SOURCES],
       },
     });
+  }
+  // ---- 目录浏览（工作区路径选择弹层；不依赖配置文件，首装向导同样可用） ----
+  if (path === '/api/fs/dirs' && req.method === 'GET') {
+    return json(res, 200, listSubdirs(url.searchParams.get('p') ?? ''));
   }
   if (path === '/api/config' && req.method === 'GET') {
     if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请提交 bootstrap 向导' });
@@ -408,13 +454,34 @@ async function handle(
     const userDir = DEFAULT_CLAUDE_DIR;
     const sameDir = bridgeDir === userDir;
     if (path === '/api/plugins' && req.method === 'GET') {
-      const from = (dir: string, source: 'bridge' | 'user') => listInstalledPlugins(dir).map((p) => ({ ...p, source }));
+      // 市场清单里的最新可装版本，附到已装插件上（前端「0.7.0 → 0.7.1」有新版提示）；
+      // 优先按 name@marketplace 精确匹配，市场名对不上时退化按插件名（提示性质，宁多勿漏）
+      const from = (dir: string, source: 'bridge' | 'user') => {
+        const latestByKey = new Map<string, string>();
+        const latestByName = new Map<string, string>();
+        for (const m of listAvailablePlugins(dir)) {
+          for (const p of m.plugins) {
+            if (!p.version) continue;
+            latestByKey.set(`${p.name}@${m.name}`, p.version);
+            latestByName.set(p.name, p.version);
+          }
+        }
+        return listInstalledPlugins(dir).map((p) => {
+          const latest = (p.marketplace && latestByKey.get(`${p.name}@${p.marketplace}`)) ?? latestByName.get(p.name);
+          return { ...p, source, ...(latest && latest !== p.version ? { latestVersion: latest } : {}) };
+        });
+      };
       return json(res, 200, {
         configDir: bridgeDir,
         userDir,
         // inherit 模式两目录相同 → 单份（source=user）；managed 合并两处各自可启停
         plugins: sameDir ? from(bridgeDir, 'user') : [...from(bridgeDir, 'bridge'), ...from(userDir, 'user')],
       });
+    }
+    if (path === '/api/plugins/available' && req.method === 'GET') {
+      // 安装下拉数据源：该目录已添加市场声明的可安装插件（CLI 语义：install 只能装已添加市场里的）
+      const dir = url.searchParams.get('dir') === 'bridge' ? bridgeDir : userDir;
+      return json(res, 200, { marketplaces: listAvailablePlugins(dir) });
     }
     if (path === '/api/plugins/action' && req.method === 'POST') {
       const body = await readJsonBody(req);
@@ -427,10 +494,18 @@ async function handle(
         uninstall: arg ? ['uninstall', arg] : [],
         enable: arg ? ['enable', arg] : [],
         disable: arg ? ['disable', arg] : [],
+        update: arg ? ['update', arg] : [],
         'marketplace-add': arg ? ['marketplace', 'add', arg] : [],
         'marketplace-remove': arg ? ['marketplace', 'remove', arg] : [],
         'marketplace-update': ['marketplace', 'update', ...(arg ? [arg] : [])],
       };
+      // 全部更新 = 刷新市场索引 + 逐个更新已装插件（marketplace update 不会升级已装插件本体）
+      if (op === 'update-all') {
+        const r = await updateAllPlugins(dir);
+        invalidatePluginCache(bridgeDir);
+        if (!sameDir) invalidatePluginCache(userDir);
+        return json(res, 200, r);
+      }
       const args = argsTable[op];
       if (!args || args.length === 0) return json(res, 400, { error: `操作 ${op || '(空)'} 需要参数或未知` });
       const r = await runPluginCli(args, { claudeConfigDir: dir });

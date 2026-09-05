@@ -2,7 +2,7 @@
 // 从 Claude Code 数据目录读取 installed_plugins.json（安装清单）+ settings.json 的
 // enabledPlugins（启用状态），把 scope=user 且已启用的插件 installPath 转成 SDK plugins 选项。
 // 全程容错：文件缺失/格式异常一律 warn-once 后返回空，绝不阻断任务（插件加载失败 ≠ 桥接器不可用）
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { PluginRef } from '../types.js';
 
@@ -99,6 +99,64 @@ export function listInstalledPlugins(claudeConfigDir: string): Array<{
       enabled: enabledMap[key] === true,
       ...(typeof item?.installPath === 'string' && item.installPath ? { path: item.installPath } : {}),
       ...(typeof item?.version === 'string' ? { version: item.version } : {}),
+    });
+  }
+  return out;
+}
+
+/** 市场清单（marketplace.json）里的可安装插件条目 */
+export interface MarketplacePluginEntry {
+  name: string;
+  description?: string;
+  version?: string;
+}
+
+/** 一个市场的可安装插件目录（安装下拉数据源） */
+export interface MarketplaceCatalog {
+  /** 市场名（marketplaces/ 下的目录名，即 install key "name@marketplace" 的 @ 后段） */
+  name: string;
+  description?: string;
+  plugins: MarketplacePluginEntry[];
+}
+
+/** marketplace.json 的已知形状；字段异常时按市场/条目粒度防御跳过 */
+interface MarketplaceDoc {
+  name?: string;
+  description?: string;
+  plugins?: Array<{ name?: string; description?: string; version?: string }>;
+}
+
+/**
+ * 列出 <claudeConfigDir>/plugins/marketplaces/* 各市场 .claude-plugin/marketplace.json
+ * 声明的可安装插件（Web 配置页「安装」下拉数据源；CLI 语义：install 只能装已添加市场里的插件）。
+ * 目录缺失（未 marketplace add 过）返回空；单个市场清单损坏按市场粒度跳过，不影响其余。
+ */
+export function listAvailablePlugins(claudeConfigDir: string): MarketplaceCatalog[] {
+  const marketRoot = join(claudeConfigDir, 'plugins', 'marketplaces');
+  let entries;
+  try {
+    entries = readdirSync(marketRoot, { withFileTypes: true });
+  } catch {
+    return []; // 市场根目录不存在 = 尚未添加任何市场，正常态
+  }
+  const out: MarketplaceCatalog[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const manifest = readJson<MarketplaceDoc>(join(marketRoot, entry.name, '.claude-plugin', 'marketplace.json'));
+    if (!manifest.ok) continue;
+    const plugins: MarketplacePluginEntry[] = [];
+    for (const p of manifest.doc.plugins ?? []) {
+      if (typeof p?.name !== 'string' || !p.name) continue;
+      plugins.push({
+        name: p.name,
+        ...(typeof p.description === 'string' ? { description: p.description } : {}),
+        ...(typeof p.version === 'string' && p.version ? { version: p.version } : {}),
+      });
+    }
+    out.push({
+      name: entry.name,
+      ...(typeof manifest.doc.description === 'string' ? { description: manifest.doc.description } : {}),
+      plugins,
     });
   }
   return out;

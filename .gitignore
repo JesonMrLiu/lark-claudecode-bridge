@@ -8,3 +8,4 @@ dist/
 docs/
 .claude
 tests
+.playwright-mcp/

@@ -4,6 +4,7 @@
 // 环境仅白名单透传 + CLAUDE_CONFIG_DIR：插件装到 bridge 解析的配置目录（managed 模式与 ~/.claude 隔离）
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { listInstalledPlugins } from './plugin-discovery.js';
 
 /** 平台二进制包候选（与 sdk.mjs 解析序一致：linux 优先 musl 变体；win32 带 .exe） */
 function cliCandidates(): string[] {
@@ -91,4 +92,40 @@ export function runPluginCli(
       else resolve({ ok: false, text: tail(err || out) || `退出码 ${code}` });
     });
   });
+}
+
+/** 逐插件更新结果（update-all 汇总展示用） */
+export interface PluginUpdateDetail {
+  key: string;
+  ok: boolean;
+  text: string;
+}
+
+export interface PluginUpdateAllResult extends PluginCliResult {
+  details: PluginUpdateDetail[];
+}
+
+/** 单插件 update 的超时：比 install 略紧（通常只拉一个小仓库，不含完整 marketplace clone） */
+const UPDATE_TIMEOUT_MS = 3 * 60 * 1000;
+
+/**
+ * 「全部更新」：先刷新市场索引（marketplace update），再逐个更新已装插件
+ * （plugin update name@marketplace）。关键语义：marketplace update 只是拉取市场仓库
+ * 最新清单，不会升级已装插件——必须逐个 update 才会把新版本写进 installed_plugins.json。
+ * 市场刷新失败不中断后续（插件 update 自身会按需拉取），逐项结果聚合进 text/details。
+ */
+export async function updateAllPlugins(claudeConfigDir: string): Promise<PluginUpdateAllResult> {
+  const lines: string[] = [];
+  const details: PluginUpdateDetail[] = [];
+  const market = await runPluginCli(['marketplace', 'update'], { claudeConfigDir });
+  lines.push(`${market.ok ? '✅' : '❌'} 刷新市场索引${market.ok ? '' : `：${tail(market.text, 300)}`}`);
+  const installed = listInstalledPlugins(claudeConfigDir);
+  for (const p of installed) {
+    const r = await runPluginCli(['update', p.key], { claudeConfigDir, timeoutMs: UPDATE_TIMEOUT_MS });
+    details.push({ key: p.key, ok: r.ok, text: r.text });
+    lines.push(`${r.ok ? '✅' : '❌'} 更新 ${p.key}${r.ok ? '' : `：${tail(r.text, 300)}`}`);
+  }
+  if (!installed.length) lines.push('（该目录尚未安装任何插件，仅刷新了市场索引）');
+  const allOk = market.ok && details.every((d) => d.ok);
+  return { ok: allOk, text: lines.join('\n'), details };
 }
