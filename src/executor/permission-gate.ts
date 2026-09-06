@@ -160,8 +160,13 @@ export class PermissionGate {
       }
       const timeoutMs = this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
       const answers = await this.withTimeout(this.opts.askQuestion({ questions, workspaceName }), timeoutMs);
-      if (answers === TIMED_OUT_SYM) {
-        return { behavior: 'deny', message: `提问超时（${Math.round(timeoutMs / 60000)} 分钟未响应），请自行决策并继续` };
+      // 空答案对象与超时同义：wiring 层超时（或发卡失败降级）resolve({}) 时不再误当"用户提交了空表单"
+      // 放行——统一走 deny，由模型根据任务性质决定继续还是停下等待
+      if (answers === TIMED_OUT_SYM || Object.keys(answers).length === 0) {
+        return {
+          behavior: 'deny',
+          message: `用户未在飞书端作答（超时 ${Math.round(timeoutMs / 60000)} 分钟或提问卡片发送失败），请自行决策；若当前步骤强依赖用户确认，请停止并等待用户指示`,
+        };
       }
       return { behavior: 'allow', updatedInput: { questions: input.questions, answers } };
     }

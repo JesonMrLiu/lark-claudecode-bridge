@@ -22,6 +22,7 @@ import {
 } from './gateway/card-builder.js';
 import { buildDiffSummaryCards } from './gateway/diff-card.js';
 import { runTask } from './executor/claude-executor.js';
+import type { McpServerStatus } from '@anthropic-ai/claude-agent-sdk';
 import { PermissionGate, type PlanAskResult, type AskQuestionResult } from './executor/permission-gate.js';
 import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery.js';
 import { createGatewaySender, createNotifyServer, NOTIFY_SERVER_NAME } from './executor/notify-server.js';
@@ -45,6 +46,22 @@ const TASK_HARD_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 const CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
 // PermissionGate 的兜底超时：仅当 wiring 侧超时机制失效时才触发（正常流程 ask 必在 CONFIRM_TIMEOUT_MS 内 settle）
 const GATE_FALLBACK_TIMEOUT_MS = CONFIRM_TIMEOUT_MS + 60_000;
+// 卡片发送超时：飞书 WS 偶发无响应时 sendCardTo 可能永久挂起，而 ask/askQuestion 闭包的
+// 超时定时器在 await 发卡之后才 arm——挂起即意味着永不超时。超时/失败快速降级为 deny，
+// 模型自行决策或重试，不再整轮卡死等 gate 兜底
+const CARD_SEND_TIMEOUT_MS = 30_000;
+
+/** 发卡类 gateway 调用超时包装：到点或失败均回落 fallback（永不 reject），调用方据此降级 */
+function raceFallback<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    timer.unref();
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      () => { clearTimeout(timer); resolve(fallback); },
+    );
+  });
+}
 
 /** 确认超时后的过期态卡片（此后迟到点击不再改写此卡片） */
 function expiredConfirmCard(req: ConfirmationRequest, timeoutMs: number): unknown {
@@ -70,6 +87,10 @@ const PLAN_DECISION_TEXT: Record<Extract<CardDecision, `plan-${string}`>, string
 interface ChannelRuntime {
   queue: Promise<void>;
   abort?: AbortController;
+  /** 当前是否有任务在执行（executeTask 入口置位、finally 清空）——enqueue 据此判断是否提示排队 */
+  busy?: boolean;
+  /** 待执行任务计数（busy 时入队自增、每个任务 finally 递减）：排队提示的位次来源 */
+  queuedCount?: number;
 }
 
 export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真实实现
@@ -95,7 +116,7 @@ export function createBridge(
   config: BridgeConfig,
   app: FeishuAppConfig, // 本 bridge 绑定的飞书应用：并发/默认工作区/Claude Code 环境/人格均 per-app
   deps: BridgeDeps,
-  opts: { confirmTimeoutMs?: number; reloadConfig?: () => void } = {}, // 测试可注入更短的确认等待窗 / 自定义配置重载
+  opts: { confirmTimeoutMs?: number; cardSendTimeoutMs?: number; reloadConfig?: () => void } = {}, // 测试可注入更短的确认等待窗 / 发卡超时 / 自定义配置重载
 ): GatewayHandlers {
   const sem = new Semaphore(app.concurrency ?? config.concurrency);
   const tag = `[app:${app.name}]`;
@@ -149,15 +170,25 @@ export function createBridge(
   // 通道当前任务的进度卡：gate 的 ask/planAsk/askQuestion 闭包随 gate 通道级复用，
   // 不能捕获任务级 progress 实例（会是首个任务的旧卡）——经此间接引用每次任务的新卡
   const activeProgress = new Map<string, ProgressCard>();
+  // 当前存活 query 的 MCP 状态拉取句柄（executor onQuery 注入、任务 finally 删除）：
+  // /mcp 命令在任务运行中经此实时拉取；句柄随 query 结束失效，调用侧须 catch
+  const activeQueries = new Map<string, { wsName: string; handle: { mcpServerStatus(): Promise<McpServerStatus[]> } }>();
 
   function workspacePath(name: string): string {
     return config.workspaces.find((w) => w.name === name)?.path ?? config.workspaces[0].path;
   }
 
-  /** 通道内串行入队（每 key 一条 Promise 链），全局并发由 Semaphore 限制 */
+  /** 通道内串行入队（每 key 一条 Promise 链），全局并发由 Semaphore 限制。
+   *  有任务在跑时新消息静默 FIFO 排队——不提示的话用户不知道消息已被接收，会反复重发或误以为丢失。
+   *  queuedCount 计「等待中」消息数：enqueue 一律自增（含首位），executeTask 启动时递减（该条离开队列） */
   function enqueue(key: string, msg: IncomingMessage, prompt: string, wsName: string): void {
     const rt = runtimes.get(key) ?? { queue: Promise.resolve() };
     runtimes.set(key, rt);
+    rt.queuedCount = (rt.queuedCount ?? 0) + 1;
+    if (rt.busy) {
+      void deps.gateway.sendTextTo(msg.chatId, `⏳ 当前有任务在运行，本条消息已排队（第 ${rt.queuedCount} 位），完成后自动开始`)
+        .catch(() => {}); // 提示失败静默：不影响任务本身入队
+    }
     rt.queue = rt.queue.then(() => executeTask(key, msg, prompt, wsName)).catch((e) => {
       console.error(tag, '[任务异常]', e);
     });
@@ -215,8 +246,9 @@ export function createBridge(
     // 2. 命令：/help /new /resume /stop /status /ws
     const st = deps.store.getChannelState(key);
     // currentWorkspace 语义：store 中已设置的工作区优先，否则 app 默认，最后全局默认——
-    // 保证 /new、/status 回复与实际一致
-    const currentWorkspace = st?.workspaceName ?? app.defaultWorkspace ?? config.defaults.workspace;
+    // 保证 /new、/status 回复与实际一致。用 || 而非 ??：archiveSession 为新通道建档时
+    // workspaceName 存 ''（归档时不知工作区），空串必须回退默认，否则 inventory 键错位
+    const currentWorkspace = st?.workspaceName || app.defaultWorkspace || config.defaults.workspace;
     // 2.5 触发词映射：必须放在本地命令之前——斜杠触发词（如 /produce）会被 handleCommand
     // 的未知命令分支吞掉；rewriteByTrigger 对本地命令（/stop 等）直接放行，不会被劫持
     const triggered = rewriteByTrigger(msg.text, app.triggers);
@@ -233,6 +265,16 @@ export function createBridge(
       isAdmin: deps.access.isAdmin(msg.userId),
       currentWorkspace: () => currentWorkspace,
       getInventory: () => inventories.get(currentWorkspace),
+      // /mcp 实时拉取：当前工作区有存活 query 才有实时数据（5s 超时），否则回退 init/收尾快照
+      getLiveMcpStatus: async () => {
+        try {
+          for (const { wsName: w, handle } of activeQueries.values()) {
+            if (w !== currentWorkspace) continue;
+            return await raceFallback<McpServerStatus[] | null>(handle.mcpServerStatus(), 5000, null);
+          }
+        } catch { /* 句柄随 query 结束失效等：回退快照 */ }
+        return null;
+      },
       // /plugin 插件管理依赖：claudeConfigDir = 双模式解析的当前生效目录；userClaudeDir = 本机
       // ~/.claude（managed 模式下作为第二来源 + install 默认目标）；结果回传 = 当前聊天
       claudeConfigDir: claudeDir,
@@ -256,9 +298,11 @@ export function createBridge(
   }
 
   async function executeTask(key: string, msg: IncomingMessage, prompt: string, wsName: string): Promise<void> {
+    const rt = runtimes.get(key)!;
+    rt.busy = true; // enqueue 据此给后续消息发「已排队」提示（sem 等待期同样算占用）
+    rt.queuedCount = Math.max(0, (rt.queuedCount ?? 1) - 1); // 本条离开等待队列开始执行
     const release = await sem.acquire();
     const abort = new AbortController();
-    const rt = runtimes.get(key)!;
     rt.abort = abort;
     const progress = new ProgressCard(
       {
@@ -271,6 +315,7 @@ export function createBridge(
       `任务 · ${wsName}`,
     );
     const confirmTimeoutMs = opts.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
+    const cardSendTimeoutMs = opts.cardSendTimeoutMs ?? CARD_SEND_TIMEOUT_MS;
     // 通道级复用：已存在则沿用（allow-session 记忆跨任务），不存在才建。
     // 白名单每任务现读 config.permissions（热重载改配置下一条消息即生效——但 gate 是
     // 通道级复用实例，decide 时才查 allowTools，故以构造时引用为准；改 permissions 后
@@ -285,7 +330,13 @@ export function createBridge(
           // 超时由本闭包自管：到点删除条目 + 卡片置为过期态 + 以 deny 继续——
           // 条目有界（无人点击、/stop、4h abort 挂起中的 ask 均会被定时器清理），
           // 此后的迟到点击因条目已删被 toast 提示后忽略，卡片不再被改写为与实际不符的决策态
-          const cardId = await deps.gateway.sendCardTo(msg.chatId, buildConfirmCard(req));
+          // 发卡本身带超时：sendCardTo 挂起/失败时降级 deny（下面的等待定时器在 await 之后，挂起即永不 arm）
+          const cardId = await raceFallback(deps.gateway.sendCardTo(msg.chatId, buildConfirmCard(req)), cardSendTimeoutMs, '');
+          if (!cardId) {
+            void deps.gateway.sendTextTo(msg.chatId, `⚠️ 确认卡发送失败（${req.toolName}），已自动拒绝；模型重试时会再次弹出`)
+              .catch(() => {});
+            return 'deny';
+          }
           // 确认卡在进度卡下方追加会把进度卡顶上去：删旧卡重发，让进度卡始终沉在会话最底
           void activeProgress.get(key)?.sinkToBottom();
           return new Promise<PermissionDecision>((resolve) => {
@@ -311,7 +362,15 @@ export function createBridge(
         planAsk: async (req) => {
           const planReq: PlanCardRequest = { requestId: randomUUID(), plan: req.plan, workspaceName: req.workspaceName };
           const ids: string[] = [];
-          for (const c of buildPlanCards(planReq)) ids.push(await deps.gateway.sendCardTo(msg.chatId, c));
+          for (const c of buildPlanCards(planReq)) {
+            const id = await raceFallback(deps.gateway.sendCardTo(msg.chatId, c), cardSendTimeoutMs, '');
+            if (!id) {
+              void deps.gateway.sendTextTo(msg.chatId, '⚠️ 计划卡发送失败，本次计划已自动放弃；模型重新提交计划时会再次弹出')
+                .catch(() => {});
+              return { action: 'reject' };
+            }
+            ids.push(id);
+          }
           const cardId = ids[0];
           void activeProgress.get(key)?.sinkToBottom();
           return new Promise<PlanAskResult>((resolve) => {
@@ -341,7 +400,13 @@ export function createBridge(
             workspaceName: req.workspaceName,
           };
           const answers: QuestionCardAnswers = {};
-          const cardId = await deps.gateway.sendCardTo(msg.chatId, buildQuestionCard(qaReq, answers));
+          // 发卡失败/超时返回空答案：gate 对空答案统一按「未作答」deny，模型自行决策或停下等待
+          const cardId = await raceFallback(deps.gateway.sendCardTo(msg.chatId, buildQuestionCard(qaReq, answers)), cardSendTimeoutMs, '');
+          if (!cardId) {
+            void deps.gateway.sendTextTo(msg.chatId, '⚠️ 提问卡发送失败，已按未作答处理；模型会自行决策或停下等待你的回复')
+              .catch(() => {});
+            return {};
+          }
           void activeProgress.get(key)?.sinkToBottom();
           return new Promise<AskQuestionResult>((resolve) => {
             const gc = setTimeout(() => {
@@ -366,7 +431,8 @@ export function createBridge(
       });
       gates.set(key, gate);
     }
-    const hardTimeout = setTimeout(() => abort.abort(), TASK_HARD_TIMEOUT_MS);
+    // 硬超时 abort 带 reason 标记：catch 侧据此与 /stop 区分停止文案
+    const hardTimeout = setTimeout(() => abort.abort(new Error('hard-timeout')), TASK_HARD_TIMEOUT_MS);
     hardTimeout.unref();
     // lcb-notify 发送能力：chatId 硬绑定当前任务（权限闸直通的安全前提）；
     // sentPaths 记录中途已推送的文件，任务收尾的产出回传据此去重（用户已收过的不重发）。
@@ -397,9 +463,11 @@ export function createBridge(
     try {
       await progress.start();
       const state = deps.store.getChannelState(key);
-      // 续接指针：currentSessionId 优先（/new 置空即新开会话），缺省回退 sessions[0]
-      //（兼容旧版数据：旧语义 sessions[0] 即当前会话）
-      const resumeId = state?.currentSessionId ?? state?.sessions?.[0]?.sessionId;
+      // 续接指针三态：undefined=旧版存量数据 → 回退 sessions[0]（旧语义 sessions[0] 即当前）；
+      // null=/new 或 /ws use 已清指针 → 新开会话；字符串 → resume 该会话。
+      // 不能用 ??：null 会被 ?? 当成空值回退 sessions[0]，/new 的意图就被吞掉了
+      const pointer = state?.currentSessionId;
+      const resumeId = pointer === undefined ? state?.sessions?.[0]?.sessionId : pointer || undefined;
       const now = () => nowBeijingISO();
       // 落盘 · user：任务起点（prompt 全文 + resume 链上一轮 sessionId）
       deps.transcript?.user({
@@ -432,12 +500,22 @@ export function createBridge(
           return merged.length ? { plugins: merged.map((p) => ({ path: p.path })) } : {};
         })(),
         canUseTool: (toolName, input, ctx) => gate.decide(toolName, input, wsName, ctx),
+        onQuery: (handle) => { activeQueries.set(key, { wsName, handle }); },
       }, {
         onInit: (inv) => {
           inventories.set(wsName, { ...inv, workspace: wsName, loadedAt: new Date().toISOString() });
         },
+        onMcpStatus: (servers) => {
+          // 任务收尾时 executor 拉取的真实 MCP 状态回写 inventory——init 快照必为 pending，
+          // 这是 /mcp 空闲期显示 connected/failed 的数据源（prev 不存在说明 init 未到，等 init 全量落盘）
+          const prev = inventories.get(wsName);
+          if (prev) inventories.set(wsName, { ...prev, mcpServers: servers, loadedAt: new Date().toISOString() });
+        },
         onProgress: (e: ProgressEvent) => {
-          if (e.kind === 'text') {
+          if (e.kind === 'status') {
+            // CLI 状态心跳（等待模型响应/上下文压缩）：刷新进度卡状态行，避免静默期黑盒感
+            progress.setStatus(e.content);
+          } else if (e.kind === 'text') {
             progress.appendText(e.content);
             // 落盘 · assistant：流式文本块全文（每块一行，天然增量）
             deps.transcript?.assistant({
@@ -527,6 +605,19 @@ export function createBridge(
         }
       }
     } catch (e) {
+      // 主动中止（/stop 或 4h 硬超时）：SDK 多数场景把 AbortError("Operation aborted") 抛进消息循环
+      // 而非正常收尾——按停止处理不误报「出错」，与上方 executor 正常 return 后的 aborted 判断二选一命中
+      if (abort.signal.aborted) {
+        const hardTimedOut = abort.signal.reason instanceof Error && abort.signal.reason.message === 'hard-timeout';
+        await progress.finish(hardTimedOut ? '🛑 已停止（超过 4 小时上限自动停止）' : '🛑 已停止');
+        const stoppedSessionId = (e as { sessionId?: string })?.sessionId;
+        if (stoppedSessionId) deps.store.archiveSession(key, stoppedSessionId, prompt);
+        deps.transcript?.result({
+          v: 1, ts: nowBeijingISO(), kind: 'result', app: app.appId,
+          chatId: msg.chatId, userId: msg.userId, sessionId: stoppedSessionId ?? '', subtype: 'stopped', text: '',
+        });
+        return;
+      }
       // 常见错误附配置指引（认证 hint 按模式分流：managed 指向配置页，inherit 指向 claude login）；
       // No conversation found 多因旧版独立目录里的会话（本版起统一 Claude 配置目录，旧会话无法跨目录 resume）
       const errText = String(e);
@@ -555,7 +646,9 @@ export function createBridge(
     } finally {
       clearTimeout(hardTimeout);
       activeProgress.delete(key);
+      activeQueries.delete(key);
       rt.abort = undefined;
+      rt.busy = false;
       release();
     }
   }
@@ -822,4 +915,10 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   }
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+  // 长驻进程兜底：任何遗漏的未处理 rejection 只记日志不退出——飞书发送偶发失败若崩掉整个
+  // bridge（Node 默认行为），systemd 重启会掩盖崩溃，但当时所有在跑回合横死、会话尾部残缺，
+  // 下一轮 resume 便是「上一轮被中断」的连环错乱
+  process.on('unhandledRejection', (reason) => {
+    console.error('[unhandledRejection]（已忽略，进程继续运行）', reason);
+  });
 }

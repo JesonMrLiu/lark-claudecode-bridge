@@ -19,7 +19,7 @@ export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status',
 export const SLASH_COMMAND_META: Record<string, { description: string; icon: string }> = {
   help: { description: '查看全部命令', icon: 'slash-ai_outlined' },
   new: { description: '开启新会话', icon: 'add-chat-ai_outlined' },
-  resume: { description: '列出/恢复历史会话', icon: 'update-ai_outlined' },
+  resume: { description: '列出/恢复历史会话（支持翻页）', icon: 'update-ai_outlined' },
   stop: { description: '停止当前任务', icon: 'clear_outlined' },
   status: { description: '查看当前状态', icon: 'diagnosis-ai_outlined' },
   ws: { description: '切换工作区（/ws list 列出）', icon: 'folder_outlined' },
@@ -43,6 +43,8 @@ export interface CommandContext {
   stopCurrentTask(): boolean;
   /** 本 app 当前工作区最近一次会话的加载清单（SDK init 消息缓存）；尚无会话时 undefined */
   getInventory(): SessionInventory | undefined;
+  /** /mcp 实时拉取：当前工作区有存活 query 时返回真实连接状态，否则 null（回退快照）。wiring 注入 */
+  getLiveMcpStatus?(): Promise<SessionInventory['mcpServers'] | null>;
   /** Claude 配置目录（/plugin 安装目标）。wiring 注入；未注入时 /plugin 回复不可用 */
   claudeConfigDir?: string;
   /** 本机 ~/.claude（managed 模式下作为插件第二来源与默认安装目标） */
@@ -59,8 +61,9 @@ export interface CommandResult {
 
 const HELP = `**可用命令**
 /new — 开启新会话
-/resume — 列出历史会话
-/resume <编号> — 恢复指定会话
+/resume — 列出历史会话（最近 20 条，倒序，1 = 最新）
+/resume <编号> — 恢复指定会话（编号全局连续，可跨页）
+/resume page <页码> — 翻看更早的历史会话
 /stop — 停止当前任务
 /status — 查看当前状态
 /ws list — 列出工作区
@@ -78,6 +81,9 @@ const HELP = `**可用命令**
 /** 清单类命令的空态提示（会话未初始化 → init 消息未到 → 无缓存） */
 const NO_INVENTORY_REPLY = '暂无加载清单——Claude Code 会话尚未初始化。\n先发一条任务消息（任意内容，如「你好」），完成后再查看。';
 
+/** /resume 每页展示条数；超过后 /resume page <n> 翻看更早 */
+const RESUME_PAGE_SIZE = 20;
+
 /** 清单超过 30 项时截断展示 */
 function tail(items: string[]): string {
   return items.length > 30 ? `${items.slice(0, 30).join('、')} …等 ${items.length} 个` : items.join('、');
@@ -93,8 +99,9 @@ function inventoryHeader(inv: SessionInventory): string {
  * 本地命令之外的 / 开头消息也返回 { handled: false, taskText } 原文透传——
  * SDK 会话可直接派发 prompt 里的斜杠命令（user skills / 插件命令等），
  * Claude Code 侧不存在的命令会在任务结果里回报错误，比 bridge 拦截信息量更大。
- * 会话编号约定：列表按时间正序展示（1 = 最早归档）；
- * 内部存储为新→旧（sessions[0] 为当前），故编号 n 对应内部下标 length - n。
+ * 会话编号约定：/resume 列表按时间倒序展示（1 = 最新归档），编号全局连续——
+ * 翻页后编号顺延（第 2 页为 21-40 …），/resume <编号> 可跨页直接恢复；
+ * 内部存储为新→旧（sessions[0] 为最新），故编号 n 对应内部下标 n - 1。
  */
 export async function handleCommand(text: string, ctx: CommandContext): Promise<CommandResult> {
   if (!text.startsWith('/')) return { handled: false, taskText: text };
@@ -108,29 +115,41 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       const st = store.getChannelState(key);
       // 仅清除「当前续接指针」，历史会话列表保留（/resume 仍可切回）——
       // 旧版清空整个 sessions 导致开新会话后历史「消失」，列表永远积累不起来
-      store.setCurrentSession(key, null, st?.workspaceName ?? ws);
+      store.setCurrentSession(key, null, st?.workspaceName || ws);
       return { handled: true, reply: `✅ 已开启新会话（工作区：${ws}）。历史会话未清空，/resume 可随时切回` };
     }
     case 'resume': {
-      const sessions = store.listSessions(key);
-      if (args.length === 0) {
-        if (sessions.length === 0) return { handled: true, reply: '暂无历史会话' };
-        // 按时间正序展示：最早的排最前；当前续接的会话打标（一眼看出下条消息会接到哪）
+      const sessions = store.listSessions(key); // 内部新→旧（sessions[0] 最新）
+      if (sessions.length === 0) return { handled: true, reply: '暂无历史会话' };
+      const totalPages = Math.max(1, Math.ceil(sessions.length / RESUME_PAGE_SIZE));
+      // 渲染一页：倒序（1 = 最新）、编号全局连续（翻页后 21-40 …，/resume <编号> 跨页可用），
+      // 当前续接的会话打标（一眼看出下条消息会接到哪）
+      const renderPage = (page: number): string => {
         const current = store.getChannelState(key)?.currentSessionId;
-        const chrono = [...sessions].reverse();
-        const list = chrono
-          .map((s, i) => `${i + 1}. ${s.summary || '(无摘要)'} <font color='grey'>${formatBeijingTime(s.updatedAt)}</font>${s.sessionId === current ? ' ← 当前' : ''}`)
+        const slice = sessions.slice((page - 1) * RESUME_PAGE_SIZE, page * RESUME_PAGE_SIZE);
+        const list = slice
+          .map((s, i) => `${(page - 1) * RESUME_PAGE_SIZE + i + 1}. ${s.summary || '(无摘要)'} <font color='grey'>${formatBeijingTime(s.updatedAt)}</font>${s.sessionId === current ? ' ← 当前' : ''}`)
           .join('\n');
-        return { handled: true, reply: `**历史会话**（回复 /resume 编号 恢复；/new 另起一支，历史保留）\n${list}` };
+        const nav: string[] = [];
+        if (page < totalPages) nav.push(`/resume page ${page + 1} 查看更早`);
+        if (page > 1) nav.push(`/resume page ${page - 1} 查看更新`);
+        return `**历史会话**（第 ${page}/${totalPages} 页 · 共 ${sessions.length} 条 · 倒序，编号 1 = 最新）\n${list}\n/resume <编号> 恢复 · /new 另起一支${nav.length ? ` · ${nav.join(' · ')}` : ''}`;
+      };
+      if (args[0] === 'page') {
+        const p = Number(args[1]);
+        if (!Number.isInteger(p) || p < 1 || p > totalPages) {
+          return { handled: true, reply: `页码无效，范围 1-${totalPages}` };
+        }
+        return { handled: true, reply: renderPage(p) };
       }
+      if (args.length === 0) return { handled: true, reply: renderPage(1) };
       const n = Number(args[0]);
       if (!Number.isInteger(n) || n < 1 || n > sessions.length) {
         return { handled: true, reply: `编号无效，范围 1-${sessions.length}` };
       }
-      const target = sessions[sessions.length - n]; // 编号 n → 时间正序第 n 个
-      // 恢复 = 当前续接指针指向选中会话（列表顺序不动，历史保持时间序）
+      const target = sessions[n - 1]; // 倒序全局编号：n=1 → 最新（sessions[0]），跨页直接可用
+      // 恢复 = 当前续接指针指向选中会话（列表顺序不动，历史保持归档时间序）
       store.setCurrentSession(key, target.sessionId);
-      // 标注当前指针，方便 /resume 列表辨认正在续接哪条
       return { handled: true, reply: `↩️ 已恢复会话：${target.summary || target.sessionId}\n下一条任务将从该会话继续` };
     }
     case 'stop':
@@ -139,7 +158,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       const st = store.getChannelState(key);
       return {
         handled: true,
-        reply: `机器人：**${ctx.appName}**\n工作区：**${st?.workspaceName ?? ctx.currentWorkspace()}**\n模型：**${st?.model ?? '跟随全局'}**\n历史会话：${store.listSessions(key).length} 个`,
+        reply: `机器人：**${ctx.appName}**\n工作区：**${st?.workspaceName || ctx.currentWorkspace()}**\n模型：**${st?.model ?? '跟随全局'}**\n历史会话：${store.listSessions(key).length} 个`,
       };
     }
     case 'ws': {
@@ -212,11 +231,24 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
     case 'mcp': {
       const inv = ctx.getInventory();
       if (!inv) return { handled: true, reply: NO_INVENTORY_REPLY };
-      const list = inv.mcpServers.map((s) => {
-        const ok = s.status === 'connected';
-        return `- ${ok ? '✅' : '⚠️'} **${s.name}**（${s.status}）`;
+      // init 快照必为 pending（拍摄于 MCP server 握手完成前）：任务运行中实时拉取真实状态，
+      // 空闲期回退最近快照（任务收尾时 executor 已刷过一次真实状态）
+      const live = (await ctx.getLiveMcpStatus?.()) ?? null;
+      const servers = live ?? inv.mcpServers;
+      const list = servers.map((s) => {
+        const icon = s.status === 'connected' ? '✅'
+          : s.status === 'failed' ? '❌'
+          : s.status === 'needs-auth' ? '🔑'
+          : s.status === 'disabled' ? '⏸️'
+          : '⏳';
+        const toolsNote = s.status === 'connected' && s.tools?.length ? `（${s.tools.length} 个工具）` : '';
+        const errNote = s.status === 'failed' && s.error ? `：${s.error.split('\n')[0].slice(0, 80)}` : '';
+        return `- ${icon} **${s.name}**（${s.status}）${toolsNote}${errNote}`;
       }).join('\n');
-      return { handled: true, reply: `**MCP 服务** ${inv.mcpServers.length} 个 · ${inventoryHeader(inv)}\n${list}` };
+      const source = live
+        ? '实时状态'
+        : `快照 · ${formatBeijingTime(inv.loadedAt)} 加载（下次任务运行时自动刷新）`;
+      return { handled: true, reply: `**MCP 服务** ${servers.length} 个 · <font color='grey'>${source}</font>\n${list}` };
     }
     case 'plugin': {
       // 飞书端插件管理（安装/启停/市场）：本地接管，不再透传给 Claude Code 会话

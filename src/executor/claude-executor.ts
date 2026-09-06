@@ -1,6 +1,6 @@
 // Claude 执行器：封装 Agent SDK 的 query()，把流消息转成进度事件并收集产出
 // 注意：不覆盖/清理任何 ANTHROPIC_* 环境变量，凭证与代理配置透传 process.env
-import { query, type McpServerConfig, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type McpServerConfig, type McpServerStatus, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { OutputCollector } from './output-collector.js';
 import type { ProgressEvent, SessionInventory, TaskOutcome } from '../types.js';
 
@@ -8,6 +8,9 @@ export interface ExecutorCallbacks {
   onProgress(event: ProgressEvent): Promise<void> | void;
   /** SDK init(system/init) 消息到达时回调（每 query 仅一次）；提取本会话实际加载的模型/技能/插件/MCP 清单 */
   onInit?(inventory: Omit<SessionInventory, 'workspace' | 'loadedAt'>): void;
+  /** MCP server 真实连接状态（任务收尾时经 Query.mcpServerStatus() 拉取一次）。init 快照必为 pending——
+   *  此回调是 /mcp 命令在任务空闲期显示 connected/failed 的唯一数据源 */
+  onMcpStatus?(servers: McpServerStatus[]): void;
 }
 
 /** canUseTool 第三参（SDK 原样透传的子集）：suggestions 为 CLI 建议的权限更新（如 ExitPlanMode 后 setMode acceptEdits） */
@@ -42,6 +45,9 @@ export interface RunTaskOptions {
   mcpServers?: Record<string, McpServerConfig>;
   /** 显式加载的本地插件目录（含 .claude-plugin/plugin.json），映射为 SDK 的 {type:'local', path} */
   plugins?: Array<{ path: string }>;
+  /** query 创建后回调：暴露 mcpServerStatus 窄句柄（wiring 存入 activeQueries，/mcp 命令实时拉取用）。
+   *  句柄仅在该 query 存活期间有效，任务结束后调用会 reject——调用方须自行 catch */
+  onQuery?(handle: { mcpServerStatus(): Promise<McpServerStatus[]> }): void;
 }
 
 // SDK 选项只收 abortController（无 signal 项），把外部 signal 的中止转发给它
@@ -68,7 +74,7 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
   const collector = new OutputCollector(opts.cwd);
   // Streaming Input（官方推荐姿势）：prompt 经 AsyncGenerator 送入，yield 一条用户消息后挂起不结束——
   // stdin 在整个会话期间保持打开。字符串 prompt 的单轮模式在收到第一条 result 后即关 stdin
-  // （SDK isSingleUserTurn 行为，agent-sdk#384），plan mode 下 ExitPlanMode/AskUserQuestion 这类
+  //（SDK isSingleUserTurn 行为，agent-sdk#384），plan mode 下 ExitPlanMode/AskUserQuestion 这类
   // 轮次边界的权限请求落在 result 之后，CLI 侧 inputClosed 后全部报 "Stream closed" 中断审批流
   async function* inputStream(): AsyncGenerator<SDKUserMessage> {
     yield { type: 'user', message: { role: 'user', content: prompt }, parent_tool_use_id: null };
@@ -116,60 +122,89 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
   // init 消息提取的会话清单（每 query 一次）；数组字段全部 ?? [] 兜底——SDK 升级字段改名时清单为空但不崩
   let inventory: Omit<SessionInventory, 'workspace' | 'loadedAt'> | undefined;
   const toolNames = new Map<string, string>(); // tool_use_id → 工具名（tool_result 块本身不带 name）
-  for await (const message of q as AsyncIterable<SDKMessage>) {
-    switch (message.type) {
-      case 'system': {
-        if (message.subtype === 'init') {
-          inventory = {
-            model: message.model,
-            claudeCodeVersion: message.claude_code_version,
-            skills: message.skills ?? [],
-            slashCommands: message.slash_commands ?? [],
-            plugins: (message.plugins ?? []).map((p) => ({ name: p.name, path: p.path, version: p.version })),
-            mcpServers: message.mcp_servers ?? [],
-            agents: message.agents ?? [],
-          };
-          cb.onInit?.(inventory);
-        }
-        break;
-      }
-      case 'assistant': {
-        turns++;
-        for (const block of message.message.content) {
-          if (block.type === 'text') {
-            await cb.onProgress({ kind: 'text', content: block.text });
-          } else if (block.type === 'tool_use') {
-            const input = (block.input ?? {}) as Record<string, unknown>;
-            toolNames.set(block.id, block.name);
-            collector.track(block.name, input);
-            await cb.onProgress({ kind: 'tool-start', content: `${block.name}: ${summarizeToolInput(input)}` });
+  opts.onQuery?.(q);
+  try {
+    for await (const message of q as AsyncIterable<SDKMessage>) {
+      switch (message.type) {
+        case 'system': {
+          if (message.subtype === 'init') {
+            inventory = {
+              model: message.model,
+              claudeCodeVersion: message.claude_code_version,
+              skills: message.skills ?? [],
+              slashCommands: message.slash_commands ?? [],
+              plugins: (message.plugins ?? []).map((p) => ({ name: p.name, path: p.path, version: p.version })),
+              mcpServers: message.mcp_servers ?? [],
+              agents: message.agents ?? [],
+            };
+            cb.onInit?.(inventory);
+          } else if (message.subtype === 'status') {
+            // CLI 状态心跳（requesting=等模型响应 / compacting=上下文压缩 / null=空闲）：刷新进度卡
+            // 状态行——includePartialMessages=false 下长 API 轮次没有任何其他事件，避免「只有计时在走」的黑盒感
+            await cb.onProgress({
+              kind: 'status',
+              content: message.status === 'requesting' ? '🌐 等待模型响应…'
+                : message.status === 'compacting' ? '🗜️ 上下文压缩中…'
+                : '🔄 运行中',
+            });
           }
+          break;
         }
-        break;
-      }
-      case 'user': {
-        const content = message.message.content;
-        if (!Array.isArray(content)) break;
-        for (const block of content) {
-          if (block.type === 'tool_result') {
-            const name = toolNames.get(block.tool_use_id) ?? '';
-            await cb.onProgress({ kind: 'tool-result', content: name, ok: !block.is_error });
+        case 'assistant': {
+          turns++;
+          for (const block of message.message.content) {
+            if (block.type === 'text') {
+              await cb.onProgress({ kind: 'text', content: block.text });
+            } else if (block.type === 'tool_use') {
+              const input = (block.input ?? {}) as Record<string, unknown>;
+              toolNames.set(block.id, block.name);
+              collector.track(block.name, input);
+              await cb.onProgress({ kind: 'tool-start', content: `${block.name}: ${summarizeToolInput(input)}` });
+            }
           }
+          break;
         }
-        break;
-      }
-      case 'result': {
-        if (message.subtype === 'success') finalText = message.result;
-        // 非成功终态（error_during_execution / error_max_turns 等，错误文本在 errors 数组）：
-        // 带出循环后统一抛出，消息格式与单轮模式 SDK throw 保持一致（index.ts catch 的 hint 依赖该格式）
-        else if (message.subtype.startsWith('error')) resultErrorText = message.errors?.join('\n') || message.subtype;
-        if ('session_id' in message && typeof message.session_id === 'string') sessionId = message.session_id;
-        // 最终 result 到手即主动结束：break 触发 q.return() → SDK 清理输入流与子进程
-        //（streaming 输入永不自终，不 break 任务会一直挂起）
-        if (message.subtype === 'success' || message.subtype.startsWith('error')) return finalize();
-        break;
+        case 'user': {
+          const content = message.message.content;
+          if (!Array.isArray(content)) break;
+          for (const block of content) {
+            if (block.type === 'tool_result') {
+              const name = toolNames.get(block.tool_use_id) ?? '';
+              await cb.onProgress({ kind: 'tool-result', content: name, ok: !block.is_error });
+            }
+          }
+          break;
+        }
+        case 'result': {
+          if (message.subtype === 'success') finalText = message.result;
+          // 非成功终态（error_during_execution / error_max_turns 等，错误文本在 errors 数组）：
+          // 带出循环后统一抛出，消息格式与单轮模式 SDK throw 保持一致（index.ts catch 的 hint 依赖该格式）
+          else if (message.subtype.startsWith('error')) resultErrorText = message.errors?.join('\n') || message.subtype;
+          if ('session_id' in message && typeof message.session_id === 'string') sessionId = message.session_id;
+          // 最终 result 到手即主动结束：return 触发 q.return() → SDK 清理输入流与子进程
+          //（streaming 输入永不自终，不 return 任务会一直挂起）
+          if (message.subtype === 'success' || message.subtype.startsWith('error')) {
+            // 收尾前拉一次 MCP 真实连接状态（init 快照必为 pending，这是空闲期 /mcp 的数据源）；
+            // try/catch 同时兜住同步异常（旧 mock/异常环境下方法缺失）与异步拒绝，绝不阻断收尾
+            try {
+              const statuses = await q.mcpServerStatus();
+              cb.onMcpStatus?.(statuses);
+            } catch { /* 拉取失败：保留 init 快照 */ }
+            return finalize();
+          }
+          break;
+        }
       }
     }
+  } catch (e) {
+    // 流错误（/stop 的 AbortError、Stream closed 等）：把已知的 sessionId 挂到错误对象再抛——
+    // wiring 侧据此把中止/出错任务的会话也归档进 /resume 历史（AbortError 自身不携带
+    // sessionId；不改动原 message，index.ts catch 的 hint 匹配不受影响）
+    const err = e instanceof Error ? e : new Error(String(e));
+    if (sessionId && !(err as Error & { sessionId?: string }).sessionId) {
+      (err as Error & { sessionId?: string }).sessionId = sessionId;
+    }
+    throw err;
   }
   return finalize();
 

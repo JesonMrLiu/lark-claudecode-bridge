@@ -149,7 +149,9 @@ export interface SessionInventory {
   skills: string[];
   slashCommands: string[];
   plugins: Array<{ name: string; version?: string; path: string }>;
-  mcpServers: Array<{ name: string; status: string }>;
+  /** mcpServers 状态来源有两类：init 快照（仅 name/status）与任务收尾的 mcpServerStatus() 实时拉取
+   *  （另含 failed 的 error、connected 的 tools 清单）——error/tools 为可选以兼容快照形态 */
+  mcpServers: Array<{ name: string; status: string; error?: string; tools?: Array<{ name: string }> }>;
   agents: string[];
   /** 以下为 bridge 侧附加信息（非 SDK 字段） */
   workspace: string;

@@ -12,12 +12,16 @@ export interface ChannelState {
   workspaceName: string;
   sessions: SessionMeta[];
   /**
-   * 当前续接的会话指针：executeTask 每任务 resume 它；/new 置空（下个任务新开会话），
-   * /resume <n> 指向选中会话。缺省时回退 sessions[0]（兼容旧数据：旧版 sessions[0] 即当前）。
+   * 当前续接的会话指针，三态（executeTask 据此决定续接/新开）：
+   * - 字段缺失（undefined）= 旧版存量数据 → 回退 sessions[0]（旧语义 sessions[0] 即当前）
+   * - 显式 null = 已 /new（或 /ws use 切工作区）→ 下个任务新开会话
+   * - 字符串 = 续接指针 → 每任务 resume 它；/resume <n> 指向选中会话；收尾归档恢复为字符串
+   * 必须显式存 null 而非 delete：delete 后读回 undefined 与存量数据不可区分，
+   * 兼容回退会吞掉 /new 的意图（0.15.x 前 bug：/resume 列表恒为 1 条）。
    * 与历史列表分离是 /new 语义的关键：开新会话 ≠ 清空历史（0.13.x 前清空导致
    * /resume 列表永远只剩一条、重启后看似「丢了」全部历史）。
    */
-  currentSessionId?: string;
+  currentSessionId?: string | null;
   /** 通道级模型覆盖（/model 命令设置，跨重启持久；/new 不清除——它是通道偏好而非会话状态）。
    *  缺省/undefined = 跟随 ~/.claude/settings.json 的 model */
   model?: string;
@@ -72,12 +76,13 @@ export class SessionStore {
   /**
    * 设置/清除当前续接指针（不动历史列表）：
    * /new 传 null（下个任务新开会话，历史保留）；/resume <n> 传选中 sessionId。
+   * null 显式落盘（JSON 保留 "currentSessionId": null）——读取端以「字段缺失 vs null」
+   * 区分存量数据与用户主动 /new，不能 delete（会退化为 undefined，见 ChannelState 注释）。
    * channel 不存在时以 defaultWorkspace 初始化后设置。
    */
   setCurrentSession(key: string, sessionId: string | null, defaultWorkspace = ''): void {
     const st = this.data[key] ?? { workspaceName: defaultWorkspace, sessions: [] };
-    if (sessionId === null) delete st.currentSessionId;
-    else st.currentSessionId = sessionId;
+    st.currentSessionId = sessionId;
     this.data[key] = st;
     this.save();
   }
