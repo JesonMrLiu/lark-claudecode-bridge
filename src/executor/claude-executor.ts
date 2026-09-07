@@ -2,7 +2,7 @@
 // 注意：不覆盖/清理任何 ANTHROPIC_* 环境变量，凭证与代理配置透传 process.env
 import { query, type McpServerConfig, type McpServerStatus, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { OutputCollector } from './output-collector.js';
-import type { ProgressEvent, SessionInventory, TaskOutcome } from '../types.js';
+import type { ProgressEvent, SessionInventory, TaskOutcome, TaskUsage } from '../types.js';
 
 export interface ExecutorCallbacks {
   onProgress(event: ProgressEvent): Promise<void> | void;
@@ -68,6 +68,10 @@ function summarizeToolInput(input: Record<string, unknown>): string {
   return JSON.stringify(input).slice(0, 100);
 }
 
+/** 等待后台任务期间的静默超时：超时仍无任何事件（CLI 异常/卡死）按已有信息收尾，防任务永久挂起。
+ *  正常路径无须走到——后台任务完成会唤醒主循环产生新事件，最终由 result/idle 信号收尾 */
+const BG_WAIT_SILENCE_TIMEOUT_MS = 15 * 60 * 1000;
+
 export async function runTask(prompt: string, opts: RunTaskOptions, cb: ExecutorCallbacks): Promise<TaskOutcome> {
   // collector 按 cwd 过滤：只收集工作区内文件（plan mode 的计划文件写在 ~/.claude/plans/
   // 等工作区外路径，不属于「本次修改/新增的文件」，不应进入收尾清单与文件追踪）
@@ -88,6 +92,9 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
       settingSources: ['user', 'project'],
       permissionMode: opts.permissionMode ?? 'default',
       includePartialMessages: false,
+      // 转发子代理 text 块（默认只转发 tool_use/tool_result 心跳）——配合 parent_tool_use_id
+      // 区分主/子代理输出，飞书进度卡能看到子代理在做什么
+      forwardSubagentText: true,
       ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
       ...(opts.canUseTool
         ? {
@@ -119,12 +126,42 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
   let finalText = '';
   let sessionId = opts.resumeSessionId ?? '';
   let turns = 0;
+  // 最后一次 result 的主循环用量：input+cache 三项之和 ≈ 当前上下文规模（超长提醒判定口径）。
+  // streaming 模式下每个 result 携带最近 turn 的用量，取最新值即可（不累加）
+  let usage: TaskUsage | undefined;
+  // 后台任务在途集合（background_tasks_changed 为 level 信号，整组替换；ambient 杂务任务不计）。
+  // 主 turn result 到达时集合非空 → 不收尾挂起等待：进程一退后台子代理就被连带杀掉，
+  // 永远等不到完成通知——后台任务完成会唤醒 CLI 主循环自动续跑，新事件继续流出直到真正收尾
+  const bgTasks = new Map<string, { taskType: string; description: string }>();
+  // 主 turn 终态已到但仍在等后台任务（true 期间静默超时看门狗生效）
+  let waitingBg = false;
+  let lastEventAt = Date.now();
   // init 消息提取的会话清单（每 query 一次）；数组字段全部 ?? [] 兜底——SDK 升级字段改名时清单为空但不崩
   let inventory: Omit<SessionInventory, 'workspace' | 'loadedAt'> | undefined;
   const toolNames = new Map<string, string>(); // tool_use_id → 工具名（tool_result 块本身不带 name）
   opts.onQuery?.(q);
+  // 等待后台任务期间的静默看门狗：pending 期间长时间无任何事件则按已有信息收尾。
+  // 经 q.return() 结束 for await（与收到 result 主动 return 走同一条清理路径）
+  const silenceWatch = setInterval(() => {
+    if (waitingBg && Date.now() - lastEventAt > BG_WAIT_SILENCE_TIMEOUT_MS) {
+      console.warn(`[executor] 等待后台任务静默超 ${Math.round(BG_WAIT_SILENCE_TIMEOUT_MS / 60000)} 分钟无事件，按已有结果收尾（后台任务: ${[...bgTasks.values()].map((t) => t.description).join(' / ')}）`);
+      void q.return(undefined).catch(() => { /* 进程已退等场景：忽略，外层自会收尾 */ });
+    }
+  }, 30_000);
+  silenceWatch.unref?.();
+  // 收尾（含 MCP 真实连接状态拉取）：result 即收尾与 idle 权威收尾两条路径共用
+  const finalizeWithMcpPoll = async (): Promise<TaskOutcome> => {
+    // 收尾前拉一次 MCP 真实连接状态（init 快照必为 pending，这是空闲期 /mcp 的数据源）；
+    // try/catch 同时兜住同步异常（旧 mock/异常环境下方法缺失）与异步拒绝，绝不阻断收尾
+    try {
+      const statuses = await q.mcpServerStatus();
+      cb.onMcpStatus?.(statuses);
+    } catch { /* 拉取失败：保留 init 快照 */ }
+    return finalize();
+  };
   try {
     for await (const message of q as AsyncIterable<SDKMessage>) {
+      lastEventAt = Date.now();
       switch (message.type) {
         case 'system': {
           if (message.subtype === 'init') {
@@ -147,14 +184,45 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
                 : message.status === 'compacting' ? '🗜️ 上下文压缩中…'
                 : '🔄 运行中',
             });
+          } else if (message.subtype === 'background_tasks_changed') {
+            // 后台任务在途清单（level 信号）：整组替换语义。ambient=true 的杂务任务
+            // （live-update watcher 等）不算用户可见工作，不计数避免状态行虚高
+            bgTasks.clear();
+            for (const t of message.tasks) {
+              if (!t.ambient) bgTasks.set(t.task_id, { taskType: t.task_type, description: t.description });
+            }
+            if (waitingBg && bgTasks.size > 0) {
+              await cb.onProgress({ kind: 'status', content: `⏳ 等待 ${bgTasks.size} 个后台任务完成…` });
+            }
+          } else if (message.subtype === 'session_state_changed' && message.state === 'idle') {
+            // 权威 turn-over 信号：idle 在 heldBackResult flush 且后台任务续跑循环退出后触发。
+            // 主 turn result 已到 + 后台任务全部结束 → 真正收尾（后台任务若再唤醒主循环，
+            // 会先收到新的 assistant/result 事件并覆盖 finalText，idle 仍在最后）
+            if (waitingBg && bgTasks.size === 0) {
+              return await finalizeWithMcpPoll();
+            }
+          } else if (message.subtype === 'task_started') {
+            const tag = message.subagent_type ? ` [${message.subagent_type}]` : '';
+            await cb.onProgress({
+              kind: 'status',
+              content: `${message.is_backgrounded ? '🤖 后台子代理启动' : '🤖 子代理启动'}${tag}: ${message.description}`,
+            });
+          } else if (message.subtype === 'task_notification') {
+            // 后台任务落定（completed/failed/stopped）：summary 为任务自述结论
+            const label = message.status === 'completed' ? '✅ 后台任务完成' : message.status === 'failed' ? '❌ 后台任务失败' : '🛑 后台任务已停止';
+            await cb.onProgress({ kind: 'status', content: `${label}: ${message.summary}` });
           }
           break;
         }
         case 'assistant': {
-          turns++;
+          // turns 只计主循环轮次：子代理消息（parent_tool_use_id 非空）混入会把单任务轮数
+          // 放大数倍（旧超长提醒误报的帮凶），兜底口径应以主循环为准
+          if (!message.parent_tool_use_id) turns++;
           for (const block of message.message.content) {
             if (block.type === 'text') {
-              await cb.onProgress({ kind: 'text', content: block.text });
+              // 子代理文本加标识前缀（forwardSubagentText 转发），与主 Agent 输出在进度卡上区分
+              const prefix = message.parent_tool_use_id ? '🤖 ' : '';
+              await cb.onProgress({ kind: 'text', content: `${prefix}${block.text}` });
             } else if (block.type === 'tool_use') {
               const input = (block.input ?? {}) as Record<string, unknown>;
               toolNames.set(block.id, block.name);
@@ -180,17 +248,30 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
           // 非成功终态（error_during_execution / error_max_turns 等，错误文本在 errors 数组）：
           // 带出循环后统一抛出，消息格式与单轮模式 SDK throw 保持一致（index.ts catch 的 hint 依赖该格式）
           else if (message.subtype.startsWith('error')) resultErrorText = message.errors?.join('\n') || message.subtype;
+          // usage 提取（error result 可能缺字段，全部兜 0 不抛）
+          const u = (message as { usage?: Partial<Record<'input_tokens' | 'output_tokens' | 'cache_creation_input_tokens' | 'cache_read_input_tokens', number>> }).usage;
+          if (u) {
+            usage = {
+              inputTokens: u.input_tokens ?? 0,
+              outputTokens: u.output_tokens ?? 0,
+              cacheCreationInputTokens: u.cache_creation_input_tokens ?? 0,
+              cacheReadInputTokens: u.cache_read_input_tokens ?? 0,
+            };
+          }
           if ('session_id' in message && typeof message.session_id === 'string') sessionId = message.session_id;
-          // 最终 result 到手即主动结束：return 触发 q.return() → SDK 清理输入流与子进程
-          //（streaming 输入永不自终，不 return 任务会一直挂起）
+          // 主 turn 终态。后台任务仍在跑时不收尾：return 会触发 q.return() → SDK 清理子进程，
+          // 后台子代理被连带杀掉、完成通知永远收不到（旧版「主代理结束、子代理无声消失」根因）。
+          // 挂起继续 for await：后台任务完成会唤醒 CLI 主循环自动续跑（新的 assistant/result
+          // 事件照常流出，飞书端继续收到推送），直到 session_state_changed(idle) 或续跑 turn 的
+          // result 在 bgTasks 清空后到达才真正收尾。bgTasks 为空 = 无在途任务，维持旧行为立即收尾
+          //（CLI 不发 background_tasks_changed 事件时自然退化，不会比旧版更差）
           if (message.subtype === 'success' || message.subtype.startsWith('error')) {
-            // 收尾前拉一次 MCP 真实连接状态（init 快照必为 pending，这是空闲期 /mcp 的数据源）；
-            // try/catch 同时兜住同步异常（旧 mock/异常环境下方法缺失）与异步拒绝，绝不阻断收尾
-            try {
-              const statuses = await q.mcpServerStatus();
-              cb.onMcpStatus?.(statuses);
-            } catch { /* 拉取失败：保留 init 快照 */ }
-            return finalize();
+            if (bgTasks.size > 0) {
+              waitingBg = true;
+              await cb.onProgress({ kind: 'status', content: `⏳ 主线回复完成，等待 ${bgTasks.size} 个后台任务…` });
+              break;
+            }
+            return await finalizeWithMcpPoll();
           }
           break;
         }
@@ -205,6 +286,8 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
       (err as Error & { sessionId?: string }).sessionId = sessionId;
     }
     throw err;
+  } finally {
+    clearInterval(silenceWatch);
   }
   return finalize();
 
@@ -216,6 +299,6 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
       err.sessionId = sessionId || undefined;
       throw err;
     }
-    return { sessionId, finalText, producedFiles: collector.files(), turns, ...(inventory ? { inventory } : {}) };
+    return { sessionId, finalText, producedFiles: collector.files(), turns, ...(usage ? { usage } : {}), ...(inventory ? { inventory } : {}) };
   }
 }

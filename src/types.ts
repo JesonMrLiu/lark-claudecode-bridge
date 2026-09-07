@@ -98,6 +98,15 @@ export interface BridgeConfig {
   claude?: ClaudeConfig;
   /** 飞书斜杠命令同步；缺省仅内置命令集 */
   slashCommands?: SlashCommandsConfig;
+  /** 会话行为微调；缺省 contextRemindTokens 用 config.ts 的内置默认 */
+  session?: SessionConfig;
+}
+
+/** 会话行为配置（整体可选） */
+export interface SessionConfig {
+  /** 上下文超长提醒阈值（tokens，估算口径 = 最后一次 result 的 input+cache 三项之和）。
+   *  0 = 关闭提醒；缺省用 DEFAULT_CONTEXT_REMIND_TOKENS（150000） */
+  contextRemindTokens?: number;
 }
 export interface IncomingMessage {
   chatId: string; chatType: 'p2p' | 'group'; userId: string; text: string; messageId: string;
@@ -165,4 +174,15 @@ export interface TaskOutcome {
   turns: number;
   /** 本任务 init 消息提取的清单（SDK 每 query 只发一次 init；workspace/loadedAt 由 wiring 侧补齐） */
   inventory?: Omit<SessionInventory, 'workspace' | 'loadedAt'>;
+  /** 最后一次 result 的主循环用量（snake→camel；SDK 缺字段时兜 0）。
+   *  inputTokens + cacheCreation + cacheRead ≈ 当前上下文规模，超长提醒的判定口径 */
+  usage?: TaskUsage;
+}
+
+/** result.usage 的 bridge 侧映射（SDK NonNullableUsage 的子集，全 number） */
+export interface TaskUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
 }

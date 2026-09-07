@@ -20,7 +20,8 @@
 - 流式进度卡片（打字机效果 + 工具调用 + 运行心跳，静默不等于卡死）
 - **接收图片与富文本**：直接给机器人发图片（下载到 `~/.lark-claudecode-bridge/inbox/`，Claude 用 Read 工具识图）；粘贴的多行/带格式内容（post 富文本）自动拍平为多行文本；不支持的类型（语音等）私聊会回复提示；入站消息按 message_id 去重（WS 重投不会导致任务跑两遍）
 - 结果文本 + 产出文件回传（图片预览、>10 文件自动 zip；generic 工作区）
-- 多工作区切换（/ws）、会话管理（/new /resume）、/stop 打断、模型切换（/model）、加载清单查看（/skills /plugins /mcp）、插件管理（/plugin）
+- 多工作区切换（/ws）、会话管理（/new /resume）、/stop 打断、模型切换（/model）、厂商档案切换（/model-profile）、加载清单查看（/skills /plugins /mcp）、插件管理（/plugin）
+- **后台子代理续跑**：主 Agent 派发的后台子代理在主回复结束后继续执行，完成后自动唤醒主循环汇总结果（进度卡可见「等待后台任务」与子代理输出）
 - **对话内容落盘**：用户消息与 Claude 回复全文存为 JSONL（`transcripts/`，为后续知识库挖掘打底；可选保留期）
 - 通道并发（默认 3），通道内串行
 
@@ -100,6 +101,7 @@ lcb start
 | /status | 当前状态 |
 | /ws list / /ws use \<名字\> | 工作区（切换仅 admin 可用） |
 | /model | 查看当前模型；`/model <名字>` 通道级切换；`/model reset` 恢复默认 |
+| /model-profile | 查看/切换厂商档案（多厂商凭证+模型整体切换，切换仅 admin；managed 模式下一条消息生效） |
 | /skills / /plugins / /mcp | 查看本会话实际加载的技能 / 插件 / MCP 服务 |
 | /plugin | 插件管理：`/plugin list`（全员，含本机 ~/.claude 与托管目录两处清单）；`install/uninstall/enable/disable/marketplace …`（仅 admin，默认装 ~/.claude，`--dir=managed` 装托管目录），装好下一条消息自动加载 |
 | /reload-plugins | 重载插件：清插件发现缓存，下一条消息重新扫描加载（终端命令的 bridge 等价物） |
@@ -154,6 +156,8 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 #       icon: skill_outlined
 # transcripts:             # 对话落盘清理策略；缺省 = 永久保留
 #   retention_days: 90
+# session:                 # 会话行为微调
+#   context_remind_tokens: 150000   # 上下文超长提醒阈值（tokens）；0 = 关闭；改后热生效
 ```
 
 ### 认证双模式（inherit / managed）

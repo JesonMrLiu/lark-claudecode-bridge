@@ -6,7 +6,7 @@ import type {
   BridgeConfig, CardActionEvent, CardActionResponse, CardDecision, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
   IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory,
 } from './types.js';
-import { CONFIG_DIR, CONFIG_PATH, loadConfig, sameApps } from './config.js';
+import { CONFIG_DIR, CONFIG_PATH, DEFAULT_CONTEXT_REMIND_TOKENS, loadConfig, sameApps } from './config.js';
 import { DEFAULT_CLAUDE_DIR, resolveClaudeDir } from './claude-config.js';
 import { warnIfNoClaudeAuth } from './auth-precheck.js';
 import { serverUrl } from './util/server-url.js';
@@ -557,9 +557,19 @@ export function createBridge(
         sessionId: outcome.sessionId, subtype: 'success',
         text: outcome.finalText, producedFiles: outcome.producedFiles, turns: outcome.turns,
       });
-      // 会话超长提醒（累计轮次粗略估计，防上下文爆炸）
-      if (outcome.turns > 40) {
-        await deps.gateway.sendTextTo(msg.chatId, '💡 本会话已较长，建议发送 /new 开启新会话（/resume 可随时切回）');
+      // 会话超长提醒（token 基准）：最后一次 result 的 input+cache 三项之和 ≈ 当前上下文规模，
+      // 跨任务（resume 续接）持续累积，比轮次口径真实得多（一个多轮工具调用任务就可能轮次很高
+      // 而上下文尚小，旧 turns>40 口径频繁误报）。0 = 关闭；usage 缺失（旧 mock/异常环境）回退轮次兜底
+      const remindThreshold = config.session?.contextRemindTokens ?? DEFAULT_CONTEXT_REMIND_TOKENS;
+      const ctxTokens = outcome.usage
+        ? outcome.usage.inputTokens + outcome.usage.cacheCreationInputTokens + outcome.usage.cacheReadInputTokens
+        : 0;
+      if (remindThreshold > 0 && (ctxTokens >= remindThreshold || (!outcome.usage && outcome.turns > 40))) {
+        const scale = outcome.usage ? `（当前约 ${(ctxTokens / 10000).toFixed(1)} 万 tokens）` : '';
+        await deps.gateway.sendTextTo(
+          msg.chatId,
+          `💡 本会话上下文已较大${scale}，建议发送 /new 开启新会话（/resume 可随时切回）。阈值可在 config.yaml 的 session.context_remind_tokens 调整，设为 0 关闭`,
+        );
       }
       // 结果回传（超长截断，防飞书消息体超限）。
       // 短回复（≤进度卡正文上限）跳过独立结果消息：finalText 是最后一个 assistant 消息的文本，
@@ -793,11 +803,18 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     if (!sameApps(fresh.apps, config.apps) || fresh.concurrency !== config.concurrency) {
       console.warn('[配置热重载] 检测到应用列表/凭证或 concurrency 变更，需重启后生效');
     }
-    // claude/server 段为启动时定妆照：CLAUDE_CONFIG_DIR 在 createBridge 构造 env 时注入、
-    // web server 在 startBridge 时监听——运行中变更只能提示重启，避免「以为已生效」
-    if (JSON.stringify(fresh.claude ?? {}) !== JSON.stringify(config.claude ?? {})
-      || JSON.stringify(fresh.server ?? {}) !== JSON.stringify(config.server ?? {})) {
-      console.warn('[配置热重载] 检测到 claude / server 段变更，需重启后生效');
+    // claude 段仅 mode/env/profiles 变更才需重启（CLAUDE_CONFIG_DIR 在 createBridge 构造 env 时定妆）；
+    // 顶层四字段（auth_token/api_key/base_url/model）变化无需重启——写入侧（配置页 PUT /
+    // use-profile / 飞书 /model-profile）managed 模式下已即时 syncManagedClaude 重写托管
+    // settings.json，下一条任务消息即生效，此处再 warn 会误导「以为没生效」。
+    // server 段为启动时定妆照（startBridge 时监听），运行中变更只能提示重启
+    const claudeRestartShape = (c: BridgeConfig['claude']) =>
+      JSON.stringify(c ? { mode: c.mode, env: c.env, profiles: c.profiles } : {});
+    if (claudeRestartShape(fresh.claude) !== claudeRestartShape(config.claude)) {
+      console.warn('[配置热重载] 检测到 claude 模式 / 环境变量 / 档案列表变更，需重启后生效');
+    }
+    if (JSON.stringify(fresh.server ?? {}) !== JSON.stringify(config.server ?? {})) {
+      console.warn('[配置热重载] 检测到 server 段变更，需重启后生效');
     }
     config.workspaces = fresh.workspaces;
     config.defaults = fresh.defaults;
@@ -806,6 +823,8 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     config.claude = fresh.claude;
     config.server = fresh.server;
     config.slashCommands = fresh.slashCommands;
+    // 会话行为热应用：超长提醒阈值每任务收尾现读，改盘后下一条消息即用新值
+    config.session = fresh.session;
     // app 数量变化属需重启的变更（上面 sameApps 长度比较已警告），仅等长时逐位 mutate
     if (fresh.apps.length === config.apps.length) {
       fresh.apps.forEach((fa, i) => {

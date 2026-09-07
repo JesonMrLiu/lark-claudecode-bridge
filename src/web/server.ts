@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { parseDocument, stringify } from 'yaml';
 import { CONFIG_PATH, SLASH_COMMAND_RE, loadConfig, parseConfigText } from '../config.js';
 import { DEFAULT_CLAUDE_DIR, initManagedClaudeDir, resolveClaudeDir } from '../claude-config.js';
+import { switchProfile } from '../claude-profile.js';
 import { hasClaudeAuth } from '../auth-precheck.js';
 import { defaultPermissionsDoc, defaultServerDoc } from '../config-defaults.js';
 import { VERSION } from '../version.js';
@@ -302,51 +303,15 @@ async function handle(
       return json(res, 502, { error: e instanceof Error ? e.message : String(e) });
     }
   }
-  // ---- 切换当前生效厂商档案：前端拿不到档案凭证明文（脱敏模型），切换必须由后端完成并即时落盘 ----
+  // ---- 切换当前生效厂商档案：前端拿不到档案凭证明文（脱敏模型），切换必须由后端完成并即时落盘。
+  //      内核在 claude-profile.ts（飞书端 /model-profile 命令复用同一份逻辑），此处仅 HTTP 薄壳 ----
   if (path === '/api/claude/use-profile' && req.method === 'POST') {
     if (firstRun) return json(res, 404, { error: '尚无配置文件，请先完成 bootstrap' });
     const body = await readJsonBody(req);
     const name = String(body.name ?? '').trim();
     if (!name) return json(res, 400, { error: '缺少档案名 name' });
-    let config: BridgeConfig;
-    try {
-      config = loadConfig(ctx.configPath);
-    } catch (e) {
-      return json(res, 500, { error: `配置加载失败：${e instanceof Error ? e.message : String(e)}` });
-    }
-    const prof = config.claude?.profiles?.find((p) => p.name === name);
-    if (!prof) return json(res, 404, { error: `档案 "${name}" 不存在（新增/修改档案后须先保存再切换）` });
-    // 可选 model 覆盖（档案候选模型点选切换）：须属于该档案 models 候选集或其默认模型，防手滑串档案
-    const modelOverride = String(body.model ?? '').trim();
-    if (modelOverride) {
-      const candidates = new Set([...(prof.models ?? []), ...(prof.model ? [prof.model] : [])]);
-      if (!candidates.has(modelOverride)) {
-        return json(res, 400, { error: `模型 "${modelOverride}" 不在档案 "${name}" 的候选模型中（${[...candidates].join('、') || '空'}）` });
-      }
-    }
-    // 顶层四字段整体替换为档案值（档案未配置的字段清除，保证切换干净；mode 与 profiles 原样保留）
-    const rawText = readFileSync(ctx.configPath, 'utf8');
-    const doc = parseDocument(rawText);
-    const oldJs = doc.toJS() as Record<string, unknown>;
-    const oldClaude = (oldJs.claude && typeof oldJs.claude === 'object' && !Array.isArray(oldJs.claude) ? oldJs.claude : {}) as Record<string, unknown>;
-    const newClaude: Record<string, unknown> = { ...oldClaude };
-    if (prof.authToken) { newClaude.auth_token = prof.authToken; delete newClaude.api_key; }
-    else if (prof.apiKey) { newClaude.api_key = prof.apiKey; delete newClaude.auth_token; }
-    else { delete newClaude.auth_token; delete newClaude.api_key; }
-    if (prof.baseUrl) newClaude.base_url = prof.baseUrl; else delete newClaude.base_url;
-    const effModel = modelOverride || prof.model;
-    if (effModel) newClaude.model = effModel; else delete newClaude.model;
-    doc.set('claude', newClaude);
-    const text = doc.toString();
-    let after: BridgeConfig;
-    try {
-      after = parseConfigText(text, ctx.configPath);
-    } catch (e) {
-      return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
-    }
-    writeAtomic(ctx.configPath, text);
-    syncManagedClaude(after);
-    return json(res, 200, { ok: true, message: `已切换到档案「${name}」${effModel ? `（模型 ${effModel}）` : ''}${after.claude?.mode === 'managed' ? '，managed 模式下对后续任务即生效' : '，当前 inherit 模式：顶层值已更新，切到 managed 后生效'}` });
+    const r = switchProfile(ctx.configPath, name, String(body.model ?? '').trim() || undefined);
+    return r.ok ? json(res, 200, r) : json(res, r.status, { error: r.error });
   }
   if (path === '/api/bootstrap' && req.method === 'POST') {
     if (!firstRun) return json(res, 409, { error: '配置文件已存在（bootstrap 仅用于首次安装），请改用配置页编辑' });    const body = await readJsonBody(req);

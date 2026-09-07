@@ -30,7 +30,15 @@ export function rewriteByTrigger(text: string, rules: TriggerRule[] | undefined)
     if (RESERVED_COMMANDS.has(firstToken.slice(1).toLowerCase())) return null;
     const rule = rules.find((r) => r.match.startsWith('/') && r.match === firstToken);
     if (!rule) return null;
-    return applyRewrite(rule.rewrite, t, t.slice(firstToken.length).trim());
+    const rewritten = applyRewrite(rule.rewrite, t, t.slice(firstToken.length).trim());
+    // 模板不含任何占位符时用户参数会整个丢失（如 rewrite: '/xx:xxxx' 命中「/xxxx 描述」后描述被吞，
+    // 技能侧提示「描述为空」）——斜杠命令透传场景参数必须跟在命令后，这里自动补上。
+    // 仅斜杠形态追加：关键词形态的 args=全文，追加等于把匹配消息拼在固定指令后，语义不同
+    const args = t.slice(firstToken.length).trim();
+    if (args && !rule.rewrite.includes('{text}') && !rule.rewrite.includes('{args}')) {
+      return `${rewritten} ${args}`;
+    }
+    return rewritten;
   }
   const rule = rules.find((r) => !r.match.startsWith('/') && t.includes(r.match));
   if (!rule) return null;

@@ -1550,9 +1550,14 @@ async function renderPlugins(el) {
           </td>
         </tr>`).join('');
       body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = () => {
+        const { op, arg, dir } = b.dataset;
+        // 影响性操作先二次确认（启用/安装/市场管理为新增类，无需确认）
+        if (op === 'disable' && !window.confirm(`确定要停用插件「${arg}」吗？\n停用后下一条消息不再加载该插件，可随时再启用。`)) return;
+        if (op === 'update' && !window.confirm(`确定要更新插件「${arg}」吗？\n更新后下一条消息按新版本加载。`)) return;
+        if (op === 'uninstall' && !window.confirm(`确定要卸载插件「${arg}」吗？\n卸载后需重新安装才能恢复，进行中的会话不受影响。`)) return;
         // 慢操作走进度弹框；亚秒级启停走轻量 act（弹框一闪而过反而干扰）
-        if (b.dataset.op === 'enable' || b.dataset.op === 'disable') act(b.dataset.op, b.dataset.arg, b.dataset.dir, b);
-        else runOpDialog(b.dataset.op, b.dataset.arg, b.dataset.dir, b);
+        if (op === 'enable' || op === 'disable') act(op, arg, dir, b);
+        else runOpDialog(op, arg, dir, b);
       });
     } catch (e) {
       installed = [];

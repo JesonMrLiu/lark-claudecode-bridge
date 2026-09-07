@@ -2,6 +2,7 @@ import type { BridgeConfig, SessionInventory } from '../types.js';
 import type { SessionStore } from './session-store.js';
 import { formatBeijingTime } from '../util/beijing-time.js';
 import { handlePluginCommand } from './plugin-command.js';
+import { handleModelProfileCommand } from './model-profile-command.js';
 import { invalidatePluginCache } from '../executor/plugin-discovery.js';
 
 /**
@@ -9,7 +10,7 @@ import { invalidatePluginCache } from '../executor/plugin-discovery.js';
  * triggers.ts 的 RESERVED、index.ts 的透传说明均以此为准——本地命令永远优先，
  * 不被触发词劫持、不透传给 Claude Code。新增本地命令务必同步此清单
  */
-export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'skills', 'plugins', 'mcp', 'plugin', 'reload-plugins'] as const;
+export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'model-profile', 'skills', 'plugins', 'mcp', 'plugin', 'reload-plugins'] as const;
 
 /**
  * 内置命令的飞书 Slash Command 注册元信息（icon 为飞书 icon_key，见开放平台文档可选列表）。
@@ -24,6 +25,7 @@ export const SLASH_COMMAND_META: Record<string, { description: string; icon: str
   status: { description: '查看当前状态', icon: 'diagnosis-ai_outlined' },
   ws: { description: '切换工作区（/ws list 列出）', icon: 'folder_outlined' },
   model: { description: '查看/切换模型', icon: 'ai-style_outlined' },
+  'model-profile': { description: '查看/切换厂商档案（切换需管理员）', icon: 'switch-tracking_outlined' },
   skills: { description: '查看已加载技能', icon: 'skill_outlined' },
   plugins: { description: '查看已加载插件', icon: 'plugin_outlined' },
   mcp: { description: '查看已加载 MCP 服务', icon: 'ai-functions_outlined' },
@@ -51,6 +53,8 @@ export interface CommandContext {
   userClaudeDir?: string;
   /** 异步消息通道：/plugin 长操作 ack 后异步推送结果。wiring 注入 gateway.sendTextTo */
   send?: (markdown: string) => Promise<void>;
+  /** 配置文件路径（/model-profile 切换的落盘目标）。缺省 CONFIG_PATH；测试注入临时路径 */
+  configPath?: string;
 }
 
 export interface CommandResult {
@@ -69,6 +73,7 @@ const HELP = `**可用命令**
 /ws list — 列出工作区
 /ws use <名字> — 切换工作区
 /model — 查看/切换模型（/model <名字> 切换，/model reset 恢复默认）
+/model-profile — 查看/切换厂商档案（/model-profile <名字> 切换，管理员）
 /skills — 查看已加载技能
 /plugins — 查看已加载插件
 /mcp — 查看已加载 MCP 服务
@@ -128,12 +133,15 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
         const current = store.getChannelState(key)?.currentSessionId;
         const slice = sessions.slice((page - 1) * RESUME_PAGE_SIZE, page * RESUME_PAGE_SIZE);
         const list = slice
-          .map((s, i) => `${(page - 1) * RESUME_PAGE_SIZE + i + 1}. ${s.summary || '(无摘要)'} <font color='grey'>${formatBeijingTime(s.updatedAt)}</font>${s.sessionId === current ? ' ← 当前' : ''}`)
+          .map((s, i) => `${(page - 1) * RESUME_PAGE_SIZE + i + 1}. <font color='grey'>${formatBeijingTime(s.updatedAt)}</font> ${s.summary || '(无摘要)'}${s.sessionId === current ? ' ← 当前' : ''}`)
           .join('\n');
         const nav: string[] = [];
         if (page < totalPages) nav.push(`/resume page ${page + 1} 查看更早`);
         if (page > 1) nav.push(`/resume page ${page - 1} 查看更新`);
-        return `**历史会话**（第 ${page}/${totalPages} 页 · 共 ${sessions.length} 条 · 倒序，编号 1 = 最新）\n${list}\n/resume <编号> 恢复 · /new 另起一支${nav.length ? ` · ${nav.join(' · ')}` : ''}`;
+        // 底部操作提示与列表用分隔线隔开、各自独占一行（挤在最后一个会话后面易被当成列表项）；
+        // 恢复与翻页语法固定带全——单页时也教会用户 /resume page 用法，不依赖 nav 露出
+        const footer = ['`/resume <编号> 恢复 · /resume page <页码> 翻页`', '`/new 另起一支`', ...nav.map((n) => `\`${n}\``)].join('\n');
+        return `**历史会话**（第 ${page}/${totalPages} 页 · 共 ${sessions.length} 条 · 倒序，编号 1 = 最新）\n${list}\n\n---\n${footer}`;
       };
       if (args[0] === 'page') {
         const p = Number(args[1]);
@@ -196,7 +204,8 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
           handled: true,
           reply: `**模型设置**\n当前生效：**${current}**（来源：${source}）`
             + `\n${st?.model ? '本通道已设置覆盖；' : '未设置通道覆盖时跟随 ~/.claude/settings.json；'}`
-            + `\n切换：/model <名字>（如 /model opus）；恢复默认：/model reset。下一条消息起生效，仅影响本通道`,
+            + `\n切换：/model <名字>（如 /model opus）；恢复默认：/model reset。下一条消息起生效，仅影响本通道`
+            + `\n管理多厂商档案（凭证+模型整体切换）：/model-profile`,
         };
       }
       if (arg === 'reset' || arg === 'default') {
@@ -212,6 +221,10 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
         store.setChannelState(key, { workspaceName: ctx.currentWorkspace(), sessions: [], model: arg });
       }
       return { handled: true, reply: `✅ 已切换模型：**${arg}**（下一条消息起生效；/model reset 恢复默认）` };
+    }
+    case 'model-profile': {
+      // 厂商档案查看/切换（全局认证配置，切换仅 admin）；内核 claude-profile.ts 与配置页共用
+      return { handled: true, reply: handleModelProfileCommand(args, { isAdmin: ctx.isAdmin, configPath: ctx.configPath }) };
     }
     case 'skills': {
       const inv = ctx.getInventory();

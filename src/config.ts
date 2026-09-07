@@ -4,12 +4,29 @@ import { join } from 'node:path';
 import { parse, type YAMLParseError } from 'yaml';
 import type {
   BridgeConfig, ClaudeAuthMode, ClaudeConfig, ClaudeProfile, FeishuAppConfig, PermissionsConfig, PluginRef,
-  ServerConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace, WorkspaceType,
+  ServerConfig, SessionConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace, WorkspaceType,
 } from './types.js';
 
 /** LCB_CONFIG_DIR 环境变量可覆盖配置根目录（多租户分进程场景用；正常用户无须设置） */
 export const CONFIG_DIR = join(process.env.LCB_CONFIG_DIR ?? homedir(), '.lark-claudecode-bridge');
 export const CONFIG_PATH = join(CONFIG_DIR, 'config.yaml');
+
+/** 会话上下文超长提醒默认阈值（tokens）：约 200k 窗口的 75%，估算口径见 SessionConfig 注释 */
+export const DEFAULT_CONTEXT_REMIND_TOKENS = 150000;
+
+/** 会话行为段（整体可选）：context_remind_tokens 硬校验（非法值会让提醒永久误报/永不触发） */
+function normalizeSession(doc: Record<string, unknown>): SessionConfig | undefined {
+  const raw = doc.session;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object') throw new Error('session 必须为对象（含 context_remind_tokens），请检查 config.yaml');
+  const s = raw as { context_remind_tokens?: unknown };
+  if (s.context_remind_tokens === undefined || s.context_remind_tokens === null) return {};
+  const n = Number(s.context_remind_tokens);
+  if (!Number.isInteger(n) || n < 0 || n > 10_000_000) {
+    throw new Error(`session.context_remind_tokens 必须为 0-10000000 的整数（0 = 关闭提醒；当前值：${String(s.context_remind_tokens)}），请检查 config.yaml`);
+  }
+  return { contextRemindTokens: n };
+}
 
 /** config.yaml 中单个 app 的原始形状（snake_case） */
 interface RawApp {
@@ -35,9 +52,9 @@ function normalizeTriggers(raw: RawApp['triggers'], where: string): TriggerRule[
     const rewrite = typeof t?.rewrite === 'string' ? t.rewrite.trim() : '';
     if (!match) throw new Error(`${where} 的 triggers[${j}].match 不能为空`);
     if (!rewrite) throw new Error(`${where} 的 triggers[${j}].rewrite 不能为空`);
-    // 无占位符合法但通常系笔误：用户输入会整个丢弃，warn 提示
+    // 无占位符时斜杠形态命中会自动把用户参数追加到改写结果末尾（triggers.ts），warn 提示确认是否符合预期
     if (!rewrite.includes('{text}') && !rewrite.includes('{args}')) {
-      console.warn(`[配置] ${where} 的 triggers[${j}].rewrite 不含 {text} / {args} 占位符，用户输入将不会传入（若非有意请修正）`);
+      console.warn(`[配置] ${where} 的 triggers[${j}].rewrite 不含 {text} / {args} 占位符，斜杠命中时用户参数将自动追加在改写结果末尾（需精确控制位置请改用占位符）`);
     }
     return { match, rewrite };
   });
@@ -389,6 +406,7 @@ export function parseConfigText(raw: string, pathForError: string = CONFIG_PATH)
   const server = normalizeServer(doc);
   const claude = normalizeClaude(doc);
   const slashCommands = normalizeSlashCommands(doc);
+  const session = normalizeSession(doc);
   return {
     apps,
     workspaces,
@@ -401,6 +419,7 @@ export function parseConfigText(raw: string, pathForError: string = CONFIG_PATH)
     ...section(server, 'server'),
     ...section(claude, 'claude'),
     ...section(slashCommands, 'slashCommands'),
+    ...section(session, 'session'),
   };
 }
 

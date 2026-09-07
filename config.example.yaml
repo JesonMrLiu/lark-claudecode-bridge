@@ -85,3 +85,6 @@ concurrency: 3                 # 全局并发上限（未单独配置的 app 沿
 #       icon: skill_outlined  # 图标（可选，icon_key 列表见飞书文档）
 # transcripts:                # 对话落盘清理策略；缺省 = 永久保留
 #   retention_days: 90
+# session:                    # 会话行为微调；缺省用内置默认
+#   context_remind_tokens: 150000   # 上下文超长提醒阈值（tokens，估算口径 = 最后一次回复的输入+缓存规模）；
+#                             # 超过才提示「建议 /new」；0 = 关闭提醒。改后下一条消息热生效
