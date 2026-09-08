@@ -104,8 +104,11 @@ export function parseQuestions(input: Record<string, unknown>): QuestionItem[] {
 
 export class PermissionGate {
   private remembered = new Set<string>();
-  private allowTools: ReadonlySet<string>;
-  private dangerousCommands: readonly RegExp[];
+  // 热生效数据源：getter 形态（wiring 传 () => config.permissions.allowTools）让 gate 在
+  // decide 时现读——gate 按通道永久复用，静态快照会让改白名单后已有通道继续用旧名单，
+  // 直到新通道/重启才生效（0.17.0「配了免确认工具仍弹卡/被拒」根因）。也接受静态值（测试）。
+  private allowTools: () => ReadonlySet<string>;
+  private dangerousCommands: () => readonly RegExp[];
 
   constructor(
     private opts: {
@@ -115,19 +118,23 @@ export class PermissionGate {
       /** 提问回调：AskUserQuestion 工具调用时触发（飞书问题选项卡片）；未配置时一律拒绝并让模型改用文本 */
       askQuestion?: (req: AskQuestionRequest) => Promise<AskQuestionResult>;
       timeoutMs?: number;
-      /** 免确认白名单；缺省 DEFAULT_ALLOW_TOOLS */
-      allowTools?: ReadonlySet<string>;
-      /** Bash 危险命令正则；缺省 DEFAULT_DANGEROUS_COMMANDS */
-      dangerousCommands?: readonly RegExp[];
+      /** 免确认白名单（静态值或 getter）；缺省 DEFAULT_ALLOW_TOOLS */
+      allowTools?: ReadonlySet<string> | (() => ReadonlySet<string>);
+      /** Bash 危险命令正则（静态值或 getter）；缺省 DEFAULT_DANGEROUS_COMMANDS */
+      dangerousCommands?: readonly RegExp[] | (() => readonly RegExp[]);
     },
   ) {
-    this.allowTools = opts.allowTools ?? DEFAULT_ALLOW_TOOLS;
-    this.dangerousCommands = opts.dangerousCommands ?? DEFAULT_DANGEROUS_COMMANDS;
+    this.allowTools = typeof opts.allowTools === 'function' ? opts.allowTools
+      : opts.allowTools ? () => opts.allowTools as ReadonlySet<string>
+        : () => DEFAULT_ALLOW_TOOLS;
+    this.dangerousCommands = typeof opts.dangerousCommands === 'function' ? opts.dangerousCommands
+      : opts.dangerousCommands ? () => opts.dangerousCommands as readonly RegExp[]
+        : () => DEFAULT_DANGEROUS_COMMANDS;
   }
 
   private isDangerousCommand(input: Record<string, unknown>): boolean {
     const cmd = typeof input.command === 'string' ? input.command : '';
-    return cmd ? this.dangerousCommands.some((re) => re.test(cmd)) : false;
+    return cmd ? this.dangerousCommands().some((re) => re.test(cmd)) : false;
   }
 
   async decide(
@@ -170,8 +177,9 @@ export class PermissionGate {
       }
       return { behavior: 'allow', updatedInput: { questions: input.questions, answers } };
     }
-    // 白名单直通；Bash 命中危险命令正则时落到确认卡（安全优先于白名单）
-    if (this.allowTools.has(toolName) && !(toolName === 'Bash' && this.isDangerousCommand(input))) {
+    // 白名单直通（decide 时经 getter 现读：热重载改配置后已有通道的下一个工具调用即生效）；
+    // Bash 命中危险命令正则时落到确认卡（安全优先于白名单）
+    if (this.allowTools().has(toolName) && !(toolName === 'Bash' && this.isDangerousCommand(input))) {
       return { behavior: 'allow' };
     }
     // 会话记忆同样不能绕过危险命令黑名单（用户对 Bash 点过「不再询问」≠ 授权 rm -rf）

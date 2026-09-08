@@ -2,8 +2,8 @@
 // 安全基线：默认只绑 127.0.0.1；Host/Origin 校验防 DNS rebinding；body ≤1MB；
 // secret 永不出进程（GET 脱敏回显，PUT 空值=不修改）。改动写盘后由现有热重载器/重启消费
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { existsSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, parse, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, extname, join, parse, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument, stringify } from 'yaml';
 import { CONFIG_PATH, SLASH_COMMAND_RE, loadConfig, parseConfigText } from '../config.js';
@@ -42,7 +42,13 @@ export interface WebServerOptions {
 
 export interface WebServerHandle { url: string; port: number; close(): void }
 
-const INDEX_HTML_PATH = fileURLToPath(new URL('../../assets/web/index.html', import.meta.url));
+const WEB_ROOT = fileURLToPath(new URL('../../assets/web', import.meta.url));
+const INDEX_HTML_PATH = join(WEB_ROOT, 'index.html');
+/** 静态模块仅限 js/css 两前缀 + 扩展名白名单（纵深防御：目录内误放的敏感文件不可被 serve） */
+const STATIC_MIME: Record<string, string> = {
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+};
 const BODY_LIMIT = 1024 * 1024;
 const startedAt = Date.now();
 
@@ -79,9 +85,16 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
-/** 原子写盘（tmp + rename），与 claude-config 同款防半截文件 */
+/**
+ * 原子写盘（tmp + rename），与 claude-config 同款防半截文件。
+ * - 先递归建父目录：首装 bootstrap 时 ~/.lark-claudecode-bridge 可能尚不存在
+ *   （lcb start/ui 仅起 Web server 不建目录），缺 mkdir 直接 ENOENT（0.17.0 首装保存报错根因）；
+ * - tmp 带 pid 后缀：固定名在并发 PUT（多标签页/双击保存）下会发生 A rename 消费掉
+ *   B 的 tmp、B rename 报 ENOENT 的竞态（claude-profile.ts 同款防法）。
+ */
 function writeAtomic(path: string, text: string): void {
-  const tmp = `${path}.tmp`;
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, text, 'utf8');
   renameSync(tmp, path);
 }
@@ -159,7 +172,7 @@ export async function startWebServer(opts: WebServerOptions = {}): Promise<WebSe
   if (serverCfg.enabled === false) return null;
   const configPath = opts.configPath ?? CONFIG_PATH;
   const host = serverCfg.host ?? '127.0.0.1';
-  const port = serverCfg.port ?? 17317;
+  let port = serverCfg.port ?? 17317; // listen 后回写实际端口：port:0 随机分配时 Origin 校验须用实际值
 
   const server: Server = createServer((req, res) => {
     void handle(req, res, { configPath, host, port, embedded: opts.embedded ?? false, appsStarted: opts.appsStarted, selfStop: opts.selfStop }).catch((e) => {
@@ -172,13 +185,13 @@ export async function startWebServer(opts: WebServerOptions = {}): Promise<WebSe
     server.once('error', reject);
     server.listen(port, host, () => resolve());
   });
-  const actualPort = (server.address() as { port: number }).port;
-  const url = `http://${host === '::1' ? '[::1]' : host}:${actualPort}`;
+  port = (server.address() as { port: number }).port;
+  const url = `http://${host === '::1' ? '[::1]' : host}:${port}`;
   console.log(`🧭 配置页已就绪：${url}${opts.embedded ? '' : '（lcb ui 独立模式，桥接器未启动）'}`);
   if (opts.autoOpen) openBrowser(url);
   return {
     url,
-    port: actualPort,
+    port,
     close: () => server.close(),
   };
 }
@@ -202,7 +215,7 @@ async function handle(
     res.end('Forbidden');
     return;
   }
-  // 静态页（单文件，无目录遍历面）
+  // 静态页与模块：入口单文件 + js/css 目录服务（防穿越见下）
   if (req.method === 'GET' && (path === '/' || path === '/index.html')) {
     try {
       const html = readFileSync(INDEX_HTML_PATH, 'utf8');
@@ -211,6 +224,34 @@ async function handle(
     } catch {
       res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('配置页资源缺失（assets/web/index.html）');
+    }
+    return;
+  }
+  // js/css 静态模块：decode → resolve 归一 → 必须仍在 WEB_ROOT 内（前缀+分隔符，杜绝同前缀绕过）
+  // + 扩展名白名单第二道闸；非文件（目录）→ 404，无目录列举。目录内新增页面模块无需改后端
+  if (req.method === 'GET' && (path.startsWith('/js/') || path.startsWith('/css/'))) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(path);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Bad encoding');
+      return;
+    }
+    const mime = STATIC_MIME[extname(decoded).toLowerCase()];
+    const file = resolve(WEB_ROOT, `.${decoded}`);
+    if (!mime || !file.startsWith(WEB_ROOT + sep)) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not found');
+      return;
+    }
+    try {
+      if (!statSync(file).isFile()) throw new Error('not a file');
+      res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'no-store' });
+      res.end(readFileSync(file));
+    } catch {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not found');
     }
     return;
   }
@@ -476,6 +517,15 @@ async function handle(
       const r = await runPluginCli(args, { claudeConfigDir: dir });
       invalidatePluginCache(bridgeDir);
       if (!sameDir) invalidatePluginCache(userDir);
+      // 卸载后校验：CLI 退出码 0 但 installed_plugins.json 仍留有条目 = 半完成卸载
+      // （仅从 enabledPlugins 移除、安装记录未清，CLI /plugins list 里表现为 disabled）。
+      // 显式失败返回，把 CLI 输出带给前端，避免「以为卸载了其实只是禁用」
+      if (op === 'uninstall' && r.ok && listInstalledPlugins(dir).some((p) => p.key === arg)) {
+        return json(res, 200, {
+          ok: false,
+          text: `卸载后 ${arg} 仍存在于安装清单（installed_plugins.json 未清除，可能仅被禁用）。CLI 输出：\n${r.text}\n可尝试在本机 claude CLI 中执行 /plugins 手动卸载，或检查目录是否选对（user/bridge 双目录可能各装有一份）。`,
+        });
+      }
       return json(res, 200, r);
     }
   }

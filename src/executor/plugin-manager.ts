@@ -65,8 +65,9 @@ export function runPluginCli(
   for (const key of ['PATH', 'SystemRoot', 'windir', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TMP', 'TEMP', 'LANG']) {
     if (process.env[key] !== undefined) passThrough[key] = process.env[key];
   }
-  // -y（非 TTY 跳过确认）仅 install 支持（实测其余子命令报 unknown option）
-  const fullArgs = ['plugin', ...args, ...(args[0] === 'install' ? ['-y'] : [])];
+  // -y（非 TTY 跳过确认）：install/uninstall 均支持（uninstall 实测接受，缺省时非 TTY 下
+  // 可能挂起等确认直到超时被 kill，留下「只 disable 未卸载」的半完成状态）
+  const fullArgs = ['plugin', ...args, ...((args[0] === 'install' || args[0] === 'uninstall') ? ['-y'] : [])];
   return new Promise((resolve) => {
     const child = spawn(cli, fullArgs, {
       env: { ...passThrough, CLAUDE_CONFIG_DIR: opts.claudeConfigDir },

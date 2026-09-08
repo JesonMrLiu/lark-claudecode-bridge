@@ -14,7 +14,7 @@
 - **直接使用本机 Claude Code 全套配置**（inherit 模式）：模型设置（`~/.claude/settings.json`）、登录态、user 级 MCP、skills、marketplace 插件自动继承，无须二次配置；已启用插件自动加载
 - **斜杠透传**：飞书里直接发 `/superpowers:brainstorming` 等斜杠命令，原文透传给 Claude Code 展开（user skills / 插件命令均可触发）
 - **多机器人**：一个进程同时跑 N 个飞书机器人，各自独立会话池、独立并发、独立人格（`append_system_prompt`）；共享同一套 Claude 配置
-- 写操作确认卡片：允许 / 拒绝 / 本次会话不再询问（仅任务发起人可点），Write/Edit 卡片直接展示红绿 diff
+- 写操作确认嵌在计时进度卡底部（允许 / 拒绝 / 本次会话不再询问，仅任务发起人可点；Write/Edit 直接展示红绿 diff；等待确认时正文自动收敛，决策后按钮消失、状态行显示结果）
 - **读操作免确认**：读工具（Read/Grep/Glob 等）与 Bash 读命令默认直通，危险命令黑名单兜底；白名单可通过 `permissions.allow_tools` 自定义（配置页可增删，新建配置默认预置完整默认值）
 - **开发场景工作流（`type: code-dev`）**：统一 plan mode——先出计划 → 飞书卡片批准/按意见修改/放弃 → 批准后自动执行；任务收尾发汇总 diff 卡片（红绿着色），不再整文件刷屏
 - 流式进度卡片（打字机效果 + 工具调用 + 运行心跳，静默不等于卡死）
@@ -174,7 +174,7 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 
 **managed 模式的 MCP 与环境继承**（0.14.0 起，`lcb start` 时自动完成）：本机 `~/.claude.json` 的全局 `mcpServers` 单向同步到托管目录（CLI 读 `$CLAUDE_CONFIG_DIR/.claude.json`，不同步则托管会话丢掉全部 user 级 MCP）；本机 `~/.claude/settings.json` env 块中的**非认证键**（MCP 工具依赖的 `IMAGE_GEN_*`、`API_HOST` 等自定义变量）并入托管 settings.json。需要覆盖继承值或本机没有这些配置时，用**显式配置**：配置页「Claude 认证」→「环境变量」行编辑器（或 config.yaml 的 `claude.env` 键值对），优先级 `claude.env` > 本机继承 > 托管目录既有值；认证与模型 4 键（`ANTHROPIC_AUTH_TOKEN/API_KEY/BASE_URL/MODEL`）不在此生效——永远以认证表单为准。
 
-**插件双目录（managed 模式）**：新装插件默认装到本机 `~/.claude`（与本机 claude CLI 共用一份），`/plugin install xxx --dir=managed` 或配置页安装框选「bridge 托管目录」可装到托管目录；启停/卸载自动按插件所在目录执行，两处清单在配置页「插件」tab 与 `/plugin list` 中均带来源标记。
+**插件双目录（managed 模式）**：新装插件默认装到本机 `~/.claude`（与本机 claude CLI 共用一份），`/plugin install xxx --dir=managed` 或配置页安装框选「bridge 托管目录」可装到托管目录；启停/卸载自动按插件所在目录执行，两处清单在配置页「插件」tab 与 `/plugin list` 中均带来源标记。注意：**卸载按所选目录逐处执行**——同一插件在两个目录各装一份时，卸载一处不影响另一处（本机 CLI 的 `/plugins list` 看的是它自己的配置目录）；配置页卸载后会校验安装清单已清除，残留（仅被禁用）会显式报错并附 CLI 输出。配置页「管理市场」支持 git 地址与本机路径（本地路径市场按 CLI 语义不复制文件，登记原路径读取）。
 
 ### 开发场景工作流（`type: code-dev`）
 
@@ -188,9 +188,11 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 
 **执行器为 Streaming Input 模式**（0.14.0 起）：prompt 经持久输入流送入 CLI，stdin 全程保持打开——这是计划审批与提问卡片能稳定工作的前提（旧版单轮模式在轮次边界会触发 CLI 的 "Stream closed" 中断，属 Agent SDK 已知问题）。**提问卡片**：Claude 调用 AskUserQuestion 时飞书收到问题选项卡，点选项作答（多选题可多选）、全部作答后「提交答案」——答案直接回传模型继续任务。
 
-**读操作免确认**：读工具与 Bash 默认直通（`ls`/`cat`/`grep` 不再弹卡），命中 `dangerous_commands` 黑名单（`rm -rf`、`sudo`、`git push --force` 等）仍弹确认卡；「本次会话不再询问」的记忆同样绕不过黑名单。想放行其它工具（如 `Edit`）往 `permissions.allow_tools` 追加即可——注意配置即**整体替换**内置默认，需把内置读工具一并写上。
+**读操作免确认**：读工具与 Bash 默认直通（`ls`/`cat`/`grep` 不再弹卡），命中 `dangerous_commands` 黑名单（`rm -rf`、`sudo`、`git push --force` 等）仍弹确认卡；「本次会话不再询问」的记忆同样绕不过黑名单。想放行其它工具（如 `Edit`）往 `permissions.allow_tools` 追加即可——注意配置即**整体替换**内置默认，需把内置读工具一并写上。**白名单/黑名单热生效**（0.18.0 起）：配置页保存后，已有会话通道的下一个工具调用即用新名单（旧版需新通道或重启）。
 
-> plan 卡片与 permissions 配置的改动需重启 bridge 进程生效（`workspaces[].type` 改动亦然）。
+**plan mode 下的白名单语义**：code-dev 工作区的计划阶段，Claude Code 内部对写操作强制走桥接的权限闸（官方语义：plan 模式无视 CLI 侧 allow 规则、写工具一律路由到宿主判定）——因此桥接白名单在计划阶段对写工具**依然生效**（命中直通执行，未命中弹确认卡嵌在计时卡上），直到计划批准切回可编辑模式。只读工具不经桥接直接执行。计时卡上工具行的 `✘` 表示该次工具调用**执行失败**（含首行失败原因），不代表「工具没权限」。
+
+> plan 卡片相关与 `workspaces[].type` 的改动需重启 bridge 进程生效（permissions 配置已支持热生效，见上）。
 
 ### 配置继承（inherit 模式：本机 ~/.claude 一处配置，全机器人共享）
 

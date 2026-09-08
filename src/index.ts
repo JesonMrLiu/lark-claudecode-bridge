@@ -16,14 +16,17 @@ import { AccessControl } from './access/access-control.js';
 import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard } from './gateway/progress-card.js';
 import {
-  buildConfirmCard, buildConfirmResultCard, DECISION_TEXT,
+  DECISION_TEXT,
   buildPlanCards, buildPlanResultCard, buildExpiredPlanCard, PROGRESS_TAIL_CHARS, type PlanCardRequest,
   buildQuestionCard, buildQuestionResultCard, buildExpiredQuestionCard, type QuestionCardRequest, type QuestionCardAnswers,
 } from './gateway/card-builder.js';
 import { buildDiffSummaryCards } from './gateway/diff-card.js';
 import { runTask } from './executor/claude-executor.js';
 import type { McpServerStatus } from '@anthropic-ai/claude-agent-sdk';
-import { PermissionGate, type PlanAskResult, type AskQuestionResult } from './executor/permission-gate.js';
+import {
+  PermissionGate, DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMANDS,
+  type PlanAskResult, type AskQuestionResult,
+} from './executor/permission-gate.js';
 import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery.js';
 import { createGatewaySender, createNotifyServer, NOTIFY_SERVER_NAME } from './executor/notify-server.js';
 import { collectWorkspaceDiff } from './util/workspace-diff.js';
@@ -61,20 +64,6 @@ function raceFallback<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
       () => { clearTimeout(timer); resolve(fallback); },
     );
   });
-}
-
-/** 确认超时后的过期态卡片（此后迟到点击不再改写此卡片） */
-function expiredConfirmCard(req: ConfirmationRequest, timeoutMs: number): unknown {
-  return {
-    schema: '2.0',
-    config: { update_multi: true },
-    body: {
-      elements: [{
-        tag: 'markdown',
-        content: `**🔐 Claude 请求执行操作**\n\n工具: \`${req.toolName}\`　工作区: \`${req.workspaceName}\`\n\`\`\`\n${req.summary.slice(0, 500)}\n\`\`\`\n\n⏰ 已超时自动拒绝（${Math.round(timeoutMs / 60000)} 分钟未确认）`,
-      }],
-    },
-  };
 }
 
 /** plan 卡片按钮文案（toast 用） */
@@ -150,7 +139,8 @@ export function createBridge(
     resolve: (d: PermissionDecision) => void;
     req: ConfirmationRequest;
     ownerId: string;
-    cardId: string;
+    /** 决策落定（用户点击或超时清理前）后的收尾钩子：清除进度卡内嵌确认区并刷新状态行 */
+    onSettled: (d: PermissionDecision) => void;
   }>();
   // plan 确认挂起项：requestId → 等待中的计划决策（plan-approve/revise/reject）
   const planPending = new Map<string, {
@@ -317,43 +307,44 @@ export function createBridge(
     const confirmTimeoutMs = opts.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
     const cardSendTimeoutMs = opts.cardSendTimeoutMs ?? CARD_SEND_TIMEOUT_MS;
     // 通道级复用：已存在则沿用（allow-session 记忆跨任务），不存在才建。
-    // 白名单每任务现读 config.permissions（热重载改配置下一条消息即生效——但 gate 是
-    // 通道级复用实例，decide 时才查 allowTools，故以构造时引用为准；改 permissions 后
-    // 新通道或重启即全量生效，README 注明）
+    // 白名单/黑名单经 getter 传入：gate 虽按通道永久复用，decide 时才经 getter 现读
+    // config.permissions——热重载原地 mutate 同一 config 对象后，已有通道的下一个工具
+    // 调用即生效（不再需要新通道/重启；0.17.0 静态快照导致改配置后旧通道不生效）
     let gate = gates.get(key);
     if (!gate) {
       gate = new PermissionGate({
-        allowTools: config.permissions?.allowTools ? new Set(config.permissions.allowTools) : undefined,
-        dangerousCommands: config.permissions?.dangerousCommands,
+        allowTools: () => new Set(config.permissions?.allowTools ?? DEFAULT_ALLOW_TOOLS_LIST),
+        dangerousCommands: () => config.permissions?.dangerousCommands ?? DEFAULT_DANGEROUS_COMMANDS,
         ask: async (req) => {
-          // 发确认卡片并挂起，等待 onCardAction 按 requestId 唤醒；
-          // 超时由本闭包自管：到点删除条目 + 卡片置为过期态 + 以 deny 继续——
-          // 条目有界（无人点击、/stop、4h abort 挂起中的 ask 均会被定时器清理），
-          // 此后的迟到点击因条目已删被 toast 提示后忽略，卡片不再被改写为与实际不符的决策态
-          // 发卡本身带超时：sendCardTo 挂起/失败时降级 deny（下面的等待定时器在 await 之后，挂起即永不 arm）
-          const cardId = await raceFallback(deps.gateway.sendCardTo(msg.chatId, buildConfirmCard(req)), cardSendTimeoutMs, '');
-          if (!cardId) {
-            void deps.gateway.sendTextTo(msg.chatId, `⚠️ 确认卡发送失败（${req.toolName}），已自动拒绝；模型重试时会再次弹出`)
-              .catch(() => {});
-            return 'deny';
-          }
-          // 确认卡在进度卡下方追加会把进度卡顶上去：删旧卡重发，让进度卡始终沉在会话最底
-          void activeProgress.get(key)?.sinkToBottom();
+          // 工具确认嵌入当前任务的进度卡（按钮在计时行上方、正文收敛）——不再单独发确认卡：
+          // 独立确认卡与进度卡正文内容大量重复，且追加在进度卡下方会把进度卡顶出会话底部。
+          // 经 activeProgress 现查当前任务的进度卡：gate 通道级复用，闭包不能捕获任务级实例。
+          // 超时由本闭包自管：到点删除条目 + 清除确认区 + 以 deny 继续——条目有界
+          // （无人点击、/stop、4h abort 挂起中的 ask 均会被定时器清理），迟到点击因条目
+          // 已删被 toast 提示后忽略
+          const progress = activeProgress.get(key);
+          if (!progress) return 'deny';
+          progress.setConfirm(req);
           return new Promise<PermissionDecision>((resolve) => {
             const gc = setTimeout(() => {
               confirmPending.delete(req.requestId);
-              void deps.gateway.updateCard(cardId, expiredConfirmCard(req, confirmTimeoutMs)).catch(() => {});
+              progress.setConfirm(undefined);
+              progress.setStatus(`⏰ 确认超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未确认），已自动拒绝 \`${req.toolName}\`；模型重试时会再次请求`);
               resolve('deny');
             }, confirmTimeoutMs);
             gc.unref();
+            const settle = (d: PermissionDecision) => {
+              progress.setConfirm(undefined);
+              progress.setStatus(DECISION_TEXT[d]);
+            };
             confirmPending.set(req.requestId, {
               resolve: (d) => {
-                clearTimeout(gc); // 用户已及时确认：撤销过期态 PATCH，防止已决策的卡片被改写为超时
+                clearTimeout(gc); // 用户已及时确认：撤销超时定时器
                 resolve(d);
               },
               req,
               ownerId: msg.userId,
-              cardId,
+              onSettled: settle,
             });
           });
         },
@@ -530,11 +521,16 @@ export function createBridge(
               chatId: msg.chatId, userId: msg.userId, phase: 'start', tool: n, summary: rest.join(': '), ok: true,
             });
           } else if (e.kind === 'tool-result') {
-            progress.toolResult(e.content, e.ok ?? true);
+            progress.toolResult(e.content, e.ok ?? true, e.note);
             deps.transcript?.tool({
               v: 1, ts: now(), kind: 'tool', app: app.appId,
               chatId: msg.chatId, userId: msg.userId, phase: 'result', tool: e.content, summary: '', ok: e.ok ?? true,
             });
+          } else if (e.kind === 'agent-start') {
+            // 子代理/后台任务启动：进度卡子代理清单（独立区块，对齐 CLI 的 agent 进度显示）
+            progress.agentStart(e.agent);
+          } else if (e.kind === 'agent-settle') {
+            progress.agentSettle(e.id, e.status, e.summary);
           }
         },
       });
@@ -762,15 +758,9 @@ export function createBridge(
       }
       confirmPending.delete(action.value.requestId);
       pending.resolve(decision);
-      const resultCard = buildConfirmResultCard(pending.req, decision, '任务发起人');
-      // 兜底 PATCH 不再 await：回调须在 3 秒内响应（协议 200341），且响应体已内联结果卡同步换卡，
-      // PATCH 仅在 WS 回传响应丢失时保证最终一致（同时消掉 await PATCH 慢网络下拖垮响应窗口的隐患）
-      void deps.gateway.updateCard(pending.cardId, resultCard)
-        .catch((e) => console.error('[卡片兜底更新失败]', action.value.requestId, e));
-      return {
-        toast: { type: 'success', content: DECISION_TEXT[decision] },
-        card: { type: 'raw', data: resultCard },
-      };
+      // 决策落定：清除进度卡内嵌确认区并刷新状态行（按钮随 setConfirm 的 flush 消失）
+      pending.onSettled(decision);
+      return { toast: { type: 'success', content: DECISION_TEXT[decision] } };
     } catch (e) {
       console.error(tag, '[卡片回调异常]', action.value.requestId, e);
       // resolve 之后的代码理论不可抛；若未来插入可抛代码，按条目是否仍在区分决策是否已生效
@@ -818,7 +808,8 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     }
     config.workspaces = fresh.workspaces;
     config.defaults = fresh.defaults;
-    // 权限白名单热应用：gate 每任务现读 config.permissions（通道级 gate 虽复用，白名单在 decide 时取用）
+    // 权限白名单/黑名单热应用：通道级 gate 复用，但经 getter 在 decide 时现读 config.permissions，
+    // 此处原地替换后已有通道的下一个工具调用即用新名单
     config.permissions = fresh.permissions;
     config.claude = fresh.claude;
     config.server = fresh.server;

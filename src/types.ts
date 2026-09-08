@@ -146,7 +146,16 @@ export interface ConfirmationRequest {
   requestId: string; toolName: string; summary: string; diff?: string; workspaceName: string;
 }
 export type PermissionDecision = 'allow' | 'deny' | 'allow-session';
-export interface ProgressEvent { kind: 'text' | 'tool-start' | 'tool-result' | 'status'; content: string; ok?: boolean }
+/**
+ * 执行器 → 进度卡的流事件：
+ * - text/tool-start/tool-result/status：主循环输出与状态（tool-result 失败时带首行原因 note）
+ * - agent-start/agent-settle：子代理与后台任务生命周期（进度卡子代理清单的数据源）
+ */
+export type ProgressEvent =
+  | { kind: 'text' | 'tool-start' | 'status'; content: string }
+  | { kind: 'tool-result'; content: string; ok: boolean; note?: string }
+  | { kind: 'agent-start'; agent: { id: string; description: string; type: string } }
+  | { kind: 'agent-settle'; id: string; status: 'done' | 'failed' | 'stopped'; summary?: string };
 
 /**
  * SDK init(system/init) 消息提取的会话清单：本会话实际加载到的模型/技能/插件/MCP/斜杠命令。

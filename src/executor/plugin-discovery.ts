@@ -2,7 +2,7 @@
 // 从 Claude Code 数据目录读取 installed_plugins.json（安装清单）+ settings.json 的
 // enabledPlugins（启用状态），把 scope=user 且已启用的插件 installPath 转成 SDK plugins 选项。
 // 全程容错：文件缺失/格式异常一律 warn-once 后返回空，绝不阻断任务（插件加载失败 ≠ 桥接器不可用）
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, type Dirent } from 'node:fs';
 import { join } from 'node:path';
 import type { PluginRef } from '../types.js';
 
@@ -126,38 +126,75 @@ interface MarketplaceDoc {
   plugins?: Array<{ name?: string; description?: string; version?: string }>;
 }
 
+/** known_marketplaces.json 的已知形状：市场名 → 源描述与安装位置（CLI marketplace add 的登记表） */
+interface KnownMarketplacesDoc {
+  [name: string]: {
+    source?: { source?: string; repo?: string; url?: string; path?: string };
+    installLocation?: string;
+  };
+}
+
+function catalogFrom(name: string, doc: MarketplaceDoc): MarketplaceCatalog {
+  const plugins: MarketplacePluginEntry[] = [];
+  for (const p of doc.plugins ?? []) {
+    if (typeof p?.name !== 'string' || !p.name) continue;
+    plugins.push({
+      name: p.name,
+      ...(typeof p.description === 'string' ? { description: p.description } : {}),
+      ...(typeof p.version === 'string' && p.version ? { version: p.version } : {}),
+    });
+  }
+  return {
+    name,
+    ...(typeof doc.description === 'string' ? { description: doc.description } : {}),
+    plugins,
+  };
+}
+
 /**
- * 列出 <claudeConfigDir>/plugins/marketplaces/* 各市场 .claude-plugin/marketplace.json
- * 声明的可安装插件（Web 配置页「安装」下拉数据源；CLI 语义：install 只能装已添加市场里的插件）。
- * 目录缺失（未 marketplace add 过）返回空；单个市场清单损坏按市场粒度跳过，不影响其余。
+ * 列出可安装插件目录（Web 配置页「安装」下拉数据源；CLI 语义：install 只能装已添加市场里的插件）。
+ * 两个数据源合并、按市场名去重：
+ * 1. <claudeConfigDir>/plugins/marketplaces 下各市场目录内的 .claude-plugin/marketplace.json
+ *    ——github/git/url 源市场会被 CLI clone 物化到该目录（目录缺失 = 未添加过任何远程市场，正常态）；
+ * 2. <claudeConfigDir>/plugins/known_marketplaces.json 中 source 为 directory/file 的本地路径
+ *    市场——CLI 对本地源不物化副本，只登记 installLocation 指向原路径，漏读会导致
+ *    「添加本地市场成功但安装下拉永远看不到」（0.17.0 根因）。原路径已移动/删除时静默跳过。
+ * 单个市场清单损坏按市场粒度跳过，不影响其余。
  */
 export function listAvailablePlugins(claudeConfigDir: string): MarketplaceCatalog[] {
   const marketRoot = join(claudeConfigDir, 'plugins', 'marketplaces');
-  let entries;
+  const out: MarketplaceCatalog[] = [];
+  const seen = new Set<string>();
+  let entries: Dirent[];
   try {
     entries = readdirSync(marketRoot, { withFileTypes: true });
   } catch {
-    return []; // 市场根目录不存在 = 尚未添加任何市场，正常态
+    entries = []; // 市场根目录不存在 = 尚未添加任何远程市场，仍继续读本地市场登记表
   }
-  const out: MarketplaceCatalog[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const manifest = readJson<MarketplaceDoc>(join(marketRoot, entry.name, '.claude-plugin', 'marketplace.json'));
     if (!manifest.ok) continue;
-    const plugins: MarketplacePluginEntry[] = [];
-    for (const p of manifest.doc.plugins ?? []) {
-      if (typeof p?.name !== 'string' || !p.name) continue;
-      plugins.push({
-        name: p.name,
-        ...(typeof p.description === 'string' ? { description: p.description } : {}),
-        ...(typeof p.version === 'string' && p.version ? { version: p.version } : {}),
-      });
+    seen.add(entry.name);
+    out.push(catalogFrom(entry.name, manifest.doc));
+  }
+  const known = readJson<KnownMarketplacesDoc>(join(claudeConfigDir, 'plugins', 'known_marketplaces.json'));
+  if (known.ok) {
+    for (const [name, info] of Object.entries(known.doc)) {
+      if (seen.has(name)) continue;
+      const sourceType = info?.source?.source;
+      if (sourceType !== 'directory' && sourceType !== 'file') continue; // 远程源已由目录扫描覆盖
+      // file 源的 source.path 即 marketplace.json 本身；directory 源从 installLocation（原目录）拼清单路径
+      const manifestPath = sourceType === 'file' && typeof info.source?.path === 'string' && info.source.path
+        ? info.source.path
+        : typeof info.installLocation === 'string' && info.installLocation
+          ? join(info.installLocation, '.claude-plugin', 'marketplace.json')
+          : '';
+      if (!manifestPath) continue;
+      const manifest = readJson<MarketplaceDoc>(manifestPath);
+      if (!manifest.ok) continue;
+      out.push(catalogFrom(name, manifest.doc));
     }
-    out.push({
-      name: entry.name,
-      ...(typeof manifest.doc.description === 'string' ? { description: manifest.doc.description } : {}),
-      plugins,
-    });
   }
   return out;
 }

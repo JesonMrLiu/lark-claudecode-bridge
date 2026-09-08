@@ -68,6 +68,19 @@ function summarizeToolInput(input: Record<string, unknown>): string {
   return JSON.stringify(input).slice(0, 100);
 }
 
+/** tool_result 失败内容的首行文本（兼容 string / blocks 数组形态）：进度卡 ✘ 行的失败原因 */
+function firstErrorLine(content: unknown): string | undefined {
+  let text = '';
+  if (typeof content === 'string') text = content;
+  else if (Array.isArray(content)) {
+    text = content
+      .map((b) => (b && typeof b === 'object' && 'text' in b && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : ''))
+      .join(' ');
+  }
+  const line = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
+  return line ? line.slice(0, 80) : undefined;
+}
+
 /** 等待后台任务期间的静默超时：超时仍无任何事件（CLI 异常/卡死）按已有信息收尾，防任务永久挂起。
  *  正常路径无须走到——后台任务完成会唤醒主循环产生新事件，最终由 result/idle 信号收尾 */
 const BG_WAIT_SILENCE_TIMEOUT_MS = 15 * 60 * 1000;
@@ -207,10 +220,21 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
               kind: 'status',
               content: `${message.is_backgrounded ? '🤖 后台子代理启动' : '🤖 子代理启动'}${tag}: ${message.description}`,
             });
+            // 子代理清单：进度卡独立区块展示每个子代理的运行状态（对齐 CLI 的 agent 进度显示）
+            await cb.onProgress({
+              kind: 'agent-start',
+              agent: { id: message.task_id, description: message.description, type: message.subagent_type ?? 'task' },
+            });
           } else if (message.subtype === 'task_notification') {
             // 后台任务落定（completed/failed/stopped）：summary 为任务自述结论
             const label = message.status === 'completed' ? '✅ 后台任务完成' : message.status === 'failed' ? '❌ 后台任务失败' : '🛑 后台任务已停止';
             await cb.onProgress({ kind: 'status', content: `${label}: ${message.summary}` });
+            await cb.onProgress({
+              kind: 'agent-settle',
+              id: message.task_id,
+              status: message.status === 'completed' ? 'done' : message.status === 'failed' ? 'failed' : 'stopped',
+              ...(message.summary ? { summary: message.summary } : {}),
+            });
           }
           break;
         }
@@ -238,7 +262,8 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
           for (const block of content) {
             if (block.type === 'tool_result') {
               const name = toolNames.get(block.tool_use_id) ?? '';
-              await cb.onProgress({ kind: 'tool-result', content: name, ok: !block.is_error });
+              const note = block.is_error ? firstErrorLine(block.content) : undefined;
+              await cb.onProgress({ kind: 'tool-result', content: name, ok: !block.is_error, ...(note ? { note } : {}) });
             }
           }
           break;

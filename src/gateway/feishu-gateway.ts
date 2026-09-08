@@ -171,7 +171,7 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
 
 interface RawCardActionPayload {
   action?: {
-    value?: { requestId?: string; decision?: string; feedback?: string };
+    value?: { requestId?: string; decision?: string; feedback?: string; qIndex?: number; option?: string };
     // 卡片 input 组件的值随按钮回调传回（plan 修改意见 name=feedback）；
     // 不同飞书客户端/版本落点可能是 form_value 或并入 value，两处兜底
     form_value?: Record<string, unknown>;
@@ -185,10 +185,11 @@ interface RawCardActionPayload {
 const VALID_DECISIONS: ReadonlySet<string> = new Set([
   'allow', 'deny', 'allow-session',
   'plan-approve', 'plan-revise', 'plan-reject',
+  'qa-pick', 'qa-submit',
 ]);
 
 /** 解析 card.action.trigger 回调；不完整或 decision 不在合法枚举内返回 null */
-function parseCardAction(data: unknown): { value: { requestId: string; decision: CardDecision; feedback?: string }; operatorId: string; openMessageId: string } | null {
+function parseCardAction(data: unknown): { value: { requestId: string; decision: CardDecision; feedback?: string; qIndex?: number; option?: string }; operatorId: string; openMessageId: string } | null {
   try {
     if (data === null || typeof data !== 'object') return null;
     const d = data as RawCardActionPayload;
@@ -199,8 +200,17 @@ function parseCardAction(data: unknown): { value: { requestId: string; decision:
     const fromValue = typeof value.feedback === 'string' && value.feedback ? value.feedback : undefined;
     const fromForm = typeof d.action?.form_value?.feedback === 'string' ? (d.action.form_value.feedback as string) : undefined;
     const feedback = fromValue ?? fromForm;
+    // 提问卡选项透传（qa-pick 依赖 qIndex/option 定位选项；qa-submit 不带）
+    const qIndex = typeof value.qIndex === 'number' ? value.qIndex : undefined;
+    const option = typeof value.option === 'string' ? value.option : undefined;
     return {
-      value: { requestId: value.requestId, decision: value.decision as CardDecision, ...(feedback ? { feedback } : {}) },
+      value: {
+        requestId: value.requestId,
+        decision: value.decision as CardDecision,
+        ...(feedback ? { feedback } : {}),
+        ...(qIndex !== undefined ? { qIndex } : {}),
+        ...(option ? { option } : {}),
+      },
       operatorId: d.operator.open_id,
       openMessageId: d.context?.open_message_id ?? d.open_message_id ?? '',
     };

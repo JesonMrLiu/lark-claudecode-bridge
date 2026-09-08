@@ -1,4 +1,5 @@
 import { buildProgressCard, type ProgressState } from './card-builder.js';
+import type { ConfirmationRequest } from '../types.js';
 
 export interface CardSender {
   sendCard(card: unknown): Promise<string>;        // 返回 messageId
@@ -29,7 +30,7 @@ export class ProgressCard {
     title: string,
     private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number } = {},
   ) {
-    this.state = { title, status: '🚀 已接收，启动中…', textTail: '', toolLine: '', startedAt: Date.now() };
+    this.state = { title, status: '🚀 已接收，启动中…', textTail: '', toolLine: '', startedAt: Date.now(), agents: [] };
   }
 
   async start(): Promise<void> {
@@ -58,15 +59,54 @@ export class ProgressCard {
     void this.flush();
   }
 
-  toolResult(name: string, ok: boolean): void {
+  toolResult(name: string, ok: boolean, note?: string): void {
     if (this.done) return;
-    this.state.toolLine = `${ok ? '✔' : '✘'} ${name}`;
+    // 失败时带首行原因（权限被拒/命令出错一眼可辨），不再让 ✘ 被误读成「工具没权限」
+    this.state.toolLine = note ? `${ok ? '✔' : '✘'} ${name} — ${note}` : `${ok ? '✔' : '✘'} ${name}`;
     this.lastActivityAt = Date.now();
   }
 
   setStatus(status: string): void {
     if (this.done) return;
     this.state.status = status;
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /**
+   * 挂起/清除内嵌工具确认：非 undefined 时卡片底部渲染确认按钮区并收敛正文，
+   * 决策（含超时）后置回 undefined 恢复正文展示。appendText 期间照常积累 buffer，
+   * 清除后 flush 一次性带出。
+   */
+  setConfirm(req: ConfirmationRequest | undefined): void {
+    if (this.done) return;
+    this.state.confirm = req;
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /** 子代理/后台任务启动：加入清单（同 id 重复启动幂等跳过） */
+  agentStart(agent: { id: string; description: string; type: string }): void {
+    if (this.done) return;
+    if (this.state.agents.some((t) => t.id === agent.id)) return;
+    this.state.agents.push({ ...agent, startedAt: Date.now(), status: 'running' });
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /**
+   * 子代理/后台任务落定：标记完成/失败/停止（条目保留至任务结束供回看）。
+   * 找不到条目时补建（resume 续跑场景：上轮启动的后台任务本轮才收到通知）。
+   */
+  agentSettle(id: string, status: 'done' | 'failed' | 'stopped', summary?: string): void {
+    if (this.done) return;
+    const t = this.state.agents.find((x) => x.id === id);
+    if (t) {
+      t.status = status;
+      if (summary) t.summary = summary;
+    } else {
+      this.state.agents.push({ id, description: summary?.slice(0, 80) ?? id, type: 'task', startedAt: Date.now(), status, ...(summary ? { summary } : {}) });
+    }
     this.lastActivityAt = Date.now();
     void this.flush();
   }
@@ -78,6 +118,8 @@ export class ProgressCard {
     clearInterval(this.heartbeatTimer);
     this.state.status = summary;
     this.state.toolLine = '';
+    // 终态不再带确认按钮（决策未落的最极端兜底；正常路径 ask 先于 finish settle）
+    this.state.confirm = undefined;
     await this.flush(); // 经由同一串行链落地，保证是最后一张（终态不被旧 flush 覆盖）
   }
 
