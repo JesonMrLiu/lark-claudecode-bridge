@@ -2,30 +2,38 @@
 // 安全基线：默认只绑 127.0.0.1；Host/Origin 校验防 DNS rebinding；body ≤1MB；
 // secret 永不出进程（GET 脱敏回显，PUT 空值=不修改）。改动写盘后由现有热重载器/重启消费
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { homedir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, extname, join, parse, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDocument, stringify } from 'yaml';
-import { CONFIG_PATH, SLASH_COMMAND_RE, loadConfig, parseConfigText } from '../config.js';
-import { DEFAULT_CLAUDE_DIR, initManagedClaudeDir, resolveClaudeDir } from '../claude-config.js';
+import AdmZip from 'adm-zip';
+import { CONFIG_DIR, CONFIG_PATH, SLASH_COMMAND_RE, loadConfig, parseConfigText } from '../config.js';
+import { DEFAULT_CLAUDE_DIR, MANAGED_CLAUDE_DIR, initManagedClaudeDir, resolveClaudeDir } from '../claude-config.js';
 import { switchProfile } from '../claude-profile.js';
 import { hasClaudeAuth } from '../auth-precheck.js';
 import { defaultPermissionsDoc, defaultServerDoc } from '../config-defaults.js';
 import { VERSION } from '../version.js';
 import type { BridgeConfig, ServerConfig } from '../types.js';
 import { appStatusSummary, applyPermissionDisplayDefaults, applySecrets, claudeSettingsSummary, computeRestartRequired, docForClient, isAllowedHost, isAllowedOrigin, type ClaudeCurrentSummary } from './config-api.js';
+import {
+  BRIDGE_MCP_JSON, MCP_NAME_RE, SKILL_NAME_RE, USER_CLAUDE_JSON,
+  listAllSkills, listMcpServers, listSkills, parseClaudeMcpAdd, readMcpServersFromJsonFile, readPluginMcpFromManifest, resolveEnvRefs,
+} from './skills-mcp-api.js';
 import { fetchModelList, resolveModelFetchParams } from './model-list.js';
 import { SLASH_COMMAND_META } from '../session/commands.js';
 import { DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMAND_SOURCES } from '../executor/permission-gate.js';
 import { openBrowser } from '../util/open-browser.js';
+import { ensureRuntimeDirs } from '../util/runtime-dirs.js';
 import { builtinCommands, createSlashApiClient, ensureBuiltins, expectedCommands, syncSlashCommands } from '../feishu/slash-commands.js';
 import { runPluginCli, updateAllPlugins } from '../executor/plugin-manager.js';
-import { invalidatePluginCache, listAvailablePlugins, listInstalledPlugins } from '../executor/plugin-discovery.js';
+import { invalidatePluginCache, listAvailablePlugins, listInstalledPlugins, loadEnabledPlugins } from '../executor/plugin-discovery.js';
 import { bridgeStatus, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDetached, stopBridgeByPid } from './lifecycle.js';
 import { checkUpdate, installMode, runUpdate } from './update.js';
 
 /** PUT /api/config 参与整段替换的顶级键；body 未携带的键保持磁盘原文（含注释） */
-const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'server', 'claude', 'slash_commands', 'transcripts'] as const;
+const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'server', 'claude', 'slash_commands', 'transcripts', 'session', 'card'] as const;
 
 export interface WebServerOptions {
   /** server 段配置；缺省用默认（firstRun 无配置文件场景） */
@@ -58,14 +66,14 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+function readBody(req: IncomingMessage, limit = BODY_LIMIT): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => {
       size += c.length;
-      if (size > BODY_LIMIT) {
-        reject(new Error('请求体超过 1MB 上限'));
+      if (size > limit) {
+        reject(new Error(`请求体超过 ${Math.floor(limit / 1024 / 1024)}MB 上限`));
         req.destroy();
         return;
       }
@@ -76,8 +84,8 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
-  return readBody(req).then((text) => {
+function readJsonBody(req: IncomingMessage, limit = BODY_LIMIT): Promise<Record<string, unknown>> {
+  return readBody(req, limit).then((text) => {
     if (!text.trim()) return {};
     const v = JSON.parse(text);
     if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error('请求体必须为 JSON 对象');
@@ -168,6 +176,7 @@ function readRawDoc(configPath: string): Record<string, unknown> | null {
 }
 
 export async function startWebServer(opts: WebServerOptions = {}): Promise<WebServerHandle | null> {
+  ensureRuntimeDirs(); // 独立入口兜底：即使不经 lcb CLI（测试/嵌入式调用），首装写盘也有目录
   const serverCfg = opts.server ?? (defaultServerDoc() as unknown as ServerConfig);
   if (serverCfg.enabled === false) return null;
   const configPath = opts.configPath ?? CONFIG_PATH;
@@ -529,6 +538,251 @@ async function handle(
       return json(res, 200, r);
     }
   }
+  // ---- Skills 管理（#12）：三来源聚合（用户级·本机 / 用户级·bridge / 项目级·工作区）+ create/delete + zip 导入。
+  // 首装（无 config.yaml）不拦截：两个用户级目录照常可看可管，仅项目级来源为空 ----
+  /** 磁盘 config 的 workspaces（project 来源与 zip 导入目标依据）；解析失败/首装返回空数组 */
+  const currentWorkspaces = (): Array<{ name: string; path: string }> => {
+    const doc = readRawDoc(ctx.configPath);
+    const ws = doc?.workspaces;
+    if (!Array.isArray(ws)) return [];
+    return ws.filter((w): w is { name: string; path: string } =>
+      !!w && typeof w === 'object' && typeof (w as { name?: unknown }).name === 'string' && typeof (w as { path?: unknown }).path === 'string');
+  };
+  /** skill 生效目录（用户级）：managed 模式 → bridge 自管 claude/skills；否则共享本机 ~/.claude/skills */
+  const effectiveSkillsDir = (): string => {
+    const doc = readRawDoc(ctx.configPath);
+    return (doc?.claude as { mode?: string } | undefined)?.mode === 'managed'
+      ? join(CONFIG_DIR, 'claude', 'skills')
+      : join(homedir(), '.claude', 'skills');
+  };
+  /** 插件清单（#12 插件来源补全）：扫描双 claude 目录的 installed_plugins.json（本机必扫；
+   *  managed 时额外扫 bridge 自管目录——managed 模式生效目录），合并去重（installPath 主键）。
+   *  enabled 字段联合两目录 settings.json 的 enabledPlugins 判定（任一处开启即视为启用——
+   *  保守显示启用，与 executeTask 任一处目录可加载语义一致） */
+  const currentPlugins = (): Array<{ name: string; path: string; enabled: boolean }> => {
+    const doc = readRawDoc(ctx.configPath);
+    const isManaged = (doc?.claude as { mode?: string } | undefined)?.mode === 'managed';
+    const dirs: string[] = [DEFAULT_CLAUDE_DIR];
+    if (isManaged) dirs.push(MANAGED_CLAUDE_DIR);
+    const enabledKeys = new Set<string>();
+    for (const d of dirs) for (const k of loadEnabledPlugins(d)) enabledKeys.add(k);
+    const byPath = new Map<string, { name: string; path: string; enabled: boolean }>();
+    for (const d of dirs) {
+      for (const p of listInstalledPlugins(d)) {
+        if (!p.path) continue;
+        if (byPath.has(p.path)) continue; // installPath 重复（双目录登记同一 install）按先到先得
+        byPath.set(p.path, { name: p.name, path: p.path, enabled: enabledKeys.has(p.key) });
+      }
+    }
+    return [...byPath.values()];
+  };
+  if (path === '/api/skills' && req.method === 'GET') {
+    const plugins = currentPlugins();
+    return json(res, 200, {
+      skills: listAllSkills(currentWorkspaces(), plugins),
+      effectiveDir: effectiveSkillsDir(),
+      pluginStats: { total: plugins.length, withSkills: plugins.filter((p) => listSkills(join(p.path, 'skills'), 'plugin').length > 0).length },
+    });
+  }
+  if (path === '/api/skills/action' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const op = String(body.op ?? '');
+    const name = String(body.name ?? '').trim();
+    if (!SKILL_NAME_RE.test(name)) return json(res, 400, { error: `skill 名 "${name}" 须为 1-64 位字母/数字/下划线/连字符` });
+    if (op === 'create') {
+      const description = String(body.description ?? '').trim();
+      const md = `---\nname: ${name}\ndescription: ${description}\n---\n\n# ${name}\n\n（请补充 skill 说明）\n`;
+      const skillDir = join(effectiveSkillsDir(), name);
+      if (existsSync(skillDir)) return json(res, 409, { error: `skill "${name}" 已存在（${skillDir}）` });
+      try {
+        mkdirSync(skillDir, { recursive: true });
+        writeAtomic(join(skillDir, 'SKILL.md'), md);
+      } catch (e) {
+        return json(res, 500, { error: `创建 skill 失败：${e instanceof Error ? e.message : String(e)}` });
+      }
+      return json(res, 200, { ok: true, skill: { name, description, path: skillDir } });
+    }
+    if (op === 'delete') {
+      // 按来源定位目录：machine-user / bridge（自管） / project（workspaceName 定位工作区）
+      const source = String(body.source ?? 'machine-user') as 'machine-user' | 'bridge' | 'project';
+      const root = source === 'bridge'
+        ? join(CONFIG_DIR, 'claude', 'skills')
+        : source === 'project'
+          ? join(currentWorkspaces().find((w) => w.name === String(body.workspaceName ?? ''))?.path ?? '\0not-found', '.claude', 'skills')
+          : join(homedir(), '.claude', 'skills');
+      const skillDir = join(root, name);
+      if (!existsSync(skillDir)) return json(res, 400, { error: `skill "${name}" 不存在（${root}）` });
+      try {
+        rmSync(skillDir, { recursive: true, force: true });
+      } catch (e) {
+        return json(res, 500, { error: `删除 skill 失败：${e instanceof Error ? e.message : String(e)}` });
+      }
+      return json(res, 200, { ok: true });
+    }
+    return json(res, 400, { error: `未知 op "${op}"（支持 create / delete）` });
+  }
+  if (path === '/api/skills/import' && req.method === 'POST') {
+    // zip 导入（#12）：base64 上传，独立放宽到 10MB（全局 1MB 不放 zip）；解压后复制进用户级生效目录
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonBody(req, 10 * 1024 * 1024);
+    } catch (e) {
+      return json(res, 413, { error: e instanceof Error ? e.message : String(e) });
+    }
+    const zipBase64 = String(body.zipBase64 ?? '');
+    if (!zipBase64) return json(res, 400, { error: '缺少 zipBase64' });
+    let entries: Array<{ entryName: string; isDirectory: boolean }>;
+    try {
+      const zip = new AdmZip(Buffer.from(zipBase64, 'base64'));
+      entries = zip.getEntries().map((e) => ({ entryName: e.entryName, isDirectory: e.isDirectory }));
+      // 兼容两种打包结构：根即 skill 目录（SKILL.md 在根）/ 单层子目录是 skill 目录
+      const skillMd = entries.find((e) => !e.isDirectory && (e.entryName === 'SKILL.md' || /^[^/\\]+[/\\]SKILL\.md$/.test(e.entryName)));
+      if (!skillMd) return json(res, 400, { error: 'zip 内未找到 SKILL.md（须为 skill 目录打包，或压缩包根含 SKILL.md）' });
+      const prefix = skillMd.entryName === 'SKILL.md' ? '' : skillMd.entryName.replace(/[/\\]SKILL\.md$/, '') + '/';
+      const name = prefix ? prefix.replace(/[/\\]$/, '') : String(body.name ?? '').trim();
+      if (!SKILL_NAME_RE.test(name)) {
+        return json(res, 400, { error: `skill 名 "${name}" 不合法（1-64 位字母/数字/下划线/连字符；根打包时请传 name 或改为目录打包）` });
+      }
+      const targetDir = join(effectiveSkillsDir(), name);
+      if (existsSync(targetDir)) return json(res, 409, { error: `skill "${name}" 已存在（${targetDir}），如需覆盖请先删除` });
+      mkdirSync(targetDir, { recursive: true });
+      let extracted = 0;
+      for (const e of zip.getEntries()) {
+        if (e.isDirectory) continue;
+        if (!e.entryName.startsWith(prefix)) continue;
+        // 路径穿越防御：跳过含 .. 的条目；落盘路径去掉 prefix 前缀
+        const rel = e.entryName.slice(prefix.length).replace(/\\/g, '/');
+        if (!rel || rel.split('/').some((seg) => seg === '..')) continue;
+        const dest = join(targetDir, ...rel.split('/'));
+        mkdirSync(dirname(dest), { recursive: true });
+        zip.extractEntryTo(e.entryName, dirname(dest), false, true);
+        extracted++;
+      }
+      if (extracted === 0 || !existsSync(join(targetDir, 'SKILL.md'))) {
+        rmSync(targetDir, { recursive: true, force: true });
+        return json(res, 400, { error: '解压后未得到有效 skill（SKILL.md 缺失），已回滚' });
+      }
+      return json(res, 200, { ok: true, name, path: targetDir, files: extracted });
+    } catch (e) {
+      return json(res, 500, { error: `zip 导入失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+  // ---- MCP server 管理（#12）：页面可管理存储 = bridge 自管 <CONFIG_DIR>/mcp/servers.json（executeTask
+  // 注入 SDK 生效）；~/.claude.json（用户级·本机）展示+可删不写入；工作区 .mcp.json（项目级）只读 ----
+  if (path === '/api/mcp' && req.method === 'GET') {
+    const plugins = currentPlugins();
+    const servers = listMcpServers(currentWorkspaces(), plugins).map((s) => {
+      const { resolved, missing } = resolveEnvRefs(s.config.env as Record<string, unknown> | undefined);
+      return { ...s, resolvedEnv: resolved, missingEnv: missing };
+    });
+    return json(res, 200, {
+      servers,
+      bridgePath: BRIDGE_MCP_JSON,
+      pluginStats: { total: plugins.length, withMcp: plugins.filter((p) =>
+        Object.keys(readMcpServersFromJsonFile(join(p.path, '.mcp.json')).servers).length > 0
+        || Object.keys(readPluginMcpFromManifest(p.path).servers).length > 0
+      ).length },
+    });
+  }
+  if (path === '/api/mcp/action' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const op = String(body.op ?? '');
+    const name = String(body.name ?? '').trim();
+    if (!MCP_NAME_RE.test(name)) return json(res, 400, { error: `mcp 名 "${name}" 须为 1-64 位字母/数字/下划线/点/连字符` });
+    if (op === 'add' || op === 'update') {
+      // 两种入参：command = claude mcp add / add-json 原生命令文本（后端解析）；或 config = 配置对象
+      let cfg: Record<string, unknown> | undefined;
+      if (typeof body.command === 'string' && body.command.trim()) {
+        const parsed = parseClaudeMcpAdd(String(body.command));
+        if (!parsed.ok) return json(res, 400, { error: parsed.error });
+        if (parsed.name !== name) return json(res, 400, { error: `命令中的名字 "${parsed.name}" 与表单名字 "${name}" 不一致` });
+        cfg = parsed.config;
+      } else if (body.config && typeof body.config === 'object') {
+        cfg = body.config as Record<string, unknown>;
+      }
+      if (!cfg) return json(res, 400, { error: '缺少 config（配置对象）或 command（claude mcp add 命令）' });
+      // 宽松校验：stdio 走 command，http/sse 走 url
+      if (!(typeof cfg.type === 'string' || typeof cfg.command === 'string' || typeof cfg.url === 'string')) {
+        return json(res, 400, { error: 'config 至少需要 type / command / url 之一' });
+      }
+      const { servers } = readMcpServersFromJsonFile(BRIDGE_MCP_JSON);
+      if (op === 'add' && servers[name]) return json(res, 409, { error: `mcp server "${name}" 已存在（bridge 目录），请改名或用更新` });
+      servers[name] = cfg;
+      try { writeAtomic(BRIDGE_MCP_JSON, JSON.stringify({ mcpServers: servers }, null, 2)); }
+      catch (e) { return json(res, 500, { error: `写入 ${BRIDGE_MCP_JSON} 失败：${e instanceof Error ? e.message : String(e)}` }); }
+      return json(res, 200, { ok: true, name, config: cfg });
+    }
+    if (op === 'remove') {
+      const source = String(body.source ?? 'bridge') as 'bridge' | 'machine-user' | 'project';
+      if (source === 'project') return json(res, 400, { error: '项目级 .mcp.json 只读（请在对应工作区目录手动修改）' });
+      if (source === 'machine-user') {
+        // 删 ~/.claude.json 条目：保留 mcpServers 之外的其它键（numStartups 等用户级 CLI 运行时状态）
+        let doc: Record<string, unknown> = {};
+        if (existsSync(USER_CLAUDE_JSON)) {
+          try { doc = JSON.parse(readFileSync(USER_CLAUDE_JSON, 'utf8')) as Record<string, unknown>; }
+          catch { return json(res, 500, { error: '~/.claude.json 解析失败，请先修复后再操作' }); }
+        }
+        const mcp = (doc.mcpServers && typeof doc.mcpServers === 'object' ? doc.mcpServers : {}) as Record<string, Record<string, unknown>>;
+        if (!mcp[name]) return json(res, 400, { error: `mcp server "${name}" 不存在（~/.claude.json）` });
+        delete mcp[name];
+        doc.mcpServers = mcp;
+        try { writeAtomic(USER_CLAUDE_JSON, JSON.stringify(doc, null, 2)); }
+        catch (e) { return json(res, 500, { error: `写入 ~/.claude.json 失败：${e instanceof Error ? e.message : String(e)}` }); }
+        return json(res, 200, { ok: true });
+      }
+      const { servers } = readMcpServersFromJsonFile(BRIDGE_MCP_JSON);
+      if (!servers[name]) return json(res, 400, { error: `mcp server "${name}" 不存在（${BRIDGE_MCP_JSON}）` });
+      delete servers[name];
+      try { writeAtomic(BRIDGE_MCP_JSON, JSON.stringify({ mcpServers: servers }, null, 2)); }
+      catch (e) { return json(res, 500, { error: `写入 ${BRIDGE_MCP_JSON} 失败：${e instanceof Error ? e.message : String(e)}` }); }
+      return json(res, 200, { ok: true });
+    }
+    return json(res, 400, { error: `未知 op "${op}"（支持 add / update / remove）` });
+  }
+  if (path === '/api/mcp/check' && req.method === 'POST') {
+    // 按需探测（不自动批量探测：stdio spawn 最长 3s，逐行自动探测会拖垮列表加载）
+    const body = await readJsonBody(req);
+    const name = String(body.name ?? '');
+    const source = String(body.source ?? '');
+    const entry = listMcpServers(currentWorkspaces(), currentPlugins())
+      .find((s) => s.name === name && s.source === source && (s.workspaceName ?? '') === String(body.workspaceName ?? ''));
+    if (!entry) return json(res, 400, { error: `mcp server "${name}"（${source}）不存在，请刷新列表` });
+    const cfg = entry.config;
+    const isRemote = cfg.type === 'http' || cfg.type === 'sse' || (!cfg.type && typeof cfg.url === 'string');
+    if (isRemote) {
+      const url = typeof cfg.url === 'string' ? cfg.url : '';
+      if (!/^https?:\/\//.test(url)) return json(res, 200, { status: 'failed', detail: 'url 不是合法的 http(s) 地址' });
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+        // 任何 HTTP 响应都说明网络可达；4xx 多为鉴权/路径问题（MCP 端点通常要求特定握手）
+        return json(res, 200, { status: r.status < 500 ? 'ok' : 'failed', detail: `HTTP ${r.status}${r.status >= 400 ? '（可达；鉴权或路径问题）' : ''}` });
+      } catch (e) {
+        return json(res, 200, { status: 'unreachable', detail: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    // stdio：spawn 后短时观察——MCP server 正常行为是启动后等 stdin，存活即「可启动」
+    const command = typeof cfg.command === 'string' ? cfg.command : '';
+    if (!command) return json(res, 200, { status: 'failed', detail: '缺少 command' });
+    const { resolved } = resolveEnvRefs(cfg.env as Record<string, unknown> | undefined);
+    const child = spawn(command, Array.isArray(cfg.args) ? cfg.args.map(String) : [], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, ...resolved },
+      windowsHide: true,
+    });
+    let stderr = '';
+    child.stderr?.on('data', (c: Buffer) => { if (stderr.length < 500) stderr += c.toString('utf8'); });
+    const result = await new Promise<{ status: string; detail: string }>((resolve) => {
+      const done = (status: string, detail: string): void => { clearTimeout(killTimer); resolve({ status, detail }); };
+      const killTimer = setTimeout(() => {
+        child.kill();
+        done('ok', '进程存活（正常：MCP server 启动后等待 stdio 输入）');
+      }, 800);
+      child.on('error', (e) => done('failed', `无法启动：${e.message}`));
+      child.on('exit', (code) => done('failed', `进程退出（code ${code}）：${stderr.split('\n')[0] || '无 stderr 输出'}`));
+    });
+    try { child.kill(); } catch { /* 已退出 */ }
+    return json(res, 200, result);
+  }
   // ---- 桥接器进程启停（页面托管）。embedded 与 lcb ui 独立模式语义不同：embedded 停止/重启
   // 会连带本页所在进程，先回响应再走 selfStop 优雅关闭；独立模式经 PID 文件跨进程操作 ----
   if (path === '/api/bridge/action' && req.method === 'POST') {
@@ -541,7 +795,7 @@ async function handle(
       if (st.running) return json(res, 409, { error: `桥接器已在运行（PID ${st.pid}）` });
       const r = spawnBridgeDetached();
       if (!r.ok) return json(res, 400, { error: r.error });
-      return json(res, 200, { ok: true, pid: r.pid, message: '桥接器已在后台启动（运行日志见 ~/.lark-claudecode-bridge/bridge.log）' });
+      return json(res, 200, { ok: true, pid: r.pid, message: '桥接器已在后台启动（运行日志见 ~/.lark-claudecode-bridge/logs/bridge-YYYY-MM-DD.log）' });
     }
     if (op === 'stop' || op === 'restart') {
       if (ctx.embedded && !ctx.selfStop) return json(res, 500, { error: '内部错误：embedded 模式未注入 selfStop' });

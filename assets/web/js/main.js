@@ -11,8 +11,10 @@ import { page as pClaude } from './pages/claude.js';
 import { page as pPermissions } from './pages/permissions.js';
 import { page as pSlash } from './pages/slash.js';
 import { page as pPlugins } from './pages/plugins.js';
+import { page as pSkills } from './pages/skills.js';
+import { page as pMcp } from './pages/mcp.js';
 
-const PAGES = [pOverview, pApps, pWorkspaces, pClaude, pPermissions, pSlash, pPlugins];
+const PAGES = [pOverview, pApps, pWorkspaces, pClaude, pPermissions, pSlash, pPlugins, pSkills, pMcp];
 const pageById = new Map(PAGES.map((p) => [p.id, p]));
 const DEFAULT_TAB = 'overview';
 

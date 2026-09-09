@@ -19,9 +19,16 @@ function renderWorkspaces(el) {
   </div>
   <div class="card">
     <h3>全局默认${dirtyDotHtml('def')}</h3>
-    <div class="row">
+    <div class="row-2col">
       <div><label>默认工作区（defaults.workspace）</label><select id="defWs"></select></div>
       <div><label>全局并发（concurrency）</label><input type="number" id="globalCc" min="1" max="100"></div>
+      <div><label>上下文提醒阈值（session.context_remind_tokens；0=关闭）</label><input type="number" id="defCtxRemind" min="0" max="10000000"></div>
+      <div><label>飞书卡片宽度（card.width）</label>
+        <select id="cardWidth">
+          <option value="default">默认（飞书默认）</option>
+          <option value="fill">撑满聊天窗口</option>
+        </select>
+      </div>
     </div>
     ${saveBarHtml('def')}
   </div>`;
@@ -67,7 +74,8 @@ function renderWorkspaces(el) {
         cardDirty('ws', true);
       };
     });
-    tr.querySelector('.btn').onclick = () => {
+    // 「删」按钮精确选择（class="btn sm danger"）；原 tr.querySelector('.btn') 命中「浏览」并被浏览逻辑覆盖，故点「删」无反应
+    tr.querySelector('.danger').onclick = () => {
       if (doc.workspaces.length <= 1) return toast('至少保留一个工作区', true);
       doc.workspaces.splice(idx, 1);
       cardDirty('ws', true);
@@ -89,6 +97,19 @@ function renderWorkspaces(el) {
   $('#defWs').onchange = () => { doc.defaults = { ...(doc.defaults || {}), workspace: $('#defWs').value }; cardDirty('def', true); };
   $('#globalCc').value = doc.concurrency ?? 3;
   $('#globalCc').oninput = () => { doc.concurrency = Number($('#globalCc').value) || 3; cardDirty('def', true); };
+  // 上下文提醒阈值：空值 = 移除 session 段（PUT 跳过 = 磁盘原值未变，等价回滚）；合法数字 = 写 session 段
+  const ctxInput = $('#defCtxRemind');
+  ctxInput.value = doc.session?.context_remind_tokens ?? 150000;
+  ctxInput.oninput = () => {
+    const v = ctxInput.value.trim();
+    if (v === '') delete doc.session;
+    else doc.session = { context_remind_tokens: Number(v) };
+    cardDirty('def', true);
+  };
+  // 卡片宽度：写 card.width；空/未设回 'default'
+  const cw = $('#cardWidth');
+  cw.value = doc.card?.width ?? 'default';
+  cw.onchange = () => { doc.card = { width: cw.value }; cardDirty('def', true); };
   applyDirty(); // 增删行等操作先 cardDirty 再整卡重渲染：回放防止保存条/圆点随重建丢失
 }
 

@@ -23,6 +23,8 @@
 - 多工作区切换（/ws）、会话管理（/new /resume）、/stop 打断、模型切换（/model）、厂商档案切换（/model-profile）、加载清单查看（/skills /plugins /mcp）、插件管理（/plugin）
 - **后台子代理续跑**：主 Agent 派发的后台子代理在主回复结束后继续执行，完成后自动唤醒主循环汇总结果（进度卡可见「等待后台任务」与子代理输出）
 - **对话内容落盘**：用户消息与 Claude 回复全文存为 JSONL（`transcripts/`，为后续知识库挖掘打底；可选保留期）
+- **回复链上游自动拼入 prompt**：在飞书里「回复」某条消息再发新指令，上游最多 3 层消息文本会作为引用附在新消息前部一起发给 Claude（需 `im:message` 读取权限；失败降级只发当前消息）
+- **Skills / MCP 可视化管理页**：配置页新增「Skills」「MCP」两页——Skills 三来源（用户级·本机 / 用户级·bridge / 项目级·工作区） + zip 导入；MCP 三来源 + 命令方式（`claude mcp add`）/ JSON 配置 + 状态探测 + 抽屉查看 env 引用展开当前值。页面添加的 MCP 存 `~/.lark-claudecode-bridge/mcp/servers.json`，任务级热生效（无须重启）
 - 通道并发（默认 3），通道内串行
 
 ## 前置条件
@@ -46,7 +48,7 @@ lcb start
 ## 飞书应用配置（图文）
 
 1. https://open.feishu.cn → 创建企业自建应用 → 添加「机器人」能力
-2. 权限管理开通：`im:message`、`im:message:send_as_bot`、`im:resource`（**接收用户图片时下载消息资源用，不开则图片任务会提示下载失败**）、`contact:user.base:readonly`、`application:app_slash_command:write` / `application:app_slash_command:read`（斜杠命令一键同步用，见下）
+2. 权限管理开通：`im:message`（**含读取单条消息：回复链上游内容拼接用，不开则回复消息时降级为只发当前消息**）、`im:message:send_as_bot`、`im:resource`（**接收用户图片时下载消息资源用，不开则图片任务会提示下载失败**）、`contact:user.base:readonly`、`application:app_slash_command:write` / `application:app_slash_command:read`（斜杠命令一键同步用，见下）
 3. 事件与回调 → 事件配置 → 订阅方式选「使用长连接接收事件」→ 添加 `im.message.receive_v1`
 4. 事件与回调 → 回调配置 → 订阅方式选「使用长连接接收回调」→「已订阅的回调」点「添加回调」，添加「卡片回传交互」（`card.action.trigger`）
 5. 凭证与基础信息 → 复制 App ID / App Secret
@@ -88,7 +90,7 @@ lcb start
 配置页「概览」支持托管桥接器进程与自更新（源码 tsx 运行模式下自动降级为手动指引）：
 
 - **启停/重启**：概览「运行状态」卡显示桥接器进程状态（PID），可一键启动（后台守护进程）/ 停止 / 重启。`lcb start` 内嵌页面停止/重启时页面随进程短暂失联后自动恢复；`lcb ui` 独立页面则跨进程操作（Windows 下停止为硬终止，会话逐消息落盘不受影响）。
-- **后台运行日志**：经页面启动/重启的桥接器，输出落 `~/.lark-claudecode-bridge/bridge.log`（超 5MB 自动截断）；进程 PID 记录于同目录 `bridge.pid`（进程消亡后自动清理）。
+- **后台运行日志**：桥接器输出按天落 `~/.lark-claudecode-bridge/logs/bridge-YYYY-MM-DD.log`（自动跨天切换，保留 14 天）；进程 PID 记录于 `~/.lark-claudecode-bridge/bridge.pid`（进程消亡后自动清理）。
 - **版本更新**：概览「版本与更新」卡自动对比 npm registry（跟随本机 `.npmrc` 镜像配置）与当前版本；有新版时一键更新（`npm install -g`）并自动重启生效。
 
 ## 命令速查（飞书里发给机器人）
@@ -291,7 +293,7 @@ WantedBy=default.target
 8. **plan 卡片的「按意见修改」依赖飞书卡片输入框回传**：修改意见经卡片 input 组件随按钮回调传回；若个别客户端版本不回传输入值，点「按意见修改」会提示先填写意见——此时可改用「放弃计划」后在会话里直接发修改要求重新起任务。
 9. **code-dev 工作区的收尾 diff 基于 git**：`type: code-dev` 的工作区需要是 git 仓库（含未提交改动即可，无需 commit）；非 git 仓库自动回退为旧的整文件上传行为。untracked 新文件按全新增 diff 展示（目录级 untracked 与超过 20 个的 untracked 文件不展开）。
 10. **入站图片不清理**：用户发送的图片落盘 `~/.lark-claudecode-bridge/inbox/` 后不会自动删除（供会话内多次查看），长期使用可手动清理；Claude 是否能「看懂」图片取决于当前模型是否多模态（非多模态模型可配置识图 MCP 兜底）。富文本（post）中的超链接以 `[文字](链接)` 形式拍平进文本，@用户 被移除。
-11. **短回复不再单独发结果消息**：回复不超过进度卡正文上限（1200 字）时，结果就展示在进度卡终态里（避免同内容两条消息）；更长回复仍会单独发一条结果消息（进度卡只保留尾部）。
+11. **短回复不再单独发结果消息**：回复不超过进度卡终态上限（400 字）时，结果就展示在进度卡终态里（避免同内容两条消息）；更长回复仍会单独发一条结果消息（进度卡只保留尾部）。运行中的进度卡**不展示**过程文本与思考内容（主卡只留状态 / 当前工具 / 子代理 / 确认区 / 计时等关键信息）。
 12. **Web 配置页改 apps/workspaces 段会丢段内手写注释**：页面按整段替换写回（值未变的段落跳过重写、注释保留；`lcb ws add` 等增量命令不受影响）。手工注释建议写在段外或段头。
 13. **config.yaml 并发写**：配置页写盘为原子替换，但与 `lcb ws add` / `lcb app add` 等独立进程命令同时操作存在读-改-写窗口，请避免同时修改。
 14. **配置页默认仅本机可访问**（127.0.0.1）；改 `server.host` 放开到局域网意味着页面可读写全部凭证，请仅在可信网络使用。

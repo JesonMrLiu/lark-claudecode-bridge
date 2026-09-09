@@ -28,13 +28,13 @@ export class ProgressCard {
   constructor(
     private sender: CardSender,
     title: string,
-    private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number } = {},
+    private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number; cardWidthMode?: 'default' | 'fill' } = {},
   ) {
     this.state = { title, status: '🚀 已接收，启动中…', textTail: '', toolLine: '', startedAt: Date.now(), agents: [] };
   }
 
   async start(): Promise<void> {
-    this.messageId = await this.sender.sendCard(buildProgressCard(this.state));
+    this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
     const interval = this.opts.flushIntervalMs ?? 1500;
     this.flushTimer = setInterval(() => void this.flush(), interval).unref();
     this.heartbeatTimer = setInterval(() => {
@@ -45,6 +45,8 @@ export class ProgressCard {
     }, 1000).unref();
   }
 
+  /** 过程文本累积（产品决策：运行中不在卡片渲染过程文本与思考内容，仅终态露出结果尾部——
+   *  见 card-builder buildProgressCard 的 done 分支；buffer 照常积累供终态使用，不丢内容） */
   appendText(delta: string): void {
     if (this.done) return;
     this.buffer += delta;
@@ -85,6 +87,64 @@ export class ProgressCard {
     void this.flush();
   }
 
+  /**
+   * 挂起/清除内嵌计划确认（#3+#6）：plan 内容过长仅露 600 字预览，完整原文落盘到 planFilePath，
+   * 「查看完整方案」按钮 callback 触发 send_file 而非嵌入卡片。决策后 clearPlan() 收回区域
+   */
+  setPlan(req: import('./card-builder.js').EmbeddedPlanState | undefined): void {
+    if (this.done) return;
+    this.state.plan = req;
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /**
+   * 挂起/清除内嵌提问确认（#3）：每题选项全宽单行 + 提交按钮全部在主卡上，qa-pick PATCH 选中态。
+   * 决策后 clearQuestion() 收回区域
+   */
+  setQuestion(req: import('./card-builder.js').EmbeddedQuestionState | undefined): void {
+    if (this.done) return;
+    this.state.question = req;
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /** 当前某题的选中答案（wiring 的 qa-pick 回调同步给 qaPending 校验用；公开读，
+   *  替代旧版 wiring 直接访问私有 state 的 hack） */
+  getQuestionAnswer(qIndex: number): string | string[] | undefined {
+    return this.state.question?.answers[qIndex];
+  }
+
+  /** 当前挂起的内嵌 plan / question requestId（wiring 诊断入口 _pendingAsk 用） */
+  pendingAsk(): { planId?: string; questionId?: string } {
+    return {
+      planId: this.state.plan?.requestId,
+      questionId: this.state.question?.requestId,
+    };
+  }
+
+  /**
+   * qa-pick 选项点击：更新选中态并 flush（multiSelect 累加/移除，单选直接覆盖）。
+   * 异常状态（如 question 已被清空）静默忽略——迟到点击不报错
+   */
+  updateQuestionAnswer(qIndex: number, option: string, multiSelect: boolean): void {
+    if (this.done || !this.state.question) return;
+    const q = this.state.question.questions[qIndex];
+    if (!q) return;
+    if (multiSelect) {
+      const cur = this.state.question.answers[qIndex];
+      const arr = Array.isArray(cur) ? [...cur] : cur !== undefined ? [cur] : [];
+      const i = arr.indexOf(option);
+      if (i >= 0 && arr.length > 1) arr.splice(i, 1); // 至少保留一项：单选/全取消等于未答
+      else if (i < 0) arr.push(option);
+      this.state.question.answers[qIndex] = arr;
+    } else {
+      this.state.question.answers[qIndex] = option;
+    }
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
   /** 子代理/后台任务启动：加入清单（同 id 重复启动幂等跳过） */
   agentStart(agent: { id: string; description: string; type: string }): void {
     if (this.done) return;
@@ -118,8 +178,10 @@ export class ProgressCard {
     clearInterval(this.heartbeatTimer);
     this.state.status = summary;
     this.state.toolLine = '';
-    // 终态不再带确认按钮（决策未落的最极端兜底；正常路径 ask 先于 finish settle）
+    // 终态不再带交互区（决策未落的最极端兜底；正常路径 plan/question/confirm 先于 finish settle）
     this.state.confirm = undefined;
+    this.state.plan = undefined;
+    this.state.question = undefined;
     await this.flush(); // 经由同一串行链落地，保证是最后一张（终态不被旧 flush 覆盖）
   }
 
@@ -137,7 +199,7 @@ export class ProgressCard {
     if (this.sender.deleteCard) await this.sender.deleteCard(old).catch(() => {});
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        this.messageId = await this.sender.sendCard(buildProgressCard(this.state));
+        this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
         void this.flush();
         return;
       } catch (e) {
@@ -167,7 +229,7 @@ export class ProgressCard {
           this.buffer = '';
         }
         try {
-          await this.sender.updateCard(this.messageId!, buildProgressCard(this.state));
+          await this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
         } catch {
           // 单次 PATCH 失败不致命（限流/网络抖动），下轮重试
         }

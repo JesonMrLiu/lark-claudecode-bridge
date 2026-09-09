@@ -14,6 +14,8 @@ import { startWebServer } from '../web/server.js';
 import { AccessControl } from '../access/access-control.js';
 import { VERSION } from '../version.js';
 import { join } from 'node:path';
+import { ensureRuntimeDirs } from '../util/runtime-dirs.js';
+import { installLogTee, cleanupOldLogs } from '../util/log-tee.js';
 
 function showPending(access: AccessControl): void {
   const pending = access.listPending();
@@ -21,6 +23,9 @@ function showPending(access: AccessControl): void {
 }
 
 async function main(): Promise<void> {
+  ensureRuntimeDirs(); // 首装即建目录：后续所有命令的写盘（含配置页 tmp 文件）不再因目录缺失 ENOENT
+  installLogTee(); // console 双写到 logs/bridge-YYYY-MM-DD.log（#7：按天拆分，替代旧 bridge.log）
+  cleanupOldLogs(); // 启动时清 14 天前的日志
   const [cmd, ...args] = process.argv.slice(2);
   switch (cmd) {
     case 'setup':

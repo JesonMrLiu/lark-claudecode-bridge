@@ -1,6 +1,6 @@
 // 装配主流程：消息 → 访问控制 → 命令 → 通道队列 → 执行 → 确认卡片 → 回传
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import type {
   BridgeConfig, CardActionEvent, CardActionResponse, CardDecision, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
@@ -17,8 +17,8 @@ import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard } from './gateway/progress-card.js';
 import {
   DECISION_TEXT,
-  buildPlanCards, buildPlanResultCard, buildExpiredPlanCard, PROGRESS_TAIL_CHARS, type PlanCardRequest,
-  buildQuestionCard, buildQuestionResultCard, buildExpiredQuestionCard, type QuestionCardRequest, type QuestionCardAnswers,
+  PROGRESS_TAIL_CHARS, type PlanCardRequest,
+  type QuestionCardRequest, type QuestionCardAnswers,
 } from './gateway/card-builder.js';
 import { buildDiffSummaryCards } from './gateway/diff-card.js';
 import { runTask } from './executor/claude-executor.js';
@@ -29,6 +29,8 @@ import {
 } from './executor/permission-gate.js';
 import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery.js';
 import { createGatewaySender, createNotifyServer, NOTIFY_SERVER_NAME } from './executor/notify-server.js';
+import { BRIDGE_MCP_JSON, readMcpServersFromJsonFile } from './web/skills-mcp-api.js';
+import { FEISHU_NOTIFY_SOP_PROMPT } from './notify-sop.js';
 import { collectWorkspaceDiff } from './util/workspace-diff.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
@@ -71,6 +73,8 @@ const PLAN_DECISION_TEXT: Record<Extract<CardDecision, `plan-${string}`>, string
   'plan-approve': '✅ 计划已批准，开始执行（后续写操作免确认）',
   'plan-revise': '📝 修改意见已提交',
   'plan-reject': '❌ 计划已放弃',
+  // plan-view-file 不消费挂起项，仅 toast「正在发送方案文件…」——文案不在此出现，留口供编译期完整性
+  'plan-view-file': '',
 };
 
 interface ChannelRuntime {
@@ -80,6 +84,8 @@ interface ChannelRuntime {
   busy?: boolean;
   /** 待执行任务计数（busy 时入队自增、每个任务 finally 递减）：排队提示的位次来源 */
   queuedCount?: number;
+  /** 代际计数：/new 时自增；enqueue 捕获当前值传入 executeTask；不匹配则 no-op（丢弃旧代际排队消息） */
+  epoch?: number;
 }
 
 export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真实实现
@@ -106,7 +112,10 @@ export function createBridge(
   app: FeishuAppConfig, // 本 bridge 绑定的飞书应用：并发/默认工作区/Claude Code 环境/人格均 per-app
   deps: BridgeDeps,
   opts: { confirmTimeoutMs?: number; cardSendTimeoutMs?: number; reloadConfig?: () => void } = {}, // 测试可注入更短的确认等待窗 / 发卡超时 / 自定义配置重载
-): GatewayHandlers {
+): GatewayHandlers & {
+  /** 测试/诊断入口：返回通道当前挂起的内嵌 plan / question requestId */
+  _pendingAsk(channelKey: string): { planId?: string; questionId?: string };
+} {
   const sem = new Semaphore(app.concurrency ?? config.concurrency);
   const tag = `[app:${app.name}]`;
   // Claude 配置目录双模式：inherit（缺省）共享本机 ~/.claude（settingSources 含 user，
@@ -139,22 +148,28 @@ export function createBridge(
     resolve: (d: PermissionDecision) => void;
     req: ConfirmationRequest;
     ownerId: string;
+    channelKey: string;
     /** 决策落定（用户点击或超时清理前）后的收尾钩子：清除进度卡内嵌确认区并刷新状态行 */
     onSettled: (d: PermissionDecision) => void;
   }>();
-  // plan 确认挂起项：requestId → 等待中的计划决策（plan-approve/revise/reject）
+  // plan 确认挂起项：requestId → 等待中的计划决策（plan-approve/revise/reject）。
+  // 嵌入主卡片后回调侧无 cardId（主卡 messageId 由 ProgressCard 内部管理），改带 channelKey 定位活跃进度卡
   const planPending = new Map<string, {
     resolve: (r: PlanAskResult) => void;
     req: PlanCardRequest;
     ownerId: string;
-    cardId: string;
+    channelKey: string;
+    chatId: string;
+    planFilePath: string;
   }>();
-  // 提问挂起项：requestId → 等待中的问题答案（qa-pick 逐项收集，qa-submit 一次性 resolve）
+  // 提问挂起项：requestId → 等待中的问题答案（qa-pick 逐项收集，qa-submit 一次性 resolve）。
+  // 嵌入主卡片后无 cardId，改带 channelKey 定位活跃进度卡
   const qaPending = new Map<string, {
     resolve: (r: AskQuestionResult) => void;
     req: QuestionCardRequest;
     ownerId: string;
-    cardId: string;
+    channelKey: string;
+    chatId: string;
     answers: QuestionCardAnswers;
   }>();
   // 通道当前任务的进度卡：gate 的 ask/planAsk/askQuestion 闭包随 gate 通道级复用，
@@ -167,19 +182,28 @@ export function createBridge(
   function workspacePath(name: string): string {
     return config.workspaces.find((w) => w.name === name)?.path ?? config.workspaces[0].path;
   }
+  /** 配置页管理的 MCP（#12）：bridge 自管 mcp/servers.json 每任务现读注入 SDK（改配置即热生效，
+   *  无须重启）。notify 名固定后展开防被用户配置同名覆盖；文件缺失/损坏返回空（配置页写坏
+   *  不应拖垮任务执行） */
+  function loadBridgeMcpServers(): Record<string, Record<string, unknown>> {
+    return readMcpServersFromJsonFile(BRIDGE_MCP_JSON).servers;
+  }
 
   /** 通道内串行入队（每 key 一条 Promise 链），全局并发由 Semaphore 限制。
    *  有任务在跑时新消息静默 FIFO 排队——不提示的话用户不知道消息已被接收，会反复重发或误以为丢失。
-   *  queuedCount 计「等待中」消息数：enqueue 一律自增（含首位），executeTask 启动时递减（该条离开队列） */
+   *  queuedCount 计「等待中」消息数：enqueue 一律自增（含首位），executeTask 启动时递减（该条离开队列）。
+   *  /new 通过 epoch 代际丢弃旧排队消息：enqueue 捕获当前 epoch 传入 executeTask，不匹配则 no-op */
   function enqueue(key: string, msg: IncomingMessage, prompt: string, wsName: string): void {
     const rt = runtimes.get(key) ?? { queue: Promise.resolve() };
+    if (rt.epoch === undefined) rt.epoch = 0; // 旧状态无 epoch 字段的运行期兜底
     runtimes.set(key, rt);
     rt.queuedCount = (rt.queuedCount ?? 0) + 1;
     if (rt.busy) {
       void deps.gateway.sendTextTo(msg.chatId, `⏳ 当前有任务在运行，本条消息已排队（第 ${rt.queuedCount} 位），完成后自动开始`)
         .catch(() => {}); // 提示失败静默：不影响任务本身入队
     }
-    rt.queue = rt.queue.then(() => executeTask(key, msg, prompt, wsName)).catch((e) => {
+    const myEpoch = rt.epoch; // 闭包捕获本条消息入队时的代际；executeTask 据此判断是否被 /new 作废
+    rt.queue = rt.queue.then(() => executeTask(key, msg, prompt, wsName, myEpoch)).catch((e) => {
       console.error(tag, '[任务异常]', e);
     });
   }
@@ -278,17 +302,51 @@ export function createBridge(
     });
     if (cmd.handled) {
       if (cmd.reply) await deps.gateway.sendTextTo(msg.chatId, cmd.reply);
-      // /new 开启新会话：「本次会话不再询问」的授权随之失效（handleCommand 无权访问 wiring
-      // 持有的 gate，故在命令处理分支后于 wiring 侧检测并 reset）
-      if (/^\/new(?:\s|$)/.test(msg.text.trim())) gates.get(key)?.reset();
+      // /new 开启新会话：
+      // 1) 清空旧代际排队消息（epoch 自增，旧任务入 executeTask 即 no-op）
+      // 2) abort 正在执行的任务
+      // 3) 结算本用户挂起的 confirm/plan/qa 条目（按取消/拒绝处理：对话继续推进或被放弃）
+      // 4) 通道级权限闸 reset（spec：「本次会话不再询问」的记忆跨任务生效，直至 /new）
+      // 5) 汇总已取消的排队消息数（用户能看到新建会话的真实影响面）
+      // ——handleCommand 无权访问 wiring 的 runtime/pending map，统一在 wiring 侧做
+      if (/^\/new(?:\s|$)/.test(msg.text.trim())) {
+        const rt = runtimes.get(key);
+        const cancelled = rt?.queuedCount ?? 0;
+        if (rt) {
+          rt.epoch = (rt.epoch ?? 0) + 1;
+          rt.queuedCount = 0; // 旧代际消息在 executeTask 入口 no-op，不会再 decrement；此处一次性清零即可
+          if (rt.abort) rt.abort.abort();
+        }
+        for (const [id, p] of confirmPending) {
+          if (p.channelKey !== key) continue;
+          confirmPending.delete(id);
+          p.resolve('deny');
+        }
+        for (const [id, p] of planPending) {
+          if (p.channelKey !== key) continue;
+          planPending.delete(id);
+          p.resolve({ action: 'reject' });
+        }
+        for (const [id, p] of qaPending) {
+          if (p.channelKey !== key) continue;
+          qaPending.delete(id);
+          p.resolve({});
+        }
+        gates.get(key)?.reset();
+        if (cancelled > 0) {
+          await deps.gateway.sendTextTo(msg.chatId, `🗑️ 已因新建会话取消 ${cancelled} 条排队消息`);
+        }
+      }
       return;
     }
     // 3. 普通文本：通道内串行入队（每 key 一条 Promise 链），全局并发由 Semaphore 限制
     enqueue(key, msg, cmd.taskText ?? msg.text, currentWorkspace);
   }
 
-  async function executeTask(key: string, msg: IncomingMessage, prompt: string, wsName: string): Promise<void> {
+  async function executeTask(key: string, msg: IncomingMessage, prompt: string, wsName: string, myEpoch: number): Promise<void> {
     const rt = runtimes.get(key)!;
+    // /new 丢弃旧代际：静默 no-op（不入队列、不 decrement、不建进度卡；汇总条数已在 /new 时回）
+    if (myEpoch !== (rt.epoch ?? 0)) return;
     rt.busy = true; // enqueue 据此给后续消息发「已排队」提示（sem 等待期同样算占用）
     rt.queuedCount = Math.max(0, (rt.queuedCount ?? 1) - 1); // 本条离开等待队列开始执行
     const release = await sem.acquire();
@@ -303,6 +361,8 @@ export function createBridge(
           : undefined,
       },
       `任务 · ${wsName}`,
+      // card.width 热生效：每任务现读 config（与同款「同对象 mutate 即生效」语义一致）
+      { cardWidthMode: config.card?.width ?? 'default' },
     );
     const confirmTimeoutMs = opts.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
     const cardSendTimeoutMs = opts.cardSendTimeoutMs ?? CARD_SEND_TIMEOUT_MS;
@@ -344,30 +404,38 @@ export function createBridge(
               },
               req,
               ownerId: msg.userId,
+              channelKey: key,
               onSettled: settle,
             });
           });
         },
-        // plan 确认：发计划卡片组（首卡带按钮+输入框）挂起等待；超时自动放弃。
-        // chatId/userId 绑定构造时任务——通道 key = chatId+userId，同通道内固定，闭包安全
-        planAsk: async (req) => {
+        // plan 确认（#3+#6）：不再单独发计划卡片组。计划正文先落盘到 ~/.lark-claudecode-bridge/claude/plans/
+// （slug + 时间戳，方便后续 review 与 SOP 要求的 plan 本地归档），然后嵌入当前任务的进度卡：
+// 卡片正文仅露 600 字预览 + 「查看完整方案」按钮（callback send_file 发送原 md 文件，不塞卡片正文
+// ——飞书单卡 30KB 上限与可读性都不允许长方案铺在卡片里）；批准/放弃/按意见修改三按钮与意见输入框
+// 仍在主卡片的内嵌 form 内。超时由本闭包自管：到点 clearPlan + resolve reject
+planAsk: async (req) => {
           const planReq: PlanCardRequest = { requestId: randomUUID(), plan: req.plan, workspaceName: req.workspaceName };
-          const ids: string[] = [];
-          for (const c of buildPlanCards(planReq)) {
-            const id = await raceFallback(deps.gateway.sendCardTo(msg.chatId, c), cardSendTimeoutMs, '');
-            if (!id) {
-              void deps.gateway.sendTextTo(msg.chatId, '⚠️ 计划卡发送失败，本次计划已自动放弃；模型重新提交计划时会再次弹出')
-                .catch(() => {});
-              return { action: 'reject' };
-            }
-            ids.push(id);
+          // 落盘计划原文：路径走 ensureRuntimeDirs 已建的 claude/plans 目录，文件名加时间戳避免并发冲突
+          const plansDir = join(CONFIG_DIR, 'claude', 'plans');
+          try { mkdirSync(plansDir, { recursive: true }); } catch { /* 已存在 */ }
+          const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+          const slug = (req.workspaceName || 'plan').replace(/[^\w-]+/g, '_').slice(0, 32);
+          const planFilePath = join(plansDir, `${ts}-${slug}.md`);
+          try {
+            writeFileSync(planFilePath, `# 执行计划 · ${req.workspaceName} · ${new Date().toLocaleString('zh-CN', { hour12: false })}\n\n${req.plan}\n`, 'utf8');
+          } catch (e) {
+            console.error(tag, '[计划落盘失败]（不影响流程，仅「查看完整方案」可能不可用）：', e);
           }
-          const cardId = ids[0];
-          void activeProgress.get(key)?.sinkToBottom();
+          const progress = activeProgress.get(key);
+          if (!progress) return { action: 'reject' }; // 进度卡不在 = 任务已结束/被 abort，按放弃处理
+          progress.setPlan({ requestId: planReq.requestId, plan: req.plan, workspaceName: req.workspaceName, planFilePath });
+          // 不再 sinkToBottom：plan 区嵌入主进度卡，flush 自然 PATCH，删旧卡重发只会让用户看到计划区跳一下
           return new Promise<PlanAskResult>((resolve) => {
             const gc = setTimeout(() => {
               planPending.delete(planReq.requestId);
-              void deps.gateway.updateCard(cardId, buildExpiredPlanCard(planReq, confirmTimeoutMs)).catch(() => {});
+              progress.setPlan(undefined);
+              progress.setStatus(`⏰ 计划确认超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未确认），已自动放弃；模型重新提交计划时会再次弹出`);
               resolve({ action: 'reject' });
             }, confirmTimeoutMs);
             gc.unref();
@@ -378,12 +446,14 @@ export function createBridge(
               },
               req: planReq,
               ownerId: msg.userId,
-              cardId,
+              channelKey: key,
+              chatId: msg.chatId,
+              planFilePath,
             });
           });
         },
-        // 提问确认：AskUserQuestion 的问题选项卡（每问选项按钮 + 提交）；qa-pick 逐项
-        // 更新选中态（PATCH 重渲染），qa-submit 全部作答后一次性 resolve。超时自动跳过
+        // 提问确认（#3）：AskUserQuestion 的选项 + 提交按钮全部嵌入主进度卡（#3 决策：彻底替换独立提问卡）。
+        // qa-pick 仅 PATCH 选中态（卡片不刷新整卡，仅更新 answer map），qa-submit 一次性 resolve 并 clearQuestion
         askQuestion: async (req) => {
           const qaReq: QuestionCardRequest = {
             requestId: randomUUID(),
@@ -391,18 +461,15 @@ export function createBridge(
             workspaceName: req.workspaceName,
           };
           const answers: QuestionCardAnswers = {};
-          // 发卡失败/超时返回空答案：gate 对空答案统一按「未作答」deny，模型自行决策或停下等待
-          const cardId = await raceFallback(deps.gateway.sendCardTo(msg.chatId, buildQuestionCard(qaReq, answers)), cardSendTimeoutMs, '');
-          if (!cardId) {
-            void deps.gateway.sendTextTo(msg.chatId, '⚠️ 提问卡发送失败，已按未作答处理；模型会自行决策或停下等待你的回复')
-              .catch(() => {});
-            return {};
-          }
-          void activeProgress.get(key)?.sinkToBottom();
+          const progress = activeProgress.get(key);
+          if (!progress) return {}; // 进度卡不在 = 任务已结束/被 abort，按未作答处理
+          progress.setQuestion({ requestId: qaReq.requestId, questions: req.questions, workspaceName: req.workspaceName, answers });
+          // 不再 sinkToBottom：提问区嵌入主进度卡后，flush 自然 PATCH（理由同 planAsk 上方注释）
           return new Promise<AskQuestionResult>((resolve) => {
             const gc = setTimeout(() => {
               qaPending.delete(qaReq.requestId);
-              void deps.gateway.updateCard(cardId, buildExpiredQuestionCard(qaReq, confirmTimeoutMs)).catch(() => {});
+              progress.setQuestion(undefined);
+              progress.setStatus(`⏰ 提问超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未作答），已按未作答处理；模型自行决策或停下等待你的回复`);
               resolve({});
             }, confirmTimeoutMs);
             gc.unref();
@@ -413,7 +480,8 @@ export function createBridge(
               },
               req: qaReq,
               ownerId: msg.userId,
-              cardId,
+              channelKey: key,
+              chatId: msg.chatId,
               answers,
             });
           });
@@ -428,6 +496,8 @@ export function createBridge(
     // lcb-notify 发送能力：chatId 硬绑定当前任务（权限闸直通的安全前提）；
     // sentPaths 记录中途已推送的文件，任务收尾的产出回传据此去重（用户已收过的不重发）。
     // 每次中途推送后进度卡沉底一次（删旧卡重发），保持「任务是否还在跑」始终可见于会话底部
+    // SOP 开关：本任务级现读 config.session.notifySop（缺省 true），决定后续 sendText 是否被强制降级
+    const sopEnabled = config.session?.notifySop !== false;
     const sentPaths = new Set<string>();
     const sink = async (): Promise<void> => { await activeProgress.get(key)?.sinkToBottom(); };
     const notifySender = createGatewaySender({
@@ -449,6 +519,10 @@ export function createBridge(
         await deps.gateway.uploadAndSendFile(c, p);
         await sink();
       },
+    }, {
+      enabled: sopEnabled,
+      // #11 SOP 提示文案前缀（用户看到的「为什么自动转附件」提示）
+      sopTag: '⚠️ 推送上限',
     });
     activeProgress.set(key, progress);
     try {
@@ -470,15 +544,21 @@ export function createBridge(
         resumeSessionId: resumeId,
         signal: abort.signal,
         env: appEnv,
-        appendSystemPrompt: app.appendSystemPrompt,
+        // #11 SOP 软约束：app.appendSystemPrompt 后追加 SOP 摘要（关闭时仅传 app 原有部分）
+        appendSystemPrompt: (() => {
+          const base = app.appendSystemPrompt?.trim() ?? '';
+          if (!sopEnabled) return base || undefined;
+          return base ? `${base}\n\n${FEISHU_NOTIFY_SOP_PROMPT}` : FEISHU_NOTIFY_SOP_PROMPT;
+        })(),
         // code-dev 工作区统一 plan mode：模型先出计划（ExitPlanMode → planAsk 飞书卡片），
         // 用户批准后 SDK 自动切回可编辑模式继续执行
         ...(config.workspaces.find((w) => w.name === wsName)?.type === 'code-dev' ? { permissionMode: 'plan' as const } : {}),
         // 通道级模型覆盖（/model 设置，每任务现读——改完下一条消息即生效）；未设 = 跟随 ~/.claude 全局
         ...(state?.model ? { model: state.model } : {}),
         // 进程内通知工具（send_text/send_image/send_file）：中间产物实时推给当前聊天。
-        // server 实例按任务构造，chatId 在 sender 闭包内硬绑定——模型无法选择接收者
-        mcpServers: { [NOTIFY_SERVER_NAME]: createNotifyServer(notifySender) },
+        // server 实例按任务构造，chatId 在 sender 闭包内硬绑定——模型无法选择接收者。
+        // 配置页 MCP（#12）一并注入：bridge 自管 servers.json 每任务现读（热生效），notify 后展开保名
+        mcpServers: { ...loadBridgeMcpServers(), [NOTIFY_SERVER_NAME]: createNotifyServer(notifySender) },
         // 插件：config.yaml 显式配置（开发期指源码目录）+ Claude 配置目录已启用的 marketplace
         // 插件自动发现，同名显式优先；SDK 对无效路径静默跳过，实际加载以 init 清单（/plugins 命令）为准。
         // managed 模式合并发现两处目录（自管 + 本机 ~/.claude）：按绝对 installPath 传 SDK，
@@ -671,10 +751,17 @@ export function createBridge(
       const plan = planPending.get(action.value.requestId);
       if (plan) {
         if (action.operatorId !== plan.ownerId) {
-          console.log(tag, `[卡片回调] 非发起人 ${action.operatorId} 点击计划卡 ${action.value.requestId}，已忽略`);
+          console.log(tag, `[卡片回调] 非发起人 ${action.operatorId} 点击计划区 ${action.value.requestId}，已忽略`);
           return { toast: { type: 'info', content: '仅任务发起人可操作计划' } };
         }
         const decision = action.value.decision;
+        // 「查看完整方案」（#6）：callback 触发 send_file 直接发原 md 文件，不消耗挂起项
+        if (decision === 'plan-view-file') {
+          // 文件在 planAsk 时已落盘；这里直接 send_file（feishuGateway 走 file_type:stream，md 等任意后缀可发）
+          void deps.gateway.uploadAndSendFile(plan.chatId, plan.planFilePath)
+            .catch((e) => console.error('[查看方案发送失败]', action.value.requestId, e));
+          return { toast: { type: 'info', content: '正在发送方案文件…' } };
+        }
         if (decision !== 'plan-approve' && decision !== 'plan-revise' && decision !== 'plan-reject') {
           return { toast: { type: 'info', content: '该计划确认已被处理或已过期' } };
         }
@@ -687,19 +774,20 @@ export function createBridge(
         plan.resolve(decision === 'plan-approve' ? { action: 'approve' }
           : decision === 'plan-revise' ? { action: 'revise', feedback }
           : { action: 'reject' });
-        const resultCard = buildPlanResultCard(plan.req, decision, '任务发起人', feedback);
-        void deps.gateway.updateCard(plan.cardId, resultCard)
-          .catch((e) => console.error('[计划卡兜底更新失败]', action.value.requestId, e));
-        return {
-          toast: { type: 'success', content: PLAN_DECISION_TEXT[decision] },
-          card: { type: 'raw', data: resultCard },
-        };
+        // 清除主进度卡的内嵌计划区（按钮随 setPlan(undefined) 的 flush 消失）
+        const prog = activeProgress.get(plan.channelKey);
+        if (prog) {
+          prog.setPlan(undefined);
+          prog.setStatus(PLAN_DECISION_TEXT[decision]);
+        }
+        return { toast: { type: 'success', content: PLAN_DECISION_TEXT[decision] } };
       }
-      // 提问回调分流：qa-pick 更新选中态（卡片 PATCH 重渲染，不消耗挂起项）；qa-submit 全部作答后 resolve
+      // 提问回调分流（#3）：qa-pick 仅 PATCH 选中态（不消耗挂起项，等所有题答完才 submit）；
+      // qa-submit 全部作答后一次性 resolve 并 clearQuestion。主进度卡的 PATCH 由 ProgressCard 内部 flush 串行化
       const qa = qaPending.get(action.value.requestId);
       if (qa) {
         if (action.operatorId !== qa.ownerId) {
-          console.log(tag, `[卡片回调] 非发起人 ${action.operatorId} 点击提问卡 ${action.value.requestId}，已忽略`);
+          console.log(tag, `[卡片回调] 非发起人 ${action.operatorId} 点击提问区 ${action.value.requestId}，已忽略`);
           return { toast: { type: 'info', content: '仅任务发起人可作答' } };
         }
         const { decision } = action.value;
@@ -709,17 +797,15 @@ export function createBridge(
           if (!q || !label || !q.options.some((o) => o.label === label)) {
             return { toast: { type: 'info', content: '该选项无效' } };
           }
-          const cur = qa.answers[action.value.qIndex!];
-          if (q.multiSelect) {
-            const arr = Array.isArray(cur) ? cur : cur !== undefined ? [cur] : [];
-            qa.answers[action.value.qIndex!] = arr.includes(label)
-              ? (arr.length > 1 ? arr.filter((x) => x !== label) : arr) // 至少保留一项：全取消等于未答
-              : [...arr, label];
-          } else {
-            qa.answers[action.value.qIndex!] = label;
-          }
-          void deps.gateway.updateCard(qa.cardId, buildQuestionCard(qa.req, qa.answers)).catch(() => {});
-          return { toast: { type: 'success', content: `已选：${label}` } };
+          // 切换选中态由 ProgressCard.updateQuestionAnswer 唯一维护（toggle / 至少保留一项）；本处只调 PATCH
+          const prog = activeProgress.get(qa.channelKey);
+          const before = prog?.getQuestionAnswer(action.value.qIndex!);
+          const willUnpick = !!q.multiSelect && Array.isArray(before) && before.includes(label) && before.length > 1;
+          prog?.updateQuestionAnswer(action.value.qIndex!, label, !!q.multiSelect);
+          // 把 progress 的最新答案同步回 qa.answers 供 submit 校验，避免双 mutate（toggle 重复计数）
+          if (prog) qa.answers[action.value.qIndex!] = prog.getQuestionAnswer(action.value.qIndex!)
+            ?? (q.multiSelect ? [] : label);
+          return { toast: { type: 'success', content: willUnpick ? `已取消：${label}` : `已选：${label}` } };
         }
         if (decision === 'qa-submit') {
           const missing = qa.req.questions
@@ -731,13 +817,13 @@ export function createBridge(
           const result: AskQuestionResult = {};
           qa.req.questions.forEach((q, i) => { result[q.question] = qa.answers[i] as string | string[]; });
           qa.resolve(result);
-          const resultCard = buildQuestionResultCard(qa.req, qa.answers, '任务发起人');
-          void deps.gateway.updateCard(qa.cardId, resultCard)
-            .catch((e) => console.error('[提问卡兜底更新失败]', action.value.requestId, e));
-          return {
-            toast: { type: 'success', content: '✅ 答案已提交' },
-            card: { type: 'raw', data: resultCard },
-          };
+          // 清除主进度卡的内嵌提问区（按钮随 setQuestion(undefined) 的 flush 消失）
+          const prog = activeProgress.get(qa.channelKey);
+          if (prog) {
+            prog.setQuestion(undefined);
+            prog.setStatus('✅ 答案已提交，继续执行…');
+          }
+          return { toast: { type: 'success', content: '✅ 答案已提交' } };
         }
         return { toast: { type: 'info', content: '该提问已被处理或已过期' } };
       }
@@ -769,7 +855,20 @@ export function createBridge(
     }
   }
 
-  return { onMessage: handleIncoming, onCardAction: handleCardAction };
+  return {
+    onMessage: handleIncoming,
+    onCardAction: handleCardAction,
+    /**
+     * 测试/诊断入口：返回通道当前挂起的内嵌 plan / question requestId。
+     * 仅用于测试断言与生产期诊断，不影响业务流。channelKey 取 chatId + userId。
+     * 内嵌挂起项被 settle/超时清空时对应字段变 undefined
+     */
+    _pendingAsk(channelKey: string): { planId?: string; questionId?: string } {
+      const prog = activeProgress.get(channelKey);
+      if (!prog) return {};
+      return prog.pendingAsk();
+    },
+  };
 }
 
 /**

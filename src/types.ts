@@ -100,6 +100,14 @@ export interface BridgeConfig {
   slashCommands?: SlashCommandsConfig;
   /** 会话行为微调；缺省 contextRemindTokens 用 config.ts 的内置默认 */
   session?: SessionConfig;
+  /** 卡片展示；缺省 width=default（飞书默认宽度） */
+  card?: CardConfig;
+}
+
+/** 卡片展示配置（整体可选） */
+export interface CardConfig {
+  /** 卡片宽度：default = 飞书默认（与消息等宽留边）；fill = 撑满聊天窗口 */
+  width?: 'default' | 'fill';
 }
 
 /** 会话行为配置（整体可选） */
@@ -107,19 +115,24 @@ export interface SessionConfig {
   /** 上下文超长提醒阈值（tokens，估算口径 = 最后一次 result 的 input+cache 三项之和）。
    *  0 = 关闭提醒；缺省用 DEFAULT_CONTEXT_REMIND_TOKENS（150000） */
   contextRemindTokens?: number;
+  /** 飞书推送规范化（#11）：启用时 SOP 提示词注入 appendSystemPrompt（软约束）+ notify-server 硬兜底。缺省 true */
+  notifySop?: boolean;
 }
 export interface IncomingMessage {
   chatId: string; chatType: 'p2p' | 'group'; userId: string; text: string; messageId: string;
   /** image 消息 / post 内嵌图片的 image_key（gateway 下载后把本地路径注记拼进 text，下游不再消费此字段） */
   imageKeys?: string[];
+  /** 父消息 ID（用户回复上游消息时存在；#5 据此拉取上游链文本拼进 prompt，最多向上 3 层） */
+  parentId?: string;
 }
 /** parseIncomingMessage 对「明确发给机器人但不支持的消息类型」的拒绝信息（p2p 场景上层回提示；群聊保持静默 null） */
 export interface RejectedMessage {
   rejected: { kind: 'unsupported-type'; chatId: string; chatType: 'p2p' | 'group'; messageType: string };
 }
-/** 卡片回调决策：allow/deny/allow-session 为写工具确认卡；plan-* 为计划确认卡（feedback = 按意见修改时的用户输入） */
+/** 卡片回调决策：allow/deny/allow-session 为写工具确认卡；plan-* 为计划确认卡（feedback = 按意见修改时的用户输入）；
+ *  plan-view-file = 计划「查看完整方案」按钮触发，原文 md 直接 send_file 而非塞入卡片正文 */
 export type CardDecision = 'allow' | 'deny' | 'allow-session'
-  | 'plan-approve' | 'plan-revise' | 'plan-reject'
+  | 'plan-approve' | 'plan-revise' | 'plan-reject' | 'plan-view-file'
   | 'qa-pick' | 'qa-submit';
 export interface CardActionValue {
   requestId: string; decision: CardDecision; feedback?: string;

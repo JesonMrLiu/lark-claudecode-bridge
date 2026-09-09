@@ -37,9 +37,11 @@ export interface FeishuSdk {
         }>;
       };
     };
-    // 通用请求口（SDK 1.73.0 未封装 bot info 接口，经此调 GET /open-apis/bot/v3/info 拿机器人 open_id）
-    request(payload: { method: string; url: string }):
-      Promise<{ code?: number; msg?: string; bot?: { open_id?: string } }>;
+    // 通用请求口（SDK 1.73.0 未封装 bot info 接口，经此调 GET /open-apis/bot/v3/info 拿机器人 open_id）。
+    // 实际实现接受 params/data/headers/path（详见 SDK Client.request 签名），但本接口只暴露实际用到的部分——
+    // #5 回复链上游消息拉取用同一入口
+    request(payload: { method: string; url: string; params?: Record<string, unknown> }):
+      Promise<{ code?: number; msg?: string; bot?: { open_id?: string }; data?: { items?: unknown[] } }>;
   };
   Domain: { Feishu: unknown; Lark: unknown };
 }
@@ -56,6 +58,8 @@ interface RawMessagePayload {
     message_type?: string;
     content?: string;
     message_id?: string;
+    /** 父消息 ID（用户回复时存在；#5 据此拉取上游消息文本拼进 prompt） */
+    parent_id?: string;
     mentions?: Array<{ key?: string; id?: { open_id?: string } }>;
   };
   sender?: { sender_id?: { open_id?: string } };
@@ -162,6 +166,7 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
       userId,
       text: stripMention(text),
       messageId: m.message_id,
+      ...(m.parent_id ? { parentId: m.parent_id } : {}),
       ...(imageKeys.length > 0 ? { imageKeys } : {}),
     };
   } catch {
@@ -322,6 +327,44 @@ export class FeishuGateway {
     return { paths, failures };
   }
 
+  /**
+   * 拉取回复链上游消息文本（#5）：用户回复某条消息时把上游最多 3 条消息文本一并拼进 prompt。
+   * SDK 1.73.0 未封装 im.message.get（只有 list/create/patch/delete），经 Client.request 调
+   * GET /open-apis/im/v1/messages/:message_id。失败仅 warn，不阻断主消息流（拉不到时降级为只发当前消息）
+   */
+  private async fetchUpstreamChain(parentId: string, maxDepth = 3): Promise<string[]> {
+    const out: string[] = [];
+    const visited = new Set<string>();
+    let cur: string | undefined = parentId;
+    for (let depth = 0; depth < maxDepth && cur && !visited.has(cur); depth++) {
+      visited.add(cur);
+      try {
+        const res = await this.client.request({
+          method: 'GET',
+          url: `/open-apis/im/v1/messages/${cur}`,
+          params: { user_id_type: 'open_id' },
+        });
+        const items = (res as { data?: { items?: unknown[] } }).data?.items;
+        const msg = Array.isArray(items) && items.length > 0
+          ? items[0] as { parent_id?: string; message_type?: string; body?: { content?: string } }
+          : null;
+        if (!msg) break;
+        let text = '';
+        if (msg.message_type === 'text') {
+          text = (JSON.parse(msg.body?.content ?? '{}') as { text?: string }).text ?? '';
+        } else if (msg.message_type === 'post') {
+          text = flattenPost(msg.body?.content ?? '{}')?.text ?? '';
+        }
+        if (text.trim()) out.push(`> [L${depth + 1}] ${text.trim()}`);
+        cur = msg.parent_id;
+      } catch (e) {
+        this.log.warn('[回复链] 拉取上游消息失败', cur, e);
+        break;
+      }
+    }
+    return out;
+  }
+
   /** 建立 WS 长连接并注册事件分发（im.message.receive_v1 / card.action.trigger） */
   async start(handlers: GatewayHandlers): Promise<void> {
     const botOpenId = await this.fetchBotOpenId();
@@ -356,6 +399,11 @@ export class FeishuGateway {
               notes.push(`[另有 ${failures.length} 张图片下载失败（${failures.join('、')}）——如需查看请让用户重发，或检查应用 im:resource 权限。]`);
             }
             parsed.text = hasText ? `${parsed.text}\n\n${notes.join('\n')}` : notes.join('\n');
+          }
+          // #5 回复链上游消息：把 parent_id 链路上最多 3 条消息文本拼到 prompt 头部
+          if (parsed.parentId) {
+            const upstream = await this.fetchUpstreamChain(parsed.parentId);
+            if (upstream.length > 0) parsed.text = `${upstream.join('\n\n')}\n\n---\n\n${parsed.text}`;
           }
           await handlers.onMessage(parsed);
         }

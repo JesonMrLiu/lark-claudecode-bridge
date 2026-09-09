@@ -31,6 +31,8 @@
   input:focus, select:focus, textarea:focus { outline: 2px solid #c9d8ff; border-color: var(--primary); }
   textarea { font-family: Consolas, monospace; font-size: 12.5px; min-height: 90px; resize: vertical; }
   .row { display: flex; gap: 12px; } .row > * { flex: 1; min-width: 0; }
+  /* 两列布局：配置项多的区块（如全局默认配置）一行 2 个，避免 4 列挤压（.row 的 flex 平分在 4 项时过窄） */
+  .row-2col { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 16px; }
   /* .row 内按钮按内容宽：内联 flex:0 展开为 0 1 0% 会把按钮压到单字宽（一字一行），一律走类规则 */
   .row > .btn, .row > .btn-wrap { flex: 0 0 auto; align-self: end; }
   .btn-wrap { display: flex; }

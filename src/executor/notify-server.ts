@@ -3,10 +3,13 @@
 // 构造——chatId 在闭包内硬绑定，模型无法选择接收者，只能发到当前任务发起的聊天，
 // 因此权限闸对该前缀直通（见 permission-gate.ts）。
 import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
-import { stat } from 'node:fs/promises';
-import { basename, extname, resolve } from 'node:path';
+import { mkdir, stat } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
+import { basename, extname, join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { z } from 'zod';
 import { chunkText } from '../util/chunk-text.js';
+import { CONFIG_DIR } from '../config.js';
 
 // 分块算法已抽到 util/chunk-text（gateway 卡片层复用）；此处 re-export 保持既有引用兼容
 export { chunkText };
@@ -132,6 +135,12 @@ export function createNotifyServer(sender: NotifySender): McpSdkServerConfigWith
  * 由 gateway 发送能力 + chatId 组装 NotifySender（executeTask 每任务构造）。
  * sendImageWithCaption 可选：缺省（旧 gateway / 测试 mock）时图片降级为
  * 「caption 文本卡 + 图片消息」两条；sentPaths 记录已推送路径供任务收尾去重。
+ *
+ * sopOptions=#11 SOP 硬兜底配置（仅 sendText 路径生效；图片/附件不强制）：
+ *   - enabled=false 时跳过（保留旧行为）
+ *   - lineLimit=50：单次 markdown > 50 行 → 落盘 changes-<ts>.md，提示卡 + send_file
+ *   - sequentialLimit=4：本任务连续 sendText ≥ 第 4 张起 → 后续 sendText 自动转 send_file
+ *   计数属于本 sender 闭包，每任务新一次（createGatewaySender 由 executeTask 每任务调一次）
  */
 export function createGatewaySender(args: {
   chatId: string;
@@ -139,10 +148,64 @@ export function createGatewaySender(args: {
   sendText: (chatId: string, markdown: string) => Promise<unknown>;
   sendImageWithCaption?: (chatId: string, path: string, caption?: string) => Promise<unknown>;
   sendFileTo: (chatId: string, path: string) => Promise<unknown>;
+}, sopOptions?: {
+  enabled?: boolean;
+  lineLimit?: number;
+  sequentialLimit?: number;
+  notifyDir?: string;
+  /** sendText 升档「已降级」提示用的提示文案；由 index.ts 注入 SOP 摘要行 */
+  sopTag?: string;
 }): NotifySender {
   const { chatId, sentPaths } = args;
+  const sopEnabled = sopOptions?.enabled !== false;
+  const lineLimit = sopOptions?.lineLimit ?? 50;
+  const sequentialLimit = sopOptions?.sequentialLimit ?? 4;
+  const notifyDir = sopOptions?.notifyDir ?? join(CONFIG_DIR, 'notify');
+  const sopTag = sopOptions?.sopTag ?? '【#11 SOP】';
+  // 顺序计数：递增写入；上限仅作判定，超阈值 → 后续全部走降级
+  let textCallCount = 0;
+  let downgradedByLines = false;
+
+  function renderTitle(): string {
+    const d = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  }
+
   return {
-    sendText: async (md) => { await args.sendText(chatId, md); },
+    sendText: async (md) => {
+      textCallCount++;
+      const lines = md.split('\n').length;
+      const overLines = lines > lineLimit;
+      const overSequential = textCallCount > sequentialLimit;
+      // downgradedByLines 一旦置位，整个任务后续 sendText 全走降级——避免大块持续刷屏；
+      // sequentialLimit 则每张都判定（次数远超才逐张转），避免误伤正常 4 张内调用
+      if (sopEnabled && (downgradedByLines || overLines || overSequential)) {
+        if (overLines) downgradedByLines = true;
+        try {
+          await mkdir(notifyDir, { recursive: true });
+        } catch { /* 极端权限异常：继续走提示卡，但 send_file 会失败由调用方兜底 */ }
+        const filename = `changes-${renderTitle()}-${textCallCount}.md`;
+        const filepath = join(notifyDir, filename);
+        try {
+          writeFileSync(filepath, md, 'utf-8');
+        } catch (e) {
+          // 落盘失败兜底：跳过降级，按原样 sendText——硬兜底不该把内容吞掉
+          console.warn(`[notify-server] SOP 降级落盘失败：${e instanceof Error ? e.message : e}（已按原内容发送）`);
+          await args.sendText(chatId, md);
+          return;
+        }
+        const reason = overLines
+          ? `内容 ${lines} 行超阈值 ${lineLimit}`
+          : `连续 ${textCallCount} 张超阈值 ${sequentialLimit}`;
+        await args.sendText(chatId, `${sopTag} 推送上限触发：${reason} · 已自动转为附件（${filename}）`).catch(() => {});
+        await args.sendFileTo(chatId, filepath).catch((e) => {
+          console.error('[notify-server] SOP 降级 send_file 失败：', e);
+        });
+        return;
+      }
+      await args.sendText(chatId, md);
+    },
     sendImage: async (p, caption) => {
       sentPaths.add(resolve(p));
       if (args.sendImageWithCaption) {

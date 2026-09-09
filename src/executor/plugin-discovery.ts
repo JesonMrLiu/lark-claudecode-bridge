@@ -79,6 +79,19 @@ export function invalidatePluginCache(claudeConfigDir: string): void {
   cache.delete(claudeConfigDir);
 }
 
+/**
+ * 读取 settings.json 的 enabledPlugins 键名集合（即 "name@marketplace" 形式）。
+ * 文件缺失 / 解析失败返回空集（不抛）；调用方据此把 enabled 字段写到返回条目上
+ * ——与 listInstalledPlugins 内联合并逻辑同源，独立暴露便于 server 端跨多目录合并判定。
+ */
+export function loadEnabledPlugins(claudeConfigDir: string): Set<string> {
+  const r = readJson<SettingsDoc>(join(claudeConfigDir, 'settings.json'));
+  if (!r.ok) return new Set();
+  const map = r.doc.enabledPlugins;
+  if (!map || typeof map !== 'object') return new Set();
+  return new Set(Object.keys(map).filter((k) => map[k] === true));
+}
+
 /** 已安装插件全量清单（含未启用项；Web 配置页 /api/plugins 用）。文件缺失返回空 */
 export function listInstalledPlugins(claudeConfigDir: string): Array<{
   key: string; name: string; marketplace?: string; enabled: boolean; path?: string; version?: string;

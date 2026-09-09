@@ -1,16 +1,15 @@
 // 桥接器进程生命周期：PID 文件探活 / 后台拉起 / 跨进程停止 / 旧进程退出后重启。
 // 消费方：Web 配置页 /api/bridge/* 端点（页面按钮启停）；startBridge 写/清 PID（src/index.ts）。
 // 路径参数可注入（默认 CONFIG_DIR），便于测试用临时目录
-import { closeSync, existsSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CONFIG_DIR } from '../config.js';
 
 const PID_PATH = join(CONFIG_DIR, 'bridge.pid');
-const LOG_PATH = join(CONFIG_DIR, 'bridge.log');
-/** 后台运行日志超 5MB 先截断，避免常驻进程日志无限增长 */
-const LOG_TRUNCATE_BYTES = 5 * 1024 * 1024;
+/** 后台运行日志落 ~/.lark-claudecode-bridge/logs/bridge-YYYY-MM-DD.log（#7：按天拆分，由进程内 console tee 自管）。
+ * 历史版本曾重定向 stdio 到 bridge.log（被本文件保留字段 LOG_PATH 引用但不再使用），现统一走 logs/。 */
 
 /** 桥接器进程启动成功后自写 PID 文件（页面据此探活/跨进程停止） */
 export function writePidFile(pidPath: string = PID_PATH): void {
@@ -68,26 +67,17 @@ export function resolveLcbEntry(): { ok: true; entry: string } | { ok: false; er
   return { ok: true, entry };
 }
 
-/** 打开后台日志 fd（append；超 5MB 先截断） */
-function openLogFd(): number {
-  try {
-    if (existsSync(LOG_PATH) && statSync(LOG_PATH).size > LOG_TRUNCATE_BYTES) rmSync(LOG_PATH, { force: true });
-  } catch { /* 截断失败继续 append */ }
-  return openSync(LOG_PATH, 'a');
-}
-
-/** 后台拉起桥接器：detached 守护进程，stdio 落 bridge.log，父进程退出不影响其存活 */
+/** 后台拉起桥接器：detached 守护进程，stdio 走 ignore（#7：日志由进程内 console tee 自管到 logs/，
+ * 不再重定向到 bridge.log——既避免文件双写分裂，也避免 detach 后日志继续堆在单文件） */
 export function spawnBridgeDetached(): { ok: true; pid: number } | { ok: false; error: string } {
   const r = resolveLcbEntry();
   if (!r.ok) return r;
-  const fd = openLogFd();
   const child = spawn(process.execPath, [r.entry, 'start'], {
     detached: true,
-    stdio: ['ignore', fd, fd],
+    stdio: 'ignore',
     windowsHide: true,
   });
   child.unref();
-  closeSync(fd); // 父进程关闭自有 fd 副本（子进程已继承）
   return { ok: true, pid: child.pid ?? -1 };
 }
 
@@ -108,21 +98,18 @@ export function stopBridgeByPid(pid: number): boolean {
 /**
  * 内嵌重启 helper（CJS，node -e 执行）：轮询旧进程退出 → 拉起新桥接器 → 自退。
  * 不能「先拉新再杀旧」：新进程的 Web 配置页会因端口仍被旧进程占用而启动失败，
- * 导致重启后页面失联。超时 30s 放弃（保留旧进程运行态，页面可重试）
+ * 导致重启后页面失联。超时 30s 放弃（保留旧进程运行态，页面可重试）。
+ * #7：stdio 走 ignore，日志由进程内 console tee 自管到 logs/bridge-YYYY-MM-DD.log
  */
 const RESTART_HELPER = `
 const { spawn } = require('node:child_process');
-const { openSync, closeSync, existsSync, statSync, rmSync } = require('node:fs');
-const [oldPid, entry, logPath] = process.argv.slice(1);
+const [oldPid, entry] = process.argv.slice(1);
 const t0 = Date.now();
 (function wait() {
   try { process.kill(+oldPid, 0); } catch {
     try {
-      if (existsSync(logPath) && statSync(logPath).size > 5*1024*1024) rmSync(logPath, { force: true });
-      const fd = openSync(logPath, 'a');
-      const child = spawn(process.execPath, [entry, 'start'], { detached: true, stdio: ['ignore', fd, fd], windowsHide: true });
+      const child = spawn(process.execPath, [entry, 'start'], { detached: true, stdio: 'ignore', windowsHide: true });
       child.unref();
-      closeSync(fd);
     } catch (e) { try { console.error('restart helper failed:', e); } catch {} }
     process.exit(0);
   }
@@ -135,7 +122,7 @@ const t0 = Date.now();
 export function restartBridgeWithHelper(oldPid: number): { ok: true } | { ok: false; error: string } {
   const r = resolveLcbEntry();
   if (!r.ok) return r;
-  const helper = spawn(process.execPath, ['-e', RESTART_HELPER, String(oldPid), r.entry, LOG_PATH], {
+  const helper = spawn(process.execPath, ['-e', RESTART_HELPER, String(oldPid), r.entry], {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,

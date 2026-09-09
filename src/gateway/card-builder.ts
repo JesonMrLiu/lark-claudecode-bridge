@@ -1,6 +1,5 @@
 import type { CardDecision, ConfirmationRequest, PermissionDecision } from '../types.js';
 import type { AskQuestionRequest } from '../executor/permission-gate.js';
-import { chunkText } from '../util/chunk-text.js';
 
 export interface ProgressState {
   title: string;
@@ -13,6 +12,25 @@ export interface ProgressState {
   confirm?: ConfirmationRequest;
   /** 子代理/后台任务清单（启动加入、落定标记保留到任务结束） */
   agents: SubagentTask[];
+  /** 内嵌计划确认（独立提问卡 #3+#6：方案不再单独发卡，正文收敛为一行 + 内嵌表单按钮 + 「查看完整方案」按钮，原文落盘并通过 send_file 发送） */
+  plan?: EmbeddedPlanState;
+  /** 内嵌提问确认（AskUserQuestion：选项按钮 + 提交按钮全部在主卡上，qa-pick PATCH 选中态） */
+  question?: EmbeddedQuestionState;
+}
+
+/** 内嵌计划状态：planFilePath 用于「查看完整方案」回调发送原文 md；plan 原文仅在卡片内露出预览片段（防爆卡片） */
+export interface EmbeddedPlanState {
+  requestId: string;
+  plan: string;
+  workspaceName: string;
+  planFilePath: string;
+}
+/** 内嵌提问状态：answers 跟随选项点击 PATCH 更新（multiSelect 时为 string[]） */
+export interface EmbeddedQuestionState {
+  requestId: string;
+  questions: AskQuestionRequest['questions'];
+  workspaceName: string;
+  answers: Record<number, string | string[]>;
 }
 
 /** 子代理/后台任务的卡片展示条目 */
@@ -29,8 +47,8 @@ export interface SubagentTask {
 /** 子代理清单最多渲染条数（防爆卡片；超出折叠为「…等共 N 个」） */
 const AGENT_LIST_MAX = 5;
 
-function card(elements: unknown[]): unknown {
-  return { schema: '2.0', config: { update_multi: true }, body: { elements } };
+function card(elements: unknown[], widthMode: 'default' | 'fill' = 'default'): unknown {
+  return { schema: '2.0', config: { update_multi: true, ...(widthMode === 'fill' ? { width_mode: 'fill' } : {}) }, body: { elements } };
 }
 function md(content: string): unknown {
   return { tag: 'markdown', content };
@@ -38,8 +56,11 @@ function md(content: string): unknown {
 export function buildTextCard(markdown: string): unknown {
   return card([md(markdown)]);
 }
-/** 进度卡正文尾部的字符上限（防爆卡片）；任务收尾据此判断短回复是否需要独立结果消息 */
-export const PROGRESS_TAIL_CHARS = 1200;
+/** 进度卡终态结果尾部的字符上限（防爆卡片）。运行中不展示过程文本（产品决策：主卡只留
+ *  关键信息——状态/工具/子代理/确认区/计时；思考内容与过程文本一律不进卡），仅任务收尾
+ *  露出结果尾部。index.ts 以同一常量判断「短回复是否需要独立结果消息」，两处保持同值，
+ *  否则 400–1200 区间内容会卡片/消息两边都不展示 */
+export const PROGRESS_TAIL_CHARS = 400;
 /** 图片卡片：caption（可选）显示在图片上方——逐张发图时带编号说明用 */
 export function buildImageCard(caption: string | undefined, imgKey: string): unknown {
   const elements: unknown[] = [];
@@ -47,7 +68,7 @@ export function buildImageCard(caption: string | undefined, imgKey: string): unk
   elements.push({ tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: caption ?? '图片' } });
   return card(elements);
 }
-export function buildProgressCard(state: ProgressState): unknown {
+export function buildProgressCard(state: ProgressState, widthMode: 'default' | 'fill' = 'default'): unknown {
   const elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
   const duration = `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒`;
   const lines = [`**${state.title}**`, ``, state.status, ``];
@@ -73,8 +94,22 @@ export function buildProgressCard(state: ProgressState): unknown {
     // 等待确认：正文收敛为一行——确认区已展示工具与摘要，正文尾部流式输出与确认内容
     // 大量重叠（尤其 plan mode 下计划文本同时出现在正文与计划卡），收敛避免重复刷屏
     lines.push('---', `⏸ 正文已收起，等待下方确认后继续…`);
-  } else if (state.textTail) {
-    lines.push('---', `**📝 最新输出**`, state.textTail.slice(-PROGRESS_TAIL_CHARS)); // 只保留尾部，防爆卡片
+  } else if (state.question) {
+    // 内嵌提问区同样收敛正文：选项已承载信息，正文尾部继续刷只会冲淡提问区
+    lines.push('---', `⏸ 正文已收起，等待下方问题作答后继续…`);
+  } else if (state.plan) {
+    // 内嵌计划区同理收敛正文
+    lines.push('---', `⏸ 正文已收起，等待下方计划确认后继续…`);
+  } else if (state.done && state.textTail) {
+    // 终态才展示结果尾部（产品决策：运行中过程文本不进卡片，主卡只留关键信息；思考内容
+    // 也不采集不展示）。textTail 仍保留全部内容（appendText 不断积累），超长部分由 index.ts
+    // 的独立结果消息承载（阈值与本常量同值），渲染层截断不丢内容
+    if (state.textTail.length > PROGRESS_TAIL_CHARS) {
+      const folded = state.textTail.length - PROGRESS_TAIL_CHARS;
+      lines.push('---', `**📝 结果**`, `<font color='grey'>⋯ 已折叠前面 ${folded} 字符</font>`, state.textTail.slice(-PROGRESS_TAIL_CHARS));
+    } else {
+      lines.push('---', `**📝 结果**`, state.textTail);
+    }
   }
   const elements: unknown[] = [md(lines.join('\n'))];
   // 工具确认区：嵌入进度卡（按钮在计时行上方）——不再单独发确认卡（旧版独立确认卡与
@@ -100,6 +135,55 @@ export function buildProgressCard(state: ProgressState): unknown {
       })),
     });
   }
+  // 内嵌计划确认区（#3+#6）：方案正文不进卡片（产品决策：主卡不铺长内容），仅一行就绪提示 +
+  // 「查看完整方案」按钮（send_file 发送落盘的原 md）+ 表单（批准/放弃/按意见修改 + 意见输入框）。
+  // 用户动线：点按钮看方案文件 → 回卡片选操作
+  if (state.plan) {
+    elements.push(md(`**📋 执行计划已就绪**（共 ${state.plan.plan.length} 字）· 工作区 \`${state.plan.workspaceName}\`\n\n请先点击下方「📂 查看完整方案」阅读原文，再选择操作`));
+    elements.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '📂 查看完整方案' },
+      type: 'default',
+      behaviors: [{ type: 'callback', value: { requestId: state.plan.requestId, decision: 'plan-view-file' } }],
+    });
+    elements.push({
+      tag: 'form',
+      name: 'plan_form',
+      elements: [
+        {
+          tag: 'column_set',
+          flex_mode: 'flow',
+          columns: [
+            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-approve', '✅ 批准执行', 'primary', state.plan.requestId, 'plan_btn_approve')] },
+            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-reject', '❌ 放弃计划', 'danger', state.plan.requestId, 'plan_btn_reject')] },
+            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-revise', '📝 按意见修改', 'default', state.plan.requestId, 'plan_btn_revise')] },
+          ],
+        },
+        { tag: 'input', name: 'feedback', width: 'fill', placeholder: { tag: 'plain_text', content: '修改意见（点「按意见修改」时随意见重新出计划）' } },
+      ],
+    });
+  }
+  // 内嵌提问确认区（#3）：选项按钮全宽单行 + 提交按钮；qa-pick PATCH 选中态（✓ + primary），
+  // qa-submit 一次性 resolve。点击是 callback（非 form 提交），所以可与 plan/confirm 共存区下同列
+  if (state.question) {
+    const q = state.question;
+    elements.push(md(`**❓ Claude 需要你确认** · 工作区 \`${q.workspaceName}\``));
+    q.questions.forEach((qq, qIndex) => {
+      const sel = q.answers[qIndex];
+      const picked = Array.isArray(sel) ? sel : sel !== undefined ? [sel] : [];
+      elements.push(md(`**${qIndex + 1}. ${qq.question}**${qq.multiSelect ? '（可多选）' : ''}`));
+      for (const o of qq.options) {
+        elements.push(embeddedQaOptionButton(q.requestId, qIndex, o.label, picked.includes(o.label)));
+      }
+    });
+    elements.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '✅ 提交答案' },
+      type: 'primary',
+      margin: '8px 0px 0px 0px',
+      behaviors: [{ type: 'callback', value: { requestId: q.requestId, decision: 'qa-submit' } }],
+    });
+  }
   // 计时行上方加分隔横线，与正文/确认区做视觉划分
   elements.push({ tag: 'hr' });
   // 终态改为「总耗时」+ 完成时刻：运行中的「已运行」在停止刷新后读起来仍像在计时，任务
@@ -107,7 +191,7 @@ export function buildProgressCard(state: ProgressState): unknown {
   elements.push(md(state.done
     ? `<font color='grey'>⏱ 总耗时 ${duration} · 已结束于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}</font>`
     : `<font color='grey'>⏱ 已运行 ${duration}</font>`));
-  return card(elements);
+  return card(elements, widthMode);
 }
 export const DECISION_TEXT: Record<PermissionDecision, string> = {
   allow: '✅ 已允许',
@@ -115,7 +199,7 @@ export const DECISION_TEXT: Record<PermissionDecision, string> = {
   'allow-session': '⏭ 本次会话不再询问',
 };
 
-// ---------- plan 确认卡片（code-dev 工作区的计划审批流） ----------
+// ---------- plan 确认（内嵌主进度卡的审批流，独立计划卡已停用删除） ----------
 
 export interface PlanCardRequest { requestId: string; plan: string; workspaceName: string }
 
@@ -142,70 +226,18 @@ function planButton(decision: PlanCardDecision, label: string, type: string, req
   };
 }
 
-/**
- * 计划确认卡片组：plan 超长时按 ~2800 字拆多张（首卡含表单容器，其余为纯正文续篇）。
- * 空白 plan 退化为单卡占位（模型未提交实质计划时用户只能放弃）。
- *
- * 首卡的按钮 + 意见输入框必须包在 tag:'form' 容器内、按钮带 form_action_type:'submit'——
- * 飞书卡片 2.0 中 input 值只有该结构下点击按钮才随 action.form_value 回传，
- * 平铺结构点击任何按钮 form_value 恒空（0.17.0 「按意见修改取不到意见」根因）。
- * 三个按钮都是 submit：批准/放弃忽略意见字段，input 不设 required。
- */
-export function buildPlanCards(req: PlanCardRequest): unknown[] {
-  const chunks = chunkText(req.plan, 2800);
-  if (chunks.length === 0) chunks.push('（模型未提交计划正文）');
-  return chunks.map((chunk, i) => {
-    const header = chunks.length > 1
-      ? `**📋 Claude 提交执行计划（${i + 1}/${chunks.length}）**\n\n工作区: \`${req.workspaceName}\`\n`
-      : `**📋 Claude 提交执行计划**\n\n工作区: \`${req.workspaceName}\`\n`;
-    if (i === 0) {
-      return card([
-        md(`${header}${chunk}`),
-        {
-          tag: 'form',
-          name: 'plan_form',
-          elements: [
-            {
-              // 卡片 V2 已废弃 tag:'action'，与确认卡同款 column_set 分栏按钮
-              tag: 'column_set',
-              flex_mode: 'flow',
-              columns: [
-                { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-approve', '✅ 批准执行', 'primary', req.requestId, 'plan_btn_approve')] },
-                { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-reject', '❌ 放弃计划', 'danger', req.requestId, 'plan_btn_reject')] },
-                { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-revise', '📝 按意见修改', 'default', req.requestId, 'plan_btn_revise')] },
-              ],
-            },
-            // 意见输入框在按钮行下方：先决策后补意见的视觉动线（name=feedback 随 form_value 回传）
-            {
-              tag: 'input',
-              name: 'feedback',
-              width: 'fill',
-              placeholder: { tag: 'plain_text', content: '修改意见（点「按意见修改」时随意见重新出计划）' },
-            },
-          ],
-        },
-      ]);
-    }
-    return card([md(`${header}${chunk}`)]);
-  });
+/** 内嵌提问按钮（qa-pick callback）：与独立卡片同款「选中 ✓ + primary」视觉，qa-pick 不消耗挂起项，仅 PATCH 选中态 */
+function embeddedQaOptionButton(reqId: string, qIndex: number, label: string, selected: boolean): unknown {
+  return {
+    tag: 'button',
+    width: 'fill',
+    text: { tag: 'plain_text', content: selected ? `✓ ${label}` : label },
+    type: selected ? 'primary' : 'default',
+    behaviors: [{ type: 'callback', value: { requestId: reqId, decision: 'qa-pick' as const, qIndex, option: label } }],
+  };
 }
 
-/** 计划决策结果卡（决策后由回调响应内联 + 兜底 PATCH 首卡） */
-export function buildPlanResultCard(req: PlanCardRequest, decision: PlanCardDecision, byName: string, feedback?: string): unknown {
-  const text = decision === 'plan-approve'
-    ? `✅ 计划已批准，开始执行（由 ${byName} 操作）`
-    : decision === 'plan-revise'
-      ? `📝 已提交修改意见，Claude 将修订计划后重新提交（由 ${byName} 操作）：\n${(feedback ?? '').slice(0, 500)}`
-      : `❌ 计划已放弃（由 ${byName} 操作）`;
-  return card([md(`**📋 Claude 提交执行计划**\n\n工作区: \`${req.workspaceName}\`\n\n${text}`)]);
-}
-
-/** 计划确认超时卡（此后迟到点击不再改写此卡片） */
-export function buildExpiredPlanCard(req: PlanCardRequest, timeoutMs: number): unknown {
-  return card([md(`**📋 Claude 提交执行计划**\n\n工作区: \`${req.workspaceName}\`\n\n⏰ 已超时自动放弃（${Math.round(timeoutMs / 60000)} 分钟未确认）`)]);
-}
-
-// ---------- 提问卡片（AskUserQuestion 的问题选项卡） ----------
+// ---------- 提问类型（AskUserQuestion 内嵌主进度卡的选项区，独立提问卡已停用删除） ----------
 
 export interface QuestionCardRequest {
   requestId: string;
@@ -215,54 +247,3 @@ export interface QuestionCardRequest {
 
 /** 已选答案的中间态（wiring 侧维护）：问题下标 → 选中的 option label（multiSelect 为数组） */
 export type QuestionCardAnswers = Record<number, string | string[]>;
-
-function qaOptionButton(reqId: string, qIndex: number, label: string, selected: boolean): unknown {
-  return {
-    tag: 'button',
-    // 全宽单行：选项文字完整可见（横排 flow 分栏长文本会被 ellipsis 截断，看不全无法决策）
-    width: 'fill',
-    text: { tag: 'plain_text', content: selected ? `✓ ${label}` : label },
-    type: selected ? 'primary' : 'default',
-    behaviors: [{ type: 'callback', value: { requestId: reqId, decision: 'qa-pick' as const, qIndex, option: label } }],
-  };
-}
-
-/**
- * 提问卡片：每个问题一节（问题文本 + 选项按钮，每选项独占一行全宽、选中态打 ✓），
- * 底部「提交答案」按钮。选项点击仅更新选中态（PATCH 重渲染），全部问题有答案后提交才有效。
- */
-export function buildQuestionCard(req: QuestionCardRequest, answers: QuestionCardAnswers): unknown {
-  const elements: unknown[] = [md(`**❓ Claude 需要你确认**\n\n工作区: \`${req.workspaceName}\``)];
-  req.questions.forEach((q, qIndex) => {
-    const sel = answers[qIndex];
-    const picked = Array.isArray(sel) ? sel : sel !== undefined ? [sel] : [];
-    elements.push(md(`**${qIndex + 1}. ${q.question}**${q.multiSelect ? '（可多选）' : ''}`));
-    // JSON 2.0 按钮可直接放 elements：逐个纵排替代旧 column_set flow 横排
-    for (const o of q.options) {
-      elements.push(qaOptionButton(req.requestId, qIndex, o.label, picked.includes(o.label)));
-    }
-  });
-  elements.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: '✅ 提交答案' },
-    type: 'primary',
-    margin: '8px 0px 0px 0px',
-    behaviors: [{ type: 'callback', value: { requestId: req.requestId, decision: 'qa-submit' as const } }],
-  });
-  return card(elements);
-}
-
-/** 提交后的结果卡（展示每问的最终答案） */
-export function buildQuestionResultCard(req: QuestionCardRequest, answers: QuestionCardAnswers, byName: string): unknown {
-  const lines = req.questions.map((q, i) => {
-    const a = answers[i];
-    const ans = a === undefined ? '（未作答）' : Array.isArray(a) ? a.join('、') : a;
-    return `- ${q.question} → **${ans}**`;
-  });
-  return card([md(`**❓ Claude 需要你确认**\n\n工作区: \`${req.workspaceName}\`\n\n${lines.join('\n')}\n\n✅ 答案已提交（由 ${byName} 操作）`)]);
-}
-
-/** 提问超时卡（此后迟到点击不再改写此卡片） */
-export function buildExpiredQuestionCard(req: QuestionCardRequest, timeoutMs: number): unknown {
-  return card([md(`**❓ Claude 需要你确认**\n\n工作区: \`${req.workspaceName}\`\n\n⏰ 已超时自动跳过（${Math.round(timeoutMs / 60000)} 分钟未响应），Claude 将自行决策继续`)]);
-}

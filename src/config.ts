@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse, type YAMLParseError } from 'yaml';
 import type {
-  BridgeConfig, ClaudeAuthMode, ClaudeConfig, ClaudeProfile, FeishuAppConfig, PermissionsConfig, PluginRef,
+  BridgeConfig, CardConfig, ClaudeAuthMode, ClaudeConfig, ClaudeProfile, FeishuAppConfig, PermissionsConfig, PluginRef,
   ServerConfig, SessionConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace, WorkspaceType,
 } from './types.js';
 
@@ -14,18 +14,42 @@ export const CONFIG_PATH = join(CONFIG_DIR, 'config.yaml');
 /** 会话上下文超长提醒默认阈值（tokens）：约 200k 窗口的 75%，估算口径见 SessionConfig 注释 */
 export const DEFAULT_CONTEXT_REMIND_TOKENS = 150000;
 
-/** 会话行为段（整体可选）：context_remind_tokens 硬校验（非法值会让提醒永久误报/永不触发） */
+/** 会话行为段（整体可选）：context_remind_tokens 硬校验（非法值会让提醒永久误报/永不触发）；
+ *  notify_sop 类型校验（非法值会让 SOP 注入/硬兜底配对错位） */
 function normalizeSession(doc: Record<string, unknown>): SessionConfig | undefined {
   const raw = doc.session;
   if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== 'object') throw new Error('session 必须为对象（含 context_remind_tokens），请检查 config.yaml');
-  const s = raw as { context_remind_tokens?: unknown };
-  if (s.context_remind_tokens === undefined || s.context_remind_tokens === null) return {};
-  const n = Number(s.context_remind_tokens);
-  if (!Number.isInteger(n) || n < 0 || n > 10_000_000) {
-    throw new Error(`session.context_remind_tokens 必须为 0-10000000 的整数（0 = 关闭提醒；当前值：${String(s.context_remind_tokens)}），请检查 config.yaml`);
+  if (typeof raw !== 'object') throw new Error('session 必须为对象（含 context_remind_tokens / notify_sop），请检查 config.yaml');
+  const s = raw as { context_remind_tokens?: unknown; notify_sop?: unknown };
+  const out: SessionConfig = {};
+  if (s.context_remind_tokens !== undefined && s.context_remind_tokens !== null) {
+    const n = Number(s.context_remind_tokens);
+    if (!Number.isInteger(n) || n < 0 || n > 10_000_000) {
+      throw new Error(`session.context_remind_tokens 必须为 0-10000000 的整数（0 = 关闭提醒；当前值：${String(s.context_remind_tokens)}），请检查 config.yaml`);
+    }
+    out.contextRemindTokens = n;
   }
-  return { contextRemindTokens: n };
+  // notify_sop：缺省=true（开启 SOP 软约束 + 硬兜底），false = 完全关闭。type 校验保证不传字符串/数字过来配对错位
+  if (s.notify_sop !== undefined && s.notify_sop !== null) {
+    if (typeof s.notify_sop !== 'boolean') {
+      throw new Error(`session.notify_sop 必须为 boolean（true = 启用，false = 关闭；当前值：${String(s.notify_sop)}），请检查 config.yaml`);
+    }
+    out.notifySop = s.notify_sop;
+  }
+  return out;
+}
+
+/** 卡片展示段（整体可选）：width 严格枚举（default = 飞书默认宽度；fill = 撑满聊天窗口） */
+function normalizeCard(doc: Record<string, unknown>): CardConfig | undefined {
+  const raw = doc.card;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object') throw new Error('card 必须为对象（含 width），请检查 config.yaml');
+  const c = raw as { width?: unknown };
+  if (c.width === undefined || c.width === null) return {};
+  if (c.width !== 'default' && c.width !== 'fill') {
+    throw new Error(`card.width 必须为 default / fill（当前值：${String(c.width)}），请检查 config.yaml`);
+  }
+  return { width: c.width };
 }
 
 /** config.yaml 中单个 app 的原始形状（snake_case） */
@@ -420,6 +444,7 @@ export function parseConfigText(raw: string, pathForError: string = CONFIG_PATH)
     ...section(claude, 'claude'),
     ...section(slashCommands, 'slashCommands'),
     ...section(session, 'session'),
+    ...section(normalizeCard(doc), 'card'),
   };
 }
 
