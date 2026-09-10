@@ -38,20 +38,47 @@ export interface SkillSummary {
   pluginEnabled?: boolean;
 }
 
-/** 简单 frontmatter 解析：仅取 name / description 两个键，避开 yaml 依赖；非法格式返回空字段 */
+/**
+ * 简单 frontmatter 解析：仅取 name / description 两个键，避开 yaml 依赖；非法格式返回空字段。
+ * 支持 YAML 块标量：`description: >`（折叠：换行→空格）/ `description: |`（保留换行），
+ * 含 `>-` / `|-` 去尾换行变体；值收集到下一个顶层 key（行首非缩进）为止。
+ * 单行值的单双引号包裹照常剥离。
+ */
 export function parseSkillFrontmatter(md: string): { name?: string; description?: string } {
   if (!md.startsWith('---')) return {};
   const end = md.indexOf('\n---', 3);
   if (end < 0) return {};
   const block = md.slice(3, end);
   const out: { name?: string; description?: string } = {};
-  for (const line of block.split('\n')) {
-    const m = /^([A-Za-z_-][A-Za-z0-9_-]*)\s*:\s*(.*)$/.exec(line);
+  const lines = block.split('\n');
+  const TOP_KEY = /^([A-Za-z_-][A-Za-z0-9_-]*)\s*:\s*(.*)$/;
+  const BLOCK_SCALAR = /^[>|][+-]?$/; // > | >- |- >+ |+
+  for (let i = 0; i < lines.length; i++) {
+    const m = TOP_KEY.exec(lines[i]);
     if (!m) continue;
     const key = m[1].toLowerCase();
-    const val = m[2].replace(/^["']|["']$/g, '').trim();
-    if (key === 'name' && val) out.name = val;
-    else if (key === 'description' && val) out.description = val;
+    const raw = m[2].trim();
+    if (key !== 'name' && key !== 'description') continue;
+    let val: string;
+    if (BLOCK_SCALAR.test(raw)) {
+      // 块标量：收集后续缩进行/空行，直到下一个顶层 key 或块结束
+      const collected: string[] = [];
+      while (i + 1 < lines.length) {
+        const next = lines[i + 1];
+        if (TOP_KEY.test(next) && !/^\s/.test(next)) break; // 下一个顶层 key
+        collected.push(next);
+        i++;
+      }
+      // 去掉尾部空行（>-/|- 与 >/| 在展示层等价：末尾空白无信息）
+      while (collected.length > 0 && collected[collected.length - 1].trim() === '') collected.pop();
+      const stripped = collected.map((l) => l.replace(/^\s+/, ''));
+      val = raw.startsWith('>') ? stripped.join(' ').replace(/\s+/g, ' ').trim() : stripped.join('\n').trim();
+    } else {
+      val = raw.replace(/^["']|["']$/g, '').trim();
+    }
+    if (!val) continue;
+    if (key === 'name') out.name = val;
+    else out.description = val;
   }
   return out;
 }
@@ -314,9 +341,11 @@ export function parseClaudeMcpAdd(cmd: string): ParsedMcpCommand {
 
 // ---------------- env 引用展开（抽屉展示当前值） ----------------
 
-/** 展开配置 env 值中的 ${VAR} 引用为进程当前环境值；未设置的变量保留原样并计入 missing
- *  （前端对 missing 项标注「未设置」——抽屉「同步展示环境变量当前配置的值」的数据源） */
-export function resolveEnvRefs(env: Record<string, unknown> | undefined): {
+/** 展开配置 env 值中的 ${VAR} / ${VAR:-default} 引用。
+ *  查找顺序：extraEnv（调用方按优先级合并好的多来源映射：飞书应用 env > claude.env >
+ *  settings.json env，见 server.ts currentMergedEnv）→ process.env → :- 默认值 →
+ *  保留原样并计入 missing（前端对 missing 项标注「未设置」） */
+export function resolveEnvRefs(env: Record<string, unknown> | undefined, extraEnv?: Record<string, string>): {
   resolved: Record<string, string>;
   missing: string[];
 } {
@@ -325,9 +354,13 @@ export function resolveEnvRefs(env: Record<string, unknown> | undefined): {
   if (!env || typeof env !== 'object') return { resolved, missing: [] };
   for (const [k, v] of Object.entries(env)) {
     const raw = typeof v === 'string' ? v : JSON.stringify(v);
-    resolved[k] = raw.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (whole, varName: string) => {
-      const cur = process.env[varName];
-      if (cur === undefined) { missing.add(varName); return whole; }
+    resolved[k] = raw.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g, (whole, varName: string, defaultVal: string | undefined) => {
+      const cur = extraEnv?.[varName] ?? process.env[varName];
+      if (cur === undefined) {
+        if (defaultVal !== undefined) return defaultVal; // ${VAR:-default}：未设置时用默认值（Claude Code 同款语法）
+        missing.add(varName);
+        return whole;
+      }
       return cur;
     });
   }

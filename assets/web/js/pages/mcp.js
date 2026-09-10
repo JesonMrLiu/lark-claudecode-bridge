@@ -133,7 +133,8 @@ function delMcp(s) {
     .catch((e) => toast(e.message, true));
 }
 
-/** 抽屉查看：完整配置 JSON + env 表（${VAR} 引用已展开为当前值；未设置的变量标红） */
+/** 抽屉查看：完整配置 JSON + env 表（${VAR}/${VAR:-default} 引用已按多来源合并展开；未设置的变量标红）。
+ *  bridge 来源支持「编辑」：JSON 原文可改，保存走 op:update（任务级热生效，无须重启） */
 function viewMcp(s) {
   const envKeys = Object.keys(s.config.env || {});
   const envRows = envKeys.length
@@ -146,18 +147,48 @@ function viewMcp(s) {
     }).join('')
     : `<tr><td colspan="3" class="desc">（无 env 配置）</td></tr>`;
   const onlyRead = !isDeletable(s);
+  const editable = s.source === 'bridge'; // 后端 op:update 只写 bridge servers.json；machine-user 只能删
   openDrawer({
     title: `MCP · ${s.name}`,
     bodyHtml: `
       <div class="hint" style="margin:0 0 8px">来源：${sourceTag(s)} · 配置文件：<code class="desc">${esc(s.path)}</code></div>
       ${onlyRead ? `<div class="hint" style="margin:0 0 8px;color:#d97706">只读来源——此 MCP 由 ${s.source === 'plugin' ? '插件' : '项目'}自带，编辑请前往 ${s.source === 'plugin' ? '插件目录' : '对应工作区目录'}手动修改。</div>` : ''}
-      <label>配置（JSON 原文）</label>
-      <textarea readonly rows="10" style="min-height:140px">${esc(JSON.stringify(s.config, null, 2))}</textarea>
-      <label>环境变量（引用值 → 当前值）</label>
+      ${!editable && !onlyRead ? `<div class="hint" style="margin:0 0 8px;color:#d97706">用户级·本机来源不支持页面编辑（可删除）；如需修改请在 ~/.claude.json 手动改，或删除后到本页重新添加。</div>` : ''}
+      <div data-pane="view">
+        <label>配置（JSON 原文）</label>
+        <textarea readonly rows="10" style="min-height:140px">${esc(JSON.stringify(s.config, null, 2))}</textarea>
+      </div>
+      <div data-pane="edit" style="display:none">
+        <label>配置（JSON，可编辑——env 也在其中改）</label>
+        <textarea id="emJson" rows="12" style="min-height:180px">${esc(JSON.stringify(s.config, null, 2))}</textarea>
+        <div class="hint" style="margin-top:6px">保存后立即对新任务生效（bridge 自管 servers.json 每任务现读）。</div>
+      </div>
+      <label>环境变量（引用值 → 当前值；当前值已合并 飞书应用 env › Claude 认证 env › settings.json env › 系统环境，支持 \${VAR:-默认值}）</label>
       <table><thead><tr><th style="width:130px">变量</th><th>配置值</th><th>当前值</th></tr></thead><tbody>${envRows}</tbody></table>`,
-    footHtml: `<button class="btn" data-act="close">关闭</button>`,
-    onMount({ foot }) {
+    footHtml: `${editable ? '<button class="btn" data-act="edit">编辑</button><button class="btn primary" data-act="save" style="display:none">保存</button>' : ''}<button class="btn" data-act="close">关闭</button>`,
+    onMount({ body, foot }) {
       foot.querySelector('[data-act="close"]').onclick = () => closeDrawer();
+      const editBtn = foot.querySelector('[data-act="edit"]');
+      const saveBtn = foot.querySelector('[data-act="save"]');
+      if (editBtn) {
+        editBtn.onclick = () => {
+          body.querySelector('[data-pane="view"]').style.display = 'none';
+          body.querySelector('[data-pane="edit"]').style.display = '';
+          editBtn.style.display = 'none';
+          saveBtn.style.display = '';
+        };
+        saveBtn.onclick = async () => {
+          const raw = body.querySelector('#emJson').value.trim();
+          let config;
+          try { config = JSON.parse(raw); } catch (e) { return toast(`JSON 解析失败：${e.message}`, true); }
+          try {
+            await api('POST', '/api/mcp/action', { op: 'update', name: s.name, config });
+            toast('已保存（任务级热生效，无须重启）');
+            closeDrawer();
+            void loadMcp();
+          } catch (e) { toast(e.message, true); }
+        };
+      }
     },
   });
 }

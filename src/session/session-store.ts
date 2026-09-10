@@ -25,6 +25,9 @@ export interface ChannelState {
   /** 通道级模型覆盖（/model 命令设置，跨重启持久；/new 不清除——它是通道偏好而非会话状态）。
    *  缺省/undefined = 跟随 ~/.claude/settings.json 的 model */
   model?: string;
+  /** 通道级计划模式（/plan 命令切换，跨重启持久；/new 不清除——它是通道偏好而非会话状态）。
+   *  true = 任务以 plan mode 启动（模型先出计划 → 飞书卡片批准后执行）；缺省 = 直接执行 */
+  planMode?: boolean;
 }
 
 /**

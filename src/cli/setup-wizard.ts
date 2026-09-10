@@ -11,7 +11,7 @@ import { defaultPermissionsDoc, defaultServerDoc } from '../config-defaults.js';
 /** 向导收集到的原始答案（apps 支持多机器人） */
 export interface SetupAnswers {
   apps: Array<{ name?: string; appId: string; appSecret: string }>;
-  workspaces: Array<{ name: string; path: string; type?: 'code-dev' | 'generic' }>;
+  workspaces: Array<{ name: string; path: string }>;
   defaultWorkspace: string;
 }
 
@@ -106,10 +106,8 @@ export async function runSetup(configPath: string): Promise<void> {
     const name = await ask(i === 0 ? '第一个工作区名字（如 demo）' : '再添一个工作区名字（直接回车结束）');
     if (!name) break;
     const path = await ask(`工作区 ${name} 的本机路径`);
-    // 类型决定开发工作流：code-dev = 统一 plan mode（先出计划→飞书批准）+ 收尾汇总 diff 卡片
-    const type = await ask(`工作区 ${name} 类型（code-dev=代码开发 / generic=通用，回车默认 generic）`, 'generic');
-    const normalized: 'code-dev' | 'generic' = type.trim() === 'code-dev' ? 'code-dev' : 'generic';
-    workspaces.push({ name, path, ...(normalized === 'code-dev' ? { type: normalized } : {}) });
+    // #6 起无工作区类型：统一通用模式；计划模式在飞书发 /plan 按通道切换
+    workspaces.push({ name, path });
     if (!defaultWorkspace) defaultWorkspace = name;
   }
   if (workspaces.length === 0) {

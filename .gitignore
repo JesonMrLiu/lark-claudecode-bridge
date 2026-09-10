@@ -9,3 +9,4 @@ docs/
 .claude
 tests
 .playwright-mcp/
+.workbuddy/

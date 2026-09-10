@@ -5,8 +5,8 @@ import { randomInt } from 'node:crypto';
 const TTL_MS = 15 * 60 * 1000;
 
 export interface AccessStoreData {
-  users: Record<string, { name: string; role: 'admin' | 'member'; pairedAt: string }>;
-  pending: Record<string, { userId: string; name: string; code: string; expiresAt: number }>;
+  users: Record<string, { name: string; role: 'admin' | 'member'; pairedAt: string; appId?: string }>;
+  pending: Record<string, { userId: string; name: string; code: string; expiresAt: number; appId?: string }>;
 }
 
 export class AccessControl {
@@ -46,14 +46,41 @@ export class AccessControl {
   isAdmin(userId: string): boolean {
     return this.data.users[userId]?.role === 'admin';
   }
+  /**
+   * 是否已有用户。传 appId 时按应用统计——多应用部署下 open_id 按应用隔离，
+   * 「首个使用者免配对自动 admin」也应按应用判定：新应用的第一个使用者同样直接成为
+   * admin，而不是因为别的应用已有用户就被迫走配对码。无 appId 的历史记录不计入
+   * 任何应用（它们会在下次发消息时被 ensureAppId 补登）。
+   */
+  hasUsers(appId?: string): boolean {
+    if (appId === undefined) return Object.keys(this.data.users).length > 0;
+    return Object.values(this.data.users).some((u) => u.appId === appId);
+  }
+  /**
+   * 直接添加用户（首个使用者免配对自动成为 admin 用）。
+   * 已存在时按传入 role/name 覆盖——与 approvePairing 的写语义一致（后写胜出）。
+   */
+  addUser(userId: string, name: string, role: 'admin' | 'member', appId?: string): void {
+    this.data.users[userId] = { name, role, pairedAt: new Date().toISOString(), ...(appId ? { appId } : {}) };
+    delete this.data.pending[userId]; // 残留的配对申请一并清掉
+    this.save();
+  }
+  /** 历史用户记录缺 appId 时按当前来路补登（老版本 access.json 的平滑迁移） */
+  ensureAppId(userId: string, appId: string): void {
+    const u = this.data.users[userId];
+    if (u && !u.appId) {
+      u.appId = appId;
+      this.save();
+    }
+  }
   listPending(): Array<{ userId: string; name: string; code: string }> {
     this.evict();
     return Object.values(this.data.pending).map(({ userId, name, code }) => ({ userId, name, code }));
   }
-  beginPairing(userId: string, name: string): string {
+  beginPairing(userId: string, name: string, appId?: string): string {
     this.evict();
     const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
-    this.data.pending[userId] = { userId, name, code, expiresAt: Date.now() + TTL_MS };
+    this.data.pending[userId] = { userId, name, code, expiresAt: Date.now() + TTL_MS, ...(appId ? { appId } : {}) };
     this.save();
     return code;
   }
@@ -66,6 +93,7 @@ export class AccessControl {
       name: entry.name,
       role: isFirstAdmin ? 'admin' : 'member',
       pairedAt: new Date().toISOString(),
+      ...(entry.appId ? { appId: entry.appId } : {}),
     };
     delete this.data.pending[entry.userId];
     this.save();

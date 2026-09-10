@@ -1,5 +1,5 @@
-// 工作区改动收集：code-dev 工作区任务收尾时用 git diff 生成全量 unified diff。
-// 不做文件快照——git 是 code-dev 工作区的既有事实（非 git 仓库回退旧上传行为，由调用方处理）
+// 工作区改动收集：git 仓库工作区任务收尾时用 git diff 生成全量 unified diff。
+// 不做文件快照——git 是代码工作区的既有事实（非 git 仓库返回 null，由调用方跳过）
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';

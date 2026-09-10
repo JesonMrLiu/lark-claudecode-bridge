@@ -23,6 +23,12 @@ export interface NotifySender {
   sendText(markdown: string): Promise<void>;
   sendImage(path: string, caption?: string): Promise<void>;
   sendFile(path: string, note?: string): Promise<void>;
+  /**
+   * SOP 降级单文件补发（#7）：任务收尾时调用——降级内容全部追加进同一文件，
+   * 首次降级已发过一次（阶段性内容），此后有新追加才在收尾补发完整版。
+   * 可选：旧实现/测试 mock 缺省时无降级文件可发，调用方 ?. 调用即可。
+   */
+  flushDowngradedFile?(): Promise<void>;
 }
 
 // 单块/单条失败重试一次的退避间隔（飞书偶发限流 / 网络抖动）
@@ -138,8 +144,9 @@ export function createNotifyServer(sender: NotifySender): McpSdkServerConfigWith
  *
  * sopOptions=#11 SOP 硬兜底配置（仅 sendText 路径生效；图片/附件不强制）：
  *   - enabled=false 时跳过（保留旧行为）
- *   - lineLimit=50：单次 markdown > 50 行 → 落盘 changes-<ts>.md，提示卡 + send_file
- *   - sequentialLimit=4：本任务连续 sendText ≥ 第 4 张起 → 后续 sendText 自动转 send_file
+ *   - lineLimit=50：单次 markdown > 50 行 → 追加进单文件 changes-<ts>.md（#7 合并策略：
+ *     首次降级提示卡 + 立即发当前文件，后续静默追加，任务收尾 flushDowngradedFile 补发完整版）
+ *   - sequentialLimit=4：本任务连续 sendText ≥ 第 4 张起 → 后续 sendText 同样进单文件
  *   计数属于本 sender 闭包，每任务新一次（createGatewaySender 由 executeTask 每任务调一次）
  */
 export function createGatewaySender(args: {
@@ -165,6 +172,12 @@ export function createGatewaySender(args: {
   // 顺序计数：递增写入；上限仅作判定，超阈值 → 后续全部走降级
   let textCallCount = 0;
   let downgradedByLines = false;
+  // #7 单文件合并：本任务所有降级内容追加进同一文件（旧行为每次降级一个新文件，
+  // 用户收到 N 个零散附件）。首次降级立即发一次（长任务也有阶段性内容可看），
+  // 之后静默追加；收尾 flushDowngradedFile 有新追加才补发完整版
+  let downgradeFilePath: string | undefined;
+  let downgradeDirty = false;
+  let downgradeSent = false;
 
   function renderTitle(): string {
     const d = new Date();
@@ -185,10 +198,11 @@ export function createGatewaySender(args: {
         try {
           await mkdir(notifyDir, { recursive: true });
         } catch { /* 极端权限异常：继续走提示卡，但 send_file 会失败由调用方兜底 */ }
-        const filename = `changes-${renderTitle()}-${textCallCount}.md`;
-        const filepath = join(notifyDir, filename);
+        if (!downgradeFilePath) downgradeFilePath = join(notifyDir, `changes-${renderTitle()}.md`);
+        const filename = basename(downgradeFilePath);
         try {
-          writeFileSync(filepath, md, 'utf-8');
+          writeFileSync(downgradeFilePath, `${md}\n\n---\n\n`, { flag: 'a' });
+          downgradeDirty = true;
         } catch (e) {
           // 落盘失败兜底：跳过降级，按原样 sendText——硬兜底不该把内容吞掉
           console.warn(`[notify-server] SOP 降级落盘失败：${e instanceof Error ? e.message : e}（已按原内容发送）`);
@@ -198,13 +212,28 @@ export function createGatewaySender(args: {
         const reason = overLines
           ? `内容 ${lines} 行超阈值 ${lineLimit}`
           : `连续 ${textCallCount} 张超阈值 ${sequentialLimit}`;
-        await args.sendText(chatId, `${sopTag} 推送上限触发：${reason} · 已自动转为附件（${filename}）`).catch(() => {});
-        await args.sendFileTo(chatId, filepath).catch((e) => {
-          console.error('[notify-server] SOP 降级 send_file 失败：', e);
-        });
+        if (!downgradeSent) {
+          // 首次降级：提示卡说明合并策略 + 立即发当前文件（长任务也有阶段性内容可看）；
+          // 后续追加静默——不逐次刷附件，收尾 flushDowngradedFile 补发完整版
+          downgradeSent = true;
+          await args.sendText(chatId, `${sopTag} 推送上限触发：${reason} · 已合并为单文件附件（${filename}），后续超限内容追加进同一文件，任务结束时补发完整版`).catch(() => {});
+          await args.sendFileTo(chatId, downgradeFilePath).catch((e) => {
+            console.error('[notify-server] SOP 降级 send_file 失败：', e);
+          });
+          downgradeDirty = false;
+        }
         return;
       }
       await args.sendText(chatId, md);
+    },
+    // 任务收尾补发：首次降级后又有新追加时才重发完整文件（至多 2 条附件消息）
+    flushDowngradedFile: async () => {
+      if (!downgradeFilePath || !downgradeDirty) return;
+      downgradeDirty = false;
+      await args.sendText(chatId, `${sopTag} 任务结束，补发合并后的完整附件（${basename(downgradeFilePath)}）`).catch(() => {});
+      await args.sendFileTo(chatId, downgradeFilePath).catch((e) => {
+        console.error('[notify-server] SOP 收尾补发 send_file 失败：', e);
+      });
     },
     sendImage: async (p, caption) => {
       sentPaths.add(resolve(p));

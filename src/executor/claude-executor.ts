@@ -28,7 +28,7 @@ export interface RunTaskOptions {
   appendSystemPrompt?: string;
   /** 通道级模型覆盖（/model 命令设置），直通 Options.model；未设 = 跟随 ~/.claude/settings.json 的 model */
   model?: string;
-  /** SDK 权限模式：code-dev 工作区传 'plan'（先出计划 → 飞书卡片批准后切 acceptEdits），缺省 'default' */
+  /** SDK 权限模式：通道 /plan 开启时传 'plan'（先出计划 → 飞书卡片批准后切 acceptEdits），缺省 'default' */
   permissionMode?: 'default' | 'plan';
   // 收窄签名：SDK 的 CanUseTool 返回值还支持 updatedPermissions 等，此处暴露宿主需要的子集。
   // deny 分支 message 必填，与 SDK PermissionResult 判别联合结构兼容，可直接透传；

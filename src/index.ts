@@ -99,6 +99,12 @@ export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真
     sendImageTo?(chatId: string, p: string, caption?: string): Promise<string>;
     /** 撤回消息（进度卡沉底）；可选——缺省时沉底退化为仅重刷 */
     deleteCard?(id: string): Promise<void>;
+    /** 卡片实体模式（cardkit）：进度卡专用，支持局部更新保 form 输入；可选——缺省降级整卡 PATCH */
+    sendCardEntityTo?(chatId: string, card: unknown): Promise<{ messageId: string; cardId: string }>;
+    /** 卡片实体局部更新（batch_update）；可选 */
+    partialUpdateCardElements?(cardId: string, sequence: number, actions: unknown[]): Promise<void>;
+    /** 卡片实体全量替换；可选 */
+    replaceCardEntity?(cardId: string, sequence: number, card: unknown): Promise<void>;
   };
   access: AccessControl;
   store: SessionStore;
@@ -245,17 +251,31 @@ export function createBridge(
     // 0. 用户主动拿文件：消息中包含本通道非图片文件清单的 basename 即发 + ack，
     // 命中后拦截不再交给 Claude Code——避免模型重复 send_file 同一文件造成轰炸
     if (await tryDeliverRequestedFiles(msg, key)) return;
-    // 1. 访问控制：白名单外发配对码（首个配对成功者自动成为 admin，见 AccessControl）
+    // 1. 访问控制：白名单外首个使用者自动成为 admin（免配对），其后未知用户发配对码
     // 每条消息先重读 access.json：lcb pair / 运行终端等独立进程批准写盘后，
     // 长存的内存实例不 reload 会查到旧白名单 → 反复发配对码且整盘覆写抹掉新用户（死循环）
     deps.access.reload();
     // 配置热重载：lcb ws add/remove 独立进程写盘后，本实例下一条消息即读到新工作区
     opts.reloadConfig?.();
     if (!deps.access.isAllowed(msg.userId)) {
-      const code = deps.access.beginPairing(msg.userId, msg.userId);
-      console.log(`${tag}[配对] 未知用户 ${msg.userId} 请求接入，配对码：${code}（在终端输入 lcb pair ${code} 批准）`);
-      await deps.gateway.sendTextTo(msg.chatId, `🔐 首次使用需配对。\n\n请管理员在桥接器终端确认配对码：**${code}**（15 分钟内有效）`);
-      return;
+      // 首个使用者免配对直接成为 admin——按应用判定：多应用部署下 open_id 按应用隔离，
+      // 新应用的第一个使用者同样是「首个」，不应因别的应用已有用户而被配对码拦住
+      if (!deps.access.hasUsers(app.appId)) {
+        deps.access.addUser(msg.userId, msg.userId, 'admin', app.appId);
+        console.log(`${tag}[接入] 应用 ${app.appId} 首位用户 ${msg.userId} 已自动成为 admin（后续用户需配对）`);
+        await deps.gateway.sendTextTo(msg.chatId,
+          `🎉 欢迎！你是本机器人的首位用户，已自动成为 **admin**。\n\n后续其他同事首次使用时需由你在桥接器终端批准配对（\`lcb pair <配对码>\`）。`);
+        // 不 return：欢迎语之外，本条消息照常进入命令/任务处理
+      } else {
+        const code = deps.access.beginPairing(msg.userId, msg.userId, app.appId);
+        console.log(`${tag}[配对] 未知用户 ${msg.userId} 请求接入，配对码：${code}（在终端输入 lcb pair ${code} 批准）`);
+        await deps.gateway.sendTextTo(msg.chatId, `🔐 首次使用需配对。\n\n请管理员在桥接器终端确认配对码：**${code}**（15 分钟内有效）`);
+        return;
+      }
+    } else {
+      // 老版本 access.json 的用户记录没有 appId：按当前来路补登，
+      // 保证 hasUsers(appId) 的按应用统计对存量用户同样成立
+      deps.access.ensureAppId(msg.userId, app.appId);
     }
     // 2. 命令：/help /new /resume /stop /status /ws
     const st = deps.store.getChannelState(key);
@@ -358,6 +378,15 @@ export function createBridge(
         updateCard: (id, c) => deps.gateway.updateCard(id, c),
         deleteCard: deps.gateway.deleteCard
           ? (id) => deps.gateway.deleteCard!(id)
+          : undefined,
+        sendCardEntity: deps.gateway.sendCardEntityTo
+          ? (c) => deps.gateway.sendCardEntityTo!(msg.chatId, c)
+          : undefined,
+        partialUpdateCard: deps.gateway.partialUpdateCardElements
+          ? (cardId, seq, actions) => deps.gateway.partialUpdateCardElements!(cardId, seq, actions)
+          : undefined,
+        replaceCard: deps.gateway.replaceCardEntity
+          ? (cardId, seq, c) => deps.gateway.replaceCardEntity!(cardId, seq, c)
           : undefined,
       },
       `任务 · ${wsName}`,
@@ -550,9 +579,9 @@ planAsk: async (req) => {
           if (!sopEnabled) return base || undefined;
           return base ? `${base}\n\n${FEISHU_NOTIFY_SOP_PROMPT}` : FEISHU_NOTIFY_SOP_PROMPT;
         })(),
-        // code-dev 工作区统一 plan mode：模型先出计划（ExitPlanMode → planAsk 飞书卡片），
-        // 用户批准后 SDK 自动切回可编辑模式继续执行
-        ...(config.workspaces.find((w) => w.name === wsName)?.type === 'code-dev' ? { permissionMode: 'plan' as const } : {}),
+        // 计划模式（#6）：通道级 /plan 开关——模型先出计划（ExitPlanMode → planAsk 飞书卡片），
+        // 用户批准后 SDK 自动切回可编辑模式继续执行（替代旧工作区 code-dev 类型）
+        ...(state?.planMode ? { permissionMode: 'plan' as const } : {}),
         // 通道级模型覆盖（/model 设置，每任务现读——改完下一条消息即生效）；未设 = 跟随 ~/.claude 全局
         ...(state?.model ? { model: state.model } : {}),
         // 进程内通知工具（send_text/send_image/send_file）：中间产物实时推给当前聊天。
@@ -677,17 +706,12 @@ planAsk: async (req) => {
         await deps.gateway.sendTextTo(msg.chatId, `📁 本次修改/新增的文件（共 ${outcome.producedFiles.length} 个）：\n${list}`);
       }
       await uploadProducedImages();
-      // code-dev 工作区额外发汇总 diff 卡片（git diff 不是文件本身，不冲突）；
-      // 非 git 仓库 wsDiff===null 时只发图片、不再回退上传非图片
-      const isCodeDev = config.workspaces.find((w) => w.name === wsName)?.type === 'code-dev';
-      if (isCodeDev) {
-        const wsDiff = await collectWorkspaceDiff(workspacePath(wsName));
-        if (wsDiff === null) {
-          console.warn(tag, `[任务收尾] 工作区 ${wsName} 不是 git 仓库，非图片文件不再自动发送（git init 后可改用汇总 diff 卡片）`);
-        } else if (wsDiff.diff.trim()) {
-          for (const c of buildDiffSummaryCards(wsDiff.diff, { workspaceName: wsName, files: wsDiff.files })) {
-            await deps.gateway.sendCardTo(msg.chatId, c);
-          }
+      // 汇总 diff 收尾卡片（#6 起不再依赖工作区类型）：工作区是 git 仓库且有改动才发——
+      // git 仓库即「代码工作区」的客观信号；非 git 仓库（内容生产类目录）天然跳过
+      const wsDiff = await collectWorkspaceDiff(workspacePath(wsName));
+      if (wsDiff !== null && wsDiff.diff.trim()) {
+        for (const c of buildDiffSummaryCards(wsDiff.diff, { workspaceName: wsName, files: wsDiff.files })) {
+          await deps.gateway.sendCardTo(msg.chatId, c);
         }
       }
     } catch (e) {
@@ -730,6 +754,8 @@ planAsk: async (req) => {
         subtype: 'error', text: String(e).slice(0, 300),
       });
     } finally {
+      // SOP 降级单文件补发（#7）：任务任何结局（完成/停止/出错）都在收尾补齐完整附件
+      await notifySender.flushDowngradedFile?.().catch(() => {});
       clearTimeout(hardTimeout);
       activeProgress.delete(key);
       activeQueries.delete(key);
@@ -971,6 +997,11 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
         uploadAndSendFile: (chatId, p) => gateway.uploadAndSendFile(chatId, p),
         sendImageTo: (chatId, p, caption) => gateway.sendImage(chatId, p, caption),
         deleteCard: (id) => gateway.deleteCard(id),
+        // 卡片实体模式（cardkit）：进度卡局部更新保 plan 表单输入；FeishuGateway 恒定实现，
+        // 权限/接口异常时 ProgressCard.start 捕获降级为普通卡片 + 整卡 PATCH
+        sendCardEntityTo: (chatId, card) => gateway.sendCardEntity(chatId, card),
+        partialUpdateCardElements: (cardId, seq, actions) => gateway.partialUpdateCardElements(cardId, seq, actions),
+        replaceCardEntity: (cardId, seq, card) => gateway.replaceCardEntity(cardId, seq, card),
       },
       access,
       store: SessionStore.load(join(CONFIG_DIR, `sessions.${app.appId}.json`)),

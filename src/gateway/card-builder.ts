@@ -68,7 +68,14 @@ export function buildImageCard(caption: string | undefined, imgKey: string): unk
   elements.push({ tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: caption ?? '图片' } });
   return card(elements);
 }
-export function buildProgressCard(state: ProgressState, widthMode: 'default' | 'fill' = 'default'): unknown {
+/** 进度卡局部更新的固定组件 ID（cardkit element_id，长度限 1-20）：状态主块 + 计时行。
+ *  局部更新只替换这两个 markdown 组件的 content，form/按钮区不触碰——用户在 plan 表单
+ *  输入框打的内容不会被状态心跳刷掉（整卡 PATCH 会重置全部客户端输入态） */
+export const MAIN_ELEMENT_ID = 'lcb_main';
+export const TIMER_ELEMENT_ID = 'lcb_timer';
+
+/** 进度卡主块内容（标题/状态/工具行/子代理清单/收敛提示/终态结果尾部）——整卡渲染与局部更新共用 */
+function buildMainLines(state: ProgressState): string[] {
   const elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
   const duration = `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒`;
   const lines = [`**${state.title}**`, ``, state.status, ``];
@@ -111,7 +118,22 @@ export function buildProgressCard(state: ProgressState, widthMode: 'default' | '
       lines.push('---', `**📝 结果**`, state.textTail);
     }
   }
-  const elements: unknown[] = [md(lines.join('\n'))];
+  return lines;
+}
+
+/** 计时行文案——整卡渲染与局部更新共用 */
+function buildTimerLine(state: ProgressState): string {
+  const elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
+  const duration = `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒`;
+  // 终态改为「总耗时」+ 完成时刻：运行中的「已运行」在停止刷新后读起来仍像在计时，任务
+  // 是否结束必须一眼可辨（用户分不清计时停了是完成还是卡死）
+  return state.done
+    ? `<font color='grey'>⏱ 总耗时 ${duration} · 已结束于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}</font>`
+    : `<font color='grey'>⏱ 已运行 ${duration}</font>`;
+}
+
+export function buildProgressCard(state: ProgressState, widthMode: 'default' | 'fill' = 'default'): unknown {
+  const elements: unknown[] = [{ tag: 'markdown', content: buildMainLines(state).join('\n'), element_id: MAIN_ELEMENT_ID }];
   // 工具确认区：嵌入进度卡（按钮在计时行上方）——不再单独发确认卡（旧版独立确认卡与
   // 进度卡正文内容重复、还会把进度卡顶出会话底部）
   if (state.confirm) {
@@ -186,12 +208,20 @@ export function buildProgressCard(state: ProgressState, widthMode: 'default' | '
   }
   // 计时行上方加分隔横线，与正文/确认区做视觉划分
   elements.push({ tag: 'hr' });
-  // 终态改为「总耗时」+ 完成时刻：运行中的「已运行」在停止刷新后读起来仍像在计时，任务
-  // 是否结束必须一眼可辨（用户分不清计时停了是完成还是卡死）
-  elements.push(md(state.done
-    ? `<font color='grey'>⏱ 总耗时 ${duration} · 已结束于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}</font>`
-    : `<font color='grey'>⏱ 已运行 ${duration}</font>`));
+  elements.push({ tag: 'markdown', content: buildTimerLine(state), element_id: TIMER_ELEMENT_ID });
   return card(elements, widthMode);
+}
+
+/**
+ * 局部更新 actions（cardkit batch_update 的 partial_update_element）：只替换状态主块与
+ * 计时行两个 markdown 组件的 content，form/按钮区完全不触碰——用户在 plan 意见输入框
+ * 里打的字不会被状态心跳刷掉。仅结构未变化时使用（结构变化走全量替换）。
+ */
+export function buildPartialUpdateActions(state: ProgressState): Array<{ action: string; params: { element_id: string; partial_element: { content: string } } }> {
+  return [
+    { action: 'partial_update_element', params: { element_id: MAIN_ELEMENT_ID, partial_element: { content: buildMainLines(state).join('\n') } } },
+    { action: 'partial_update_element', params: { element_id: TIMER_ELEMENT_ID, partial_element: { content: buildTimerLine(state) } } },
+  ];
 }
 export const DECISION_TEXT: Record<PermissionDecision, string> = {
   allow: '✅ 已允许',

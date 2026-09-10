@@ -1,4 +1,4 @@
-import { buildProgressCard, type ProgressState } from './card-builder.js';
+import { buildProgressCard, buildPartialUpdateActions, type ProgressState } from './card-builder.js';
 import type { ConfirmationRequest } from '../types.js';
 
 export interface CardSender {
@@ -6,12 +6,26 @@ export interface CardSender {
   updateCard(messageId: string, card: unknown): Promise<void>;
   /** 撤回消息（进度卡沉底用）；缺省（旧 gateway/测试 mock）时沉底退化为仅重刷 */
   deleteCard?(messageId: string): Promise<void>;
+  /** 卡片实体模式（cardkit）：创建实体并发送，返回 messageId + cardId。
+   *  实体卡片支持 batch_update 局部更新——状态刷新只改指定 element_id 组件，
+   *  plan 表单输入框的用户输入不会被心跳刷掉。缺省（无权限/旧 gateway）降级整卡 PATCH。 */
+  sendCardEntity?(card: unknown): Promise<{ messageId: string; cardId: string }>;
+  /** 卡片实体局部更新（batch_update + partial_update_element），sequence 须严格递增 */
+  partialUpdateCard?(cardId: string, sequence: number, actions: unknown[]): Promise<void>;
+  /** 卡片实体全量替换（结构变化：交互区增删/终态/选中态变化），sequence 须严格递增 */
+  replaceCard?(cardId: string, sequence: number, card: unknown): Promise<void>;
 }
 
 const FLUSH_CHARS = 200;
 
 export class ProgressCard {
   private messageId?: string;
+  /** 卡片实体 ID（cardkit 实体模式）：非空时状态刷新走局部更新（保 form 输入），结构变化走全量替换 */
+  private cardId?: string;
+  /** cardkit 操作序号：同一实体的每次 update/batch_update 必须严格递增 */
+  private seq = 0;
+  /** 上次全量渲染的结构签名：交互区（confirm/plan/question）增删、终态、qa 选中态变化都需要全量重渲染 */
+  private lastStructure = '';
   private buffer = '';
   private state: ProgressState;
   private flushTimer?: NodeJS.Timeout;
@@ -34,7 +48,22 @@ export class ProgressCard {
   }
 
   async start(): Promise<void> {
-    this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
+    const initial = buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default');
+    // 优先卡片实体模式（支持局部更新 → plan 表单输入不被心跳刷掉）；
+    // 创建失败（cardkit:card:write 权限缺失/接口异常）降级为普通卡片 + 整卡 PATCH，功能不退化
+    if (this.sender.sendCardEntity) {
+      try {
+        const { messageId, cardId } = await this.sender.sendCardEntity(initial);
+        this.messageId = messageId;
+        this.cardId = cardId;
+      } catch (e) {
+        console.warn('[进度卡] 卡片实体模式不可用，降级为整卡更新（plan 表单输入可能被心跳清空）：', e instanceof Error ? e.message : e);
+      }
+    }
+    if (!this.messageId) {
+      this.messageId = await this.sender.sendCard(initial);
+    }
+    this.lastStructure = this.structureKey();
     const interval = this.opts.flushIntervalMs ?? 1500;
     this.flushTimer = setInterval(() => void this.flush(), interval).unref();
     this.heartbeatTimer = setInterval(() => {
@@ -195,11 +224,23 @@ export class ProgressCard {
   async sinkToBottom(): Promise<void> {
     if (this.done || !this.messageId) return;
     const old = this.messageId;
+    const oldCardId = this.cardId;
     this.messageId = undefined; // 期间 flush 自动跳过，避免 PATCH 打到已删除的旧卡
+    this.cardId = undefined;
     if (this.sender.deleteCard) await this.sender.deleteCard(old).catch(() => {});
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
+        const fresh = buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default');
+        // 沉底重发沿用当前模式：原先是实体模式则新建实体（旧实体已随消息撤回弃用）
+        if (this.sender.sendCardEntity && oldCardId) {
+          const { messageId, cardId } = await this.sender.sendCardEntity(fresh);
+          this.messageId = messageId;
+          this.cardId = cardId;
+          this.seq = 0; // sequence 按实体计数：新实体从 1 重新递增
+        } else {
+          this.messageId = await this.sender.sendCard(fresh);
+        }
+        this.lastStructure = this.structureKey();
         void this.flush();
         return;
       } catch (e) {
@@ -213,6 +254,9 @@ export class ProgressCard {
    * 串行化 flush：所有更新走同一条 promise 链按发起顺序落地。
    * - in-flight 中再来请求 → 标记 dirty，本轮落地后自动补刷一次（带上最新 state）；
    * - finish 的终态 flush 也入链，天然排在先前挂起的更新之后。
+   * 实体模式下按结构签名分流：结构未变（纯状态/计时/子代理刷新）→ 局部更新
+   * （只改 main/timer 两个 markdown 组件，form 输入保留）；结构变化（交互区增删、
+   * 终态、qa 选中态）→ 全量替换实体。旧模式（无实体能力）维持整卡 PATCH。
    */
   private flush(): Promise<void> {
     if (!this.messageId) return Promise.resolve();
@@ -229,9 +273,21 @@ export class ProgressCard {
           this.buffer = '';
         }
         try {
-          await this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
+          if (this.cardId && this.sender.partialUpdateCard && this.sender.replaceCard) {
+            const structure = this.structureKey();
+            if (structure === this.lastStructure) {
+              // 纯状态刷新：局部更新，form/按钮区不动（用户输入保留）
+              await this.sender.partialUpdateCard(this.cardId, ++this.seq, buildPartialUpdateActions(this.state));
+            } else {
+              // 结构变化：全量替换实体（form 输入会重置，但这些时刻用户尚未输入或已提交）
+              await this.sender.replaceCard(this.cardId, ++this.seq, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
+              this.lastStructure = structure;
+            }
+          } else {
+            await this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
+          }
         } catch {
-          // 单次 PATCH 失败不致命（限流/网络抖动），下轮重试
+          // 单次更新失败不致命（限流/网络抖动/交互进行中 200810），下轮重试
         }
         if (!this.dirty) break; // 落地期间无新请求，收工
       }
@@ -239,5 +295,11 @@ export class ProgressCard {
       this.flushing = false;
     });
     return this.flushChain;
+  }
+
+  /** 结构签名：交互区存在性 + 终态 + qa 选中态——任一变化都需要全量重渲染才能上屏 */
+  private structureKey(): string {
+    const s = this.state;
+    return JSON.stringify([!!s.confirm, !!s.plan, !!s.question, !!s.done, s.question?.answers ?? null]);
   }
 }

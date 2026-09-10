@@ -10,7 +10,7 @@ import { invalidatePluginCache } from '../executor/plugin-discovery.js';
  * triggers.ts 的 RESERVED、index.ts 的透传说明均以此为准——本地命令永远优先，
  * 不被触发词劫持、不透传给 Claude Code。新增本地命令务必同步此清单
  */
-export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'model-profile', 'skills', 'plugins', 'mcp', 'plugin', 'reload-plugins'] as const;
+export const BRIDGE_LOCAL_COMMANDS = ['help', 'new', 'resume', 'stop', 'status', 'ws', 'model', 'model-profile', 'plan', 'skills', 'plugins', 'mcp', 'plugin', 'reload-plugins'] as const;
 
 /**
  * 内置命令的飞书 Slash Command 注册元信息（icon 为飞书 icon_key，见开放平台文档可选列表）。
@@ -26,6 +26,7 @@ export const SLASH_COMMAND_META: Record<string, { description: string; icon: str
   ws: { description: '切换工作区（/ws list 列出）', icon: 'folder_outlined' },
   model: { description: '查看/切换模型', icon: 'ai-style_outlined' },
   'model-profile': { description: '查看/切换厂商档案（切换需管理员）', icon: 'switch-tracking_outlined' },
+  plan: { description: '切换计划模式（先出方案再执行）', icon: 'plan_outlined' },
   skills: { description: '查看已加载技能', icon: 'skill_outlined' },
   plugins: { description: '查看已加载插件', icon: 'plugin_outlined' },
   mcp: { description: '查看已加载 MCP 服务', icon: 'ai-functions_outlined' },
@@ -74,6 +75,7 @@ const HELP = `**可用命令**
 /ws use <名字> — 切换工作区
 /model — 查看/切换模型（/model <名字> 切换，/model reset 恢复默认）
 /model-profile — 查看/切换厂商档案（/model-profile <名字> 切换，管理员）
+/plan — 切换计划模式（先出方案、批准后再执行；/plan on 开启，/plan off 关闭）
 /skills — 查看已加载技能
 /plugins — 查看已加载插件
 /mcp — 查看已加载 MCP 服务
@@ -166,7 +168,26 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       const st = store.getChannelState(key);
       return {
         handled: true,
-        reply: `机器人：**${ctx.appName}**\n工作区：**${st?.workspaceName || ctx.currentWorkspace()}**\n模型：**${st?.model ?? '跟随全局'}**\n历史会话：${store.listSessions(key).length} 个`,
+        reply: `机器人：**${ctx.appName}**\n工作区：**${st?.workspaceName || ctx.currentWorkspace()}**\n模型：**${st?.model ?? '跟随全局'}**\n计划模式：**${st?.planMode ? '开（先出方案再执行）' : '关'}**\n历史会话：${store.listSessions(key).length} 个`,
+      };
+    }
+    case 'plan': {
+      // 计划模式（#6）：通道级开关，替代旧工作区 code-dev 类型——任何工作区按需开启。
+      // 开启后任务以 plan mode 启动（模型先出计划 → 飞书卡片批准后执行）；/new 不清除（通道偏好）
+      const st = store.getChannelState(key);
+      const arg = (args[0] ?? '').toLowerCase();
+      const next = arg === 'on' ? true : arg === 'off' ? false : !st?.planMode;
+      const base = st ?? { workspaceName: ctx.currentWorkspace(), sessions: [] };
+      if (next) store.setChannelState(key, { ...base, planMode: true });
+      else {
+        const { planMode: _drop, ...rest } = base;
+        store.setChannelState(key, rest);
+      }
+      return {
+        handled: true,
+        reply: next
+          ? '📋 计划模式已**开启**：下一条任务将先出执行方案，你在卡片上批准后才动手（/plan off 关闭）'
+          : '✅ 计划模式已**关闭**：任务将直接执行',
       };
     }
     case 'ws': {
@@ -186,6 +207,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
           workspaceName: target.name,
           sessions: st?.sessions ?? [],
           ...(st?.model ? { model: st.model } : {}),
+          ...(st?.planMode ? { planMode: st.planMode } : {}),
         });
         store.setCurrentSession(key, null, target.name);
         return { handled: true, reply: `✅ 已切换工作区：**${target.name}**（${target.path}）。已自动开启新会话（/resume 可切回历史）` };

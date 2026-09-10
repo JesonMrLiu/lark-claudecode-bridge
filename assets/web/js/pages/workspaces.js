@@ -8,11 +8,11 @@ function renderWorkspaces(el) {
   el.innerHTML = `
   <div class="card">
     <h3>工作区${dirtyDotHtml('ws')}</h3>
-    <div class="desc">Claude 的工作目录白名单。「开发工作流（code-dev）」类型：先出计划（飞书批准）+ 收尾汇总 diff。</div>
+    <div class="desc">Claude 的工作目录白名单。需要「先出方案再执行」时，在飞书会话里发 /plan 按通道切换计划模式；git 仓库工作区任务收尾会自动发汇总 diff 卡片。</div>
     <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
       <button class="btn sm" id="wsAdd">+ 添加工作区</button>
     </div>
-    <table><thead><tr><th style="width:180px">名字</th><th>路径</th><th style="width:170px">类型</th><th style="width:50px"></th></tr></thead>
+    <table><thead><tr><th style="width:180px">名字</th><th>路径</th><th style="width:50px"></th></tr></thead>
     <tbody id="wsBody"></tbody></table>
     ${saveBarHtml('ws')}
     <div class="footer-note">运行中的桥接器下一条消息自动生效，无需重启。</div>
@@ -53,16 +53,11 @@ function renderWorkspaces(el) {
         <input type="text" data-f="path" value="${esc(ws.path || '')}">
         <button class="btn sm" data-browse="path" title="浏览选择目录">浏览</button>
       </div></td>
-      <td><select data-f="type">
-        <option value="generic" ${ws.type !== 'code-dev' ? 'selected' : ''}>通用（generic）</option>
-        <option value="code-dev" ${ws.type === 'code-dev' ? 'selected' : ''}>开发工作流（code-dev）</option>
-      </select></td>
       <td><button class="btn sm danger">删</button></td>`;
     tr.querySelectorAll('[data-f]').forEach((input) => {
       input.oninput = input.onchange = () => {
         const f = input.dataset.f;
-        if (f === 'type') { if (input.value === 'code-dev') ws.type = 'code-dev'; else delete ws.type; }
-        else if (f === 'name') {
+        if (f === 'name') {
           // 改名联动：全局默认指向旧名时同步，否则保存会因 defaults.workspace 不在工作区列表报错
           if (doc.defaults?.workspace && doc.defaults.workspace === ws.name) {
             doc.defaults = { ...(doc.defaults || {}), workspace: input.value };

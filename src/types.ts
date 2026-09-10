@@ -26,9 +26,9 @@ export interface FeishuAppConfig {
    *  显式配置用于开发期直指源码目录（同名时优先于自动发现） */
   plugins?: PluginRef[];
 }
-/** 工作区场景类型：code-dev = 代码开发（统一 plan mode + diff 收尾），generic = 通用（缺省） */
-export type WorkspaceType = 'code-dev' | 'generic';
-export interface Workspace { name: string; path: string; type?: WorkspaceType }
+/** 工作区：name + path。旧版 type（code-dev/generic）已废弃（#6）——计划模式改为
+ *  通道级 /plan 命令切换，diff 收尾改为 git 仓库自动判定；旧配置携带 type 仅 warn 忽略 */
+export interface Workspace { name: string; path: string }
 /** 权限白名单配置：字段可选——未配置的字段回退内置默认（读工具 + Bash + 危险命令表，见 permission-gate）。
  *  allowTools 配置即整体替换内置默认（不与默认合并）；dangerousCommands 为 Bash 危险命令正则（命中弹确认卡） */
 export interface PermissionsConfig { allowTools?: string[]; dangerousCommands?: RegExp[] }

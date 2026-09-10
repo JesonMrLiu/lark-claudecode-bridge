@@ -621,6 +621,57 @@ async function handle(
     }
     return json(res, 400, { error: `未知 op "${op}"（支持 create / delete）` });
   }
+  // ---- Skill 文件浏览（#3）：目录列举 + 文件原文读取。
+  // 安全：所有路径必须解析后落在任一已知 skill 根目录内（防路径穿越读到 ~/.claude/credentials.json 等）；
+  // 原文读取另有扩展名白名单 + 1MB 上限 ----
+  /** 全部已知 skill 根（用户级本机/bridge 自管/各工作区项目级/各已装插件），resolve 后的绝对路径 */
+  const skillRootsAll = (): string[] => {
+    const roots = [join(homedir(), '.claude', 'skills'), join(CONFIG_DIR, 'claude', 'skills')];
+    for (const w of currentWorkspaces()) roots.push(join(w.path, '.claude', 'skills'));
+    for (const p of currentPlugins()) roots.push(join(p.path, 'skills'));
+    return roots.map((r) => resolve(r));
+  };
+  const isUnderSkillRoots = (p: string): boolean => {
+    const rp = resolve(p);
+    return skillRootsAll().some((root) => rp === root || rp.startsWith(root + sep));
+  };
+  if (path === '/api/skills/files' && req.method === 'GET') {
+    const dir = String(url.searchParams.get('path') ?? '');
+    if (!dir || !isUnderSkillRoots(dir)) return json(res, 403, { error: '路径不在允许的 skill 目录内' });
+    let dirents;
+    try {
+      dirents = readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      return json(res, 400, { error: `目录读取失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+    const files = dirents.map((d) => {
+      let size = 0;
+      let mtime = '';
+      try {
+        const st = statSync(join(dir, d.name));
+        size = st.size;
+        mtime = st.mtime.toISOString();
+      } catch { /* 单条 stat 失败按 0 处理 */ }
+      return { name: d.name, isDir: d.isDirectory(), size, mtime };
+    }).sort((a, b) => Number(b.isDir) - Number(a.isDir) || a.name.localeCompare(b.name));
+    return json(res, 200, { path: resolve(dir), files });
+  }
+  if (path === '/api/skills/raw' && req.method === 'GET') {
+    const fp = String(url.searchParams.get('path') ?? '');
+    if (!fp || !isUnderSkillRoots(fp)) return json(res, 403, { error: '路径不在允许的 skill 目录内' });
+    // 扩展名白名单：只放行文本类文件（防借道读凭证/二进制）
+    const RAW_EXTS = new Set(['.md', '.txt', '.json', '.yaml', '.yml', '.sh', '.py', '.ts', '.js', '.mjs', '.cjs', '.toml', '.xml', '.csv', '.html', '.css']);
+    const ext = extname(fp).toLowerCase();
+    if (!RAW_EXTS.has(ext)) return json(res, 400, { error: `不支持预览 ${ext || '无扩展名'} 类型文件（仅文本类可查看）` });
+    try {
+      const st = statSync(fp);
+      if (!st.isFile()) return json(res, 400, { error: '不是文件' });
+      if (st.size > 1024 * 1024) return json(res, 400, { error: `文件过大（${(st.size / 1024 / 1024).toFixed(1)}MB > 1MB），请本地查看` });
+      return json(res, 200, { path: resolve(fp), name: parse(fp).base, ext, size: st.size, content: readFileSync(fp, 'utf8') });
+    } catch (e) {
+      return json(res, 400, { error: `文件读取失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
   if (path === '/api/skills/import' && req.method === 'POST') {
     // zip 导入（#12）：base64 上传，独立放宽到 10MB（全局 1MB 不放 zip）；解压后复制进用户级生效目录
     let body: Record<string, unknown>;
@@ -669,10 +720,35 @@ async function handle(
   }
   // ---- MCP server 管理（#12）：页面可管理存储 = bridge 自管 <CONFIG_DIR>/mcp/servers.json（executeTask
   // 注入 SDK 生效）；~/.claude.json（用户级·本机）展示+可删不写入；工作区 .mcp.json（项目级）只读 ----
+  /** MCP env 多来源合并（#4/#8）：优先级 高→低 = 飞书应用 env（apps[].env，多应用按配置序先写胜出）
+   *  > claude.env > 生效 Claude 目录 settings.json env > process.env。MCP 列表 resolvedEnv
+   *  与 check 探测 spawn env 的统一数据源——只查 process.env 会把应用在配置页/env 块里
+   *  设的变量误判为「未设置」 */
+  const currentMergedEnv = (): Record<string, string> => {
+    const merged: Record<string, string> = {};
+    const put = (src: unknown): void => {
+      if (!src || typeof src !== 'object' || Array.isArray(src)) return;
+      for (const [k, v] of Object.entries(src as Record<string, unknown>)) {
+        if (typeof v === 'string' && v && !(k in merged)) merged[k] = v; // 先写胜出：调用顺序即优先级
+      }
+    };
+    const doc = readRawDoc(ctx.configPath);
+    const rawApps = Array.isArray(doc?.apps) ? doc.apps : doc?.feishu ? [doc.feishu] : [];
+    for (const a of rawApps) put((a as { env?: unknown }).env);
+    put((doc?.claude as { env?: unknown } | undefined)?.env);
+    const isManaged = (doc?.claude as { mode?: string } | undefined)?.mode === 'managed';
+    try {
+      const s = JSON.parse(readFileSync(join(isManaged ? MANAGED_CLAUDE_DIR : DEFAULT_CLAUDE_DIR, 'settings.json'), 'utf8')) as { env?: unknown };
+      put(s.env);
+    } catch { /* settings.json 不存在/损坏：跳过该来源 */ }
+    put(process.env);
+    return merged;
+  };
   if (path === '/api/mcp' && req.method === 'GET') {
     const plugins = currentPlugins();
+    const mergedEnv = currentMergedEnv();
     const servers = listMcpServers(currentWorkspaces(), plugins).map((s) => {
-      const { resolved, missing } = resolveEnvRefs(s.config.env as Record<string, unknown> | undefined);
+      const { resolved, missing } = resolveEnvRefs(s.config.env as Record<string, unknown> | undefined, mergedEnv);
       return { ...s, resolvedEnv: resolved, missingEnv: missing };
     });
     return json(res, 200, {
@@ -763,10 +839,13 @@ async function handle(
     // stdio：spawn 后短时观察——MCP server 正常行为是启动后等 stdin，存活即「可启动」
     const command = typeof cfg.command === 'string' ? cfg.command : '';
     if (!command) return json(res, 200, { status: 'failed', detail: '缺少 command' });
-    const { resolved } = resolveEnvRefs(cfg.env as Record<string, unknown> | undefined);
+    const mergedEnv = currentMergedEnv();
+    const { resolved } = resolveEnvRefs(cfg.env as Record<string, unknown> | undefined, mergedEnv);
     const child = spawn(command, Array.isArray(cfg.args) ? cfg.args.map(String) : [], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ...resolved },
+      // 探测环境与任务运行时对齐：合并源（含飞书应用 env / claude.env / settings env）垫底，
+      // server 自身 env 解析值覆盖（${VAR} 已按同一合并源展开）
+      env: { ...process.env, ...mergedEnv, ...resolved },
       windowsHide: true,
     });
     let stderr = '';

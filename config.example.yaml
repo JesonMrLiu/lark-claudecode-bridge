@@ -37,11 +37,10 @@ apps:
 workspaces:                    # 工作区白名单：名字 + 路径（所有机器人共享列表，当前使用哪个 per-app 隔离）
   - name: demo
     path: F:\workspace\demo
-    # type: code-dev           # 工作区类型：code-dev = 代码开发（每个任务先出计划 → 飞书卡片批准后自动执行；
-                               # 收尾发汇总 diff 卡片，不再整文件上传，git 仓库专属）；缺省 generic = 通用
+    # 需要「先出方案再执行」时，在飞书会话里发 /plan 按通道切换计划模式；
+    # git 仓库工作区任务收尾自动发汇总 diff 卡片（不再整文件上传）
   # - name: my-project
   #   path: F:\workspace\my-project
-  #   type: code-dev
 defaults:
   workspace: demo
 concurrency: 3                 # 全局并发上限（未单独配置的 app 沿用此值）

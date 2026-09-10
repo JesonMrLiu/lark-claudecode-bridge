@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { parse, type YAMLParseError } from 'yaml';
 import type {
   BridgeConfig, CardConfig, ClaudeAuthMode, ClaudeConfig, ClaudeProfile, FeishuAppConfig, PermissionsConfig, PluginRef,
-  ServerConfig, SessionConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace, WorkspaceType,
+  ServerConfig, SessionConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace,
 } from './types.js';
 
 /** LCB_CONFIG_DIR 环境变量可覆盖配置根目录（多租户分进程场景用；正常用户无须设置） */
@@ -100,9 +100,9 @@ function normalizePlugins(raw: RawApp['plugins'], where: string): PluginRef[] | 
   });
 }
 
-const WORKSPACE_TYPES: ReadonlySet<string> = new Set(['code-dev', 'generic']);
-
-/** 归一化工作区列表：name/path 必须非空；type 严格枚举（code-dev = 统一 plan mode + diff 收尾，generic = 缺省） */
+/** 归一化工作区列表：name/path 必须非空。
+ * type 字段已废弃（#6：统一通用模式 + /plan 命令通道级切换计划模式，diff 收尾改为
+ * git 仓库自动判定）——旧配置携带 type 仅 warn 忽略，不报错、不再生效 */
 function normalizeWorkspaces(raw: unknown): Workspace[] {
   const list = (Array.isArray(raw) ? raw : []) as Array<{ name?: unknown; path?: unknown; type?: unknown }>;
   if (list.length === 0) throw new Error('配置至少需要一个 workspaces 条目');
@@ -111,11 +111,10 @@ function normalizeWorkspaces(raw: unknown): Workspace[] {
     const path = typeof w?.path === 'string' ? w.path.trim() : '';
     if (!name) throw new Error(`workspaces[${i}] 缺少 name，请检查 config.yaml`);
     if (!path) throw new Error(`workspaces[${i}](${name}) 缺少 path，请检查 config.yaml`);
-    if (w.type === undefined || w.type === null) return { name, path };
-    if (typeof w.type !== 'string' || !WORKSPACE_TYPES.has(w.type)) {
-      throw new Error(`workspaces[${i}](${name}) 的 type 必须为 code-dev / generic（当前值：${String(w.type)}），请检查 config.yaml`);
+    if (w.type !== undefined && w.type !== null) {
+      console.warn(`[配置] workspaces[${i}](${name}) 的 type 已废弃（统一通用模式；计划模式请在飞书发 /plan 按通道切换），该配置项将被忽略`);
     }
-    return { name, path, type: w.type as WorkspaceType };
+    return { name, path };
   });
 }
 

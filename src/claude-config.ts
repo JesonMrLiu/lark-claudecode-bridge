@@ -2,9 +2,9 @@
 // inherit（缺省）= 共享本机 ~/.claude（0.4 起行为：登录态/settings/user MCP/skills 全继承）；
 // managed = bridge 自管 ~/.lark-claudecode-bridge/claude/，认证与模型由 config.yaml claude 段
 // 全权写入该目录 settings.json——彻底摆脱对本机 claude login 的依赖（一键安装开箱即用）。
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { CONFIG_DIR } from './config.js';
 import type { BridgeConfig, ClaudeConfig } from './types.js';
 
@@ -117,9 +117,60 @@ function writeAtomicJson(path: string, value: unknown): void {
 }
 
 /**
+ * managed 模式下把本机 ~/.claude/skills 桥接到托管目录的 skills/，让托管会话看到
+ * user 范围的 skills（否则 ~/.claude/skills/* 永远不可见——因为 Claude Code 只从
+ * $CLAUDE_CONFIG_DIR/skills 发现 user skills，managed 模式 CLAUDE_CONFIG_DIR 不再
+ * 指向 ~/.claude）。每个 skill 在托管目录下用目录链接（Windows junction / POSIX
+ * symlink）挂到真实位置——skill 更新在原处落地，链接侧无感。
+ * 返回 bridged 名单供日志；同名已存在（非 symlink）时报错并跳过（用户已托管自定义
+ * 副本，勿覆盖）。
+ */
+export function bridgeUserSkills(managedDir: string, userClaudeDir: string): string[] {
+  const userSkills = join(userClaudeDir, 'skills');
+  if (resolve(managedDir) === resolve(userClaudeDir)) return [];
+  if (!existsSync(userSkills)) return [];
+  const targetDir = join(managedDir, 'skills');
+  mkdirSync(targetDir, { recursive: true });
+  const bridged: string[] = [];
+  for (const name of readdirSyncSafe(userSkills)) {
+    const src = join(userSkills, name);
+    if (!existsSync(join(src, 'SKILL.md'))) continue; // 非 skill 目录（散文件）跳过
+    const dst = join(targetDir, name);
+    // lstat 不跟随链接：能识别「源已被删除的失效链接」（existsSync 会误判为不存在）
+    let dstLstat: ReturnType<typeof lstatSync> | undefined;
+    try { dstLstat = lstatSync(dst); } catch { /* 不存在 */ }
+    if (dstLstat) {
+      if (dstLstat.isSymbolicLink()) {
+        if (existsSync(dst)) continue; // 链接有效，幂等
+        // 源已删除的失效链接：移除后重建（junction 删除不影响源目录）
+        try { rmSync(dst, { force: true }); } catch { /* 移除失败则按占用跳过 */ continue; }
+      } else {
+        console.warn(`[managed] skills/${name} 在托管目录已存在且非链接，跳过桥接（若想刷新请手动删除）`);
+        continue;
+      }
+    }
+    try {
+      symlinkSync(resolve(src), dst, 'junction'); // Windows 上无需管理员权限
+      bridged.push(name);
+    } catch (e) {
+      // 单个 skill 桥接失败（权限/跨盘符等）不阻断启动：其余 skill 照常桥接
+      console.warn(`[managed] skills/${name} 桥接失败：`, e instanceof Error ? e.message : e);
+    }
+  }
+  return bridged;
+}
+
+function readdirSyncSafe(dir: string): string[] {
+  try { return readdirSync(dir); }
+  catch { return []; }
+}
+
+/**
  * managed 模式初始化：建目录 + 把 claude 段最新值合并进 settings.json，
- * 并从本机 ~/.claude 继承 MCP servers（.claude.json mcpServers）与自定义环境变量
- * （settings.json env 块，领土键除外）——否则托管会话读不到用户全局 MCP 及其依赖变量。
+ * 并从本机 ~/.claude 继承 MCP servers（.claude.json mcpServers）、自定义环境变量
+ * （settings.json env 块，领土键除外）与 user skills（junction 桥接）——否则托管
+ * 会话读不到用户全局 MCP 及其依赖变量、看不到 ~/.claude/skills 下的 skill
+ * （典型表现：飞书斜杠命令 /<skill-name> 透传给 CLI 后报 Unknown command）。
  * lcb start 启动 bridge 前调用，保证首条消息前认证/环境就位；非 managed 模式为 no-op。
  */
 export function initManagedClaudeDir(config: BridgeConfig, userClaudeDir: string = DEFAULT_CLAUDE_DIR): void {
@@ -141,4 +192,8 @@ export function initManagedClaudeDir(config: BridgeConfig, userClaudeDir: string
     config.claude.env,
   ));
   syncMcpServers(MANAGED_CLAUDE_DIR, userClaudeDir);
+  const bridged = bridgeUserSkills(MANAGED_CLAUDE_DIR, userClaudeDir);
+  if (bridged.length > 0) {
+    console.log(`[managed] 已桥接 user skills 到托管目录：${bridged.join('、')}（${bridged.length} 个）`);
+  }
 }

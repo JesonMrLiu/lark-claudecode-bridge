@@ -37,11 +37,11 @@ export interface FeishuSdk {
         }>;
       };
     };
-    // 通用请求口（SDK 1.73.0 未封装 bot info 接口，经此调 GET /open-apis/bot/v3/info 拿机器人 open_id）。
-    // 实际实现接受 params/data/headers/path（详见 SDK Client.request 签名），但本接口只暴露实际用到的部分——
-    // #5 回复链上游消息拉取用同一入口
-    request(payload: { method: string; url: string; params?: Record<string, unknown> }):
-      Promise<{ code?: number; msg?: string; bot?: { open_id?: string }; data?: { items?: unknown[] } }>;
+  // 通用请求口（SDK 1.73.0 未封装 bot info 接口，经此调 GET /open-apis/bot/v3/info 拿机器人 open_id）。
+  // 实际实现接受 params/data/headers/path（详见 SDK Client.request 签名），但本接口只暴露实际用到的部分——
+  // #5 回复链上游消息拉取、cardkit 卡片实体 CRUD 均走同一入口
+  request(payload: { method: string; url: string; params?: Record<string, unknown>; data?: unknown }):
+      Promise<{ code?: number; msg?: string; bot?: { open_id?: string }; data?: Record<string, unknown> }>;
   };
   Domain: { Feishu: unknown; Lark: unknown };
 }
@@ -189,7 +189,7 @@ interface RawCardActionPayload {
 
 const VALID_DECISIONS: ReadonlySet<string> = new Set([
   'allow', 'deny', 'allow-session',
-  'plan-approve', 'plan-revise', 'plan-reject',
+  'plan-approve', 'plan-revise', 'plan-reject', 'plan-view-file',
   'qa-pick', 'qa-submit',
 ]);
 
@@ -447,6 +447,45 @@ export class FeishuGateway {
   /** 更新已发送卡片（流式进度刷新） */
   async updateCard(messageId: string, card: unknown): Promise<void> {
     await this.client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card) } });
+  }
+
+  /**
+   * 创建卡片实体并发送（cardkit 实体模式）：实体卡片支持 batch_update 局部更新——
+   * 状态刷新只改指定 element_id 的组件，plan 表单输入框的用户输入不会被心跳刷掉
+   * （整卡 PATCH 会重置全部客户端输入态）。需开通 cardkit:card:write 权限；
+   * 调用方（ProgressCard.start）捕获失败后自动降级普通卡片 + 整卡 PATCH。
+   */
+  async sendCardEntity(chatId: string, card: unknown): Promise<{ messageId: string; cardId: string }> {
+    const create = await this.client.request({
+      method: 'POST', url: '/open-apis/cardkit/v1/cards',
+      data: { type: 'card_json', data: JSON.stringify(card) },
+    });
+    const cardId = (create.data as { card_id?: string } | undefined)?.card_id;
+    if (create.code !== 0 || !cardId) throw new Error(`创建卡片实体失败: ${JSON.stringify(create)}`);
+    const res = await this.client.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify({ type: 'card', data: { card_id: cardId } }) },
+    });
+    if (!res.data?.message_id) throw new Error(`发送卡片实体消息失败: ${JSON.stringify(res)}`);
+    return { messageId: res.data.message_id, cardId };
+  }
+
+  /** 卡片实体局部更新（batch_update + partial_update_element）：只改 actions 指定组件，其余区域不动 */
+  async partialUpdateCardElements(cardId: string, sequence: number, actions: unknown[]): Promise<void> {
+    const res = await this.client.request({
+      method: 'POST', url: `/open-apis/cardkit/v1/cards/${cardId}/batch_update`,
+      data: { actions: JSON.stringify(actions), sequence },
+    });
+    if (res.code !== 0) throw new Error(`卡片局部更新失败: ${JSON.stringify(res)}`);
+  }
+
+  /** 卡片实体全量替换（结构变化：交互区增删/终态/选中态），data 为新卡片 JSON */
+  async replaceCardEntity(cardId: string, sequence: number, card: unknown): Promise<void> {
+    const res = await this.client.request({
+      method: 'PUT', url: `/open-apis/cardkit/v1/cards/${cardId}`,
+      data: { type: 'card_json', data: JSON.stringify(card), sequence },
+    });
+    if (res.code !== 0) throw new Error(`卡片全量更新失败: ${JSON.stringify(res)}`);
   }
 
   /** 撤回消息（进度卡沉底用：删旧卡后重发，保持进度卡始终在会话最底部） */

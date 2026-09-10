@@ -1,4 +1,4 @@
-// 汇总 diff 收尾卡片：code-dev 工作区任务完成后替代整文件上传——只发「改了什么」，
+// 汇总 diff 收尾卡片：git 仓库工作区任务完成后替代整文件上传——只发「改了什么」，
 // 多文件 diff 合并展示，超长按块拆多张卡（复用 chunkText 贪心分块）
 import { chunkText } from '../util/chunk-text.js';
 

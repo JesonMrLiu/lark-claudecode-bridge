@@ -32,7 +32,7 @@ function renderSkills(el) {
     <input type="file" id="skillZipFile" accept=".zip" style="display:none">
     <input type="search" id="skillSearch" placeholder="🔍 按名字 / 来源 / 路径过滤…" style="width:100%;padding:7px 10px;margin-bottom:8px;border:1px solid var(--border);border-radius:7px">
     <table><thead><tr>
-      <th style="width:170px">名字</th><th>说明</th><th style="width:130px">来源</th><th style="width:240px">路径</th><th style="width:50px"></th>
+      <th style="width:170px">名字</th><th>说明</th><th style="width:130px">来源</th><th style="width:240px">路径</th><th style="width:110px"></th>
     </tr></thead>
       <tbody id="skillBody"><tr><td colspan="5" class="desc">加载中…</td></tr></tbody>
     </table>
@@ -96,7 +96,11 @@ async function loadSkills() {
       <td>${esc(s.description) || '<span class="desc">（无说明）</span>'}</td>
       <td><span class="chip">${tag}</span></td>
       <td><code class="desc">${esc(s.path)}</code></td>
-      <td>${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删</button>` : '<span class="desc">只读</span>'}</td>`;
+      <td>
+        <button class="btn sm" data-browse="${esc(s.name)}">📂 浏览</button>
+        ${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删</button>` : ''}
+      </td>`;
+    tr.querySelector('[data-browse]').onclick = () => browseSkill(s);
     const delBtn = tr.querySelector('[data-del]');
     if (delBtn) delBtn.onclick = () => delSkill(s);
     body.appendChild(tr);
@@ -110,6 +114,165 @@ function delSkill(s) {
   api('POST', '/api/skills/action', { op: 'delete', name: s.name, source: s.source, workspaceName: s.workspaceName })
     .then(() => { toast('已删除'); void loadSkills(); })
     .catch((e) => toast(e.message, true));
+}
+
+// ---------- skill 文件浏览（#3）：目录树 + 原文/视图/双栏三种查看模式 ----------
+
+/** 极简 markdown → HTML（先整体转义再还原语法，绝无 XSS 面）：标题/代码块/行内代码/粗斜体/列表/引用/链接/分割线 */
+function renderMarkdown(src) {
+  const codeBlocks = [];
+  let text = String(src).replace(/```(\w*)\n?([\s\S]*?)(?:```|$)/g, (_m, lang, code) => {
+    codeBlocks.push(`<pre style="background:#f6f8fa;border:1px solid var(--border);border-radius:8px;padding:10px;overflow:auto;font-size:12px"><code>${esc(code.replace(/\n$/, ''))}</code></pre>`);
+    return `${codeBlocks.length - 1}`;
+  });
+  const lines = text.split('\n');
+  const out = [];
+  let listOpen = false;
+  const closeList = () => { if (listOpen) { out.push('</ul>'); listOpen = false; } };
+  const inline = (s) => esc(s)
+    .replace(/`([^`]+)`/g, '<code style="background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--primary)">$1</a>');
+  for (const line of lines) {
+    const block = /^ (\d+) $/.exec(line);
+    if (block) { closeList(); out.push(codeBlocks[Number(block[1])]); continue; }
+    const h = /^(#{1,4})\s+(.*)$/.exec(line);
+    if (h) { closeList(); const lv = h[1].length; out.push(`<h${lv + 1} style="margin:12px 0 6px">${inline(h[2])}</h${lv + 1}>`); continue; }
+    if (/^\s*[-*]\s+/.test(line)) {
+      if (!listOpen) { out.push('<ul style="margin:4px 0;padding-left:22px">'); listOpen = true; }
+      out.push(`<li>${inline(line.replace(/^\s*[-*]\s+/, ''))}</li>`);
+      continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      if (!listOpen) { out.push('<ul style="margin:4px 0;padding-left:22px">'); listOpen = true; }
+      out.push(`<li>${inline(line.replace(/^\s*\d+\.\s+/, ''))}</li>`);
+      continue;
+    }
+    closeList();
+    if (/^---+\s*$/.test(line)) { out.push('<hr style="border:none;border-top:1px solid var(--border);margin:10px 0">'); continue; }
+    if (/^>\s?/.test(line)) { out.push(`<blockquote style="margin:6px 0;padding:4px 12px;border-left:3px solid var(--border);color:var(--muted,#667)">${inline(line.replace(/^>\s?/, ''))}</blockquote>`); continue; }
+    if (line.trim() === '') { out.push(''); continue; }
+    out.push(`<p style="margin:4px 0">${inline(line)}</p>`);
+  }
+  closeList();
+  return out.join('\n');
+}
+
+/** 浏览抽屉：左侧文件树（目录懒加载展开），右侧查看区（markdown 文件支持 原文/视图/两者 三模式） */
+function browseSkill(s) {
+  openDrawer({
+    title: `📂 ${s.name} · ${sourceTag(s)}`,
+    bodyHtml: `
+      <div class="hint" style="margin:0 0 10px"><code class="desc">${esc(s.path)}</code></div>
+      <div style="display:flex;gap:14px;align-items:flex-start">
+        <div id="sbTree" style="width:250px;flex:none;border:1px solid var(--border);border-radius:8px;padding:8px;max-height:62vh;overflow:auto;font-size:13px">
+          <div class="desc">目录加载中…</div>
+        </div>
+        <div style="flex:1;min-width:0">
+          <div id="sbModes" style="display:none;gap:8px;margin-bottom:8px" class="subtabs">
+            <button data-mode="both" class="active">两者都看</button>
+            <button data-mode="raw">只看原文</button>
+            <button data-mode="view">只看视图</button>
+          </div>
+          <div id="sbFileName" class="desc" style="margin-bottom:6px">点击左侧文件查看内容</div>
+          <div id="sbView" style="display:none;border:1px solid var(--border);border-radius:8px;padding:12px;max-height:56vh;overflow:auto;font-size:13px;line-height:1.6"></div>
+          <textarea id="sbRaw" readonly style="display:none;width:100%;min-height:56vh;font-family:ui-monospace,Consolas,monospace;font-size:12px"></textarea>
+        </div>
+      </div>`,
+    footHtml: `<button class="btn" data-act="close">关闭</button>`,
+    onMount({ body, foot }) {
+      foot.querySelector('[data-act="close"]').onclick = () => closeDrawer();
+      const tree = body.querySelector('#sbTree');
+      const modes = body.querySelector('#sbModes');
+      const fileName = body.querySelector('#sbFileName');
+      const viewPane = body.querySelector('#sbView');
+      const rawPane = body.querySelector('#sbRaw');
+      let mode = 'both';
+      const isMd = (p) => /\.(md|markdown)$/i.test(p);
+      const applyMode = () => {
+        modes.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+        viewPane.style.display = mode === 'raw' ? 'none' : '';
+        rawPane.style.display = mode === 'view' ? 'none' : '';
+      };
+      modes.querySelectorAll('[data-mode]').forEach((b) => {
+        b.onclick = () => { mode = b.dataset.mode; applyMode(); };
+      });
+      const openFile = async (fp) => {
+        fileName.textContent = `加载中：${fp}`;
+        try {
+          const r = await api('GET', `/api/skills/raw?path=${encodeURIComponent(fp)}`);
+          fileName.innerHTML = `<strong>${esc(r.name)}</strong> <span class="desc">· ${(r.size / 1024).toFixed(1)}KB</span>`;
+          rawPane.value = r.content;
+          if (isMd(r.name)) {
+            viewPane.innerHTML = renderMarkdown(r.content);
+            modes.style.display = 'flex';
+            applyMode(); // md：按当前模式（默认两者都看）
+          } else {
+            viewPane.innerHTML = `<pre style="margin:0;white-space:pre-wrap;font-size:12px">${esc(r.content)}</pre>`;
+            modes.style.display = 'none';
+            viewPane.style.display = '';
+            rawPane.style.display = 'none'; // 非 md：格式化视图即原文等宽展示
+          }
+        } catch (e) {
+          fileName.textContent = '';
+          toast(e.message, true);
+        }
+      };
+      const renderDir = async (dir, container) => {
+        container.innerHTML = '<div class="desc" style="padding:2px 6px">加载中…</div>';
+        let files;
+        try {
+          const r = await api('GET', `/api/skills/files?path=${encodeURIComponent(dir)}`);
+          files = r.files || [];
+        } catch (e) {
+          container.innerHTML = `<div class="desc" style="padding:2px 6px;color:#dc2626">${esc(e.message)}</div>`;
+          return;
+        }
+        container.innerHTML = '';
+        if (files.length === 0) {
+          container.innerHTML = '<div class="desc" style="padding:2px 6px">（空目录）</div>';
+          return;
+        }
+        for (const f of files) {
+          const row = document.createElement('div');
+          row.style.cssText = 'padding:3px 6px;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+          row.onmouseenter = () => { row.style.background = '#f2f5fa'; };
+          row.onmouseleave = () => { row.style.background = ''; };
+          const childPath = `${dir.replace(/[\\/]+$/, '')}/${f.name}`;
+          if (f.isDir) {
+            row.textContent = `▸ 📁 ${f.name}`;
+            let expanded = false;
+            let childBox = null;
+            row.onclick = async () => {
+              expanded = !expanded;
+              row.textContent = `${expanded ? '▾' : '▸'} 📁 ${f.name}`;
+              if (expanded && !childBox) {
+                childBox = document.createElement('div');
+                childBox.style.marginLeft = '14px';
+                row.after(childBox);
+                await renderDir(childPath, childBox);
+              } else if (childBox) {
+                childBox.style.display = expanded ? '' : 'none';
+              }
+            };
+          } else {
+            row.textContent = `📄 ${f.name}`;
+            row.title = `${f.name}（${(f.size / 1024).toFixed(1)}KB）`;
+            row.onclick = () => {
+              tree.querySelectorAll('[data-active]').forEach((x) => { delete x.dataset.active; x.style.background = ''; x.style.fontWeight = ''; });
+              row.dataset.active = '1';
+              row.style.background = '#eef3ff';
+              row.style.fontWeight = '600';
+              void openFile(childPath);
+            };
+          }
+          container.appendChild(row);
+        }
+      };
+      void renderDir(s.path, tree);
+    },
+  });
 }
 
 function addSkill() {
