@@ -1,5 +1,75 @@
-// ============ 公共 UI 组件：保存条 / 目录选择弹层 / 右侧抽屉 ============
+// ============ 公共 UI 组件：保存条 / 目录选择弹层 / 右侧抽屉 / 风格化确认弹窗 ============
 import { S, $, esc, toast, api, saveDoc, refresh, hooks } from './core.js';
+
+// ============ 风格化弹窗（替代浏览器原生 confirm / prompt） ============
+let openDialogs = 0; // 打开中的弹窗计数：ESC 只关最上层弹窗，不误触抽屉
+/** 挂载弹窗遮罩（.modal-mask + .dlg）；返回卸载函数 */
+function mountDialog(innerHTML) {
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask';
+  mask.innerHTML = innerHTML;
+  document.body.appendChild(mask);
+  openDialogs++;
+  return { mask, unmount() { openDialogs--; mask.remove(); } };
+}
+/** 捕获阶段拦截 ESC / Enter（先于抽屉的冒泡监听），弹窗关闭后自动解绑 */
+function bindDialogKeys(onKey) {
+  const handler = (e) => {
+    if (e.key !== 'Escape' && e.key !== 'Enter') return;
+    e.stopPropagation();
+    onKey(e.key);
+  };
+  document.addEventListener('keydown', handler, true);
+  return () => document.removeEventListener('keydown', handler, true);
+}
+/**
+ * 二次确认弹窗（替代 window.confirm）→ Promise<boolean>。
+ * message 支持 HTML（调用方负责 esc 用户数据）；danger=true 时确认键为红色实心。
+ */
+export function confirmDialog({ title = '确认操作', message = '', confirmText = '确定', cancelText = '取消', danger = false }) {
+  return new Promise((resolve) => {
+    const { mask, unmount } = mountDialog(`
+      <div class="modal dlg" role="alertdialog" aria-modal="true">
+        <h3 class="dlg-title${danger ? ' danger' : ''}">${danger ? '<span class="dlg-ico" aria-hidden="true">!</span>' : ''}${title}</h3>
+        <div class="dlg-msg">${message}</div>
+        <div class="dlg-foot">
+          <button class="btn" data-dlg="cancel">${esc(cancelText)}</button>
+          <button class="btn ${danger ? 'danger-solid' : 'primary'}" data-dlg="ok">${esc(confirmText)}</button>
+        </div>
+      </div>`);
+    const done = (v) => { unbind(); unmount(); resolve(v); };
+    const unbind = bindDialogKeys((key) => done(key === 'Enter'));
+    mask.querySelector('[data-dlg="ok"]').onclick = () => done(true);
+    mask.querySelector('[data-dlg="cancel"]').onclick = () => done(false);
+    mask.onclick = (e) => { if (e.target === mask) done(false); };
+    mask.querySelector('[data-dlg="ok"]').focus();
+  });
+}
+/**
+ * 输入弹窗（替代 window.prompt）→ Promise<string|null>（null = 取消）。
+ */
+export function promptDialog({ title = '请输入', message = '', placeholder = '', value = '', confirmText = '确定', cancelText = '取消' }) {
+  return new Promise((resolve) => {
+    const { mask, unmount } = mountDialog(`
+      <div class="modal dlg" role="dialog" aria-modal="true">
+        <h3 class="dlg-title">${title}</h3>
+        <div class="dlg-msg">${message}</div>
+        <input type="text" class="dlg-input" placeholder="${esc(placeholder)}" value="${esc(value)}">
+        <div class="dlg-foot">
+          <button class="btn" data-dlg="cancel">${esc(cancelText)}</button>
+          <button class="btn primary" data-dlg="ok">${esc(confirmText)}</button>
+        </div>
+      </div>`);
+    const input = mask.querySelector('.dlg-input');
+    const done = (v) => { unbind(); unmount(); resolve(v); };
+    const unbind = bindDialogKeys((key) => done(key === 'Enter' ? input.value : null));
+    mask.querySelector('[data-dlg="ok"]').onclick = () => done(input.value);
+    mask.querySelector('[data-dlg="cancel"]').onclick = () => done(null);
+    mask.onclick = (e) => { if (e.target === mask) done(null); };
+    input.focus();
+    input.select();
+  });
+}
 
 /** 卡级保存行（页内表单卡通用）：保存 = saveDoc 落盘；还原 = 重拉磁盘配置 */
 export const saveBarHtml = (id) => `<div class="savebar" id="bar-${id}" style="display:none"><span class="state">有未保存的修改</span><span style="flex:1"></span><button class="btn" data-discard="${id}">还原</button><button class="btn primary" data-save="${id}">保存</button></div>`;
@@ -34,7 +104,7 @@ export function pickDirectory(initialPath) {
       <div class="row">
         <input type="text" class="pd-jump" placeholder="输入或粘贴路径，回车前往">
         <button class="btn pd-go" title="跳转到输入的路径">前往</button>
-        <button class="btn pd-up" title="返回上一级">⬆ 上级</button>
+        <button class="btn pd-up" title="返回上一级">上级目录</button>
       </div>
       <div class="hint pd-cur" style="margin:8px 0 0;word-break:break-all"></div>
       <div class="dir-list"><div class="empty">加载中…</div></div>
@@ -65,7 +135,7 @@ export function pickDirectory(initialPath) {
         ? r.drives.map((d) => ({ label: d, next: d }))
         : (r.dirs || []).map((d) => ({ label: d, next: joinPath(current, d) }));
       list.innerHTML = items.length
-        ? items.map((it) => `<button data-next="${esc(it.next)}">📁 ${esc(it.label)}</button>`).join('')
+        ? items.map((it) => `<button data-next="${esc(it.next)}">${esc(it.label)}</button>`).join('')
         : `<div class="empty">${r.error ? '（上述路径无法列出子目录）' : '（没有子目录）'}</div>`;
       list.querySelectorAll('button[data-next]').forEach((b) => b.onclick = () => go(b.dataset.next));
     };
@@ -119,5 +189,6 @@ const dismissDrawer = () => (drawerSnap ? cancelDrawer() : closeDrawer());
 export function initDrawer() {
   $('#drawerClose').onclick = dismissDrawer;
   $('#drawerMask').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) dismissDrawer(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') dismissDrawer(); });
+  // ESC 有风格化弹窗打开时归弹窗（其自身在捕获阶段拦截并 stopPropagation，此处计数兜底）
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !openDialogs) dismissDrawer(); });
 }

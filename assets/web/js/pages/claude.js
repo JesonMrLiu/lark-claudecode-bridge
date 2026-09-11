@@ -1,6 +1,6 @@
 // ============ Claude 认证 ============
 import { S, $, esc, toast, api, snapDoc, saveDoc, cardDirty, applyDirty, refresh } from '../core.js';
-import { openDrawer, closeDrawer, cancelDrawer, saveBarHtml, dirtyDotHtml, bindSaveBar } from '../ui.js';
+import { openDrawer, closeDrawer, cancelDrawer, saveBarHtml, dirtyDotHtml, bindSaveBar, confirmDialog } from '../ui.js';
 
 /** 模型拉取公共逻辑：getBody() 组请求体（凭证仅携带本次输入的明文，空则不带给后端回落磁盘值） */
 async function pullModels(getBody, btn, datalistId) {
@@ -80,7 +80,7 @@ function renderClaude(el) {
   <div class="card" id="pfCard" style="${mode === 'managed' ? '' : 'display:none'}">
     <h3>厂商档案</h3>
     <div class="desc">保存多套厂商 / 中转站凭证，每个档案可维护多个候选模型（如 fable / opus / sonnet / haiku）。「设为当前」整套切换；点候选模型即时切换当前模型。档案在抽屉「保存」后即可切换。</div>
-    <div style="display:flex;justify-content:flex-end;margin-bottom:10px"><button class="btn sm primary" id="pfAdd">+ 新增档案</button></div>
+    <div class="list-toolbar"><button class="btn primary" id="pfAdd">+ 新增档案</button></div>
     <table><thead><tr><th style="width:120px">名称</th><th style="width:100px">凭证类型</th><th>BASE_URL</th><th>模型（点击切换）</th><th style="width:190px">操作</th></tr></thead>
     <tbody id="pfBody"></tbody></table>
   </div>`;
@@ -120,7 +120,7 @@ function renderClaude(el) {
       <tr>
         <td><input type="text" data-cei="${i}" data-col="key" value="${esc(r.key)}" placeholder="SOME_KEY"></td>
         <td><input type="text" data-cei="${i}" data-col="value" value="${esc(r.value)}" placeholder="some-value"></td>
-        <td><button class="btn sm danger" data-crm="${i}">删</button></td>
+        <td><button class="btn sm danger" data-crm="${i}">删除</button></td>
       </tr>`).join('') : '<tr><td colspan="3" class="hint">未配置（本机 ~/.claude 的非认证键自动继承）</td></tr>';
     tb.querySelectorAll('input[data-cei]').forEach((input) => input.oninput = () => {
       cEnvRows[Number(input.dataset.cei)][input.dataset.col] = input.value;
@@ -196,7 +196,12 @@ function renderClaude(el) {
         return;
       }
       if (b.dataset.op === 'del') {
-        if (!window.confirm(`确认删除档案「${p.name || '未命名'}」？删除将立即保存生效。`)) return;
+        if (!(await confirmDialog({
+          title: '删除档案',
+          message: `确认删除档案「${esc(p.name || '未命名')}」？删除将立即保存生效。`,
+          danger: true,
+          confirmText: '删除',
+        }))) return;
         c.profiles.splice(i, 1);
         await saveDoc();
         return;
@@ -301,7 +306,12 @@ function openProfileDrawer(c, i, el, snap) {
         }), document.getElementById('dwPfPull'), 'dwPfModelList');
       };
       document.getElementById('dwPfDel').onclick = async () => {
-        if (!window.confirm(`确认删除档案「${p.name || '未命名'}」？删除将立即保存生效。`)) return;
+        if (!(await confirmDialog({
+          title: '删除档案',
+          message: `确认删除档案「${esc(p.name || '未命名')}」？删除将立即保存生效。`,
+          danger: true,
+          confirmText: '删除',
+        }))) return;
         c.profiles.splice(i, 1);
         if (await saveDoc()) closeDrawer();
         else cancelDrawer();

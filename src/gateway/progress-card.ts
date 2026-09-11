@@ -17,6 +17,23 @@ export interface CardSender {
 }
 
 const FLUSH_CHARS = 200;
+/** 单次卡片更新请求超时：飞书 SDK 的 axios 无超时（timeout=0），请求被网络黑洞时
+ *  flush 串行链会无限期挂起（生产实测单次挂 7.4 分钟）——挂起期间计时/交互区全停，
+ *  与任务卡死无从区分。到点按失败处理（seq 不推进）下轮重试；若超时请求实际已在
+ *  服务端落地，下轮会收 300317 经跳号分支自愈 */
+const UPDATE_TIMEOUT_MS = 30_000;
+
+/** 给单次更新请求加超时闸：到点 reject 由 flush catch 统一按失败重试 */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`卡片更新超时(${ms}ms 无响应)，按失败处理下轮重试`)), ms);
+    timer.unref();
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
 
 export class ProgressCard {
   private messageId?: string;
@@ -42,7 +59,7 @@ export class ProgressCard {
   constructor(
     private sender: CardSender,
     title: string,
-    private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number; cardWidthMode?: 'default' | 'fill' } = {},
+    private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number; cardWidthMode?: 'default' | 'fill'; updateTimeoutMs?: number } = {},
   ) {
     this.state = { title, status: '🚀 已接收，启动中…', textTail: '', toolLine: '', startedAt: Date.now(), agents: [] };
   }
@@ -272,22 +289,39 @@ export class ProgressCard {
           this.state.textTail += this.buffer;
           this.buffer = '';
         }
+        const expectedSeq = this.seq + 1; // 仅期望值,await 成功才提交推进
+        const timeoutMs = this.opts.updateTimeoutMs ?? UPDATE_TIMEOUT_MS;
         try {
           if (this.cardId && this.sender.partialUpdateCard && this.sender.replaceCard) {
             const structure = this.structureKey();
             if (structure === this.lastStructure) {
               // 纯状态刷新：局部更新，form/按钮区不动（用户输入保留）
-              await this.sender.partialUpdateCard(this.cardId, ++this.seq, buildPartialUpdateActions(this.state));
+              await withTimeout(this.sender.partialUpdateCard(this.cardId, expectedSeq, buildPartialUpdateActions(this.state)), timeoutMs);
             } else {
               // 结构变化：全量替换实体（form 输入会重置，但这些时刻用户尚未输入或已提交）
-              await this.sender.replaceCard(this.cardId, ++this.seq, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
+              await withTimeout(this.sender.replaceCard(this.cardId, expectedSeq, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
               this.lastStructure = structure;
             }
           } else {
-            await this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default'));
+            await withTimeout(this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
           }
-        } catch {
-          // 单次更新失败不致命（限流/网络抖动/交互进行中 200810），下轮重试
+          this.seq = expectedSeq; // 仅成功后提交推进
+        } catch (e) {
+          // cardkit sequence OCC:失败时区分错误码
+          // - 300317(服务端 sequence 已推进超过本地,网络超时但服务端已处理):
+          //   飞书不提供读服务端 sequence 接口,跳到 Date.now() 兜底(飞书允许 sequence 是时间戳,且保证 next > 服务端 last)
+          // - 其他错误(限流/200810 交互进行中/网络抖动):服务端没接受本次 seq,seq 不推进,下轮重试用同一 expectedSeq
+          // 错误码可能在 axios 的 response.data 里（HTTP 400 时 message 只有 status code），一并带出供定位
+          const code = extractFeishuErrorCode(e);
+          const detail = feishuErrorBody(e);
+          if (code === '300317') {
+            this.seq = Date.now();
+            console.warn('[进度卡] sequence 错位(300317),本地 seq 跳到时间戳:', this.seq,
+              e instanceof Error ? e.message : e, detail ?? '');
+          } else {
+            console.warn('[进度卡] 更新失败(seq 未推进,下次用相同 expectedSeq 重试):',
+              e instanceof Error ? e.message : e, detail ?? '');
+          }
         }
         if (!this.dirty) break; // 落地期间无新请求，收工
       }
@@ -302,4 +336,32 @@ export class ProgressCard {
     const s = this.state;
     return JSON.stringify([!!s.confirm, !!s.plan, !!s.question, !!s.done, s.question?.answers ?? null]);
   }
+}
+
+/**
+ * 飞书错误响应体原文（截断防刷屏）。axios 把 HTTP 400 的业务错误码藏在 e.response.data
+ * （300317/99992402 等），e.message 只有 "Request failed with status code 400"——
+ * 不提取响应体的话日志无从定位拒绝原因（本次 card is required 事故即如此）。
+ *
+ * 导出供单元测试使用;不在生产逻辑外暴露。
+ */
+export function feishuErrorBody(e: unknown): string | undefined {
+  const data = (e as { response?: { data?: unknown } } | null | undefined)?.response?.data;
+  if (data === undefined || data === null) return undefined;
+  const s = typeof data === 'string' ? data : JSON.stringify(data);
+  return s.length > 300 ? `${s.slice(0, 300)}…` : s;
+}
+
+/**
+ * 从 gateway 抛出的 Error 中提取飞书 cardkit 错误码。
+ * 优先读 axios 响应体（HTTP 400 场景），回落 message 正则容错匹配——
+ * gateway 业务级错误信息形如 `卡片局部更新失败: {"code":300317,"msg":"..."}`。
+ * 这里用正则容错匹配 — 不引入新依赖,只对错误信息做最小解析。
+ *
+ * 导出供单元测试使用;不在生产逻辑外暴露。
+ */
+export function extractFeishuErrorCode(e: unknown): string | undefined {
+  if (!(e instanceof Error)) return undefined;
+  const m = /"code"\s*:\s*(\d+)/.exec(feishuErrorBody(e) ?? e.message);
+  return m?.[1];
 }

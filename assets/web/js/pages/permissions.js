@@ -1,48 +1,56 @@
-// ============ 权限 ============
+// ============ 权限（页内一级 tab：免确认工具 / 危险命令黑名单） ============
 import { S, $, esc, toast, saveDoc } from '../core.js';
+import { confirmDialog } from '../ui.js';
 
-let permTab = 'allow'; // 页内子 tab 状态：免确认工具 / 危险命令黑名单（重渲染保持）
+let permTab = 'allow'; // tab 状态：切换 / 重渲染保持
 function renderPermissions(el) {
   const p = S.doc.permissions || (S.doc.permissions = {});
   p.allow_tools = p.allow_tools || [];
   p.dangerous_commands = p.dangerous_commands || [];
   el.innerHTML = `
-  <div class="card">
-    <div class="subtabs">
-      <button data-t="allow" class="${permTab === 'allow' ? 'active' : ''}">免确认工具</button>
-      <button data-t="danger" class="${permTab === 'danger' ? 'active' : ''}">危险命令黑名单</button>
-    </div>
-    <div id="permPanel"></div>
-  </div>`;
-  el.querySelectorAll('.subtabs button').forEach((b) =>
+  <div class="tabs">
+    <button data-t="allow" class="${permTab === 'allow' ? 'active' : ''}">免确认工具</button>
+    <button data-t="danger" class="${permTab === 'danger' ? 'active' : ''}">危险命令黑名单</button>
+  </div>
+  <div id="permPanel"></div>`;
+  el.querySelectorAll('.tabs button').forEach((b) =>
     b.onclick = () => { permTab = b.dataset.t; renderPermissions(el); });
   const panel = $('#permPanel');
-  if (permTab === 'danger') renderDangerTab(panel, p, el);
-  else renderAllowTab(panel, p, el);
+  if (permTab === 'danger') renderDangerTab(panel, p);
+  else renderAllowTab(panel, p);
 }
 
-function renderAllowTab(panel, p, el) {
+function renderAllowTab(panel, p) {
   const defaults = S.status?.permissionDefaults?.allowTools || [];
   const isDefault = defaults.length > 0 && JSON.stringify(p.allow_tools) === JSON.stringify(defaults);
   panel.innerHTML = `
+  <div class="card">
+    <h3>免确认工具</h3>
     <div class="desc">名单内工具直接放行不弹确认卡（配置即整体替换内置默认）。Bash 仍受危险命令黑名单约束。</div>
-    <div class="row" style="max-width:480px;margin:8px 0 10px">
-      <input type="text" id="newTool" placeholder="工具名，如 Write">
-      <div class="btn-wrap"><button class="btn sm" id="addTool">添加</button></div>
-      <div class="btn-wrap"><button class="btn sm" id="resetTools" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button></div>
+    <div class="list-toolbar">
+      <input type="text" id="newTool" placeholder="工具名，如 Write" style="max-width:320px">
+      <button class="btn" id="addTool">添加</button>
+      <button class="btn" id="resetTools" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button>
     </div>
-    ${p.allow_tools.length === 0 ? '<div style="background:#fff3e0;color:var(--warn);border-radius:7px;padding:7px 12px;margin:8px 0">⚠️ 名单为空：所有工具（含 Write/Edit）都会弹确认卡</div>' : ''}
+    ${p.allow_tools.length === 0 ? '<div style="background:var(--warn-bg);color:var(--warn-tx);border-radius:7px;padding:7px 12px;margin:8px 0">⚠️ 名单为空：所有工具（含 Write/Edit）都会弹确认卡</div>' : ''}
     ${isDefault ? '<div class="hint" style="margin:8px 0"><span class="tag off">与内置默认一致</span></div>' : ''}
     <table><tbody id="toolBody"></tbody></table>
-    <div class="footer-note">权限改动即时保存并热生效（已有会话的下一个工具调用即用新名单）。plan 模式下写操作仍会经此判定：白名单命中直通，未命中弹确认卡。</div>`;
+    <div class="footer-note">权限改动即时保存并热生效（已有会话的下一个工具调用即用新名单）。plan 模式下写操作仍会经此判定：白名单命中直通，未命中弹确认卡。</div>
+  </div>`;
   $('#toolBody').innerHTML = p.allow_tools.map((t, i) =>
     `<tr><td><code>${esc(t)}</code></td><td style="width:80px"><button class="btn sm danger" data-i="${i}">删除</button></td></tr>`).join('')
     || '<tr><td colspan="2" class="hint">（空）</td></tr>';
   // 即时保存：低风险高频操作，免去「改完再点保存」两步；失败回滚内存保持一致
   $('#toolBody').querySelectorAll('button').forEach((b) =>
     b.onclick = async () => {
+      const i = Number(b.dataset.i);
+      if (!(await confirmDialog({
+        title: '移出免确认名单',
+        message: `确定将工具 <code>${esc(p.allow_tools[i])}</code> 移出免确认名单？移出后该工具的调用将恢复弹确认卡。`,
+        confirmText: '移出',
+      }))) return;
       const old = [...p.allow_tools];
-      p.allow_tools.splice(Number(b.dataset.i), 1);
+      p.allow_tools.splice(i, 1);
       if (!await saveDoc()) p.allow_tools = old;
     });
   $('#addTool').onclick = async () => {
@@ -54,34 +62,48 @@ function renderAllowTab(panel, p, el) {
   };
   $('#resetTools').onclick = async () => {
     if (!defaults.length) return;
-    if (!window.confirm('恢复为内置默认名单？当前自定义项将被覆盖（立即保存生效）。')) return;
+    if (!(await confirmDialog({
+      title: '恢复默认名单',
+      message: '恢复为内置默认名单？当前自定义项将被覆盖（立即保存生效）。',
+      confirmText: '恢复默认',
+    }))) return;
     const old = [...p.allow_tools];
     p.allow_tools = [...defaults];
     if (!await saveDoc()) p.allow_tools = old;
   };
 }
 
-function renderDangerTab(panel, p, el) {
+function renderDangerTab(panel, p) {
   const defaults = S.status?.permissionDefaults?.dangerousCommands || [];
   const isDefault = defaults.length > 0 && JSON.stringify(p.dangerous_commands) === JSON.stringify(defaults);
   panel.innerHTML = `
+  <div class="card">
+    <h3>危险命令黑名单</h3>
     <div class="desc">正则源串（不区分大小写），命中即弹确认卡。删除正则 = 放宽对应命令为直通，请谨慎。</div>
-    <div class="row" style="max-width:680px;margin:8px 0 10px">
-      <input type="text" id="newDc" placeholder="正则源串，如 \\bgit\\s+push\\b.*--force">
-      <div class="btn-wrap"><button class="btn sm" id="addDc">添加</button></div>
-      <div class="btn-wrap"><button class="btn sm" id="resetDc" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button></div>
+    <div class="list-toolbar">
+      <input type="text" id="newDc" placeholder="正则源串，如 \\bgit\\s+push\\b.*--force" style="max-width:480px">
+      <button class="btn" id="addDc">添加</button>
+      <button class="btn" id="resetDc" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button>
     </div>
-    ${p.dangerous_commands.length === 0 ? '<div style="background:#fee;color:var(--danger);border-radius:7px;padding:7px 12px;margin:8px 0">⚠️ 黑名单为空：所有 Bash 命令（含 rm -rf、sudo）将免确认直通，请确认有意为之</div>' : ''}
+    ${p.dangerous_commands.length === 0 ? '<div style="background:var(--err-bg);color:var(--err-tx);border-radius:7px;padding:7px 12px;margin:8px 0">⚠️ 黑名单为空：所有 Bash 命令（含 rm -rf、sudo）将免确认直通，请确认有意为之</div>' : ''}
     ${isDefault ? '<div class="hint" style="margin:8px 0"><span class="tag off">与内置默认一致</span></div>' : ''}
     <table><tbody id="dcBody"></tbody></table>
-    <div class="footer-note">权限改动即时保存并热生效（已有会话的下一个工具调用即用新名单）。plan 模式下写操作仍会经此判定：白名单命中直通，未命中弹确认卡。</div>`;
+    <div class="footer-note">权限改动即时保存并热生效（已有会话的下一个工具调用即用新名单）。plan 模式下写操作仍会经此判定：白名单命中直通，未命中弹确认卡。</div>
+  </div>`;
   $('#dcBody').innerHTML = p.dangerous_commands.map((s, i) =>
     `<tr><td style="width:90%"><code>${esc(s)}</code></td><td><button class="btn sm danger" data-i="${i}">删除</button></td></tr>`).join('')
     || '<tr><td colspan="2" class="hint">（空）</td></tr>';
   $('#dcBody').querySelectorAll('button').forEach((b) =>
     b.onclick = async () => {
+      const i = Number(b.dataset.i);
+      if (!(await confirmDialog({
+        title: '删除黑名单正则',
+        message: `确定删除正则 <code>${esc(p.dangerous_commands[i])}</code>？删除后对应命令将免确认直通，请确认有意为之。`,
+        danger: true,
+        confirmText: '删除',
+      }))) return;
       const old = [...p.dangerous_commands];
-      p.dangerous_commands.splice(Number(b.dataset.i), 1);
+      p.dangerous_commands.splice(i, 1);
       if (!await saveDoc()) p.dangerous_commands = old;
     });
   $('#addDc').onclick = async () => {
@@ -94,7 +116,11 @@ function renderDangerTab(panel, p, el) {
   };
   $('#resetDc').onclick = async () => {
     if (!defaults.length) return;
-    if (!window.confirm('恢复为内置默认黑名单？当前自定义项将被覆盖（立即保存生效）。')) return;
+    if (!(await confirmDialog({
+      title: '恢复默认黑名单',
+      message: '恢复为内置默认黑名单？当前自定义项将被覆盖（立即保存生效）。',
+      confirmText: '恢复默认',
+    }))) return;
     const old = [...p.dangerous_commands];
     p.dangerous_commands = [...defaults];
     if (!await saveDoc()) p.dangerous_commands = old;

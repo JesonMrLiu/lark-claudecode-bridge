@@ -1,6 +1,6 @@
 // ============ 工作区（行内编辑 + 卡级保存；改动落盘后热生效） ============
 import { S, $, esc, toast, cardDirty, applyDirty } from '../core.js';
-import { saveBarHtml, dirtyDotHtml, bindSaveBar, pickDirectory } from '../ui.js';
+import { saveBarHtml, dirtyDotHtml, bindSaveBar, pickDirectory, confirmDialog } from '../ui.js';
 
 function renderWorkspaces(el) {
   const doc = S.doc;
@@ -9,8 +9,8 @@ function renderWorkspaces(el) {
   <div class="card">
     <h3>工作区${dirtyDotHtml('ws')}</h3>
     <div class="desc">Claude 的工作目录白名单。需要「先出方案再执行」时，在飞书会话里发 /plan 按通道切换计划模式；git 仓库工作区任务收尾会自动发汇总 diff 卡片。</div>
-    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
-      <button class="btn sm" id="wsAdd">+ 添加工作区</button>
+    <div class="list-toolbar">
+      <button class="btn primary" id="wsAdd">+ 添加工作区</button>
     </div>
     <table><thead><tr><th style="width:180px">名字</th><th>路径</th><th style="width:50px"></th></tr></thead>
     <tbody id="wsBody"></tbody></table>
@@ -53,7 +53,7 @@ function renderWorkspaces(el) {
         <input type="text" data-f="path" value="${esc(ws.path || '')}">
         <button class="btn sm" data-browse="path" title="浏览选择目录">浏览</button>
       </div></td>
-      <td><button class="btn sm danger">删</button></td>`;
+      <td><button class="btn sm danger">删除</button></td>`;
     tr.querySelectorAll('[data-f]').forEach((input) => {
       input.oninput = input.onchange = () => {
         const f = input.dataset.f;
@@ -69,9 +69,15 @@ function renderWorkspaces(el) {
         cardDirty('ws', true);
       };
     });
-    // 「删」按钮精确选择（class="btn sm danger"）；原 tr.querySelector('.btn') 命中「浏览」并被浏览逻辑覆盖，故点「删」无反应
-    tr.querySelector('.danger').onclick = () => {
+    // 「删除」按钮精确选择（class="btn sm danger"）；原 tr.querySelector('.btn') 命中「浏览」并被浏览逻辑覆盖，故点「删除」无反应
+    tr.querySelector('.danger').onclick = async () => {
       if (doc.workspaces.length <= 1) return toast('至少保留一个工作区', true);
+      if (!(await confirmDialog({
+        title: '删除工作区',
+        message: `确定删除工作区「${esc(ws.name || '未命名')}」？随本卡「保存」生效，保存前可点「还原」撤销。`,
+        danger: true,
+        confirmText: '删除',
+      }))) return;
       doc.workspaces.splice(idx, 1);
       cardDirty('ws', true);
       renderWorkspaces(el);

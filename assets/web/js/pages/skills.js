@@ -4,7 +4,7 @@
 // 已装插件内（<plugin-installPath>/skills；plugin 只读，未启用时标「（未启用）」）。
 // 远端 CRUD：改动即时落盘，无页内保存条
 import { $, esc, toast, api } from '../core.js';
-import { openDrawer, closeDrawer } from '../ui.js';
+import { openDrawer, closeDrawer, confirmDialog, promptDialog } from '../ui.js';
 
 /** 来源标签（function：plugin 来源需要拼插件名与启用状态） */
 const SOURCE_TAG = {
@@ -25,12 +25,12 @@ function renderSkills(el) {
   <div class="card">
     <h3>Skills</h3>
     <div class="desc">Claude Code 技能（每项一个目录，含 SKILL.md）。列表聚合四个来源：本机用户级、bridge 自管用户级、各工作区项目级、已装插件内的 skills（只读展示）。新增（含 zip 导入）统一进用户级生效目录。</div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px">
-      <button class="btn sm" id="skillImport">📦 导入 zip</button>
-      <button class="btn sm" id="skillAdd">+ 新建</button>
+    <div class="list-toolbar">
+      <button class="btn" id="skillImport">导入 zip</button>
+      <button class="btn primary" id="skillAdd">+ 新建</button>
     </div>
     <input type="file" id="skillZipFile" accept=".zip" style="display:none">
-    <input type="search" id="skillSearch" placeholder="🔍 按名字 / 来源 / 路径过滤…" style="width:100%;padding:7px 10px;margin-bottom:8px;border:1px solid var(--border);border-radius:7px">
+    <input type="search" class="list-search" id="skillSearch" placeholder="按名字 / 来源 / 路径过滤…">
     <table><thead><tr>
       <th style="width:170px">名字</th><th>说明</th><th style="width:130px">来源</th><th style="width:240px">路径</th><th style="width:110px"></th>
     </tr></thead>
@@ -83,7 +83,7 @@ async function loadSkills() {
   }
   const skills = data.skills || [];
   if (skills.length === 0) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="5" class="desc">暂无 skill（四个来源均未发现 SKILL.md）。可点上方「+ 新建」或「📦 导入 zip」。</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="5" class="desc">暂无 skill（四个来源均未发现 SKILL.md）。可点上方「+ 新建」或「导入 zip」。</td></tr>`;
     return;
   }
   body.innerHTML = '';
@@ -97,8 +97,8 @@ async function loadSkills() {
       <td><span class="chip">${tag}</span></td>
       <td><code class="desc">${esc(s.path)}</code></td>
       <td>
-        <button class="btn sm" data-browse="${esc(s.name)}">📂 浏览</button>
-        ${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删</button>` : ''}
+        <button class="btn sm" data-browse="${esc(s.name)}">查看</button>
+        ${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删除</button>` : ''}
       </td>`;
     tr.querySelector('[data-browse]').onclick = () => browseSkill(s);
     const delBtn = tr.querySelector('[data-del]');
@@ -109,8 +109,13 @@ async function loadSkills() {
   filterSkillRows();
 }
 
-function delSkill(s) {
-  if (!confirm(`删除 skill "${s.name}"（${sourceTag(s)}）？该目录会被整体移除（不可恢复）。`)) return;
+async function delSkill(s) {
+  if (!(await confirmDialog({
+    title: '删除 skill',
+    message: `确定删除 skill <b>${esc(s.name)}</b>（${sourceTag(s)}）？该目录会被整体移除（不可恢复）。`,
+    danger: true,
+    confirmText: '删除',
+  }))) return;
   api('POST', '/api/skills/action', { op: 'delete', name: s.name, source: s.source, workspaceName: s.workspaceName })
     .then(() => { toast('已删除'); void loadSkills(); })
     .catch((e) => toast(e.message, true));
@@ -122,7 +127,7 @@ function delSkill(s) {
 function renderMarkdown(src) {
   const codeBlocks = [];
   let text = String(src).replace(/```(\w*)\n?([\s\S]*?)(?:```|$)/g, (_m, lang, code) => {
-    codeBlocks.push(`<pre style="background:#f6f8fa;border:1px solid var(--border);border-radius:8px;padding:10px;overflow:auto;font-size:12px"><code>${esc(code.replace(/\n$/, ''))}</code></pre>`);
+    codeBlocks.push(`<pre style="background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:10px;overflow:auto;font-size:12px"><code>${esc(code.replace(/\n$/, ''))}</code></pre>`);
     return `${codeBlocks.length - 1}`;
   });
   const lines = text.split('\n');
@@ -130,7 +135,7 @@ function renderMarkdown(src) {
   let listOpen = false;
   const closeList = () => { if (listOpen) { out.push('</ul>'); listOpen = false; } };
   const inline = (s) => esc(s)
-    .replace(/`([^`]+)`/g, '<code style="background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px">$1</code>')
+    .replace(/`([^`]+)`/g, '<code style="background:var(--code-bg);padding:1px 5px;border-radius:4px;font-size:12px">$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--primary)">$1</a>');
@@ -162,7 +167,7 @@ function renderMarkdown(src) {
 /** 浏览抽屉：左侧文件树（目录懒加载展开），右侧查看区（markdown 文件支持 原文/视图/两者 三模式） */
 function browseSkill(s) {
   openDrawer({
-    title: `📂 ${s.name} · ${sourceTag(s)}`,
+    title: `${s.name} · ${sourceTag(s)}`,
     bodyHtml: `
       <div class="hint" style="margin:0 0 10px"><code class="desc">${esc(s.path)}</code></div>
       <div style="display:flex;gap:14px;align-items:flex-start">
@@ -226,7 +231,7 @@ function browseSkill(s) {
           const r = await api('GET', `/api/skills/files?path=${encodeURIComponent(dir)}`);
           files = r.files || [];
         } catch (e) {
-          container.innerHTML = `<div class="desc" style="padding:2px 6px;color:#dc2626">${esc(e.message)}</div>`;
+          container.innerHTML = `<div class="desc" style="padding:2px 6px;color:var(--err-tx)">${esc(e.message)}</div>`;
           return;
         }
         container.innerHTML = '';
@@ -237,7 +242,7 @@ function browseSkill(s) {
         for (const f of files) {
           const row = document.createElement('div');
           row.style.cssText = 'padding:3px 6px;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
-          row.onmouseenter = () => { row.style.background = '#f2f5fa'; };
+          row.onmouseenter = () => { row.style.background = 'var(--off-bg)'; };
           row.onmouseleave = () => { row.style.background = ''; };
           const childPath = `${dir.replace(/[\\/]+$/, '')}/${f.name}`;
           if (f.isDir) {
@@ -262,7 +267,7 @@ function browseSkill(s) {
             row.onclick = () => {
               tree.querySelectorAll('[data-active]').forEach((x) => { delete x.dataset.active; x.style.background = ''; x.style.fontWeight = ''; });
               row.dataset.active = '1';
-              row.style.background = '#eef3ff';
+              row.style.background = 'var(--primary-weak)';
               row.style.fontWeight = '600';
               void openFile(childPath);
             };
@@ -315,7 +320,12 @@ function bindZipImport() {
     const zipBase64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
     // 根打包（无子目录层级）时后端拿不到名字，先问一次；目录打包可留空由后端取名
     const guess = file.name.replace(/\.zip$/i, '');
-    const name = prompt(`skill 名（zip 内含目录结构时可留空，将取目录名；根打包时必填。建议：${guess})`, '') ?? '';
+    const name = (await promptDialog({
+      title: '导入 skill',
+      message: `zip 内含目录结构时可留空（将取目录名）；根打包时必填。建议：${esc(guess)}`,
+      placeholder: 'skill 名（可留空）',
+      confirmText: '导入',
+    })) ?? '';
     try {
       const r = await api('POST', '/api/skills/import', { zipBase64, name: name.trim() || undefined });
       toast(`已导入 "${r.name}"（${r.files} 个文件）`);

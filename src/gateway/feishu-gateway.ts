@@ -479,11 +479,15 @@ export class FeishuGateway {
     if (res.code !== 0) throw new Error(`卡片局部更新失败: ${JSON.stringify(res)}`);
   }
 
-  /** 卡片实体全量替换（结构变化：交互区增删/终态/选中态），data 为新卡片 JSON */
+  /** 卡片实体全量替换（结构变化：交互区增删/终态/选中态），data 为新卡片 JSON。
+   *  ⚠️ 更新口请求体形状与创建口不同：创建（POST /cards）是顶层 {type,data}，
+   *  更新（PUT /cards/:id）须把 {type,data} 嵌套在 card 字段下、sequence 同级——
+   *  发创建式字段会被飞书直接 400（card is required），所有结构变化（confirm/plan/
+   *  question 区、终态）都渲染不上屏，且结构签名不变回来前连计时局部更新也一并停摆 */
   async replaceCardEntity(cardId: string, sequence: number, card: unknown): Promise<void> {
     const res = await this.client.request({
       method: 'PUT', url: `/open-apis/cardkit/v1/cards/${cardId}`,
-      data: { type: 'card_json', data: JSON.stringify(card), sequence },
+      data: { card: { type: 'card_json', data: JSON.stringify(card) }, sequence },
     });
     if (res.code !== 0) throw new Error(`卡片全量更新失败: ${JSON.stringify(res)}`);
   }

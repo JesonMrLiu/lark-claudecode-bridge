@@ -1,17 +1,18 @@
 // ============ 斜杠命令（远端直操作飞书 API；本页与 config.yaml / 保存按钮无关） ============
 import { S, $, esc, toast, api } from '../core.js';
-import { openDrawer, closeDrawer } from '../ui.js';
+import { openDrawer, closeDrawer, confirmDialog } from '../ui.js';
 
 function renderSlash(el) {
   el.innerHTML = `
   <div class="card">
     <h3>飞书斜杠命令（远端管理）</h3>
     <div class="desc">直接读写飞书开放平台已注册的斜杠命令；聊天输入 <code>/</code> 弹出指令面板，选中后可继续输入描述再发送。需给应用开通 <code>application:app_slash_command</code> 读写权限并发布版本；改动约 5 分钟后生效（PC 端 7.70+）。<b>本页操作即时提交飞书，与底部「保存」按钮无关。</b></div>
-    <div class="row" style="align-items:end">
-      <div style="max-width:320px"><label>目标应用</label><select id="scApp"></select></div>
+    <div class="list-toolbar">
+      <div style="max-width:320px;width:100%"><label>目标应用</label><select id="scApp"></select></div>
+      <span class="spacer"></span>
       <button class="btn" id="scReload">刷新列表</button>
-      <button class="btn primary" id="scAdd">+ 新增命令</button>
       <button class="btn" id="scBuiltins">补齐内置命令</button>
+      <button class="btn primary" id="scAdd">+ 新增命令</button>
     </div>
     <table style="margin-top:12px"><thead><tr><th style="width:170px">命令</th><th>描述</th><th style="width:150px">图标</th><th style="width:130px">操作</th></tr></thead>
     <tbody id="scBody"><tr><td colspan="4" style="padding:36px 0"><div class="br-spin-sm"></div><div class="hint" style="text-align:center">正在从飞书拉取斜杆命令…</div></td></tr></tbody></table>
@@ -58,7 +59,12 @@ function renderSlash(el) {
     }
   };
   const delRemote = async (cid, cmd) => {
-    if (!window.confirm(`确认删除远端命令 /${cmd}？（约 5 分钟后从飞书面板消失，不可恢复）`)) return;
+    if (!(await confirmDialog({
+      title: '删除斜杠命令',
+      message: `确认删除远端命令 <code>/${esc(cmd)}</code>？约 5 分钟后从飞书面板消失，不可恢复。`,
+      danger: true,
+      confirmText: '删除',
+    }))) return;
     try {
       await api('POST', '/api/slash-commands/action', { op: 'delete', app: appSel.value, commandId: cid });
       toast(`已删除 /${cmd}`);

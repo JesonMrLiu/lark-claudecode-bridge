@@ -1,6 +1,6 @@
 // ============ 应用（列表 + 抽屉编辑；输入实时写回 S.doc.apps，抽屉「保存」一次落盘） ============
 import { S, $, esc, toast, snapDoc, saveDoc } from '../core.js';
-import { openDrawer, closeDrawer, cancelDrawer } from '../ui.js';
+import { openDrawer, closeDrawer, cancelDrawer, confirmDialog } from '../ui.js';
 
 function renderApps(el) {
   const apps = S.doc.apps || (S.doc.apps = []);
@@ -8,7 +8,7 @@ function renderApps(el) {
   <div class="card">
     <h3>飞书应用（机器人）</h3>
     <div class="desc">每个应用一条独立长连接与会话池。点击行或「编辑」在抽屉中配置；App Secret 已脱敏，留空 = 保持不变。凭证 / 名称 / 域名 / 默认工作区 / 并发 / 人格 / 环境变量改动需重启 lcb start；触发词与显式插件热生效。</div>
-    <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+    <div class="list-toolbar">
       <button class="btn primary" id="addApp">+ 新增应用</button>
     </div>
     <table>
@@ -126,7 +126,7 @@ function openAppDrawer(apps, idx, el, snap) {
         tb.innerHTML = list.map((item, i) => `
           <tr>
             ${def.cols.map(([col, ph]) => `<td><input type="text" data-l="${i}" data-c="${col}" value="${esc(item?.[col] ?? '')}" placeholder="${esc(ph)}"></td>`).join('')}
-            <td><button class="btn sm danger" data-rm="${i}">删</button></td>
+            <td><button class="btn sm danger" data-rm="${i}">删除</button></td>
           </tr>`).join('');
         tb.querySelectorAll('input[data-l]').forEach((input) => input.oninput = () => {
           app[def.key][Number(input.dataset.l)][input.dataset.c] = input.value;
@@ -151,7 +151,7 @@ function openAppDrawer(apps, idx, el, snap) {
           <tr>
             <td><input type="text" data-ei="${i}" data-c="key" value="${esc(r.key)}" placeholder="SOME_KEY"></td>
             <td><input type="text" data-ei="${i}" data-c="value" value="${esc(r.value)}" placeholder="some-value"></td>
-            <td><button class="btn sm danger" data-rm="${i}">删</button></td>
+            <td><button class="btn sm danger" data-rm="${i}">删除</button></td>
           </tr>`).join('');
         tb.querySelectorAll('input[data-ei]').forEach((input) => input.oninput = () => {
           envRows[Number(input.dataset.ei)][input.dataset.c] = input.value;
@@ -176,7 +176,12 @@ function openAppDrawer(apps, idx, el, snap) {
       // ---- 删除 / 保存 / 取消 ----
       foot.querySelector('#dwDel').onclick = async () => {
         if (apps.length <= 1) return toast('至少保留一个应用', true);
-        if (!window.confirm(`确认删除应用「${app.name || app.app_id || '未命名'}」？删除将立即保存生效。`)) return;
+        if (!(await confirmDialog({
+          title: '删除应用',
+          message: `确认删除应用「${esc(app.name || app.app_id || '未命名')}」？删除将立即保存生效。`,
+          danger: true,
+          confirmText: '删除',
+        }))) return;
         apps.splice(idx, 1);
         if (await saveDoc()) closeDrawer();
         else cancelDrawer(); // 落盘失败：回滚删除，保留编辑现场让用户重试

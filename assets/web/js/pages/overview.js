@@ -1,6 +1,7 @@
 // ============ 概览 ============
 // 桥接器启停 / 版本更新（宿主进程管理：embedded 页面随进程生死，独立页面经 PID 跨进程操作）
 import { S, $, esc, toast, api, refresh } from '../core.js';
+import { confirmDialog } from '../ui.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const UPD = { checkedAt: 0, data: null };
@@ -54,9 +55,9 @@ async function startFlow() {
 async function stopFlow() {
   const embedded = !!S.status?.embedded;
   const msg = embedded
-    ? '停止后本配置页将随桥接器进程一同关闭。\n之后可运行 lcb ui 重开配置页（并在其中重新启动桥接器）。确定停止？'
-    : '停止后机器人将不再响应消息。确定停止桥接器进程？';
-  if (!confirm(msg)) return;
+    ? '停止后本配置页将随桥接器进程一同关闭。\n之后可运行 lcb ui 重开配置页（并在其中重新启动桥接器）。'
+    : '停止后机器人将不再响应消息。';
+  if (!(await confirmDialog({ title: '停止桥接器', message: msg, danger: true, confirmText: '停止' }))) return;
   try {
     const r = await bridgeActionSafe('stop');
     if (embedded) {
@@ -119,7 +120,7 @@ async function doCheckUpdate() {
 async function runUpdateFlow() {
   const running = S.status?.embedded || S.status?.bridge?.running;
   const extra = running ? '，完成后自动重启桥接器（页面将短暂失联后自动恢复）' : '（桥接器未在运行，下次启动生效）';
-  if (!confirm(`将通过 npm 安装最新版本${extra}，可能需要 1-2 分钟。继续？`)) return;
+  if (!(await confirmDialog({ title: '一键更新', message: `将通过 npm 安装最新版本${extra}，可能需要 1-2 分钟。`, confirmText: '开始更新' }))) return;
   const btn = $('#btnUpdRun');
   if (btn) { btn.disabled = true; btn.textContent = '更新中…'; }
   try {

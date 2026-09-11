@@ -1,5 +1,6 @@
 // ============ 插件 ============
 import { $, esc, toast, api } from '../core.js';
+import { confirmDialog } from '../ui.js';
 
 // 点击 combobox 之外收起面板的监听只注册一次（模块级标志，等价原 document.body 标记法）
 let comboHideBound = false;
@@ -76,12 +77,25 @@ async function renderPlugins(el) {
             <button class="btn sm danger" data-op="uninstall" data-arg="${esc(p.key)}" data-dir="${p.source}">卸载</button>
           </td>
         </tr>`).join('');
-      body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = () => {
+      body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = async () => {
         const { op, arg, dir } = b.dataset;
-        // 影响性操作先二次确认（启用/安装/市场管理为新增类，无需确认）
-        if (op === 'disable' && !window.confirm(`确定要停用插件「${arg}」吗？\n停用后下一条消息不再加载该插件，可随时再启用。`)) return;
-        if (op === 'update' && !window.confirm(`确定要更新插件「${arg}」吗？\n更新后下一条消息按新版本加载。`)) return;
-        if (op === 'uninstall' && !window.confirm(`确定要卸载插件「${arg}」吗？\n卸载后需重新安装才能恢复，进行中的会话不受影响。`)) return;
+        // 影响性操作先二次确认（启用/安装/市场添加为新增类，无需确认）
+        if (op === 'disable' && !(await confirmDialog({
+          title: '停用插件',
+          message: `确定停用插件 <code>${esc(arg)}</code> 吗？停用后下一条消息不再加载该插件，可随时再启用。`,
+          confirmText: '停用',
+        }))) return;
+        if (op === 'update' && !(await confirmDialog({
+          title: '更新插件',
+          message: `确定更新插件 <code>${esc(arg)}</code> 吗？更新后下一条消息按新版本加载。`,
+          confirmText: '更新',
+        }))) return;
+        if (op === 'uninstall' && !(await confirmDialog({
+          title: '卸载插件',
+          message: `确定卸载插件 <code>${esc(arg)}</code> 吗？卸载后需重新安装才能恢复，进行中的会话不受影响。`,
+          danger: true,
+          confirmText: '卸载',
+        }))) return;
         // 慢操作走进度弹框；亚秒级启停走轻量 act（弹框一闪而过反而干扰）
         if (op === 'enable' || op === 'disable') act(op, arg, dir, b);
         else runOpDialog(op, arg, dir, b);
@@ -273,7 +287,16 @@ async function renderPlugins(el) {
     $('#plDir').value = $('#plMarketDir').value;
     runOpDialog('marketplace-add', v, $('#plMarketDir').value, $('#plDoMarketAdd'));
   };
-  $('#plDoMarketUpdate').onclick = () => runOpDialog('update-all', '', $('#plMarketDir').value, $('#plDoMarketUpdate'));
+  $('#plDoMarketUpdate').onclick = async () => {
+    // 影响面大（该目录全部已装插件逐个更新）：先二次确认
+    const dirLabel = $('#plMarketDir').value === 'bridge' ? 'bridge 托管目录' : '本机 ~/.claude';
+    if (!(await confirmDialog({
+      title: '全部更新',
+      message: `将刷新市场索引，并逐个更新「${dirLabel}」下的全部已装插件。确定继续？`,
+      confirmText: '全部更新',
+    }))) return;
+    runOpDialog('update-all', '', $('#plMarketDir').value, $('#plDoMarketUpdate'));
+  };
   await Promise.all([load(), loadAvailable()]);
 }
 

@@ -226,9 +226,11 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
               agent: { id: message.task_id, description: message.description, type: message.subagent_type ?? 'task' },
             });
           } else if (message.subtype === 'task_notification') {
-            // 后台任务落定（completed/failed/stopped）：summary 为任务自述结论
+            // 后台任务落定（completed/failed/stopped）：summary 为任务自述结论。
+            // status 会原文渲染进进度卡正文并随每次卡片更新发送——子代理完整报告可达
+            // 上万字符，截断保留结论摘要（全文另有 agent 清单与 transcript 承载）
             const label = message.status === 'completed' ? '✅ 后台任务完成' : message.status === 'failed' ? '❌ 后台任务失败' : '🛑 后台任务已停止';
-            await cb.onProgress({ kind: 'status', content: `${label}: ${message.summary}` });
+            await cb.onProgress({ kind: 'status', content: `${label}: ${(message.summary ?? '').slice(0, 300)}` });
             await cb.onProgress({
               kind: 'agent-settle',
               id: message.task_id,
