@@ -61,6 +61,10 @@ export function buildTextCard(markdown: string): unknown {
  *  露出结果尾部。index.ts 以同一常量判断「短回复是否需要独立结果消息」，两处保持同值，
  *  否则 400–1200 区间内容会卡片/消息两边都不展示 */
 export const PROGRESS_TAIL_CHARS = 400;
+/** 独立结果消息的按钮化阈值（0.20.0）：最终回复超过此字数不再直接发全文卡片，改为落盘 md
+ *  + 「查看完整内容」按钮 + 确认/按意见修改引导——飞书单卡 30KB 上限与可读性都不允许长文
+ *  铺卡片，旧版 4000 字硬截断会静默丢内容。400~2000 字区间仍直接发全文卡片 */
+export const LONG_OUTPUT_THRESHOLD = 2000;
 /** 图片卡片：caption（可选）显示在图片上方——逐张发图时带编号说明用 */
 export function buildImageCard(caption: string | undefined, imgKey: string): unknown {
   const elements: unknown[] = [];
@@ -181,30 +185,47 @@ export function buildProgressCard(state: ProgressState, widthMode: 'default' | '
             { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('plan-revise', '📝 按意见修改', 'default', state.plan.requestId, 'plan_btn_revise')] },
           ],
         },
-        { tag: 'input', name: 'feedback', width: 'fill', placeholder: { tag: 'plain_text', content: '修改意见（点「按意见修改」时随意见重新出计划）' } },
+        { tag: 'input', name: 'feedback', width: 'fill', multiline: true, rows: 3, max_length: 1000, placeholder: { tag: 'plain_text', content: '修改意见（点「按意见修改」时随意见重新出计划，可多行）' } },
       ],
     });
   }
-  // 内嵌提问确认区（#3）：选项按钮全宽单行 + 提交按钮；qa-pick PATCH 选中态（✓ + primary），
-  // qa-submit 一次性 resolve。点击是 callback（非 form 提交），所以可与 plan/confirm 共存区下同列
+  // 内嵌提问确认区（#3 + 0.20.0）：整个区域包进一个 form——飞书 input 值必须 form 容器 +
+  // submit 按钮才回传。每题：标题 + 选项按钮（普通 callback，仅 qa-pick 切选中态，不提交表单）
+  // + 自定义输入框（custom_N）；底部「提交答案」为 submit 按钮，form_value 携带全部输入。
+  // 合并语义（wiring 侧）：单选 custom 优先覆盖选项，多选 custom 追加进选中数组
   if (state.question) {
     const q = state.question;
-    elements.push(md(`**❓ Claude 需要你确认** · 工作区 \`${q.workspaceName}\``));
+    const formElements: unknown[] = [
+      md(`**❓ Claude 需要你确认** · 工作区 \`${q.workspaceName}\`\n\n点选选项，或在每题下方输入框填写其他答案（单选：输入优先；多选：输入追加），完成后点「提交答案」`),
+    ];
     q.questions.forEach((qq, qIndex) => {
       const sel = q.answers[qIndex];
       const picked = Array.isArray(sel) ? sel : sel !== undefined ? [sel] : [];
-      elements.push(md(`**${qIndex + 1}. ${qq.question}**${qq.multiSelect ? '（可多选）' : ''}`));
-      for (const o of qq.options) {
-        elements.push(embeddedQaOptionButton(q.requestId, qIndex, o.label, picked.includes(o.label)));
-      }
+      formElements.push(md(`**${qIndex + 1}. ${qq.question}**${qq.multiSelect ? '（可多选）' : ''}`));
+      qq.options.forEach((o, optIndex) => {
+        formElements.push(embeddedQaOptionButton(q.requestId, qIndex, optIndex, o.label, picked.includes(o.label)));
+      });
+      formElements.push({
+        tag: 'input',
+        name: `custom_${qIndex}`,
+        width: 'fill',
+        multiline: true,
+        rows: 2,
+        max_length: 500,
+        placeholder: { tag: 'plain_text', content: '其他答案（可选）：单选时优先生效，多选时与选项合并' },
+      });
     });
-    elements.push({
+    formElements.push({
       tag: 'button',
+      // form 容器内交互组件 name 必填（卡片内全局唯一），否则 form 数据发送失败
+      name: 'qa_btn_submit',
       text: { tag: 'plain_text', content: '✅ 提交答案' },
       type: 'primary',
+      form_action_type: 'submit',
       margin: '8px 0px 0px 0px',
       behaviors: [{ type: 'callback', value: { requestId: q.requestId, decision: 'qa-submit' } }],
     });
+    elements.push({ tag: 'form', name: 'qa_form', elements: formElements });
   }
   // 计时行上方加分隔横线，与正文/确认区做视觉划分
   elements.push({ tag: 'hr' });
@@ -213,15 +234,36 @@ export function buildProgressCard(state: ProgressState, widthMode: 'default' | '
 }
 
 /**
- * 局部更新 actions（cardkit batch_update 的 partial_update_element）：只替换状态主块与
+ * 局部更新 actions（cardkit batch_update 的 partial_update_element）：默认只替换状态主块与
  * 计时行两个 markdown 组件的 content，form/按钮区完全不触碰——用户在 plan 意见输入框
  * 里打的字不会被状态心跳刷掉。仅结构未变化时使用（结构变化走全量替换）。
+ * includeQaButtons=true 时追加 qa 选项按钮的局部替换（0.20.0：选中态变化不再触发全量
+ * 替换——那会清空 form 内未提交的自定义输入，改走按钮 element_id 级局部更新）。
  */
-export function buildPartialUpdateActions(state: ProgressState): Array<{ action: string; params: { element_id: string; partial_element: { content: string } } }> {
-  return [
+export function buildPartialUpdateActions(state: ProgressState, includeQaButtons = false): Array<{ action: string; params: { element_id: string; partial_element: unknown } }> {
+  const actions: Array<{ action: string; params: { element_id: string; partial_element: unknown } }> = [
     { action: 'partial_update_element', params: { element_id: MAIN_ELEMENT_ID, partial_element: { content: buildMainLines(state).join('\n') } } },
     { action: 'partial_update_element', params: { element_id: TIMER_ELEMENT_ID, partial_element: { content: buildTimerLine(state) } } },
   ];
+  if (includeQaButtons && state.question) {
+    const q = state.question;
+    q.questions.forEach((qq, qIndex) => {
+      const sel = q.answers[qIndex];
+      const picked = Array.isArray(sel) ? sel : sel !== undefined ? [sel] : [];
+      qq.options.forEach((o, optIndex) => {
+        const selected = picked.includes(o.label);
+        actions.push({
+          action: 'partial_update_element',
+          params: {
+            element_id: qaOptionElementId(qIndex, optIndex),
+            // 按钮可局部更新的字段：文案（✓ 前缀）与样式（primary/default）
+            partial_element: { text: { tag: 'plain_text', content: selected ? `✓ ${o.label}` : o.label }, type: selected ? 'primary' : 'default' },
+          },
+        });
+      });
+    });
+  }
+  return actions;
 }
 export const DECISION_TEXT: Record<PermissionDecision, string> = {
   allow: '✅ 已允许',
@@ -235,7 +277,7 @@ export interface PlanCardRequest { requestId: string; plan: string; workspaceNam
 
 export type PlanCardDecision = Extract<CardDecision, `plan-${string}`>;
 
-function planButton(decision: PlanCardDecision, label: string, type: string, requestId: string, name: string): unknown {
+function planButton(decision: CardDecision, label: string, type: string, requestId: string, name: string): unknown {
   return {
     tag: 'button',
     // form 容器内交互组件 name 必填（卡片内唯一）：点击回调据此 + form_value 携带输入框值
@@ -256,10 +298,19 @@ function planButton(decision: PlanCardDecision, label: string, type: string, req
   };
 }
 
-/** 内嵌提问按钮（qa-pick callback）：与独立卡片同款「选中 ✓ + primary」视觉，qa-pick 不消耗挂起项，仅 PATCH 选中态 */
-function embeddedQaOptionButton(reqId: string, qIndex: number, label: string, selected: boolean): unknown {
+/** qa 选项按钮的 cardkit element_id（局部更新定位用）：字母开头/仅字母数字下划线/≤20 字符 */
+function qaOptionElementId(qIndex: number, optIndex: number): string {
+  return `qa_opt_${qIndex}_${optIndex}`;
+}
+
+/** 内嵌提问按钮（qa-pick callback）：form 内普通回传按钮（不带 form_action_type，点击仅切换
+ *  选中态不提交表单）；name/element_id 必备——前者是 form 数据回传要求，后者供 cardkit
+ *  partial_update_element 局部替换选中态视觉（✓ + primary），不清空 form 内未提交输入 */
+function embeddedQaOptionButton(reqId: string, qIndex: number, optIndex: number, label: string, selected: boolean): unknown {
   return {
     tag: 'button',
+    name: `qa_pick_${qIndex}_${optIndex}`,
+    element_id: qaOptionElementId(qIndex, optIndex),
     width: 'fill',
     text: { tag: 'plain_text', content: selected ? `✓ ${label}` : label },
     type: selected ? 'primary' : 'default',
@@ -277,3 +328,60 @@ export interface QuestionCardRequest {
 
 /** 已选答案的中间态（wiring 侧维护）：问题下标 → 选中的 option label（multiSelect 为数组） */
 export type QuestionCardAnswers = Record<number, string | string[]>;
+
+// ---------- 长回复收起卡（0.20.0：最终回复 > LONG_OUTPUT_THRESHOLD 时的呈现与后续引导） ----------
+
+export interface LongOutputCardRequest {
+  requestId: string;
+  /** 落盘的完整回复 md 路径（「查看完整内容」回调 send_file 用） */
+  filePath: string;
+  charCount: number;
+  workspaceName: string;
+}
+
+/**
+ * 长回复收起卡：正文不进卡片（30KB 上限与可读性），「查看完整内容」按钮 send_file 发原文；
+ * 下方 form 提供后续引导——「确认方案 / 按意见修改」（点击即以对应 prompt 发起新一轮任务，
+ * wiring 侧经 outputPending 挂起项校验发起人），也可直接回复消息。
+ */
+export function buildLongOutputCard(req: LongOutputCardRequest): unknown {
+  const elements: unknown[] = [
+    md(`**📄 回复较长已收起**（共 ${req.charCount} 字）· 工作区 \`${req.workspaceName}\`\n\n请先点击「📂 查看完整内容」阅读全文，再选择后续操作；也可直接回复消息（确认或提意见均可）`),
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: '📂 查看完整内容' },
+      type: 'default',
+      behaviors: [{ type: 'callback', value: { requestId: req.requestId, decision: 'view-output-file' as CardDecision, filePath: req.filePath } }],
+    },
+    {
+      tag: 'form',
+      name: 'output_form',
+      elements: [
+        {
+          tag: 'column_set',
+          flex_mode: 'flow',
+          columns: [
+            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('output-confirm', '✅ 确认方案', 'primary', req.requestId, 'out_btn_confirm')] },
+            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('output-revise', '✏️ 按意见修改', 'default', req.requestId, 'out_btn_revise')] },
+          ],
+        },
+        { tag: 'input', name: 'feedback', width: 'fill', multiline: true, rows: 2, max_length: 1000, placeholder: { tag: 'plain_text', content: '修改意见（点「按意见修改」时生效，可多行）' } },
+      ],
+    },
+  ];
+  return card(elements);
+}
+
+/** 长回复卡已处理态（确认/提意见后的回调响应内联换卡）：保留查看按钮，决策按钮区收为一行文案 */
+export function buildLongOutputSettledCard(req: LongOutputCardRequest, settledText: string): unknown {
+  return card([
+    md(`**📄 回复较长已收起**（共 ${req.charCount} 字）· 工作区 \`${req.workspaceName}\``),
+    {
+      tag: 'button',
+      text: { tag: 'plain_text', content: '📂 查看完整内容' },
+      type: 'default',
+      behaviors: [{ type: 'callback', value: { requestId: req.requestId, decision: 'view-output-file' as CardDecision, filePath: req.filePath } }],
+    },
+    md(settledText),
+  ]);
+}

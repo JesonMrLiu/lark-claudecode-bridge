@@ -48,7 +48,7 @@ lcb start
 ## 飞书应用配置（图文）
 
 1. https://open.feishu.cn → 创建企业自建应用 → 添加「机器人」能力
-2. 权限管理开通：`im:message`（**含读取单条消息：回复链上游内容拼接用，不开则回复消息时降级为只发当前消息**）、`im:message:send_as_bot`、`im:resource`（**接收用户图片时下载消息资源用，不开则图片任务会提示下载失败**）、`contact:user.base:readonly`、`application:app_slash_command:write` / `application:app_slash_command:read`（斜杠命令一键同步用，见下）
+2. 权限管理开通：`im:message`（**含读取单条消息：回复链上游内容拼接用，不开则回复消息时降级为只发当前消息**）、`im:message:send_as_bot`、`im:resource`（**接收用户图片时下载消息资源用，不开则图片任务会提示下载失败**）、`contact:user.base:readonly`、`application:app_slash_command:write` / `application:app_slash_command:read`（斜杠命令一键同步用，见下）、`cardkit:card:write`（**强烈建议开通：卡片实体模式，进度卡状态局部刷新、计划/提问表单输入不被心跳清空**。不开时自动降级为整卡更新——功能不缺，但任务运行中的状态刷新体验受限；0.20.0 起降级模式下挂起输入已有冻结保护，正在输入的意见/自定义答案不会被清掉）
 3. 事件与回调 → 事件配置 → 订阅方式选「使用长连接接收事件」→ 添加 `im.message.receive_v1`
 4. 事件与回调 → 回调配置 → 订阅方式选「使用长连接接收回调」→「已订阅的回调」点「添加回调」，添加「卡片回传交互」（`card.action.trigger`）
 5. 凭证与基础信息 → 复制 App ID / App Secret

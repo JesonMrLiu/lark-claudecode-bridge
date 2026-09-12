@@ -1,7 +1,7 @@
 // 装配主流程：消息 → 访问控制 → 命令 → 通道队列 → 执行 → 确认卡片 → 回传
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 import type {
   BridgeConfig, CardActionEvent, CardActionResponse, CardDecision, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
   IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory,
@@ -17,7 +17,9 @@ import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard } from './gateway/progress-card.js';
 import {
   DECISION_TEXT,
-  PROGRESS_TAIL_CHARS, type PlanCardRequest,
+  PROGRESS_TAIL_CHARS, LONG_OUTPUT_THRESHOLD,
+  buildLongOutputCard, buildLongOutputSettledCard,
+  type PlanCardRequest, type LongOutputCardRequest,
   type QuestionCardRequest, type QuestionCardAnswers,
 } from './gateway/card-builder.js';
 import { buildDiffSummaryCards } from './gateway/diff-card.js';
@@ -76,6 +78,25 @@ const PLAN_DECISION_TEXT: Record<Extract<CardDecision, `plan-${string}`>, string
   // plan-view-file 不消费挂起项，仅 toast「正在发送方案文件…」——文案不在此出现，留口供编译期完整性
   'plan-view-file': '',
 };
+
+/**
+ * 运行期文档落盘（plan 方案 / 超长回复共用）：CONFIG_DIR 下按子目录 + 时间戳 + 工作区
+ * slug 命名，返回文件路径；写盘失败返回 ''（调用方回退降级行为，不影响主流程）
+ */
+function writeRuntimeMarkdown(subDir: string, slugBase: string, content: string, logTag: string): string {
+  const dir = join(CONFIG_DIR, subDir);
+  try { mkdirSync(dir, { recursive: true }); } catch { /* 已存在 */ }
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const slug = (slugBase || subDir).replace(/[^\w-]+/g, '_').slice(0, 32);
+  const filePath = join(dir, `${ts}-${slug}.md`);
+  try {
+    writeFileSync(filePath, content, 'utf8');
+    return filePath;
+  } catch (e) {
+    console.error(logTag, e);
+    return '';
+  }
+}
 
 interface ChannelRuntime {
   queue: Promise<void>;
@@ -177,6 +198,17 @@ export function createBridge(
     channelKey: string;
     chatId: string;
     answers: QuestionCardAnswers;
+  }>();
+  // 长回复卡挂起项（0.20.0）：requestId → 收起卡的查看/确认/提意见上下文。与 planPending
+  // 不同——无 Promise 要 resolve（任务已结束，确认/提意见是「发起新一轮」），条目仅用于：
+  // 发起人校验（仅任务发起人可操作）、settled 防重（确认/提意见只生效一次，查看可反复）、
+  // filePath/workspaceName 上下文。条目常驻供用户回看历史卡片时再次查看全文（量级：每次
+  // 超长回复一条，几十字节；超 500 条清最老，防无界增长）
+  const outputPending = new Map<string, {
+    req: LongOutputCardRequest;
+    ownerId: string;
+    chatId: string;
+    settled: boolean;
   }>();
   // 通道当前任务的进度卡：gate 的 ask/planAsk/askQuestion 闭包随 gate 通道级复用，
   // 不能捕获任务级 progress 实例（会是首个任务的旧卡）——经此间接引用每次任务的新卡
@@ -352,6 +384,11 @@ export function createBridge(
           qaPending.delete(id);
           p.resolve({});
         }
+        // 本用户在本会话的长回复卡确认/提意见按钮一并失效（保留查看全文）：新会话已无
+        // 「上一轮方案」上下文，旧确认按钮再触发只会得到脱离语境的新一轮任务
+        for (const o of outputPending.values()) {
+          if (o.chatId === msg.chatId && o.ownerId === msg.userId) o.settled = true;
+        }
         gates.get(key)?.reset();
         if (cancelled > 0) {
           await deps.gateway.sendTextTo(msg.chatId, `🗑️ 已因新建会话取消 ${cancelled} 条排队消息`);
@@ -446,16 +483,12 @@ export function createBridge(
 planAsk: async (req) => {
           const planReq: PlanCardRequest = { requestId: randomUUID(), plan: req.plan, workspaceName: req.workspaceName };
           // 落盘计划原文：路径走 ensureRuntimeDirs 已建的 claude/plans 目录，文件名加时间戳避免并发冲突
-          const plansDir = join(CONFIG_DIR, 'claude', 'plans');
-          try { mkdirSync(plansDir, { recursive: true }); } catch { /* 已存在 */ }
-          const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-          const slug = (req.workspaceName || 'plan').replace(/[^\w-]+/g, '_').slice(0, 32);
-          const planFilePath = join(plansDir, `${ts}-${slug}.md`);
-          try {
-            writeFileSync(planFilePath, `# 执行计划 · ${req.workspaceName} · ${new Date().toLocaleString('zh-CN', { hour12: false })}\n\n${req.plan}\n`, 'utf8');
-          } catch (e) {
-            console.error(tag, '[计划落盘失败]（不影响流程，仅「查看完整方案」可能不可用）：', e);
-          }
+          const planFilePath = writeRuntimeMarkdown(
+            join('claude', 'plans'),
+            req.workspaceName || 'plan',
+            `# 执行计划 · ${req.workspaceName} · ${new Date().toLocaleString('zh-CN', { hour12: false })}\n\n${req.plan}\n`,
+            `${tag}[计划落盘失败]（不影响流程，仅「查看完整方案」可能不可用）：`,
+          );
           const progress = activeProgress.get(key);
           if (!progress) return { action: 'reject' }; // 进度卡不在 = 任务已结束/被 abort，按放弃处理
           progress.setPlan({ requestId: planReq.requestId, plan: req.plan, workspaceName: req.workspaceName, planFilePath });
@@ -681,7 +714,36 @@ planAsk: async (req) => {
       // 而 textTail 按序累积全部流式文本块、卡片取尾部 PROGRESS_TAIL_CHARS 字——finalText 不超上限时
       // 必然完整落在进度卡终态里，再发一条就是内容几乎逐字相同的重复消息（0.11.0 修复的双推 bug）
       if (outcome.finalText && outcome.finalText.length > PROGRESS_TAIL_CHARS) {
-        await deps.gateway.sendTextTo(msg.chatId, outcome.finalText.slice(0, 4000));
+        // 结果回传（0.20.0 三段式）：
+        // - 400 字内：进度卡终态已完整展示，不发独立消息（0.11.0 双推修复）
+        // - 400~2000 字：直接发全文卡片（旧 slice 上限对这段区间本就不触发）
+        // - >2000 字：落盘 md + 收起卡（查看全文按钮 + 确认方案/按意见修改引导，点击
+        //   即发起新一轮任务），替代旧版 4000 字硬截断——超长部分不再静默丢弃
+        const text = outcome.finalText;
+        if (text.length > LONG_OUTPUT_THRESHOLD) {
+          const outFilePath = writeRuntimeMarkdown(
+            'outputs',
+            wsName,
+            `# 完整回复 · ${wsName} · ${new Date().toLocaleString('zh-CN', { hour12: false })}\n\n${text}\n`,
+            `${tag}[长回复落盘失败，回退为截断发送]：`,
+          );
+          if (outFilePath) {
+            const outReq: LongOutputCardRequest = {
+              requestId: randomUUID(), filePath: outFilePath,
+              charCount: text.length, workspaceName: wsName,
+            };
+            outputPending.set(outReq.requestId, { req: outReq, ownerId: msg.userId, chatId: msg.chatId, settled: false });
+            if (outputPending.size > 500) {
+              // 防无界增长：清最老的条目（Map 迭代序即插入序；被清卡片的确认按钮会提示已过期）
+              outputPending.delete(outputPending.keys().next().value as string);
+            }
+            await deps.gateway.sendCardTo(msg.chatId, buildLongOutputCard(outReq));
+          } else {
+            await deps.gateway.sendTextTo(msg.chatId, text.slice(0, 4000)); // 落盘失败兜底：维持旧截断行为
+          }
+        } else {
+          await deps.gateway.sendTextTo(msg.chatId, text);
+        }
       }
       // 图片自动发（im.image.create 通道），非图片文件不自动回传——
       // 用户从下面的文件清单里看到改了哪些文件，主动点名 basename 后由 tryDeliverRequestedFiles 处理
@@ -834,14 +896,31 @@ planAsk: async (req) => {
           return { toast: { type: 'success', content: willUnpick ? `已取消：${label}` : `已选：${label}` } };
         }
         if (decision === 'qa-submit') {
-          const missing = qa.req.questions
-            .filter((_, i) => qa.answers[i] === undefined || (Array.isArray(qa.answers[i]) && (qa.answers[i] as string[]).length === 0));
+          // 0.20.0：每题答案 = 选项点选 + 表单自定义输入（formValue.custom_N）合并——
+          // 单选：custom 非空优先覆盖选中项；多选：custom 追加进选中数组。
+          // 已答判定放宽为「选中项或自定义输入至少一项」
+          const fv = action.value.formValue ?? {};
+          const result: AskQuestionResult = {};
+          const missing: number[] = [];
+          qa.req.questions.forEach((q, i) => {
+            const raw = fv[`custom_${i}`];
+            const custom = typeof raw === 'string' ? raw.trim() : '';
+            const picked = qa.answers[i];
+            if (q.multiSelect) {
+              const arr = Array.isArray(picked) ? [...picked] : picked !== undefined ? [picked as string] : [];
+              if (custom) arr.push(custom);
+              if (arr.length === 0) { missing.push(i); return; }
+              result[q.question] = arr;
+            } else {
+              const ans = custom || (picked !== undefined ? (picked as string) : '');
+              if (!ans) { missing.push(i); return; }
+              result[q.question] = ans;
+            }
+          });
           if (missing.length > 0) {
-            return { toast: { type: 'warning', content: `还有 ${missing.length} 个问题未作答（多选题至少选 1 项）` } };
+            return { toast: { type: 'warning', content: `第 ${missing.map((i) => i + 1).join('、')} 题未作答（点选项或在输入框填写均可）` } };
           }
           qaPending.delete(action.value.requestId);
-          const result: AskQuestionResult = {};
-          qa.req.questions.forEach((q, i) => { result[q.question] = qa.answers[i] as string | string[]; });
           qa.resolve(result);
           // 清除主进度卡的内嵌提问区（按钮随 setQuestion(undefined) 的 flush 消失）
           const prog = activeProgress.get(qa.channelKey);
@@ -852,6 +931,61 @@ planAsk: async (req) => {
           return { toast: { type: 'success', content: '✅ 答案已提交' } };
         }
         return { toast: { type: 'info', content: '该提问已被处理或已过期' } };
+      }
+      // 长回复收起卡（0.20.0）：任务已结束，无 Promise 挂起——outputPending 提供发起人校验、
+      // settled 防重与文件上下文。「查看完整内容」可反复点击；「确认方案 / 按意见修改」合成
+      // 一条用户消息入队，走与真实消息完全相同的排队/resume/进度卡链路发起新一轮任务
+      const out = outputPending.get(action.value.requestId);
+      if (out) {
+        if (action.operatorId !== out.ownerId) {
+          console.log(tag, `[卡片回调] 非发起人 ${action.operatorId} 点击长回复卡 ${action.value.requestId}，已忽略`);
+          return { toast: { type: 'info', content: '仅任务发起人可操作' } };
+        }
+        const decision = action.value.decision;
+        if (decision === 'view-output-file') {
+          // 白名单校验：仅允许 outputs 目录内文件（value 虽由桥接器写入卡片，纵深防御不亏）
+          const outputsDir = join(CONFIG_DIR, 'outputs');
+          if (!out.req.filePath.startsWith(outputsDir + sep)) {
+            return { toast: { type: 'error', content: '文件路径校验失败，已忽略' } };
+          }
+          void deps.gateway.uploadAndSendFile(out.chatId, out.req.filePath)
+            .catch((e) => console.error('[完整回复发送失败]', action.value.requestId, e));
+          return { toast: { type: 'info', content: '正在发送完整回复…' } };
+        }
+        if (out.settled) {
+          return { toast: { type: 'info', content: '该回复的处理已提交，无需重复操作' } };
+        }
+        if (decision === 'output-confirm' || decision === 'output-revise') {
+          const feedback = (action.value.feedback ?? '').trim();
+          if (decision === 'output-revise' && !feedback) {
+            return { toast: { type: 'warning', content: '请先在输入框填写修改意见（或点「确认方案」）' } };
+          }
+          out.settled = true;
+          const prompt = decision === 'output-confirm'
+            ? '用户已在飞书点击「确认方案」，确认了上一轮的完整回复（方案），请继续按该方案推进执行。'
+            : `用户要求按以下意见调整上一轮完整回复中的方案：\n${feedback}`;
+          // 合成用户消息入队：新一轮会 resume 上一会话（「上一轮方案」上下文天然在场）。
+          // 发起人必在访问白名单（能发起任务才拿得到卡片），仍做 isAllowed 纵深校验；
+          // chatType 不参与任务链路（仅 gateway 消息解析用），合成消息固定 p2p
+          if (deps.access.isAllowed(action.operatorId)) {
+            const key = channelKey(out.chatId, action.operatorId);
+            enqueue(key, {
+              chatId: out.chatId, chatType: 'p2p', userId: action.operatorId,
+              text: prompt, messageId: `output-${action.value.requestId}`,
+            }, prompt, out.req.workspaceName);
+          } else {
+            console.warn(tag, '[长回复卡] 发起人不在访问白名单，已忽略新一轮请求：', action.operatorId);
+          }
+          const settledText = decision === 'output-confirm'
+            ? '✅ 已确认该方案，正在发起新一轮任务（详情见下方新进度卡）'
+            : '✏️ 修改意见已收到，正在发起新一轮任务（详情见下方新进度卡）';
+          return {
+            toast: { type: 'success', content: settledText },
+            // 回调响应内联换卡：决策按钮区收为一行文案（查看按钮保留，全文仍可回看）
+            card: { type: 'raw', data: buildLongOutputSettledCard(out.req, settledText) },
+          };
+        }
+        return { toast: { type: 'info', content: '该操作无效或已过期' } };
       }
       const pending = confirmPending.get(action.value.requestId);
       if (!pending) {

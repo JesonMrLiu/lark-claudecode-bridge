@@ -41,8 +41,14 @@ export class ProgressCard {
   private cardId?: string;
   /** cardkit 操作序号：同一实体的每次 update/batch_update 必须严格递增 */
   private seq = 0;
-  /** 上次全量渲染的结构签名：交互区（confirm/plan/question）增删、终态、qa 选中态变化都需要全量重渲染 */
+  /** 上次全量渲染的结构签名：交互区（confirm/plan/question）增删、终态需要全量重渲染。
+   *  0.20.0 起 qa 选中态不进签名（见 structureKey）——改走 partial 按钮级局部更新 */
   private lastStructure = '';
+  /** qa 选中态脏标记：updateQuestionAnswer 置位，下一次 partial 附带按钮级 actions 后清除。
+   *  显式标记取代快照对比——快照在 replace 与求值之间可能被新一轮点击改写（竞态丢刷） */
+  private qaButtonsDirty = false;
+  /** 挂起输入期间收到的沉底请求（sinkToBottom 会删卡重发清空输入态）：挂起解除后补执行 */
+  private deferSink = false;
   private buffer = '';
   private state: ProgressState;
   private flushTimer?: NodeJS.Timeout;
@@ -81,6 +87,7 @@ export class ProgressCard {
       this.messageId = await this.sender.sendCard(initial);
     }
     this.lastStructure = this.structureKey();
+    this.qaButtonsDirty = false;
     const interval = this.opts.flushIntervalMs ?? 1500;
     this.flushTimer = setInterval(() => void this.flush(), interval).unref();
     this.heartbeatTimer = setInterval(() => {
@@ -187,6 +194,7 @@ export class ProgressCard {
     } else {
       this.state.question.answers[qIndex] = option;
     }
+    this.qaButtonsDirty = true; // 下次实体 partial 附带按钮级选中态更新（不走全量替换，保 form 输入）
     this.lastActivityAt = Date.now();
     void this.flush();
   }
@@ -239,7 +247,11 @@ export class ProgressCard {
    * 绝不向上抛：调用方多为 void 调用，未处理 rejection 会拖垮整个 bridge 进程。
    */
   async sinkToBottom(): Promise<void> {
-    if (this.done || !this.messageId) return;
+    if (this.done) { this.deferSink = false; return; }
+    if (!this.messageId) return;
+    // 挂起输入期间沉底会删卡重发（输入态归零，用户打的意见/自定义答案被清掉）——
+    // 记录请求延迟到挂起解除（flush 落地后检查补执行）
+    if (this.hasInputPending()) { this.deferSink = true; return; }
     const old = this.messageId;
     const oldCardId = this.cardId;
     this.messageId = undefined; // 期间 flush 自动跳过，避免 PATCH 打到已删除的旧卡
@@ -258,6 +270,7 @@ export class ProgressCard {
           this.messageId = await this.sender.sendCard(fresh);
         }
         this.lastStructure = this.structureKey();
+        this.qaButtonsDirty = false; // 重发卡片已含最新选中态
         void this.flush();
         return;
       } catch (e) {
@@ -271,9 +284,10 @@ export class ProgressCard {
    * 串行化 flush：所有更新走同一条 promise 链按发起顺序落地。
    * - in-flight 中再来请求 → 标记 dirty，本轮落地后自动补刷一次（带上最新 state）；
    * - finish 的终态 flush 也入链，天然排在先前挂起的更新之后。
-   * 实体模式下按结构签名分流：结构未变（纯状态/计时/子代理刷新）→ 局部更新
-   * （只改 main/timer 两个 markdown 组件，form 输入保留）；结构变化（交互区增删、
-   * 终态、qa 选中态）→ 全量替换实体。旧模式（无实体能力）维持整卡 PATCH。
+   * 实体模式下按结构签名分流：结构未变（纯状态/计时/子代理刷新、qa 选中态）→ 局部更新
+   * （只改 main/timer 两个 markdown 组件，form 输入保留；选中态变化附带按钮级 actions）；
+   * 结构变化（交互区增删、终态）→ 全量替换实体。旧模式（无实体能力）维持整卡 PATCH，
+   * 且挂起输入期间冻结维持性刷新（防整卡 PATCH 清空未提交输入）。
    */
   private flush(): Promise<void> {
     if (!this.messageId) return Promise.resolve();
@@ -295,15 +309,28 @@ export class ProgressCard {
           if (this.cardId && this.sender.partialUpdateCard && this.sender.replaceCard) {
             const structure = this.structureKey();
             if (structure === this.lastStructure) {
-              // 纯状态刷新：局部更新，form/按钮区不动（用户输入保留）
-              await withTimeout(this.sender.partialUpdateCard(this.cardId, expectedSeq, buildPartialUpdateActions(this.state)), timeoutMs);
+              // 纯状态刷新：局部更新，form/按钮区不动（用户输入保留）。
+              // qa 选中态变化也走这里（answers 不触发全量替换——那会清空 form 内未提交的
+              // 自定义输入）：脏标记决定是否附带按钮级局部更新，落地后清除
+              const withQaButtons = this.qaButtonsDirty;
+              await withTimeout(this.sender.partialUpdateCard(this.cardId, expectedSeq, buildPartialUpdateActions(this.state, withQaButtons)), timeoutMs);
+              this.qaButtonsDirty = false;
             } else {
-              // 结构变化：全量替换实体（form 输入会重置，但这些时刻用户尚未输入或已提交）
+              // 结构变化：全量替换实体（form 输入会重置，但这些时刻用户尚未输入或已提交；
+              // 全量渲染已含最新选中态）
               await withTimeout(this.sender.replaceCard(this.cardId, expectedSeq, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
               this.lastStructure = structure;
+              this.qaButtonsDirty = false;
             }
           } else {
+            // 降级模式挂起冻结（0.20.0）：im.message.patch 整卡 PATCH 会重置卡片全部客户端
+            // 输入态——plan/qa 挂起期间 1.5s 心跳会把用户正在输入的意见/自定义答案瞬间清掉。
+            // 仅冻结「结构不变」的维持性刷新；挂起区出现/消失（结构变化）必须放行——
+            // 否则确认按钮根本不上屏。计时/状态行在挂起期间停更可接受（任务实际在等用户）
+            const structure = this.structureKey();
+            if (this.hasInputPending() && structure === this.lastStructure) break;
             await withTimeout(this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
+            this.lastStructure = structure;
           }
           this.seq = expectedSeq; // 仅成功后提交推进
         } catch (e) {
@@ -325,16 +352,28 @@ export class ProgressCard {
         }
         if (!this.dirty) break; // 落地期间无新请求，收工
       }
+      // 沉底延迟触发：挂起期间被暂存的 sink 请求，在挂起解除（plan/question 已清）后补执行
+      if (this.deferSink && !this.hasInputPending()) {
+        this.deferSink = false;
+        void this.sinkToBottom();
+      }
     })().finally(() => {
       this.flushing = false;
     });
     return this.flushChain;
   }
 
-  /** 结构签名：交互区存在性 + 终态 + qa 选中态——任一变化都需要全量重渲染才能上屏 */
+  /** 是否有等待用户输入的挂起区（plan 意见框 / qa 自定义输入）：降级模式冻结与沉底延迟的判定依据 */
+  private hasInputPending(): boolean {
+    return !!(this.state.plan || this.state.question);
+  }
+
+  /** 结构签名：交互区存在性 + 终态——任一变化都需要全量重渲染才能上屏。
+   *  0.20.0 起不含 qa 选中态：选中态变化只走按钮 element_id 级局部更新，全量替换会
+   *  清空 form 内未提交的自定义输入（用户点选项时输入框里可能已打了字） */
   private structureKey(): string {
     const s = this.state;
-    return JSON.stringify([!!s.confirm, !!s.plan, !!s.question, !!s.done, s.question?.answers ?? null]);
+    return JSON.stringify([!!s.confirm, !!s.plan, !!s.question, !!s.done]);
   }
 }
 

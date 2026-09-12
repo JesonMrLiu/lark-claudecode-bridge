@@ -7,7 +7,10 @@
 export const FEISHU_NOTIFY_SOP_PROMPT = `【飞书推送规范（lcb-notify 三件套：send_text / send_image / send_file）】
 
 发送前必查决策规则：
-- 主卡片正文 ≤ 10 行；超过立刻拆 send_text 第二张卡片或改 send_file 发附件
+- **长方案/长说明/最终报告：直接完整写进最终回复正文**——桥接器会把超长回复自动收起为
+  「查看完整内容」按钮（md 文件）并附带「确认方案/按意见修改」引导，你无须也无法控制
+  该呈现；严禁为长内容主动拆多张 send_text 或改 send_file 发附件
+- send_text 仅用于任务中途的简短通知/阶段性结果（单张 ≤ 50 行）
 - 关键改动 1-10 个：send_file 单发，每张附一句话说明
 - 辅助改动 10-30 个：合并为 1 份 Markdown 再 send_file
 - 任意场景 > 30 个文件：不发送，主卡片只列本地路径
@@ -16,7 +19,7 @@ export const FEISHU_NOTIFY_SOP_PROMPT = `【飞书推送规范（lcb-notify 三�
 - 子代理（Explore / Plan 等）：回报走子代理卡片，主卡片不复述
 
 禁止清单：
-- 主卡片内联 ≥ 30 行分析（拆卡片或改附件）
+- 为长方案/长报告主动 send_text 拆多卡或 send_file 发附件（直接写最终回复正文）
 - send_text 整段 Explore / Plan 报告（子代理卡片承载）
 - send_file 源码全文 / send_file > 10 个文件（合并 Markdown）
 - 主卡片复述 plan 文件内容（plan 落盘即可）

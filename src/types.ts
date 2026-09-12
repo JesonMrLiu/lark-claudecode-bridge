@@ -130,14 +130,22 @@ export interface RejectedMessage {
   rejected: { kind: 'unsupported-type'; chatId: string; chatType: 'p2p' | 'group'; messageType: string };
 }
 /** 卡片回调决策：allow/deny/allow-session 为写工具确认卡；plan-* 为计划确认卡（feedback = 按意见修改时的用户输入）；
- *  plan-view-file = 计划「查看完整方案」按钮触发，原文 md 直接 send_file 而非塞入卡片正文 */
+ *  plan-view-file = 计划「查看完整方案」按钮触发，原文 md 直接 send_file 而非塞入卡片正文；
+ *  qa-* 为提问卡；view-output-file/output-* 为长回复收起卡（0.20.0：>2000 字回复的
+ *  查看全文 / 确认方案 / 按意见修改引导，后两者点击即发起新一轮任务） */
 export type CardDecision = 'allow' | 'deny' | 'allow-session'
   | 'plan-approve' | 'plan-revise' | 'plan-reject' | 'plan-view-file'
-  | 'qa-pick' | 'qa-submit';
+  | 'qa-pick' | 'qa-submit'
+  | 'view-output-file' | 'output-confirm' | 'output-revise';
 export interface CardActionValue {
   requestId: string; decision: CardDecision; feedback?: string;
   /** qa-pick：问题下标与选项 label */
   qIndex?: number; option?: string;
+  /** form 容器提交时回传的全部输入项（name → 值）：qa_form 的 custom_N、
+   *  plan_form/output_form 的 feedback 均在此（0.20.0 泛化，取代只解析 feedback 单键） */
+  formValue?: Record<string, string>;
+  /** view-output-file：落盘的完整回复文件路径（白名单校验 outputs 目录前缀后才发送） */
+  filePath?: string;
 }
 export interface CardActionEvent { value: CardActionValue; operatorId: string; openMessageId: string }
 /**
