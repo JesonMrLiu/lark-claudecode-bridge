@@ -73,8 +73,10 @@ export function buildImageCard(caption: string | undefined, imgKey: string): unk
   return card(elements);
 }
 /** 进度卡局部更新的固定组件 ID（cardkit element_id，长度限 1-20）：状态主块 + 计时行。
- *  局部更新只替换这两个 markdown 组件的 content，form/按钮区不触碰——用户在 plan 表单
- *  输入框打的内容不会被状态心跳刷掉（整卡 PATCH 会重置全部客户端输入态） */
+ *  局部更新只替换这两个 markdown 组件的 content，不触碰 form 组件定义——但真机实测
+ *  （0.20.1）实体更新落地时部分客户端仍会重置 form 内未提交输入（官方错误码 200810 亦
+ *  表明交互期间流式更新受限），因此挂起输入期间的维持性刷新由 ProgressCard 冻结，不依赖
+ *  「局部更新保输入」这一假设 */
 export const MAIN_ELEMENT_ID = 'lcb_main';
 export const TIMER_ELEMENT_ID = 'lcb_timer';
 
@@ -127,6 +129,10 @@ function buildMainLines(state: ProgressState): string[] {
 
 /** 计时行文案——整卡渲染与局部更新共用 */
 function buildTimerLine(state: ProgressState): string {
+  // 挂起等待用户输入（plan 意见框 / qa 作答）期间维持性刷新被冻结、计时停走——必须显式
+  // 标注暂停及恢复条件，不可静默停止（停走的计时读起来像「已结束/卡死」，用户分不清）
+  if (state.plan) return `<font color='grey'>⏸ 计时已暂停 · 计划确认后恢复</font>`;
+  if (state.question) return `<font color='grey'>⏸ 计时已暂停 · 提交答案后恢复</font>`;
   const elapsed = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
   const duration = `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒`;
   // 终态改为「总耗时」+ 完成时刻：运行中的「已运行」在停止刷新后读起来仍像在计时，任务
@@ -234,35 +240,47 @@ export function buildProgressCard(state: ProgressState, widthMode: 'default' | '
 }
 
 /**
- * 局部更新 actions（cardkit batch_update 的 partial_update_element）：默认只替换状态主块与
- * 计时行两个 markdown 组件的 content，form/按钮区完全不触碰——用户在 plan 意见输入框
- * 里打的字不会被状态心跳刷掉。仅结构未变化时使用（结构变化走全量替换）。
- * includeQaButtons=true 时追加 qa 选项按钮的局部替换（0.20.0：选中态变化不再触发全量
- * 替换——那会清空 form 内未提交的自定义输入，改走按钮 element_id 级局部更新）。
+ * qa 选项按钮级局部更新 actions（cardkit partial_update_element）：仅 qa_opt_* 按钮的
+ * 文案（✓ 前缀）与样式（primary/default），不含 main/timer——0.20.1 起这是挂起输入冻结
+ * 期间的唯一放行通道（用户刚点选项按钮的即时反馈，最小触碰 form 未提交输入）。
+ * question 未挂起时返回空数组（调用方需空判后视同冻结跳过）。
+ */
+export function buildQaButtonActions(state: ProgressState): Array<{ action: string; params: { element_id: string; partial_element: unknown } }> {
+  if (!state.question) return [];
+  const q = state.question;
+  const actions: Array<{ action: string; params: { element_id: string; partial_element: unknown } }> = [];
+  q.questions.forEach((qq, qIndex) => {
+    const sel = q.answers[qIndex];
+    const picked = Array.isArray(sel) ? sel : sel !== undefined ? [sel] : [];
+    qq.options.forEach((o, optIndex) => {
+      const selected = picked.includes(o.label);
+      actions.push({
+        action: 'partial_update_element',
+        params: {
+          element_id: qaOptionElementId(qIndex, optIndex),
+          // 按钮可局部更新的字段：文案（✓ 前缀）与样式（primary/default）
+          partial_element: { text: { tag: 'plain_text', content: selected ? `✓ ${o.label}` : o.label }, type: selected ? 'primary' : 'default' },
+        },
+      });
+    });
+  });
+  return actions;
+}
+
+/**
+ * 局部更新 actions（cardkit batch_update 的 partial_update_element）：替换状态主块与
+ * 计时行两个 markdown 组件的 content。仅结构未变化且无挂起输入时使用（结构变化走全量
+ * 替换；挂起期间维持性刷新由 ProgressCard 冻结——真机实测实体更新落地会重置 form 未提交
+ * 输入，见 MAIN_ELEMENT_ID 处注释）。
+ * includeQaButtons=true 时追加 qa 选项按钮的局部替换（选中态变化不触发全量替换——那会
+ * 清空 form 内未提交的自定义输入，改走按钮 element_id 级局部更新）。
  */
 export function buildPartialUpdateActions(state: ProgressState, includeQaButtons = false): Array<{ action: string; params: { element_id: string; partial_element: unknown } }> {
   const actions: Array<{ action: string; params: { element_id: string; partial_element: unknown } }> = [
     { action: 'partial_update_element', params: { element_id: MAIN_ELEMENT_ID, partial_element: { content: buildMainLines(state).join('\n') } } },
     { action: 'partial_update_element', params: { element_id: TIMER_ELEMENT_ID, partial_element: { content: buildTimerLine(state) } } },
   ];
-  if (includeQaButtons && state.question) {
-    const q = state.question;
-    q.questions.forEach((qq, qIndex) => {
-      const sel = q.answers[qIndex];
-      const picked = Array.isArray(sel) ? sel : sel !== undefined ? [sel] : [];
-      qq.options.forEach((o, optIndex) => {
-        const selected = picked.includes(o.label);
-        actions.push({
-          action: 'partial_update_element',
-          params: {
-            element_id: qaOptionElementId(qIndex, optIndex),
-            // 按钮可局部更新的字段：文案（✓ 前缀）与样式（primary/default）
-            partial_element: { text: { tag: 'plain_text', content: selected ? `✓ ${o.label}` : o.label }, type: selected ? 'primary' : 'default' },
-          },
-        });
-      });
-    });
-  }
+  if (includeQaButtons) actions.push(...buildQaButtonActions(state));
   return actions;
 }
 export const DECISION_TEXT: Record<PermissionDecision, string> = {

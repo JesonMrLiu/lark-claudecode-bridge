@@ -9,6 +9,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { parseDocument } from 'yaml';
 import { DEFAULT_CLAUDE_DIR, MANAGED_CLAUDE_DIR } from '../claude-config.js';
 import { CONFIG_DIR } from '../config.js';
 
@@ -39,16 +40,42 @@ export interface SkillSummary {
 }
 
 /**
- * 简单 frontmatter 解析：仅取 name / description 两个键，避开 yaml 依赖；非法格式返回空字段。
- * 支持 YAML 块标量：`description: >`（折叠：换行→空格）/ `description: |`（保留换行），
- * 含 `>-` / `|-` 去尾换行变体；值收集到下一个顶层 key（行首非缩进）为止。
- * 单行值的单双引号包裹照常剥离。
+ * frontmatter 解析：仅取 name / description 两键。入口先归一化（BOM 剥离 + CRLF/CR → LF——
+ * Windows 编辑器产出的 CRLF 文件曾致行正则每行尾部残留 \r 整体失配，5 个 skill 描述全空）。
+ * 主路径 yaml 库解析（已是运行时依赖，server.ts 在用）——天然覆盖块标量、纯多行值、
+ * 引号、注释等合法 YAML 形态；块内非法 YAML（tab 缩进等）时 doc.errors 非空，回退
+ * 手写行解析器宽松提取，容错性不低于旧版。两者均取不到时返回空字段。
  */
 export function parseSkillFrontmatter(md: string): { name?: string; description?: string } {
-  if (!md.startsWith('---')) return {};
-  const end = md.indexOf('\n---', 3);
+  const src = md.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  if (!src.startsWith('---')) return {};
+  const end = src.indexOf('\n---', 3);
   if (end < 0) return {};
-  const block = md.slice(3, end);
+  const block = src.slice(3, end);
+  try {
+    const doc = parseDocument(block);
+    if (doc.errors.length === 0) {
+      const obj = doc.toJS() as unknown;
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        const out: { name?: string; description?: string } = {};
+        for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+          const key = k.toLowerCase();
+          if (key !== 'name' && key !== 'description') continue;
+          if (v === null || v === undefined) continue;
+          const val = (typeof v === 'string' ? v : String(v)).trim();
+          if (!val) continue;
+          if (key === 'name') out.name = val;
+          else out.description = val;
+        }
+        if (out.name || out.description) return out;
+      }
+    }
+  } catch { /* 非法 YAML：落入手写兜底 */ }
+  return parseSkillFrontmatterLines(block);
+}
+
+/** 手写行解析器（yaml 主路径的兜底）：支持单行值与 > / | 块标量，宽松提取不抛错 */
+function parseSkillFrontmatterLines(block: string): { name?: string; description?: string } {
   const out: { name?: string; description?: string } = {};
   const lines = block.split('\n');
   const TOP_KEY = /^([A-Za-z_-][A-Za-z0-9_-]*)\s*:\s*(.*)$/;
@@ -237,6 +264,32 @@ export function listMcpServers(
 
 /** MCP server 名合法字符（避用 / \ 与空格等，与磁盘配置键兼容） */
 export const MCP_NAME_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/** 探测 spawn 的命令解析：win32 下裸命令（npx 等 .cmd shim）无法被 CreateProcess 定位
+ *  （Node 又禁止无 shell 直接 spawn .cmd/.bat → EINVAL），统一包一层 cmd.exe /d /s /c
+ *  （cross-spawn 同款方案）。形态为【单层外引号包整条 + 内部按需引号】+ 调用方设
+ *  windowsVerbatimArguments（verbatim=true 由返回值提示，避免 Node 再做 MSVCRT 引号）。
+ *  实测（2026-09-12 变体矩阵）：双外层引号 ""line"" 无论内部全参/按需引号，cmd 均把
+ *  ""D:\Program 当命令名报「不是内部或外部命令」；单外层 + 按需引号全过——npx → exit 0、
+ *  含空格 node 路径 → 存活、不存在命令 → exit 1 + 可读 stderr。
+ *  已知局限：无空格但含 & | < > ^ % 等 cmd 特殊字符的参数不加引号会被 cmd 解析；
+ *  内嵌双引号无完美转义，剥除（探测场景几乎不出现）。
+ *  platform 参数注入便于单测；非 win32 原样返回。 */
+export function resolveSpawnCommand(
+  command: string,
+  args: string[],
+  platform: string = process.platform,
+): { command: string; args: string[]; verbatim?: boolean } {
+  if (platform !== 'win32') return { command, args };
+  // 按需引号（Node MSVCRT 同款判定）：仅含空白/引号才包引号；cmd 内引号即字面量边界，
+  // 内嵌引号无完美转义——剥除（记录为已知局限，优于产生坏命令行）
+  const q = (s: string): string => (/[\s"]/.test(s) ? `"${String(s).replace(/"/g, '')}"` : s);
+  return {
+    command: 'cmd.exe',
+    args: ['/d', '/s', '/c', `"${q(command)}${args.length ? ' ' + args.map((a) => q(a)).join(' ') : ''}"`],
+    verbatim: true,
+  };
+}
 
 // ---------------- claude mcp add 命令解析 ----------------
 

@@ -92,7 +92,7 @@ async function loadMcp() {
       <td>${conn}</td>
       <td><span class="chip">${tag}</span></td>
       <td class="mcp-status" data-status-for="${esc(s.name)}"><span class="desc">未检测</span></td>
-      <td>
+      <td class="ops">
         <button class="btn sm" data-view="${esc(s.name)}">查看</button>
         ${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删除</button>` : '<span class="desc">只读</span>'}
       </td>`;

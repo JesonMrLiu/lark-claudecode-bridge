@@ -1,4 +1,4 @@
-import { buildProgressCard, buildPartialUpdateActions, type ProgressState } from './card-builder.js';
+import { buildProgressCard, buildPartialUpdateActions, buildQaButtonActions, type ProgressState } from './card-builder.js';
 import type { ConfirmationRequest } from '../types.js';
 
 export interface CardSender {
@@ -44,7 +44,8 @@ export class ProgressCard {
   /** 上次全量渲染的结构签名：交互区（confirm/plan/question）增删、终态需要全量重渲染。
    *  0.20.0 起 qa 选中态不进签名（见 structureKey）——改走 partial 按钮级局部更新 */
   private lastStructure = '';
-  /** qa 选中态脏标记：updateQuestionAnswer 置位，下一次 partial 附带按钮级 actions 后清除。
+  /** qa 选中态脏标记：updateQuestionAnswer 置位，下一次实体 partial 经按钮级 actions 发出
+   *  （挂起冻结期间的唯一例外放行通道）前快照清零，失败在 flush catch 恢复重试。
    *  显式标记取代快照对比——快照在 replace 与求值之间可能被新一轮点击改写（竞态丢刷） */
   private qaButtonsDirty = false;
   /** 挂起输入期间收到的沉底请求（sinkToBottom 会删卡重发清空输入态）：挂起解除后补执行 */
@@ -80,7 +81,7 @@ export class ProgressCard {
         this.messageId = messageId;
         this.cardId = cardId;
       } catch (e) {
-        console.warn('[进度卡] 卡片实体模式不可用，降级为整卡更新（plan 表单输入可能被心跳清空）：', e instanceof Error ? e.message : e);
+        console.warn('[进度卡] 卡片实体模式不可用，降级为整卡更新（挂起期间状态/计时停更，输入冻结保护仍生效）。如已开通 cardkit:card:write，需在飞书开发者后台创建新版本并发布、并重启 bridge 后生效。原因：', e instanceof Error ? e.message : e);
       }
     }
     if (!this.messageId) {
@@ -88,7 +89,9 @@ export class ProgressCard {
     }
     this.lastStructure = this.structureKey();
     this.qaButtonsDirty = false;
-    const interval = this.opts.flushIntervalMs ?? 1500;
+    // 1s 对齐秒级计时（0.20.1：原 1.5s 跨秒边界会跳秒显示，如 1→3）；cardkit batch_update
+    // 限频 1000 次/分钟，单卡 60 次/分钟远在限内
+    const interval = this.opts.flushIntervalMs ?? 1000;
     this.flushTimer = setInterval(() => void this.flush(), interval).unref();
     this.heartbeatTimer = setInterval(() => {
       if (Date.now() - this.lastActivityAt >= (this.opts.idleHeartbeatMs ?? 30_000)) {
@@ -158,6 +161,8 @@ export class ProgressCard {
   setQuestion(req: import('./card-builder.js').EmbeddedQuestionState | undefined): void {
     if (this.done) return;
     this.state.question = req;
+    // 提问区收回时同步清选中态脏标记（按钮已随全量替换消失，qa-only 空批次无意义）
+    if (!req) this.qaButtonsDirty = false;
     this.lastActivityAt = Date.now();
     void this.flush();
   }
@@ -284,10 +289,12 @@ export class ProgressCard {
    * 串行化 flush：所有更新走同一条 promise 链按发起顺序落地。
    * - in-flight 中再来请求 → 标记 dirty，本轮落地后自动补刷一次（带上最新 state）；
    * - finish 的终态 flush 也入链，天然排在先前挂起的更新之后。
-   * 实体模式下按结构签名分流：结构未变（纯状态/计时/子代理刷新、qa 选中态）→ 局部更新
-   * （只改 main/timer 两个 markdown 组件，form 输入保留；选中态变化附带按钮级 actions）；
-   * 结构变化（交互区增删、终态）→ 全量替换实体。旧模式（无实体能力）维持整卡 PATCH，
-   * 且挂起输入期间冻结维持性刷新（防整卡 PATCH 清空未提交输入）。
+   * 实体模式下按结构签名分流：结构未变 → 局部更新（只改 main/timer 两个 markdown 组件）；
+   * 结构变化（交互区增删、终态）→ 全量替换实体。两种模式自 0.20.1 起对称实现「挂起输入
+   * 冻结」：plan/qa 挂起期间（hasInputPending）跳过维持性刷新——真机实测实体局部更新与
+   * 整卡 PATCH 落地都会重置 form 内未提交输入，挂起期间任何更新都清掉用户正在打的字；
+   * 计时行随挂起上屏显示「⏸ 计时已暂停」。唯一例外：qa 选中态脏标记放行一次按钮级
+   * partial（仅 qa_opt_*，用户刚点选项的即时反馈），失败恢复脏标记重试。
    */
   private flush(): Promise<void> {
     if (!this.messageId) return Promise.resolve();
@@ -305,22 +312,38 @@ export class ProgressCard {
         }
         const expectedSeq = this.seq + 1; // 仅期望值,await 成功才提交推进
         const timeoutMs = this.opts.updateTimeoutMs ?? UPDATE_TIMEOUT_MS;
+        // 本轮是否携带 qa 按钮级更新：发送前快照并清零（先清后发）——await 期间新一轮
+        // 选项点击会重新置位，经 dirty 补刷/下轮自动补发；失败恢复见 catch。旧版在成功后
+        // 才清标记，await 期间的第二次点击会丢其 ✓ 高亮（0.20.0 既有竞态，0.20.1 修复）
+        let withQaButtons = false;
         try {
           if (this.cardId && this.sender.partialUpdateCard && this.sender.replaceCard) {
             const structure = this.structureKey();
             if (structure === this.lastStructure) {
-              // 纯状态刷新：局部更新，form/按钮区不动（用户输入保留）。
-              // qa 选中态变化也走这里（answers 不触发全量替换——那会清空 form 内未提交的
-              // 自定义输入）：脏标记决定是否附带按钮级局部更新，落地后清除
-              const withQaButtons = this.qaButtonsDirty;
-              await withTimeout(this.sender.partialUpdateCard(this.cardId, expectedSeq, buildPartialUpdateActions(this.state, withQaButtons)), timeoutMs);
-              this.qaButtonsDirty = false;
+              // 0.20.1 实体模式挂起冻结（与降级分支对称）：真机实测 cardkit batch_update
+              // 落地同样会重置 form 内未提交输入（官方错误码 200810 亦表明交互期间流式
+              // 更新受限）——挂起期间跳过维持性 partial，计时/状态停更可接受（任务在等
+              // 用户，计时行随挂起上屏显示「⏸ 计时已暂停」）。例外：qa 选中态脏标记
+              // （用户刚点选项按钮的即时反馈，此刻输入框大概率未打字）放行一次按钮级
+              // partial——只发 qa_opt_*，不含 main/timer 替换（最小触碰）
+              if (this.hasInputPending() && !this.qaButtonsDirty) break;
+              withQaButtons = this.qaButtonsDirty;
+              this.qaButtonsDirty = false; // 先清后发：失败恢复见 catch
+              const actions = this.hasInputPending()
+                ? buildQaButtonActions(this.state)
+                : buildPartialUpdateActions(this.state, withQaButtons);
+              // 挂起中无 qa 按钮可发（question 刚被清等边界）：视同冻结跳过；脏标记不恢复
+              // （空批次重试只会无限刷日志，选中态由下次全量渲染/点击补齐）
+              if (actions.length === 0) break;
+              await withTimeout(this.sender.partialUpdateCard(this.cardId, expectedSeq, actions), timeoutMs);
             } else {
               // 结构变化：全量替换实体（form 输入会重置，但这些时刻用户尚未输入或已提交；
-              // 全量渲染已含最新选中态）
+              // 全量渲染已含最新选中态）。replace 前同样先清 qa 脏标记（先清后发）：await
+              // 期间新点击重新置位的 dirty 由下一轮 partial（qa 例外通道）自动补发
+              withQaButtons = this.qaButtonsDirty;
+              this.qaButtonsDirty = false;
               await withTimeout(this.sender.replaceCard(this.cardId, expectedSeq, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
               this.lastStructure = structure;
-              this.qaButtonsDirty = false;
             }
           } else {
             // 降级模式挂起冻结（0.20.0）：im.message.patch 整卡 PATCH 会重置卡片全部客户端
@@ -334,6 +357,8 @@ export class ProgressCard {
           }
           this.seq = expectedSeq; // 仅成功后提交推进
         } catch (e) {
+          // 本轮携带 qa 按钮更新但发送失败：恢复脏标记，下轮重试补发选中态（先清后发的恢复路径）
+          if (withQaButtons) this.qaButtonsDirty = true;
           // cardkit sequence OCC:失败时区分错误码
           // - 300317(服务端 sequence 已推进超过本地,网络超时但服务端已处理):
           //   飞书不提供读服务端 sequence 接口,跳到 Date.now() 兜底(飞书允许 sequence 是时间戳,且保证 next > 服务端 last)

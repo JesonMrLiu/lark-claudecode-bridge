@@ -32,7 +32,7 @@ function renderSkills(el) {
     <input type="file" id="skillZipFile" accept=".zip" style="display:none">
     <input type="search" class="list-search" id="skillSearch" placeholder="按名字 / 来源 / 路径过滤…">
     <table><thead><tr>
-      <th style="width:170px">名字</th><th>说明</th><th style="width:130px">来源</th><th style="width:240px">路径</th><th style="width:110px"></th>
+      <th style="width:170px">名字</th><th>说明</th><th style="width:130px">来源</th><th style="width:240px">路径</th><th style="width:130px"></th>
     </tr></thead>
       <tbody id="skillBody"><tr><td colspan="5" class="desc">加载中…</td></tr></tbody>
     </table>
@@ -96,7 +96,7 @@ async function loadSkills() {
       <td>${esc(s.description) || '<span class="desc">（无说明）</span>'}</td>
       <td><span class="chip">${tag}</span></td>
       <td><code class="desc">${esc(s.path)}</code></td>
-      <td>
+      <td class="ops">
         <button class="btn sm" data-browse="${esc(s.name)}">查看</button>
         ${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删除</button>` : ''}
       </td>`;

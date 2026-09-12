@@ -26,7 +26,7 @@ export const SLASH_COMMAND_META: Record<string, { description: string; icon: str
   ws: { description: '切换工作区（/ws list 列出）', icon: 'folder_outlined' },
   model: { description: '查看/切换模型', icon: 'ai-style_outlined' },
   'model-profile': { description: '查看/切换厂商档案（切换需管理员）', icon: 'switch-tracking_outlined' },
-  plan: { description: '切换计划模式（先出方案再执行）', icon: 'plan_outlined' },
+  plan: { description: '切换计划模式开关；[/plan 模式切换]、[/plan on 开启]、[/plan off 关闭]', icon: 'plan_outlined' },
   skills: { description: '查看已加载技能', icon: 'skill_outlined' },
   plugins: { description: '查看已加载插件', icon: 'plugin_outlined' },
   mcp: { description: '查看已加载 MCP 服务', icon: 'ai-functions_outlined' },

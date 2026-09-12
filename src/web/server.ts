@@ -19,7 +19,7 @@ import type { BridgeConfig, ServerConfig } from '../types.js';
 import { appStatusSummary, applyPermissionDisplayDefaults, applySecrets, claudeSettingsSummary, computeRestartRequired, docForClient, isAllowedHost, isAllowedOrigin, type ClaudeCurrentSummary } from './config-api.js';
 import {
   BRIDGE_MCP_JSON, MCP_NAME_RE, SKILL_NAME_RE, USER_CLAUDE_JSON,
-  listAllSkills, listMcpServers, listSkills, parseClaudeMcpAdd, readMcpServersFromJsonFile, readPluginMcpFromManifest, resolveEnvRefs,
+  listAllSkills, listMcpServers, listSkills, parseClaudeMcpAdd, readMcpServersFromJsonFile, readPluginMcpFromManifest, resolveEnvRefs, resolveSpawnCommand,
 } from './skills-mcp-api.js';
 import { fetchModelList, resolveModelFetchParams } from './model-list.js';
 import { SLASH_COMMAND_META } from '../session/commands.js';
@@ -826,10 +826,25 @@ async function handle(
     const cfg = entry.config;
     const isRemote = cfg.type === 'http' || cfg.type === 'sse' || (!cfg.type && typeof cfg.url === 'string');
     if (isRemote) {
-      const url = typeof cfg.url === 'string' ? cfg.url : '';
+      // url / headers 值中的 ${VAR} 按同一合并源展开（与 env 展开一致），否则带引用的配置必被误判不可达
+      const headerSrc: Record<string, string> = {};
+      if (cfg.headers && typeof cfg.headers === 'object' && !Array.isArray(cfg.headers)) {
+        for (const [k, v] of Object.entries(cfg.headers as Record<string, unknown>)) {
+          if (typeof v === 'string') headerSrc[k] = v;
+        }
+      }
+      const { resolved: rr } = resolveEnvRefs(
+        { url: typeof cfg.url === 'string' ? cfg.url : '', ...headerSrc },
+        currentMergedEnv(),
+      );
+      const url = rr.url ?? '';
       if (!/^https?:\/\//.test(url)) return json(res, 200, { status: 'failed', detail: 'url 不是合法的 http(s) 地址' });
+      const headers = Object.fromEntries(Object.entries(rr).filter(([k]) => k !== 'url'));
       try {
-        const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
+        const r = await fetch(url, {
+          signal: AbortSignal.timeout(5000),
+          ...(Object.keys(headers).length ? { headers } : {}),
+        });
         // 任何 HTTP 响应都说明网络可达；4xx 多为鉴权/路径问题（MCP 端点通常要求特定握手）
         return json(res, 200, { status: r.status < 500 ? 'ok' : 'failed', detail: `HTTP ${r.status}${r.status >= 400 ? '（可达；鉴权或路径问题）' : ''}` });
       } catch (e) {
@@ -841,25 +856,42 @@ async function handle(
     if (!command) return json(res, 200, { status: 'failed', detail: '缺少 command' });
     const mergedEnv = currentMergedEnv();
     const { resolved } = resolveEnvRefs(cfg.env as Record<string, unknown> | undefined, mergedEnv);
-    const child = spawn(command, Array.isArray(cfg.args) ? cfg.args.map(String) : [], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+    // win32：裸命令（npx 等 .cmd shim）须包 cmd.exe /c，否则 spawn ENOENT 一律误判「异常」
+    const run = resolveSpawnCommand(command, Array.isArray(cfg.args) ? cfg.args.map(String) : []);
+    const child = spawn(run.command, run.args, {
+      // stdin 留管道不写入：server 阻塞等输入；'ignore' 会立即 EOF 触发优雅退出被误判 failed
+      stdio: ['pipe', 'pipe', 'pipe'],
       // 探测环境与任务运行时对齐：合并源（含飞书应用 env / claude.env / settings env）垫底，
       // server 自身 env 解析值覆盖（${VAR} 已按同一合并源展开）
       env: { ...process.env, ...mergedEnv, ...resolved },
       windowsHide: true,
+      // win32 cmd 包装时命令行已手工引号构造，禁止 Node 再做 MSVCRT 引号（会破坏 /s 语义）
+      ...(run.verbatim ? { windowsVerbatimArguments: true } : {}),
     });
     let stderr = '';
     child.stderr?.on('data', (c: Buffer) => { if (stderr.length < 500) stderr += c.toString('utf8'); });
+    /** 清理：关 stdin + 树杀。win32 下 child.kill() 只杀 cmd/npx 壳，孙进程 node 会残留成僵尸 → taskkill /T /F */
+    const killTree = (): void => {
+      child.stdin?.destroy();
+      if (process.platform === 'win32' && child.pid) {
+        try {
+          const tk = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+          tk.on('error', () => { try { child.kill(); } catch { /* 已退出 */ } });
+        } catch { try { child.kill(); } catch { /* 已退出 */ } }
+      } else {
+        try { child.kill(); } catch { /* 已退出 */ }
+      }
+    };
     const result = await new Promise<{ status: string; detail: string }>((resolve) => {
       const done = (status: string, detail: string): void => { clearTimeout(killTimer); resolve({ status, detail }); };
       const killTimer = setTimeout(() => {
-        child.kill();
+        killTree();
         done('ok', '进程存活（正常：MCP server 启动后等待 stdio 输入）');
       }, 800);
       child.on('error', (e) => done('failed', `无法启动：${e.message}`));
       child.on('exit', (code) => done('failed', `进程退出（code ${code}）：${stderr.split('\n')[0] || '无 stderr 输出'}`));
     });
-    try { child.kill(); } catch { /* 已退出 */ }
+    killTree();
     return json(res, 200, result);
   }
   // ---- 桥接器进程启停（页面托管）。embedded 与 lcb ui 独立模式语义不同：embedded 停止/重启

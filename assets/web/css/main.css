@@ -285,6 +285,8 @@ pre.report {
 
 /* ---------- 表格 ---------- */
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
+/* 列表操作列：按钮一律横排（.btn 自身 nowrap，但 td 内模板换行空白给了折行点 → 竖排） */
+td.ops { white-space: nowrap; }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
 thead th {
   color: var(--muted); font-weight: 500; font-size: 12px; letter-spacing: .03em;
