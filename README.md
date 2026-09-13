@@ -29,7 +29,7 @@ lcb start
 ### 飞书应用配置（图文）
 
 1. [https://open.feishu.cn](https://open.feishu.cn) → 创建企业自建应用 → 添加「机器人」能力
-2. 权限管理开通：`im:message`（含读取单聊消息，回复引用拼接用）、`im:message:send_as_bot`、`im:resource`（接收图片用）、`contact:user.base:readonly`、`application:app_slash_command:write` / `application:app_slash_command:read`（斜杠命令同步用）、`cardkit:card:write`（建议开通：卡片局部刷新；不开自动降级为整卡更新，功能不缺）
+2. 权限管理开通：`im:message`（含读取单聊消息，回复引用拼接用）、`im:message:send_as_bot`、`im:resource`（接收图片/文件用）、`contact:user.base:readonly`、`application:app_slash_command:write` / `application:app_slash_command:read`（斜杠命令同步用）、`cardkit:card:write`（建议开通：卡片局部刷新；不开自动降级为整卡更新，功能不缺）
 3. 事件与回调 → 事件配置 → 订阅方式选「使用长连接接收事件」→ 添加 `im.message.receive_v1`
 4. 事件与回调 → 回调配置 → 订阅方式选「使用长连接接收回调」→「已订阅的回调」点「添加回调」，添加「卡片回传交互」（`card.action.trigger`）
 5. 凭证与基础信息 → 复制 App ID / App Secret
@@ -40,6 +40,7 @@ lcb start
 
 ## 首次使用
 
+- 支持的消息类型：**文字**、**富文本**（多行/粘贴）、**图片**、**文件**（直接拖/发文件给机器人）——图片与文件自动下载到本机 `~/.lark-claudecode-bridge/inbox/`，路径随消息带给 Claude Code 直接读取（单文件上限 100MB，飞书接口限制）
 - 每个机器人应用的**首位发消息用户免配对**，自动成为 admin
 - 后续新用户收到 6 位配对码（15 分钟内有效）：在 `lcb start` 的运行终端输入该码回车，或另开终端 `lcb pair <code>` 批准——写盘后自动生效，无需重启
 

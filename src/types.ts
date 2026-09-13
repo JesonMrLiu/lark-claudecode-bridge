@@ -122,6 +122,9 @@ export interface IncomingMessage {
   chatId: string; chatType: 'p2p' | 'group'; userId: string; text: string; messageId: string;
   /** image 消息 / post 内嵌图片的 image_key（gateway 下载后把本地路径注记拼进 text，下游不再消费此字段） */
   imageKeys?: string[];
+  /** file 消息 / post 混发（顶层 files 数组或 media 节点）的文件标识与原始文件名
+   *  （gateway 下载后把本地路径注记拼进 text，下游不再消费此字段） */
+  files?: Array<{ fileKey: string; fileName: string }>;
   /** 父消息 ID（用户回复上游消息时存在；#5 据此拉取上游链文本拼进 prompt，最多向上 3 层） */
   parentId?: string;
 }

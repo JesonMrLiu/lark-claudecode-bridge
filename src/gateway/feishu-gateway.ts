@@ -66,18 +66,25 @@ interface RawMessagePayload {
 }
 
 /** post 富文本节点（拍平时只取关心的 tag，其余跳过） */
-interface PostNode { tag?: string; text?: string; href?: string; image_key?: string }
+interface PostNode { tag?: string; text?: string; href?: string; image_key?: string; file_key?: string }
 
 /**
- * post 富文本拍平为纯文本 + 图片 key 列表：
+ * post 富文本拍平为纯文本 + 图片 key 列表 + 文件列表：
  * text→text 字段、a→[text](href)、img→收集 image_key、at 及其他 tag→跳过；
  * title 非空作首行，行间 \n 连接（保留多行结构）。content 非法返回 null。
+ * 文件两种形态均提取：① 新版客户端「文字+文件」混发——文件在顶层 files 数组（content
+ * 节点里只有文字，实测 2026-09）；② 旧客户端——content 内 media 节点（无 file_name 兜底 file）。
+ * is_folder 文件夹项跳过（不可经消息资源接口下载）。
  */
-function flattenPost(rawContent: string): { text: string; imageKeys: string[] } | null {
+function flattenPost(rawContent: string): { text: string; imageKeys: string[]; files: Array<{ fileKey: string; fileName: string }> } | null {
   try {
-    const post = JSON.parse(rawContent) as { title?: string; content?: PostNode[][] };
+    const post = JSON.parse(rawContent) as {
+      title?: string; content?: PostNode[][];
+      files?: Array<{ file_key?: string; file_name?: string; is_folder?: boolean }>;
+    };
     if (!Array.isArray(post.content)) return null;
     const imageKeys: string[] = [];
+    const files: Array<{ fileKey: string; fileName: string }> = [];
     const lines: string[] = [];
     if (typeof post.title === 'string' && post.title.trim()) lines.push(post.title);
     for (const line of post.content) {
@@ -87,10 +94,14 @@ function flattenPost(rawContent: string): { text: string; imageKeys: string[] } 
         if (node?.tag === 'text' && node.text) parts.push(node.text);
         else if (node?.tag === 'a' && node.text) parts.push(node.href ? `[${node.text}](${node.href})` : node.text);
         else if (node?.tag === 'img' && node.image_key) imageKeys.push(node.image_key);
+        else if (node?.tag === 'media' && node.file_key) files.push({ fileKey: node.file_key, fileName: 'file' });
       }
       lines.push(parts.join(''));
     }
-    return { text: lines.join('\n'), imageKeys };
+    for (const f of post.files ?? []) {
+      if (f?.file_key && !f.is_folder) files.push({ fileKey: f.file_key, fileName: f.file_name?.trim() || 'file' });
+    }
+    return { text: lines.join('\n'), imageKeys, files };
   } catch {
     return null;
   }
@@ -100,8 +111,10 @@ function flattenPost(rawContent: string): { text: string; imageKeys: string[] } 
  * 解析 im.message.receive_v1 事件为 IncomingMessage。
  *
  * 支持的消息类型：text（纯文本，含手打多行）、post（富文本——粘贴带格式内容会被客户端编码为
- * 此类型，拍平为多行纯文本并提取内嵌图片）、image（纯图片，提取 image_key 供 gateway 下载）。
- * 其余类型（audio/media/file 等）：p2p 返回 RejectedMessage 供上层回提示（不再静默蒸发），
+ * 此类型，拍平为多行纯文本并提取内嵌图片；新版客户端「文字+文件」混发也编码为此类型，
+ * 文件在顶层 files 数组）、image（纯图片，提取 image_key 供 gateway 下载）、file（纯文件，
+ * 提取 file_key/file_name 供 gateway 下载）。
+ * 其余类型（audio/media/video 等）：p2p 返回 RejectedMessage 供上层回提示（不再静默蒸发），
  * 群聊保持 null 静默（@ 判定对非常规类型无法可靠进行）。
  *
  * 群聊 @检测：botOpenId（机器人 open_id）可用时按 mentions 数组精确匹配——
@@ -125,6 +138,7 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
     if (!m?.chat_id || !m.message_id || !m.message_type) return null;
     let text = '';
     let imageKeys: string[] = [];
+    let files: Array<{ fileKey: string; fileName: string }> = [];
     if (m.message_type === 'text') {
       text = (JSON.parse(m.content ?? '{}') as { text?: string }).text ?? '';
     } else if (m.message_type === 'post') {
@@ -132,15 +146,19 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
       if (!flat) return null;
       text = flat.text;
       imageKeys = flat.imageKeys;
+      files = flat.files;
     } else if (m.message_type === 'image') {
       const key = (JSON.parse(m.content ?? '{}') as { image_key?: string }).image_key;
       if (key) imageKeys.push(key);
+    } else if (m.message_type === 'file') {
+      const f = JSON.parse(m.content ?? '{}') as { file_key?: string; file_name?: string };
+      if (f.file_key) files.push({ fileKey: f.file_key, fileName: f.file_name?.trim() || 'file' });
     } else {
       return m.chat_type === 'p2p'
         ? { rejected: { kind: 'unsupported-type', chatId: m.chat_id, chatType: 'p2p', messageType: m.message_type } }
         : null;
     }
-    if (!text.trim() && imageKeys.length === 0) return null;
+    if (!text.trim() && imageKeys.length === 0 && files.length === 0) return null;
     const isGroup = m.chat_type !== 'p2p';
     if (isGroup) {
       if (botOpenId) {
@@ -168,6 +186,7 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
       messageId: m.message_id,
       ...(m.parent_id ? { parentId: m.parent_id } : {}),
       ...(imageKeys.length > 0 ? { imageKeys } : {}),
+      ...(files.length > 0 ? { files } : {}),
     };
   } catch {
     return null;
@@ -311,6 +330,12 @@ export class FeishuGateway {
     return '.png';
   }
 
+  /** 清洗文件名：替换 Windows 路径非法字符（\/:*?"<>|）与控制符为 _，清洗后为空兜底 file */
+  private static sanitizeFileName(name: string): string {
+    const cleaned = name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim();
+    return cleaned || 'file';
+  }
+
   /**
    * 下载消息内嵌图片到 inbox 目录（文件名 messageId_序号.扩展名）。
    * 单张失败仅 warn 记录、不阻塞其余图片与消息转发（im:resource 权限缺失等场景文字任务照常）。
@@ -332,6 +357,33 @@ export class FeishuGateway {
       } catch (e) {
         this.log.warn(`[图片] 下载失败（${key}）：`, e);
         failures.push(key);
+      }
+    }
+    return { paths, failures };
+  }
+
+  /**
+   * 下载消息附件文件到 inbox 目录（文件名 messageId_序号_原始文件名，原始名经 sanitize 清洗，
+   * 保留原名便于 Claude Code 识别内容；file 资源响应头 content-type 为 octet-stream，扩展名取自原始名）。
+   * 单个失败仅 warn 记录、不阻塞消息转发（与图片一致；飞书资源下载接口单文件上限 100MB，超限报错）。
+   */
+  private async downloadFiles(msg: IncomingMessage): Promise<{ paths: string[]; failures: string[] }> {
+    const paths: string[] = [];
+    const failures: string[] = [];
+    mkdirSync(this.inboxDir, { recursive: true });
+    for (let i = 0; i < (msg.files ?? []).length; i++) {
+      const f = msg.files![i];
+      try {
+        const res = await this.client.im.messageResource.get({
+          path: { message_id: msg.messageId, file_key: f.fileKey },
+          params: { type: 'file' },
+        });
+        const filePath = join(this.inboxDir, `${msg.messageId}_${i + 1}_${FeishuGateway.sanitizeFileName(f.fileName)}`);
+        await res.writeFile(filePath);
+        paths.push(filePath);
+      } catch (e) {
+        this.log.warn(`[文件] 下载失败（${f.fileName}）：`, e);
+        failures.push(f.fileName);
       }
     }
     return { paths, failures };
@@ -386,7 +438,7 @@ export class FeishuGateway {
         if (parsed && 'rejected' in parsed) {
           // 不支持的消息类型（p2p）：明确反馈而非静默蒸发；提示发送失败不影响主流程
           if (parsed.rejected.chatType === 'p2p') {
-            await this.sendText(parsed.rejected.chatId, `🤖 暂不支持该消息类型（${parsed.rejected.messageType}），当前支持：文字、富文本（多行/粘贴）、图片`)
+            await this.sendText(parsed.rejected.chatId, `🤖 暂不支持该消息类型（${parsed.rejected.messageType}），当前支持：文字、富文本（多行/粘贴）、图片、文件`)
               .catch((e) => this.log.warn('[类型提示] 发送失败：', e));
           }
           return;
@@ -407,6 +459,20 @@ export class FeishuGateway {
             }
             if (failures.length > 0) {
               notes.push(`[另有 ${failures.length} 张图片下载失败（${failures.join('、')}）——如需查看请让用户重发，或检查应用 im:resource 权限。]`);
+            }
+            parsed.text = hasText ? `${parsed.text}\n\n${notes.join('\n')}` : notes.join('\n');
+          }
+          // file 消息 / post 内嵌文件：同图片模式下载落盘后注记路径——纯 file 消息无文字
+          //（注记即全文）；post 混发时文字在前、注记附后
+          if ((parsed.files?.length ?? 0) > 0) {
+            const { paths, failures } = await this.downloadFiles(parsed);
+            const hasText = parsed.text.trim().length > 0;
+            const notes: string[] = [];
+            if (paths.length > 0) {
+              notes.push(`[用户${hasText ? '随消息' : ''}发送了 ${paths.length} 个文件${hasText ? '' : '（无文字说明）'}，已保存到本地：${paths.join('、')}。需要查看文件内容时用 Read 工具读取这些路径。]`);
+            }
+            if (failures.length > 0) {
+              notes.push(`[另有 ${failures.length} 个文件下载失败（${failures.join('、')}）——单个文件不能超过 100MB，如需处理请压缩或拆分后重发。]`);
             }
             parsed.text = hasText ? `${parsed.text}\n\n${notes.join('\n')}` : notes.join('\n');
           }
