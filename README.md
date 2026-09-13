@@ -12,8 +12,8 @@
 
 1. Node.js ≥ 20
 2. Claude 认证（二选一，详见[认证双模式](#认证双模式inherit--managed)）：
-   - **bridge 托管（推荐，免本机登录）**：准备 `ANTHROPIC_API_KEY`（官方）或 `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`（第三方中转端点），在配置页填写即可
-   - **继承本机**：本机已 `claude login`（任意鉴权方式），桥接器自动共享 `~/.claude` 全套配置
+  - **bridge 托管（推荐，免本机登录）**：准备 `ANTHROPIC_API_KEY`（官方）或 `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`（第三方中转端点），在配置页填写即可
+  - **继承本机**：本机已 `claude login`（任意鉴权方式），桥接器自动共享 `~/.claude` 全套配置
 
 ### 安装
 
@@ -28,7 +28,7 @@ lcb start
 
 ### 飞书应用配置（图文）
 
-1. https://open.feishu.cn → 创建企业自建应用 → 添加「机器人」能力
+1. [https://open.feishu.cn](https://open.feishu.cn) → 创建企业自建应用 → 添加「机器人」能力
 2. 权限管理开通：`im:message`（含读取单聊消息，回复引用拼接用）、`im:message:send_as_bot`、`im:resource`（接收图片用）、`contact:user.base:readonly`、`application:app_slash_command:write` / `application:app_slash_command:read`（斜杠命令同步用）、`cardkit:card:write`（建议开通：卡片局部刷新；不开自动降级为整卡更新，功能不缺）
 3. 事件与回调 → 事件配置 → 订阅方式选「使用长连接接收事件」→ 添加 `im.message.receive_v1`
 4. 事件与回调 → 回调配置 → 订阅方式选「使用长连接接收回调」→「已订阅的回调」点「添加回调」，添加「卡片回传交互」（`card.action.trigger`）
@@ -47,60 +47,55 @@ lcb start
 
 配置页随桥接器常驻 `http://127.0.0.1:17317`（也可 `lcb ui` 单独启动，写盘后运行中的桥接器自动拾取可热字段）。共 9 个配置页签：
 
-**概览** —— 桥接器进程启停 / 重启 / 后台运行、版本检查与一键更新、各机器人应用运行状态。
-
-**飞书应用** —— 多机器人管理：App ID / Secret（脱敏回显）、默认工作区、并发上限、人格补充（`append_system_prompt`）、触发词、环境变量。
-
-**工作区** —— 工作区白名单（名称 / 路径）与全局默认工作区，改动热生效。
-
-**Claude 认证** —— inherit / managed 双模式切换、认证凭证（API Key / Auth Token / Base URL）、模型、厂商档案（多套凭证一键切换）、托管环境变量。
-
-**权限** —— 免确认工具白名单（`permissions.allow_tools`）与危险命令黑名单，保存后热生效。
-
-**斜杠命令** —— 把内置命令（`/new` `/status` …）+ 自定义透传命令一键同步为飞书输入框斜杠指令（输入 `/` 弹面板，选中后可继续输入描述再发送）。
-
-**插件** —— Claude Code 插件清单（启停 / 卸载，本机 `~/.claude` 与托管目录带来源标记）、从 marketplace 安装、管理市场。
-
-**Skills** —— 四来源技能聚合清单（本机用户级 / bridge 托管 / 工作区项目级 / 插件内只读），支持新建、删除、zip 导入。
-
-**MCP** —— MCP Servers 管理（命令方式或 JSON 配置添加）、状态探测、抽屉查看 env 引用展开值；任务级热生效。
-
+- **概览** —— 桥接器进程启停 / 重启 / 后台运行、版本检查与一键更新、各机器人应用运行状态。
+- **飞书应用** —— 多机器人管理：App ID / Secret（脱敏回显）、默认工作区、并发上限、人格补充（`append_system_prompt`）、触发词、环境变量。
+- **工作区** —— 工作区白名单（名称 / 路径）与全局默认工作区，改动热生效。
+- **Claude 认证** —— inherit / managed 双模式切换、认证凭证（API Key / Auth Token / Base URL）、模型、厂商档案（多套凭证一键切换）、托管环境变量。
+- **权限** —— 免确认工具白名单（`permissions.allow_tools`）与危险命令黑名单，保存后热生效。
+- **斜杠命令** —— 把内置命令（`/new` `/status` …）+ 自定义透传命令一键同步为飞书输入框斜杠指令（输入 `/` 弹面板，选中后可继续输入描述再发送）。
+- **插件** —— Claude Code 插件清单（启停 / 卸载，本机 `~/.claude` 与托管目录带来源标记）、从 marketplace 安装、管理市场。
+- **Skills** —— 四来源技能聚合清单（本机用户级 / bridge 托管 / 工作区项目级 / 插件内只读），支持新建、删除、zip 导入。
+- **MCP** —— MCP Servers 管理（命令方式或 JSON 配置添加）、状态探测、抽屉查看 env 引用展开值；任务级热生效。
 
 ## lcb 命令
 
-| 命令 | 说明 |
-|---|---|
-| `lcb setup` | 引导式配置（命令行问答；与配置页产物等价，预置 permissions / server 默认段） |
-| `lcb start` | 启动桥接器（前台，为每个机器人各建一条长连接 + 内嵌 Web 配置页；首次安装自动进引导；终端可直接输入配对码批准） |
-| `lcb ui` | 仅启动 Web 配置页（不启动机器人；可与运行中的桥接器共存，写盘后桥接器自动拾取可热字段） |
-| `lcb pair <code>` | 另开终端批准 6 位配对码 |
-| `lcb app list` | 列出机器人应用 |
-| `lcb app add` | 添加机器人应用（交互式；旧单应用配置会自动升级为多应用格式，重启后生效） |
-| `lcb app remove <名字\|app_id>` | 删除机器人应用（最后一个不可删；其会话分片与落盘目录保留待人工清理） |
-| `lcb ws add <名字> <路径>` | 添加工作区（路径需已存在；增量写回，保留 config.yaml 注释） |
-| `lcb ws remove <名字>` | 删除工作区（默认工作区被删时自动回退；apps 里的引用联动清理） |
-| `lcb ws list` | 列出工作区（`*` 为默认） |
-| `lcb version` | 查看版本 |
+
+| 命令                           | 说明                                                          |
+| ---------------------------- | ----------------------------------------------------------- |
+| `lcb setup`                  | 引导式配置（命令行问答；与配置页产物等价，预置 permissions / server 默认段）           |
+| `lcb start`                  | 启动桥接器（前台，为每个机器人各建一条长连接 + 内嵌 Web 配置页；首次安装自动进引导；终端可直接输入配对码批准） |
+| `lcb ui`                     | 仅启动 Web 配置页（不启动机器人；可与运行中的桥接器共存，写盘后桥接器自动拾取可热字段）              |
+| `lcb pair <code>`            | 另开终端批准 6 位配对码                                               |
+| `lcb app list`               | 列出机器人应用                                                     |
+| `lcb app add`                | 添加机器人应用（交互式；旧单应用配置会自动升级为多应用格式，重启后生效）                        |
+| `lcb app remove <名字|app_id>` | 删除机器人应用（最后一个不可删；其会话分片与落盘目录保留待人工清理）                          |
+| `lcb ws add <名字> <路径>`       | 添加工作区（路径需已存在；增量写回，保留 config.yaml 注释）                        |
+| `lcb ws remove <名字>`         | 删除工作区（默认工作区被删时自动回退；apps 里的引用联动清理）                           |
+| `lcb ws list`                | 列出工作区（`*` 为默认）                                              |
+| `lcb version`                | 查看版本                                                        |
+
 
 > **热生效**：桥接器运行中执行 `lcb ws add / remove`，下一条消息到达时自动重读配置，无需重启（apps 应用列表、凭证与 `concurrency` 改动除外，需重启）。
 
 ## 命令速查（飞书里发给机器人）
 
-| 命令 | 说明 |
-|---|---|
-| /new | 开新会话（历史保留，`/resume` 可随时切回） |
-| /resume | 列出/恢复历史会话（`/resume <编号>` 恢复指定会话；列表标注当前续接的会话） |
-| /stop | 停止当前任务 |
-| /status | 当前状态 |
-| /ws list / /ws use \<名字\> | 工作区（切换仅 admin 可用） |
-| /model | 查看当前模型；`/model <名字>` 通道级切换；`/model reset` 恢复默认 |
-| /model-profile | 查看/切换厂商档案（多厂商凭证+模型整体切换，切换仅 admin；managed 模式下一条消息生效） |
-| /plan | 计划模式开关：开启后每个任务先出计划 → 飞书卡片批准 / 按意见修改 / 放弃 → 批准后自动执行；git 仓库工作区任务收尾发汇总 diff 卡片 |
-| /skills / /plugins / /mcp | 查看本会话实际加载的技能 / 插件 / MCP 服务 |
-| /plugin | 插件管理：`/plugin list`（全员，含本机 ~/.claude 与托管目录两处清单）；`install/uninstall/enable/disable/marketplace …`（仅 admin，默认装 ~/.claude，`--dir=managed` 装托管目录），装好下一条消息自动加载 |
-| /reload-plugins | 重载插件：清插件发现缓存，下一条消息重新扫描加载（终端命令的 bridge 等价物） |
-| /help | 帮助 |
-| 其它 `/xxx` | **原文透传**给 Claude Code 派发斜杠命令（如 `/superpowers:brainstorming` 触发插件技能） |
+
+| 命令                        | 说明                                                                                                                                                        |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| /new                      | 开新会话（历史保留，`/resume` 可随时切回）                                                                                                                                |
+| /resume                   | 列出/恢复历史会话（`/resume <编号>` 恢复指定会话；列表标注当前续接的会话）                                                                                                              |
+| /stop                     | 停止当前任务                                                                                                                                                    |
+| /status                   | 当前状态                                                                                                                                                      |
+| /ws list / /ws use 名字     | 工作区（切换仅 admin 可用）                                                                                                                                         |
+| /model                    | 查看当前模型；`/model <名字>` 通道级切换；`/model reset` 恢复默认                                                                                                            |
+| /model-profile            | 查看/切换厂商档案（多厂商凭证+模型整体切换，切换仅 admin；managed 模式下一条消息生效）                                                                                                       |
+| /plan                     | 计划模式开关：开启后每个任务先出计划 → 飞书卡片批准 / 按意见修改 / 放弃 → 批准后自动执行；git 仓库工作区任务收尾发汇总 diff 卡片                                                                               |
+| /skills / /plugins / /mcp | 查看本会话实际加载的技能 / 插件 / MCP 服务                                                                                                                                |
+| /plugin                   | 插件管理：`/plugin list`（全员，含本机 ~/.claude 与托管目录两处清单）；`install/uninstall/enable/disable/marketplace …`（仅 admin，默认装 ~/.claude，`--dir=managed` 装托管目录），装好下一条消息自动加载 |
+| /reload-plugins           | 重载插件：清插件发现缓存，下一条消息重新扫描加载（终端命令的 bridge 等价物）                                                                                                                |
+| /help                     | 帮助                                                                                                                                                        |
+| 其它 `/xxx`                 | **原文透传**给 Claude Code 派发斜杠命令（如 `/superpowers:brainstorming` 触发插件技能）                                                                                       |
+
 
 > 清单类命令（/skills 等）的数据来自最近一次会话的加载清单；刚启动还没跑过任务时，先发一条普通消息（如「你好」）再查。
 
@@ -155,12 +150,14 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 
 ### 认证双模式（inherit / managed）
 
-| | inherit（缺省） | managed |
-|---|---|---|
-| 认证来源 | 本机 `~/.claude`（`claude login` 或其 settings.json） | config.yaml `claude` 段 → 写入 `~/.lark-claudecode-bridge/claude/settings.json` |
-| 适用 | 本机已在用 Claude Code 的用户 | 干净机器 / 不想动本机配置；配 API Key 或中转站 Token |
-| 模型 / MCP / skills / 插件 | 继承 `~/.claude` 全套，无须二次配置 | 全部落在托管目录，与本机 `~/.claude` 完全隔离；已启用插件双目录合并加载 |
-| 切换 | 改 `claude.mode` 后**重启**生效 | 同 |
+
+|                        | inherit（缺省）                                     | managed                                                                      |
+| ---------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------- |
+| 认证来源                   | 本机 `~/.claude`（`claude login` 或其 settings.json） | config.yaml `claude` 段 → 写入 `~/.lark-claudecode-bridge/claude/settings.json` |
+| 适用                     | 本机已在用 Claude Code 的用户                           | 干净机器 / 不想动本机配置；配 API Key 或中转站 Token                                          |
+| 模型 / MCP / skills / 插件 | 继承 `~/.claude` 全套，无须二次配置                        | 全部落在托管目录，与本机 `~/.claude` 完全隔离；已启用插件双目录合并加载                                   |
+| 切换                     | 改 `claude.mode` 后**重启**生效                       | 同                                                                            |
+
 
 配置页「Claude 认证」tab 可视化切换；managed 模式下认证 / 模型改动保存后即对后续任务生效（无需重启）。多个机器人共享同一套 Claude 配置，会话池与并发各自独立。
 
@@ -181,7 +178,7 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 
 ## 已知限制
 
-1. **Linux 上 >10 文件不打 zip**：文件打包依赖 bsdtar 的 zip 容器支持（Windows 10+ / macOS 自带），Linux 的 GNU tar 会自动退化为逐个上传文件（功能不丢，只是消息条数多）。
+1. **Linux 上 &gt;10 文件不打 zip**：文件打包依赖 bsdtar 的 zip 容器支持（Windows 10+ / macOS 自带），Linux 的 GNU tar 会自动退化为逐个上传文件（功能不丢，只是消息条数多）。
 2. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` 的同名键会被 `~/.claude/settings.json` 的 `env` 覆盖。
 3. **多机器人总并发 = 各应用并发之和**：N 个机器人同时满载时会同时跑 Σ(concurrency) 个 Claude Code 子进程，机器吃紧可按 app 调低。
 4. **配置页默认仅本机可访问**（127.0.0.1）：改 `server.host` 放开到局域网意味着页面可读写全部凭证，请仅在可信网络使用。
