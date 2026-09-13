@@ -5,7 +5,7 @@ dist/
 .idea
 .setting.local
 .superpowers
-docs/
+docs/*.md
 .claude
 tests
 .playwright-mcp/

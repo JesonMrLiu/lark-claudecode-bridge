@@ -4,37 +4,18 @@
 写操作以卡片按钮确认（长连接回调），结果文本与产出文件回传飞书。
 **无需公网 IP、无需内网穿透；无需预装 Claude Code CLI，一键安装 + 网页配置即可使用。**
 
-## 特性
+![配置页概览](docs/images/overview.png)
 
-- **一键安装开箱即用**：`npm install -g` 后 `lcb start` 自动弹出网页配置页，飞书凭证 / Claude 认证（API Key / 中转站 Token）/ 模型 / 权限白名单全部在页面完成，不依赖本机 `claude login`（已登录的本机用户可继续共享 `~/.claude`，见「认证双模式」）
-- **Web 配置页随桥接器常驻**（`http://127.0.0.1:17317`）：应用 / 工作区 / 权限 / 触发词 / 插件随时可改，密钥脱敏回显；改动自动区分「热生效」与「需重启」
-- **飞书斜杠命令一键同步**：配置页把 `/new` `/status` 等命令注册为飞书输入框斜杠指令（输入 `/` 弹面板、选中后可继续输入描述），替代手工去开放平台逐条创建
-- **飞书端直接装插件**：聊天里 `/plugin install xxx@marketplace`（仅管理员）即可安装 / 启停 Claude Code 插件，下一条消息自动加载；配置页同样可管
-- 私聊 / 群聊 @机器人 触发；群聊多人可用（配对 + 白名单访问控制）
-- **直接使用本机 Claude Code 全套配置**（inherit 模式）：模型设置（`~/.claude/settings.json`）、登录态、user 级 MCP、skills、marketplace 插件自动继承，无须二次配置；已启用插件自动加载
-- **斜杠透传**：飞书里直接发 `/superpowers:brainstorming` 等斜杠命令，原文透传给 Claude Code 展开（user skills / 插件命令均可触发）
-- **多机器人**：一个进程同时跑 N 个飞书机器人，各自独立会话池、独立并发、独立人格（`append_system_prompt`）；共享同一套 Claude 配置
-- 写操作确认嵌在计时进度卡底部（允许 / 拒绝 / 本次会话不再询问，仅任务发起人可点；Write/Edit 直接展示红绿 diff；等待确认时正文自动收敛，决策后按钮消失、状态行显示结果）
-- **读操作免确认**：读工具（Read/Grep/Glob 等）与 Bash 读命令默认直通，危险命令黑名单兜底；白名单可通过 `permissions.allow_tools` 自定义（配置页可增删，新建配置默认预置完整默认值）
-- **计划模式（/plan 命令）**：飞书里发 `/plan` 按通道切换——开启后每个任务先出计划 → 飞书卡片批准/按意见修改/放弃 → 批准后自动执行；git 仓库工作区任务收尾发汇总 diff 卡片（红绿着色），不再整文件刷屏
-- 流式进度卡片（打字机效果 + 工具调用 + 运行心跳，静默不等于卡死）
-- **接收图片与富文本**：直接给机器人发图片（下载到 `~/.lark-claudecode-bridge/inbox/`，Claude 用 Read 工具识图）；粘贴的多行/带格式内容（post 富文本）自动拍平为多行文本；不支持的类型（语音等）私聊会回复提示；入站消息按 message_id 去重（WS 重投不会导致任务跑两遍）
-- 结果文本 + 产出文件回传（图片预览、>10 文件自动 zip）
-- 多工作区切换（/ws）、会话管理（/new /resume）、/stop 打断、模型切换（/model）、厂商档案切换（/model-profile）、加载清单查看（/skills /plugins /mcp）、插件管理（/plugin）
-- **后台子代理续跑**：主 Agent 派发的后台子代理在主回复结束后继续执行，完成后自动唤醒主循环汇总结果（进度卡可见「等待后台任务」与子代理输出）
-- **对话内容落盘**：用户消息与 Claude 回复全文存为 JSONL（`transcripts/`，为后续知识库挖掘打底；可选保留期）
-- **回复链上游自动拼入 prompt**：在飞书里「回复」某条消息再发新指令，上游最多 3 层消息文本会作为引用附在新消息前部一起发给 Claude（需 `im:message` 读取权限；失败降级只发当前消息）
-- **Skills / MCP 可视化管理页**：配置页新增「Skills」「MCP」两页——Skills 三来源（用户级·本机 / 用户级·bridge / 项目级·工作区） + zip 导入；MCP 三来源 + 命令方式（`claude mcp add`）/ JSON 配置 + 状态探测 + 抽屉查看 env 引用展开当前值。页面添加的 MCP 存 `~/.lark-claudecode-bridge/mcp/servers.json`，任务级热生效（无须重启）
-- 通道并发（默认 3），通道内串行
+## 快速开始
 
-## 前置条件
+### 前置条件
 
 1. Node.js ≥ 20
-2. Claude 认证（二选一）：
+2. Claude 认证（二选一，详见[认证双模式](#认证双模式inherit--managed)）：
    - **bridge 托管（推荐，免本机登录）**：准备 `ANTHROPIC_API_KEY`（官方）或 `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`（第三方中转端点），在配置页填写即可
    - **继承本机**：本机已 `claude login`（任意鉴权方式），桥接器自动共享 `~/.claude` 全套配置
 
-## 安装
+### 安装
 
 ```bash
 npm install -g @jesonliu/lark-claudecode-bridge
@@ -43,29 +24,73 @@ lcb start
 
 首次运行 `lcb start` 检测到没有配置时，会自动打开浏览器进入配置页（`http://127.0.0.1:17317`）：填飞书凭证 → 选认证方式 → 完成后重新 `lcb start` 即可使用。
 
-偏好命令行问答的也可以用 `lcb setup`（两者产物等价，setup 额外预置 permissions / server 默认段）。配置页也可单独启动：`lcb ui`（不启动机器人，可与运行中的桥接器共存）。
+偏好命令行问答的也可以用 `lcb setup`（两者产物等价）。配置页也可单独启动：`lcb ui`（不启动机器人，可与运行中的桥接器共存）。
 
-## 飞书应用配置（图文）
+### 飞书应用配置（图文）
 
 1. https://open.feishu.cn → 创建企业自建应用 → 添加「机器人」能力
-2. 权限管理开通：`im:message`（**含读取单条消息：回复链上游内容拼接用，不开则回复消息时降级为只发当前消息**）、`im:message:send_as_bot`、`im:resource`（**接收用户图片时下载消息资源用，不开则图片任务会提示下载失败**）、`contact:user.base:readonly`、`application:app_slash_command:write` / `application:app_slash_command:read`（斜杠命令一键同步用，见下）、`cardkit:card:write`（**建议开通：卡片实体模式，任务运行中的状态局部刷新 + qa 选项按钮即时高亮**。不开时自动降级为整卡更新——功能不缺，状态刷新粒度变粗。**注意：权限开通后需在开发者后台创建新版本并发布、重启 bridge 才生效**。无论哪种模式，0.20.1 起计划/提问挂起等待你输入期间均冻结维持性刷新——正在输入的意见/自定义答案不会被清掉，计时行显示「⏸ 计时已暂停」，操作后恢复跳动）
+2. 权限管理开通：`im:message`（含读取单聊消息，回复引用拼接用）、`im:message:send_as_bot`、`im:resource`（接收图片用）、`contact:user.base:readonly`、`application:app_slash_command:write` / `application:app_slash_command:read`（斜杠命令同步用）、`cardkit:card:write`（建议开通：卡片局部刷新；不开自动降级为整卡更新，功能不缺）
 3. 事件与回调 → 事件配置 → 订阅方式选「使用长连接接收事件」→ 添加 `im.message.receive_v1`
 4. 事件与回调 → 回调配置 → 订阅方式选「使用长连接接收回调」→「已订阅的回调」点「添加回调」，添加「卡片回传交互」（`card.action.trigger`）
 5. 凭证与基础信息 → 复制 App ID / App Secret
 6. 版本管理与发布 → 创建版本并发布，管理员审核通过
 7. `lcb start`（首次自动进配置页）或 `lcb setup` 填入凭证 → 私聊机器人发「/help」
 
-### 配置斜杠命令（配置页一键同步）
+> 权限开通后需在开发者后台创建新版本并发布、重启 bridge 才生效。
 
-配置页 →「斜杠命令」tab：选择目标应用 → **一键同步**，把 bridge 全部内置命令（`/new` `/status` `/help` …）+ 自定义透传命令注册为飞书输入框斜杠指令。用户在聊天输入 `/` 弹出指令面板，**选中后命令留在输入框，可继续输入描述**再发送（区别于机器人菜单点击即发送）。
+## 首次使用
 
-- 同步为**全量对齐**：远端多余的命令会被删除；生效约 5 分钟（客户端缓存），PC 端需 7.70+
-- 自定义命令（如把 `/produce` 关联到 content-producer 插件）：表格添加「命令 / 描述 / 图标」→ 保存 → 同步（内部命令集恒参与同步）
-- 前置：应用已开通 `application:app_slash_command:write` / `read` 权限并发布版本
+- 每个机器人应用的**首位发消息用户免配对**，自动成为 admin
+- 后续新用户收到 6 位配对码（15 分钟内有效）：在 `lcb start` 的运行终端输入该码回车，或另开终端 `lcb pair <code>` 批准——写盘后自动生效，无需重启
 
-## 首次配对
+## Web 配置页
 
-第一个发消息的用户会收到 6 位配对码（15 分钟内有效），在 `lcb start` 的终端里输入该码回车即批准（首个批准者自动成为 admin）。或另开终端 `lcb pair <code>`——批准写盘后，运行中的桥在下一条消息到达时自动重读白名单，无需重启。
+配置页随桥接器常驻 `http://127.0.0.1:17317`（也可 `lcb ui` 单独启动，写盘后运行中的桥接器自动拾取可热字段）。共 9 个配置页签：
+
+**概览** —— 桥接器进程启停 / 重启 / 后台运行、版本检查与一键更新、各机器人应用运行状态。
+
+<!-- 📸 截图待补：配置页 →「概览」tab，存为 docs/images/overview.png 后删除本注释两行（若已在顶部放了门面图可跳过本处） -->
+<!-- ![概览](docs/images/overview.png) -->
+
+**飞书应用** —— 多机器人管理：App ID / Secret（脱敏回显）、默认工作区、并发上限、人格补充（`append_system_prompt`）、触发词、环境变量。
+
+<!-- 📸 截图待补：配置页 →「飞书应用」tab，存为 docs/images/apps.png 后删除本注释两行 -->
+<!-- ![飞书应用](docs/images/apps.png) -->
+
+**工作区** —— 工作区白名单（名称 / 路径）与全局默认工作区，改动热生效。
+
+<!-- 📸 截图待补：配置页 →「工作区」tab，存为 docs/images/workspaces.png 后删除本注释两行 -->
+<!-- ![工作区](docs/images/workspaces.png) -->
+
+**Claude 认证** —— inherit / managed 双模式切换、认证凭证（API Key / Auth Token / Base URL）、模型、厂商档案（多套凭证一键切换）、托管环境变量。
+
+<!-- 📸 截图待补：配置页 →「Claude 认证」tab，存为 docs/images/claude.png 后删除本注释两行 -->
+<!-- ![Claude 认证](docs/images/claude.png) -->
+
+**权限** —— 免确认工具白名单（`permissions.allow_tools`）与危险命令黑名单，保存后热生效。
+
+<!-- 📸 截图待补：配置页 →「权限」tab，存为 docs/images/permissions.png 后删除本注释两行 -->
+<!-- ![权限](docs/images/permissions.png) -->
+
+**斜杠命令** —— 把内置命令（`/new` `/status` …）+ 自定义透传命令一键同步为飞书输入框斜杠指令（输入 `/` 弹面板，选中后可继续输入描述再发送）。
+
+<!-- 📸 截图待补：配置页 →「斜杠命令」tab，存为 docs/images/slash.png 后删除本注释两行 -->
+<!-- ![斜杠命令](docs/images/slash.png) -->
+
+**插件** —— Claude Code 插件清单（启停 / 卸载，本机 `~/.claude` 与托管目录带来源标记）、从 marketplace 安装、管理市场。
+
+<!-- 📸 截图待补：配置页 →「插件」tab，存为 docs/images/plugins.png 后删除本注释两行 -->
+<!-- ![插件](docs/images/plugins.png) -->
+
+**Skills** —— 四来源技能聚合清单（本机用户级 / bridge 托管 / 工作区项目级 / 插件内只读），支持新建、删除、zip 导入。
+
+<!-- 📸 截图待补：配置页 →「Skills」tab，存为 docs/images/skills.png 后删除本注释两行 -->
+<!-- ![Skills](docs/images/skills.png) -->
+
+**MCP** —— MCP Servers 管理（命令方式或 JSON 配置添加）、状态探测、抽屉查看 env 引用展开值；任务级热生效。
+
+<!-- 📸 截图待补：配置页 →「MCP」tab，存为 docs/images/mcp.png 后删除本注释两行 -->
+<!-- ![MCP](docs/images/mcp.png) -->
 
 ## lcb 命令
 
@@ -85,14 +110,6 @@ lcb start
 
 > **热生效**：桥接器运行中执行 `lcb ws add / remove`，下一条消息到达时自动重读配置，无需重启（apps 应用列表、凭证与 `concurrency` 改动除外，需重启）。
 
-## 配置页进程管理与自动更新
-
-配置页「概览」支持托管桥接器进程与自更新（源码 tsx 运行模式下自动降级为手动指引）：
-
-- **启停/重启**：概览「运行状态」卡显示桥接器进程状态（PID），可一键启动（后台守护进程）/ 停止 / 重启。`lcb start` 内嵌页面停止/重启时页面随进程短暂失联后自动恢复；`lcb ui` 独立页面则跨进程操作（Windows 下停止为硬终止，会话逐消息落盘不受影响）。
-- **后台运行日志**：桥接器输出按天落 `~/.lark-claudecode-bridge/logs/bridge-YYYY-MM-DD.log`（自动跨天切换，保留 14 天）；进程 PID 记录于 `~/.lark-claudecode-bridge/bridge.pid`（进程消亡后自动清理）。
-- **版本更新**：概览「版本与更新」卡自动对比 npm registry（跟随本机 `.npmrc` 镜像配置）与当前版本；有新版时一键更新（`npm install -g`）并自动重启生效。
-
 ## 命令速查（飞书里发给机器人）
 
 | 命令 | 说明 |
@@ -104,6 +121,7 @@ lcb start
 | /ws list / /ws use \<名字\> | 工作区（切换仅 admin 可用） |
 | /model | 查看当前模型；`/model <名字>` 通道级切换；`/model reset` 恢复默认 |
 | /model-profile | 查看/切换厂商档案（多厂商凭证+模型整体切换，切换仅 admin；managed 模式下一条消息生效） |
+| /plan | 计划模式开关：开启后每个任务先出计划 → 飞书卡片批准 / 按意见修改 / 放弃 → 批准后自动执行；git 仓库工作区任务收尾发汇总 diff 卡片 |
 | /skills / /plugins / /mcp | 查看本会话实际加载的技能 / 插件 / MCP 服务 |
 | /plugin | 插件管理：`/plugin list`（全员，含本机 ~/.claude 与托管目录两处清单）；`install/uninstall/enable/disable/marketplace …`（仅 admin，默认装 ~/.claude，`--dir=managed` 装托管目录），装好下一条消息自动加载 |
 | /reload-plugins | 重载插件：清插件发现缓存，下一条消息重新扫描加载（终端命令的 bridge 等价物） |
@@ -131,7 +149,6 @@ apps:                      # 多机器人：每个应用一条长连接
 workspaces:                # 工作区白名单（列表全局共享；「当前用哪个」per-app 隔离）
   - name: demo
     path: F:\workspace\demo
-    # 计划模式在飞书发 /plan 按通道切换；git 仓库工作区收尾自动发汇总 diff 卡片
 defaults:
   workspace: demo
 concurrency: 3             # 通道间并发上限（未单独配置的 app 沿用）
@@ -168,66 +185,18 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 |---|---|---|
 | 认证来源 | 本机 `~/.claude`（`claude login` 或其 settings.json） | config.yaml `claude` 段 → 写入 `~/.lark-claudecode-bridge/claude/settings.json` |
 | 适用 | 本机已在用 Claude Code 的用户 | 干净机器 / 不想动本机配置；配 API Key 或中转站 Token |
-| 模型/MCP/skills | 继承 `~/.claude` 全套 | 全部落在托管目录，与本机 `~/.claude` 完全隔离 |
-| 插件 | `~/.claude` 已启用插件自动加载 | **双目录合并加载**：托管目录 + 本机 `~/.claude` 已启用插件（同名托管目录优先），本机已装插件无须重装 |
+| 模型 / MCP / skills / 插件 | 继承 `~/.claude` 全套，无须二次配置 | 全部落在托管目录，与本机 `~/.claude` 完全隔离；已启用插件双目录合并加载 |
 | 切换 | 改 `claude.mode` 后**重启**生效 | 同 |
 
-配置页「Claude 认证」tab 可视化切换；managed 模式下认证/模型改动保存后即对后续任务生效（无需重启）。
+配置页「Claude 认证」tab 可视化切换；managed 模式下认证 / 模型改动保存后即对后续任务生效（无需重启）。多个机器人共享同一套 Claude 配置，会话池与并发各自独立。
 
-**managed 模式的 MCP 与环境继承**（0.14.0 起，`lcb start` 时自动完成）：本机 `~/.claude.json` 的全局 `mcpServers` 单向同步到托管目录（CLI 读 `$CLAUDE_CONFIG_DIR/.claude.json`，不同步则托管会话丢掉全部 user 级 MCP）；本机 `~/.claude/settings.json` env 块中的**非认证键**（MCP 工具依赖的 `IMAGE_GEN_*`、`API_HOST` 等自定义变量）并入托管 settings.json。需要覆盖继承值或本机没有这些配置时，用**显式配置**：配置页「Claude 认证」→「环境变量」行编辑器（或 config.yaml 的 `claude.env` 键值对），优先级 `claude.env` > 本机继承 > 托管目录既有值；认证与模型 4 键（`ANTHROPIC_AUTH_TOKEN/API_KEY/BASE_URL/MODEL`）不在此生效——永远以认证表单为准。
+## 常驻运行
 
-**插件双目录（managed 模式）**：新装插件默认装到本机 `~/.claude`（与本机 claude CLI 共用一份），`/plugin install xxx --dir=managed` 或配置页安装框选「bridge 托管目录」可装到托管目录；启停/卸载自动按插件所在目录执行，两处清单在配置页「插件」tab 与 `/plugin list` 中均带来源标记。注意：**卸载按所选目录逐处执行**——同一插件在两个目录各装一份时，卸载一处不影响另一处（本机 CLI 的 `/plugins list` 看的是它自己的配置目录）；配置页卸载后会校验安装清单已清除，残留（仅被禁用）会显式报错并附 CLI 输出。配置页「管理市场」支持 git 地址与本机路径（本地路径市场按 CLI 语义不复制文件，登记原路径读取）。
+- **Windows**：任务计划程序建「开机时启动」任务，程序指向 `windows-start.bat`（先放到固定位置，如 `C:\tools\lcb\windows-start.bat`）
+- **macOS**：把 `com.lark-claudecode-bridge.plist` 放到 `~/Library/LaunchAgents/`，然后 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lark-claudecode-bridge.plist`
+- **Linux**：把 `lark-claudecode-bridge.service` 放到 `~/.config/systemd/user/`，然后 `systemctl --user daemon-reload && systemctl --user enable --now lark-claudecode-bridge`
 
-### 计划模式工作流（/plan 命令）
-
-在飞书会话里发 `/plan`（或 `/plan on`）即可为当前通道开启计划模式，每个任务自动走「先计划、后执行」（`/plan off` 关闭；开关是通道级偏好，跨重启保留，`/new` 不清除）：
-
-1. **计划审批**：任务以 plan mode 启动（期间只允许读操作），Claude 查阅代码后提交计划 → 飞书收到计划卡片：
-   - **✅ 批准执行**：批准即授权——Claude 自动切入 acceptEdits 模式按计划开工，**后续写文件不再逐次弹确认卡**（对齐本机 CLI「批准计划 → accept edits on」语义；Bash 危险命令黑名单仍生效，命中照弹确认）
-   - **📝 按意见修改**：在卡片输入框填修改意见后点击，Claude 修订计划重新提交（同一会话内循环，直到批准或放弃）
-   - **❌ 放弃计划**：任务终止；10 分钟无操作自动放弃
-2. **收尾汇总 diff**：任务完成后不再把改动文件逐个上传，而是发**汇总 diff 卡片**（标题含文件数与 +X/-Y 行统计，正文红绿着色，超长自动拆多张）。改动以 `git diff HEAD` + untracked 新文件为准——**git 仓库工作区都会自动发**（非 git 仓库天然跳过，无需任何配置）
-
-**执行器为 Streaming Input 模式**（0.14.0 起）：prompt 经持久输入流送入 CLI，stdin 全程保持打开——这是计划审批与提问卡片能稳定工作的前提（旧版单轮模式在轮次边界会触发 CLI 的 "Stream closed" 中断，属 Agent SDK 已知问题）。**提问卡片**：Claude 调用 AskUserQuestion 时飞书收到问题选项卡，点选项作答（多选题可多选）、全部作答后「提交答案」——答案直接回传模型继续任务。
-
-**读操作免确认**：读工具与 Bash 默认直通（`ls`/`cat`/`grep` 不再弹卡），命中 `dangerous_commands` 黑名单（`rm -rf`、`sudo`、`git push --force` 等）仍弹确认卡；「本次会话不再询问」的记忆同样绕不过黑名单。想放行其它工具（如 `Edit`）往 `permissions.allow_tools` 追加即可——注意配置即**整体替换**内置默认，需把内置读工具一并写上。**白名单/黑名单热生效**（0.18.0 起）：配置页保存后，已有会话通道的下一个工具调用即用新名单（旧版需新通道或重启）。
-
-**plan mode 下的白名单语义**：计划模式开启时的计划阶段，Claude Code 内部对写操作强制走桥接的权限闸（官方语义：plan 模式无视 CLI 侧 allow 规则、写工具一律路由到宿主判定）——因此桥接白名单在计划阶段对写工具**依然生效**（命中直通执行，未命中弹确认卡嵌在计时卡上），直到计划批准切回可编辑模式。只读工具不经桥接直接执行。计时卡上工具行的 `✘` 表示该次工具调用**执行失败**（含首行失败原因），不代表「工具没权限」。
-
-> /plan 开关按通道即时生效（下一条任务起）；permissions 配置同样支持热生效（见上）。
-
-### 配置继承（inherit 模式：本机 ~/.claude 一处配置，全机器人共享）
-
-inherit 模式（缺省）下所有机器人共享本机 `~/.claude`，以下内容自动继承、无须在 config.yaml 重复配置（managed 模式则全部落在托管目录）：
-
-| 继承项 | 来源 | 说明 |
-|---|---|---|
-| 模型设置 | `~/.claude/settings.json` 的 `model` 与 `env` | 含 `ANTHROPIC_*`、第三方端点等全部环境变量 |
-| 登录态 | `~/.claude/.credentials.json` / settings.json 认证声明 | 本机 `claude login` 一次即可 |
-| user 级 MCP | `~/.claude.json` 的 `mcpServers` | 与本机 CLI 用同一批 MCP 服务 |
-| skills | `~/.claude/skills/` | 可直接在飞书发 `/技能名` 触发（透传） |
-| 插件 | `~/.claude/plugins/` 中已启用的 marketplace 插件 | 按 `installed_plugins.json` + `enabledPlugins` 自动加载 |
-| 会话记录 | `~/.claude/projects/` | 飞书跑过的会话，本机 `claude --resume` 也能接着看 |
-
-**插件自动发现**：安装 / 卸载 / 启停自动跟随（按文件 mtime 失效缓存 + 操作后主动失效）。三种管理入口等价：飞书端 `/plugin install xxx@marketplace`（admin）、配置页「插件」tab、本机 CLI。`apps[].plugins` 显式配置用于开发期直指源码目录，与自动发现同名时显式优先。
-
-**多机器人隔离语义**：
-
-- **会话池**：每个机器人一份 `sessions.<app_id>.json`，历史会话绝不共享，`/resume` 只见自己的
-- **人格**：`append_system_prompt` 按机器人定制（如对话助手 / 素材收集各一套）
-- **并发**：按机器人独立限额（缺省沿用全局 `concurrency`）；同时与多个机器人对话互不排队
-- **升级兼容**：旧版 `feishu:` 单应用配置无需改动即可启动（自动归一化）；首次 `lcb app add` 会把旧配置原地转为 `apps:` 格式，**转换后新增的机器人请追加在列表后面**（旧数据归属第一个应用）
-- ⚠️ **0.4 起废弃 `claude_config_dir`**：所有机器人统一用 `~/.claude（共享配置）`，机器人间仅会话池隔离。旧版独立目录 `~/.lark-claudecode-bridge/claude/<app_id>/` 中的历史会话不再可 `/resume`（启动时会提示目录位置，确认无用后可手动删除）
-
-### 快捷操作：飞书斜杠命令 / 机器人菜单
-
-**推荐：斜杠命令**（配置页「斜杠命令」tab 一键同步）——聊天输入框输入 `/` 弹出指令面板，选中后命令留在输入框、**可继续输入描述**（如 `/produce 写一篇公众号文章`），发送后经命令 / 透传链路执行。自定义命令在表格维护，保存后点「一键同步」。
-
-备选：机器人菜单（点击即发送，无法附加描述）——开放平台 → 应用功能 → 机器人 → 机器人菜单，添加「发送消息」类菜单项填 `/content-producer:content-producer` 即可。菜单命令格式：`/<插件名>:<技能名>`（插件技能）或 `/<技能名>`（user skill），可用命令清单发 `/skills` 查看。
-
-### 对话落盘
-
-每轮任务的完整对话（你的消息、Claude 回复、工具调用、最终结果）以 JSONL 追加到 `~/.lark-claudecode-bridge/transcripts/<app_id>/<chat_id>/<日期>.jsonl`，按天分文件，为后续知识库挖掘（如写入 Notion）打底。不想要可设 `transcripts.retention_days` 定期清理；写失败只打警告，不影响任务执行。
+模板文件见 [deploy/](deploy/)（npm 包内同路径）。
 
 ## ⚠️ 安全须知（必读）
 
@@ -236,68 +205,12 @@ inherit 模式（缺省）下所有机器人共享本机 `~/.claude`，以下内
 
 **隐私提醒**：对话全文（含代码、文件路径）明文落盘于 `~/.lark-claudecode-bridge/transcripts/`；`config.yaml` 中的 `app_secret` 与 `apps[].env` 值同样为明文。请自行控制该目录与文件的访问权限，并按需配置 `transcripts.retention_days` 保留期。
 
-## 常驻运行
-
-- **Windows**：任务计划程序建「开机时启动」任务，程序指向下面的 `windows-start.bat`（先放到固定位置，如 `C:\tools\lcb\windows-start.bat`）
-- **macOS**：launchd——把 `com.lark-claudecode-bridge.plist` 放到 `~/Library/LaunchAgents/`，然后 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.lark-claudecode-bridge.plist`
-- **Linux**：systemd user 单元——把 `lark-claudecode-bridge.service` 放到 `~/.config/systemd/user/`，然后 `systemctl --user daemon-reload && systemctl --user enable --now lark-claudecode-bridge`
-
-模板全文（npm 包内 `deploy/` 目录，或仓库 [deploy/](deploy/)）：
-
-**deploy/windows-start.bat**
-
-```bat
-@echo off
-lcb start >> "%USERPROFILE%\.lark-claudecode-bridge\bridge.log" 2>&1
-```
-
-**deploy/com.lark-claudecode-bridge.plist**
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.lark-claudecode-bridge</string>
-  <key>ProgramArguments</key><array><string>/usr/local/bin/lcb</string><string>start</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/lark-claudecode-bridge.log</string>
-</dict></plist>
-```
-
-**deploy/lark-claudecode-bridge.service**
-
-```ini
-[Unit]
-Description=lark-claudecode-bridge
-After=network-online.target
-
-[Service]
-ExecStart=/usr/bin/env lcb start
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-```
-
 ## 已知限制
 
-1. **Linux 上 >10 文件不打 zip**：文件打包用 `tar -a`（按扩展名选容器），Windows 10+ / macOS 自带的 bsdtar 支持 zip 容器；Linux 的 GNU tar 不支持创建 zip，会自动退化为逐个上传文件（功能不丢，只是消息条数多）。
-2. **access.json 多进程并发写为 last-writer-wins**：`lcb pair` 独立进程批准后，运行中的桥会在下一条消息到达时重读 `~/.lark-claudecode-bridge/access.json`（无需重启、不会重复索要配对码）。剩余风险仅在极短窗口：两个进程**恰好同时**写盘时后写者覆盖先写者（如一侧刚批准的用户在另一侧写回后丢失），正常使用几乎不会触发；如遇丢失，重新配对即可。
-3. **多机器人总并发 = 各应用并发之和**：每个机器人独立限额（互不排队），N 个机器人同时满载时本机会同时跑 Σ(concurrency) 个 Claude Code 子进程，机器吃紧可按 app 调低。
-4. **多机器人同群的 @ 识别**：依赖每个机器人各自的 open_id 精确匹配；若某机器人的 open_id 拉取失败，多应用部署下该机器人的**群聊消息会被丢弃**（宁丢不猜，防止同群消息触发两个机器人重复执行）——私聊不受影响。
-5. **旧数据迁移归属**：升级多应用后，旧 `sessions.json` 归属 `apps` 列表的第一个应用；新增机器人请追加在列表末尾，否则历史会话会挂错机器人。
-6. **飞书 SDK 对非法 app_id 静默失败**：`ws.start()` 对形状不合法的 app_id 只打日志不报错，启动后请确认每条「✅ <应用名> 长连接已启动」状态行都出现了。
-7. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` 的同名键会被 `~/.claude/settings.json` 的 `env` 覆盖（优先级：CLI flags（/model）> settings.json env > apps[].env > 进程环境）。插件加载失败 SDK 会静默跳过，实际加载情况以 `/plugins` 清单为准。
-8. **plan 卡片的「按意见修改」依赖飞书卡片输入框回传**：修改意见经卡片 input 组件随按钮回调传回；若个别客户端版本不回传输入值，点「按意见修改」会提示先填写意见——此时可改用「放弃计划」后在会话里直接发修改要求重新起任务。
-9. **收尾 diff 基于 git**：工作区是 git 仓库（含未提交改动即可，无需 commit）且有改动时，任务收尾自动发汇总 diff 卡片；非 git 仓库天然跳过。untracked 新文件按全新增 diff 展示（目录级 untracked 与超过 20 个的 untracked 文件不展开）。
-10. **入站图片不清理**：用户发送的图片落盘 `~/.lark-claudecode-bridge/inbox/` 后不会自动删除（供会话内多次查看），长期使用可手动清理；Claude 是否能「看懂」图片取决于当前模型是否多模态（非多模态模型可配置识图 MCP 兜底）。富文本（post）中的超链接以 `[文字](链接)` 形式拍平进文本，@用户 被移除。
-11. **短回复不再单独发结果消息**：回复不超过进度卡终态上限（400 字）时，结果就展示在进度卡终态里（避免同内容两条消息）；更长回复仍会单独发一条结果消息（进度卡只保留尾部）。运行中的进度卡**不展示**过程文本与思考内容（主卡只留状态 / 当前工具 / 子代理 / 确认区 / 计时等关键信息）。
-12. **Web 配置页改 apps/workspaces 段会丢段内手写注释**：页面按整段替换写回（值未变的段落跳过重写、注释保留；`lcb ws add` 等增量命令不受影响）。手工注释建议写在段外或段头。
-13. **config.yaml 并发写**：配置页写盘为原子替换，但与 `lcb ws add` / `lcb app add` 等独立进程命令同时操作存在读-改-写窗口，请避免同时修改。
-14. **配置页默认仅本机可访问**（127.0.0.1）；改 `server.host` 放开到局域网意味着页面可读写全部凭证，请仅在可信网络使用。
-15. **计划/提问挂起期间进度卡静止（有意取舍）**：等待你在计划意见框/提问输入框打字期间，飞书卡片任何服务端更新落地都可能清掉未提交输入（飞书卡片无本地计时组件、不能嵌脚本，真机实测局部更新同样重置输入态），因此挂起期间冻结一切维持性刷新——状态行与计时停更，计时行显示「⏸ 计时已暂停 · 确认/提交后恢复」，操作后自动恢复。qa 选项按钮的高亮反馈走按钮级局部更新例外通道（实体模式；降级模式仅 toast 提示）；残余风险：该更新若被网络拒绝重试、迟到的按钮高亮落地时你恰好在自定义输入框打字，仍可能清掉输入（罕见，接受）。
+1. **Linux 上 >10 文件不打 zip**：文件打包依赖 bsdtar 的 zip 容器支持（Windows 10+ / macOS 自带），Linux 的 GNU tar 会自动退化为逐个上传文件（功能不丢，只是消息条数多）。
+2. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` 的同名键会被 `~/.claude/settings.json` 的 `env` 覆盖。
+3. **多机器人总并发 = 各应用并发之和**：N 个机器人同时满载时会同时跑 Σ(concurrency) 个 Claude Code 子进程，机器吃紧可按 app 调低。
+4. **配置页默认仅本机可访问**（127.0.0.1）：改 `server.host` 放开到局域网意味着页面可读写全部凭证，请仅在可信网络使用。
 
 ## 开发
 
