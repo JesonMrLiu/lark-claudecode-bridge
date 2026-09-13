@@ -59,7 +59,7 @@ lcb start
 
 **Claude 认证** —— inherit / managed 双模式切换、认证凭证（API Key / Auth Token / Base URL）、模型、厂商档案（多套凭证一键切换）、托管环境变量。
 
-![Claude 认证](docs/images/3.claude.png)
+![Claude 认证](docs/images/4.claude.png)
 
 **权限** —— 免确认工具白名单（`permissions.allow_tools`）与危险命令黑名单，保存后热生效。
 
