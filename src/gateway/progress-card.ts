@@ -41,6 +41,8 @@ export class ProgressCard {
   private cardId?: string;
   /** cardkit 操作序号：同一实体的每次 update/batch_update 必须严格递增 */
   private seq = 0;
+  /** 同一实体连续更新失败计数（任何错误码）：达到阈值放弃该实体沉底式重建，防未知错误死循环刷日志 */
+  private consecutiveFailures = 0;
   /** 上次全量渲染的结构签名：交互区（confirm/plan/question）增删、终态需要全量重渲染。
    *  0.20.0 起 qa 选中态不进签名（见 structureKey）——改走 partial 按钮级局部更新 */
   private lastStructure = '';
@@ -356,20 +358,38 @@ export class ProgressCard {
             this.lastStructure = structure;
           }
           this.seq = expectedSeq; // 仅成功后提交推进
+          this.consecutiveFailures = 0; // 成功即清零连续失败计数
         } catch (e) {
           // 本轮携带 qa 按钮更新但发送失败：恢复脏标记，下轮重试补发选中态（先清后发的恢复路径）
           if (withQaButtons) this.qaButtonsDirty = true;
-          // cardkit sequence OCC:失败时区分错误码
-          // - 300317(服务端 sequence 已推进超过本地,网络超时但服务端已处理):
-          //   飞书不提供读服务端 sequence 接口,跳到 Date.now() 兜底(飞书允许 sequence 是时间戳,且保证 next > 服务端 last)
-          // - 其他错误(限流/200810 交互进行中/网络抖动):服务端没接受本次 seq,seq 不推进,下轮重试用同一 expectedSeq
+          // cardkit sequence OCC 失败恢复：
+          // - 300317(本地 seq 与服务端错位,典型成因:超时请求实际已在服务端落地)或连续失败达到
+          //   阈值:sequence 无法对齐服务端真实值(飞书不提供读取口;实测跳 Date.now() 兜底被
+          //   9499 拒绝——sequence 只接受从 1 递增的小整数),继续同 seq 重试只会
+          //   永久失败死循环。放弃当前实体恢复：
+          //   非 done:沉底式重建(循环外 deferSink 执行点 → sinkToBottom:删旧卡→新实体,seq 从 1 干净开始);
+          //   done(sinkToBottom 不处理终态):降级整卡 PATCH(同一 messageId,无需 sequence;
+          //     终态无交互输入,重置客户端输入无副作用),尽力而为失败静默
+          // - 偶发错误(限流/200810 交互进行中/网络抖动):服务端没接受本次 seq,seq 不推进,
+          //   下轮重试用同一 expectedSeq,由连续失败计数兜底
           // 错误码可能在 axios 的 response.data 里（HTTP 400 时 message 只有 status code），一并带出供定位
           const code = extractFeishuErrorCode(e);
           const detail = feishuErrorBody(e);
-          if (code === '300317') {
-            this.seq = Date.now();
-            console.warn('[进度卡] sequence 错位(300317),本地 seq 跳到时间戳:', this.seq,
+          const giveUp = code === '300317' || ++this.consecutiveFailures >= 5;
+          if (giveUp) {
+            this.consecutiveFailures = 0;
+            console.warn(`[进度卡] 更新持续失败,放弃当前卡片实体${code === '300317' ? '(300317 sequence 错位)' : '(连续 5 次)'},沉底式重建:`,
               e instanceof Error ? e.message : e, detail ?? '');
+            if (this.done) {
+              // 终态兜底：整卡 PATCH 不依赖 sequence；失败静默（终态尽力而为，不再重试）
+              try {
+                await withTimeout(this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
+                this.lastStructure = this.structureKey();
+              } catch { /* 尽力而为 */ }
+            } else {
+              this.deferSink = true; // 循环外执行点 → sinkToBottom（自带挂起输入延迟逻辑）
+              break; // 错位 seq 继续重试无意义，退出本轮循环（定时器每秒仍会触发新 flush，无丢失）
+            }
           } else {
             console.warn('[进度卡] 更新失败(seq 未推进,下次用相同 expectedSeq 重试):',
               e instanceof Error ? e.message : e, detail ?? '');
