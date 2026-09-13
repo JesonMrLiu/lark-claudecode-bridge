@@ -9,5 +9,6 @@ docs/
 .claude
 tests
 .playwright-mcp/
-.workbuddy/.verify-cmd.tmp.mjs
+.workbuddy/
+.verify-cmd.tmp.mjs
 {}
