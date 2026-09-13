@@ -4,7 +4,7 @@
 写操作以卡片按钮确认（长连接回调），结果文本与产出文件回传飞书。
 **无需公网 IP、无需内网穿透；无需预装 Claude Code CLI，一键安装 + 网页配置即可使用。**
 
-![配置页概览](docs/images/overview.png)
+![配置页概览](docs/images/1.overview.png)
 
 ## 快速开始
 
@@ -36,7 +36,7 @@ lcb start
 6. 版本管理与发布 → 创建版本并发布，管理员审核通过
 7. `lcb start`（首次自动进配置页）或 `lcb setup` 填入凭证 → 私聊机器人发「/help」
 
-> 权限开通后需在开发者后台创建新版本并发布、重启 bridge 才生效。
+> 飞书权限开通后，需在飞书开发者后台创建新版本并发布，然后重启 该bridge 才生效。
 
 ## 首次使用
 
@@ -49,48 +49,28 @@ lcb start
 
 **概览** —— 桥接器进程启停 / 重启 / 后台运行、版本检查与一键更新、各机器人应用运行状态。
 
-<!-- 📸 截图待补：配置页 →「概览」tab，存为 docs/images/overview.png 后删除本注释两行（若已在顶部放了门面图可跳过本处） -->
-<!-- ![概览](docs/images/overview.png) -->
+![概览](docs/images/1.overview.png)
 
 **飞书应用** —— 多机器人管理：App ID / Secret（脱敏回显）、默认工作区、并发上限、人格补充（`append_system_prompt`）、触发词、环境变量。
 
-<!-- 📸 截图待补：配置页 →「飞书应用」tab，存为 docs/images/apps.png 后删除本注释两行 -->
-<!-- ![飞书应用](docs/images/apps.png) -->
+![飞书应用](docs/images/2.apps.png) 
 
 **工作区** —— 工作区白名单（名称 / 路径）与全局默认工作区，改动热生效。
 
-<!-- 📸 截图待补：配置页 →「工作区」tab，存为 docs/images/workspaces.png 后删除本注释两行 -->
-<!-- ![工作区](docs/images/workspaces.png) -->
-
 **Claude 认证** —— inherit / managed 双模式切换、认证凭证（API Key / Auth Token / Base URL）、模型、厂商档案（多套凭证一键切换）、托管环境变量。
 
-<!-- 📸 截图待补：配置页 →「Claude 认证」tab，存为 docs/images/claude.png 后删除本注释两行 -->
-<!-- ![Claude 认证](docs/images/claude.png) -->
+![Claude 认证](docs/images/3.claude.png)
 
 **权限** —— 免确认工具白名单（`permissions.allow_tools`）与危险命令黑名单，保存后热生效。
 
-<!-- 📸 截图待补：配置页 →「权限」tab，存为 docs/images/permissions.png 后删除本注释两行 -->
-<!-- ![权限](docs/images/permissions.png) -->
-
 **斜杠命令** —— 把内置命令（`/new` `/status` …）+ 自定义透传命令一键同步为飞书输入框斜杠指令（输入 `/` 弹面板，选中后可继续输入描述再发送）。
-
-<!-- 📸 截图待补：配置页 →「斜杠命令」tab，存为 docs/images/slash.png 后删除本注释两行 -->
-<!-- ![斜杠命令](docs/images/slash.png) -->
 
 **插件** —— Claude Code 插件清单（启停 / 卸载，本机 `~/.claude` 与托管目录带来源标记）、从 marketplace 安装、管理市场。
 
-<!-- 📸 截图待补：配置页 →「插件」tab，存为 docs/images/plugins.png 后删除本注释两行 -->
-<!-- ![插件](docs/images/plugins.png) -->
-
 **Skills** —— 四来源技能聚合清单（本机用户级 / bridge 托管 / 工作区项目级 / 插件内只读），支持新建、删除、zip 导入。
-
-<!-- 📸 截图待补：配置页 →「Skills」tab，存为 docs/images/skills.png 后删除本注释两行 -->
-<!-- ![Skills](docs/images/skills.png) -->
 
 **MCP** —— MCP Servers 管理（命令方式或 JSON 配置添加）、状态探测、抽屉查看 env 引用展开值；任务级热生效。
 
-<!-- 📸 截图待补：配置页 →「MCP」tab，存为 docs/images/mcp.png 后删除本注释两行 -->
-<!-- ![MCP](docs/images/mcp.png) -->
 
 ## lcb 命令
 
