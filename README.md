@@ -49,17 +49,11 @@ lcb start
 
 **概览** —— 桥接器进程启停 / 重启 / 后台运行、版本检查与一键更新、各机器人应用运行状态。
 
-![概览](docs/images/1.overview.png)
-
 **飞书应用** —— 多机器人管理：App ID / Secret（脱敏回显）、默认工作区、并发上限、人格补充（`append_system_prompt`）、触发词、环境变量。
-
-![飞书应用](docs/images/2.apps.png) 
 
 **工作区** —— 工作区白名单（名称 / 路径）与全局默认工作区，改动热生效。
 
 **Claude 认证** —— inherit / managed 双模式切换、认证凭证（API Key / Auth Token / Base URL）、模型、厂商档案（多套凭证一键切换）、托管环境变量。
-
-![Claude 认证](docs/images/4.claude.png)
 
 **权限** —— 免确认工具白名单（`permissions.allow_tools`）与危险命令黑名单，保存后热生效。
 
