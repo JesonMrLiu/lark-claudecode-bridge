@@ -113,8 +113,8 @@ apps:                      # 多机器人：每个应用一条长连接
     # default_workspace: demo   # 该机器人的默认工作区
     # concurrency: 2        # 该机器人的并发上限
     # append_system_prompt: '你是我的素材收集助手'   # 人格补充（多机器人差异化定位的主要手段）
-    # env:                  # per-app 环境变量（注意 ~/.claude/settings.json 的 env 优先级更高，
-    #                         此处适合放 settings.json 里没有的键）
+    # env:                  # per-app 环境变量（改后下一条消息热生效；注意 ~/.claude/settings.json
+    #                         # 的 env 优先级更高，此处适合放 settings.json 里没有的键）
     #   SOME_PLUGIN_KEY: xxx
 workspaces:                # 工作区白名单（列表全局共享；「当前用哪个」per-app 隔离）
   - name: demo
@@ -138,6 +138,11 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 #   # api_key: sk-ant-xxx  # ANTHROPIC_API_KEY（官方）
 #   base_url: https://relay.example   # 中转站端点；官方留空
 #   model: claude-sonnet-5 # 写入托管目录 settings.json
+#   env:                   # 全局环境变量（全部机器人共享，改后热生效；MCP 工具依赖的
+#                          # LARK_APP_ID / IMAGE_GEN_* 等在此配置）。inherit 模式并入每任务
+#                          # 子进程 env；managed 模式写入托管 settings.json。认证四键
+#                          # （ANTHROPIC_AUTH_TOKEN/API_KEY/BASE_URL/MODEL）不在此生效
+#     LARK_APP_ID: cli_xxxx
 # slash_commands:          # 飞书斜杠命令同步；内置命令恒参与，此处为自定义透传命令
 #   extra:
 #     - command: produce
@@ -162,6 +167,20 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 
 配置页「Claude 认证」tab 可视化切换；managed 模式下认证 / 模型改动保存后即对后续任务生效（无需重启）。多个机器人共享同一套 Claude 配置，会话池与并发各自独立。
 
+### MCP 环境变量：三种来源与优先级
+
+MCP server 配置（`.mcp.json` / `~/.claude.json` / 插件 `plugin.json` 的 `mcpServers`）里写的 `${VAR}` / `${VAR:-default}` 引用，由 Claude Code CLI 在启动 server 时从**子进程环境**展开。桥接侧可注入变量的三处来源（优先级低 → 高）：
+
+| 来源 | 位置 | 作用范围 | 热生效 |
+| --- | --- | --- | --- |
+| `claude.env` | config.yaml `claude` 段 / 配置页「Claude 认证 → 环境变量」 | 全部机器人共享 | ✅ 改后下一条消息（managed 同步写托管 settings.json） |
+| `apps[].env` | config.yaml 各应用段 | 仅该机器人 | ✅ 改后下一条消息 |
+| server 自身 `env` 明文 | MCP 配置 JSON 里直接写值 | 仅该 server | 随 MCP 配置任务级现读 |
+
+排障口诀：
+- server 起得来、工具列得出、**一调用就失败** → 大概率是 `${VAR}` 展开失败。CLI 的行为是把**字面量 `${VAR}` 原样传给 server**（不报启动错误），先确认变量已进上面前两处任一通道（任务启动时终端会打 `[env] 本任务注入自定义环境变量 …` 键名清单）。
+- 生效目录 `settings.json` 的 env 块由 CLI 自行应用且**优先级高于**上述注入（见已知限制 2）——同名键排查先看 settings.json。
+
 ## 常驻运行
 
 - **Windows**：任务计划程序建「开机时启动」任务，程序指向 `windows-start.bat`（先放到固定位置，如 `C:\tools\lcb\windows-start.bat`）
@@ -180,7 +199,7 @@ concurrency: 3             # 通道间并发上限（未单独配置的 app 沿�
 ## 已知限制
 
 1. **Linux 上 &gt;10 文件不打 zip**：文件打包依赖 bsdtar 的 zip 容器支持（Windows 10+ / macOS 自带），Linux 的 GNU tar 会自动退化为逐个上传文件（功能不丢，只是消息条数多）。
-2. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` 的同名键会被 `~/.claude/settings.json` 的 `env` 覆盖。
+2. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` / `claude.env` 的同名键会被生效目录 `settings.json` 的 `env` 覆盖（inherit = 本机 `~/.claude`，managed = 托管目录；见「MCP 环境变量」小节）。
 3. **多机器人总并发 = 各应用并发之和**：N 个机器人同时满载时会同时跑 Σ(concurrency) 个 Claude Code 子进程，机器吃紧可按 app 调低。
 4. **配置页默认仅本机可访问**（127.0.0.1）：改 `server.host` 放开到局域网意味着页面可读写全部凭证，请仅在可信网络使用。
 

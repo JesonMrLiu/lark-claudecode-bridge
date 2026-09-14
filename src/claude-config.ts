@@ -17,8 +17,9 @@ export function resolveClaudeDir(config: BridgeConfig): string {
   return config.claude?.mode === 'managed' ? MANAGED_CLAUDE_DIR : DEFAULT_CLAUDE_DIR;
 }
 
-/** 领土键清单：managed 模式下由 config.yaml claude 段认证/模型字段全权决定，不从任何 env 配置并入 */
-const TERRITORY_ENV_KEYS = new Set(['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL']);
+/** 领土键清单：managed 模式下由 config.yaml claude 段认证/模型字段全权决定，不从任何 env 配置并入。
+ *  导出供 task-env 复用：claude.env 并入子进程 env 时按同一清单过滤，保持认证单源语义 */
+export const TERRITORY_ENV_KEYS = new Set(['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL']);
 
 /**
  * managed 目录 settings.json 构建（纯函数）：

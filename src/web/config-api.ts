@@ -126,7 +126,11 @@ export function computeRestartRequired(before: BridgeConfig, after: BridgeConfig
   const sections: string[] = [];
   if (!sameApps(before.apps, after.apps)) sections.push('apps');
   if (before.concurrency !== after.concurrency) sections.push('concurrency');
-  if (JSON.stringify(before.claude ?? {}) !== JSON.stringify(after.claude ?? {})) sections.push('claude');
+  // claude 段需重启形状：env 除外（env 每任务经 buildTaskEnv 现读热生效；managed 下热重载器即时重写托管盘）
+  const claudeRestartShape = (c: BridgeConfig['claude']): string => JSON.stringify(c
+    ? { mode: c.mode, authToken: c.authToken, apiKey: c.apiKey, baseUrl: c.baseUrl, model: c.model, profiles: c.profiles }
+    : {});
+  if (claudeRestartShape(before.claude) !== claudeRestartShape(after.claude)) sections.push('claude');
   if (JSON.stringify(before.server ?? {}) !== JSON.stringify(after.server ?? {})) sections.push('server');
   return sections;
 }

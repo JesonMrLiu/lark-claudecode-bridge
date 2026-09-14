@@ -447,7 +447,8 @@ export function parseConfigText(raw: string, pathForError: string = CONFIG_PATH)
   };
 }
 
-/** 热重载比较：任一 app 的凭证/名称/工作区/并发/配置目录/人格变化即视为需重启的变更（顺序敏感） */
+/** 热重载比较：任一 app 的凭证/名称/工作区/并发/配置目录/人格变化即视为需重启的变更（顺序敏感）。
+ *  env 不参与比较——已纳入热重载 mutate 清单，executeTask 每任务经 buildTaskEnv 现读生效 */
 export function sameApps(a: FeishuAppConfig[], b: FeishuAppConfig[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((x, i) => {
@@ -455,7 +456,6 @@ export function sameApps(a: FeishuAppConfig[], b: FeishuAppConfig[]): boolean {
     return x.appId === y.appId && x.appSecret === y.appSecret && x.name === y.name
       && x.domain === y.domain && x.defaultWorkspace === y.defaultWorkspace
       && x.concurrency === y.concurrency
-      && x.appendSystemPrompt === y.appendSystemPrompt
-      && JSON.stringify(x.env ?? {}) === JSON.stringify(y.env ?? {});
+      && x.appendSystemPrompt === y.appendSystemPrompt;
   });
 }

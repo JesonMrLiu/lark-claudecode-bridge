@@ -7,7 +7,8 @@ import type {
   IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory,
 } from './types.js';
 import { CONFIG_DIR, CONFIG_PATH, DEFAULT_CONTEXT_REMIND_TOKENS, loadConfig, sameApps } from './config.js';
-import { DEFAULT_CLAUDE_DIR, resolveClaudeDir } from './claude-config.js';
+import { DEFAULT_CLAUDE_DIR, initManagedClaudeDir, resolveClaudeDir } from './claude-config.js';
+import { buildTaskEnv } from './task-env.js';
 import { warnIfNoClaudeAuth } from './auth-precheck.js';
 import { serverUrl } from './util/server-url.js';
 import { startWebServer } from './web/server.js';
@@ -147,17 +148,14 @@ export function createBridge(
   const tag = `[app:${app.name}]`;
   // Claude 配置目录双模式：inherit（缺省）共享本机 ~/.claude（settingSources 含 user，
   // 模型设置/登录态/user MCP/skills 自动继承）；managed 指向 bridge 自管目录（认证/模型由
-  // config claude 段写入 settings.json，无需本机 claude login）。app.env 追加 settings.json
-  // 里没有的键；process.env 先展开保证其余变量（ANTHROPIC_* 凭证、代理等）原样透传
+  // config claude 段写入 settings.json，无需本机 claude login）。
+  // 子进程 env 不再此处定稿：每任务经 buildTaskEnv 现读（apps[].env / claude.env 热生效），
+  // 优先级 process.env < CLAUDE_CONFIG_DIR < claude.env(过滤领土键) < app.env，其余变量
+  // （ANTHROPIC_* 凭证、代理等）原样透传
   const claudeDir = resolveClaudeDir(config);
-  const appEnv: Record<string, string | undefined> = {
-    ...process.env,
-    CLAUDE_CONFIG_DIR: claudeDir,
-    ...app.env,
-  };
   // 启动预检：认证来源全落空（env 无 token、配置目录无登录态）时提前 warn，
   // 免得用户配好机器人才发现每条消息都报 Not logged in（真判定仍在 CLI 侧）
-  warnIfNoClaudeAuth(app.name, appEnv, claudeDir, {
+  warnIfNoClaudeAuth(app.name, buildTaskEnv(config, app, claudeDir), claudeDir, {
     managed: config.claude?.mode === 'managed',
     serverUrl: serverUrl(config),
   });
@@ -601,11 +599,22 @@ planAsk: async (req) => {
         v: 1, ts: now(), kind: 'user', app: app.appId,
         chatId: msg.chatId, userId: msg.userId, workspace: wsName, sessionId: resumeId, text: prompt,
       });
+      // 任务级 env 现读构造（热生效）：apps[].env / claude.env 改动后下一条消息即用新值
+      const taskEnv = buildTaskEnv(config, app, claudeDir);
+      // 打点只列键名不列值（env 常含凭证，防日志泄漏）；值含 ${ 提示误配——env 值不做变量
+      // 展开，${VAR} 会原样传给 CLI（变量展开只在 MCP 配置一侧，展开源正是这里注入的环境）
+      const envKeys = [...new Set([...Object.keys(app.env ?? {}), ...Object.keys(config.claude?.env ?? {})])];
+      if (envKeys.length > 0) {
+        console.log(tag, `[env] 本任务注入自定义环境变量 ${envKeys.length} 键：${envKeys.join(', ')}（claude.env 领土键已过滤）`);
+        for (const [k, v] of [...Object.entries(app.env ?? {}), ...Object.entries(config.claude?.env ?? {})]) {
+          if (v.includes('${')) console.warn(tag, `[env] ${k} 的值含未展开的 \${...} 引用（env 值不做变量展开），请确认是否误配`);
+        }
+      }
       const outcome = await deps.executor(prompt, {
         cwd: workspacePath(wsName),
         resumeSessionId: resumeId,
         signal: abort.signal,
-        env: appEnv,
+        env: taskEnv,
         // #11 SOP 软约束：app.appendSystemPrompt 后追加 SOP 摘要（关闭时仅传 app 原有部分）
         appendSystemPrompt: (() => {
           const base = app.appendSystemPrompt?.trim() ?? '';
@@ -1034,8 +1043,9 @@ planAsk: async (req) => {
 /**
  * 配置热重载器：lcb ws add/remove 写盘后，运行实例下一条消息即见新工作区
  * （与 access.reload 同款模式——长驻进程不重读会持旧配置直至重启）。
- * 热应用 workspaces + defaults + 各 app 的 triggers/plugins：createBridge 闭包持有
- * 同一 app 对象引用、executeTask 每任务现读，原地 mutate 下一条消息即生效。
+ * 热应用 workspaces + defaults + 各 app 的 triggers/plugins/env + claude.env：
+ * createBridge 闭包持有同一 app 对象引用、executeTask 每任务经 buildTaskEnv 现读，
+ * 原地 mutate 下一条消息即生效（env 变更不再要求重启）。
  * 不热应用（且不纳入 sameApps 比较）：FeishuGateway 与 Semaphore 均为启动时构造，
  * apps 凭证 / concurrency 变更无法热生效，打警告提示重启，避免「以为已生效」的坑。
  * 读失败（文件被写坏的中间态等）沿用旧值不崩。
@@ -1052,16 +1062,19 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     if (!sameApps(fresh.apps, config.apps) || fresh.concurrency !== config.concurrency) {
       console.warn('[配置热重载] 检测到应用列表/凭证或 concurrency 变更，需重启后生效');
     }
-    // claude 段仅 mode/env/profiles 变更才需重启（CLAUDE_CONFIG_DIR 在 createBridge 构造 env 时定妆）；
-    // 顶层四字段（auth_token/api_key/base_url/model）变化无需重启——写入侧（配置页 PUT /
-    // use-profile / 飞书 /model-profile）managed 模式下已即时 syncManagedClaude 重写托管
-    // settings.json，下一条任务消息即生效，此处再 warn 会误导「以为没生效」。
-    // server 段为启动时定妆照（startBridge 时监听），运行中变更只能提示重启
+    // claude 段仅 mode/profiles 变更才需重启（CLAUDE_CONFIG_DIR 在 createBridge 构造时定妆）；
+    // env 变更热生效（每任务 buildTaskEnv 现读）不在此 warn；顶层四字段（auth_token/api_key/
+    // base_url/model）变化无需重启——写入侧（配置页 PUT / use-profile / 飞书 /model-profile）
+    // managed 模式下已即时 syncManagedClaude 重写托管 settings.json，下一条任务消息即生效，
+    // 此处再 warn 会误导「以为没生效」。server 段为启动时定妆照（startBridge 时监听），
+    // 运行中变更只能提示重启
     const claudeRestartShape = (c: BridgeConfig['claude']) =>
-      JSON.stringify(c ? { mode: c.mode, env: c.env, profiles: c.profiles } : {});
+      JSON.stringify(c ? { mode: c.mode, profiles: c.profiles } : {});
     if (claudeRestartShape(fresh.claude) !== claudeRestartShape(config.claude)) {
-      console.warn('[配置热重载] 检测到 claude 模式 / 环境变量 / 档案列表变更，需重启后生效');
+      console.warn('[配置热重载] 检测到 claude 模式 / 档案列表变更，需重启后生效');
     }
+    // claude.env 变更探测：托管盘重写要在 mutate config.claude 之前取旧值比较
+    const claudeEnvChanged = JSON.stringify(fresh.claude?.env ?? {}) !== JSON.stringify(config.claude?.env ?? {});
     if (JSON.stringify(fresh.server ?? {}) !== JSON.stringify(config.server ?? {})) {
       console.warn('[配置热重载] 检测到 server 段变更，需重启后生效');
     }
@@ -1075,11 +1088,24 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     config.slashCommands = fresh.slashCommands;
     // 会话行为热应用：超长提醒阈值每任务收尾现读，改盘后下一条消息即用新值
     config.session = fresh.session;
-    // app 数量变化属需重启的变更（上面 sameApps 长度比较已警告），仅等长时逐位 mutate
+    // managed 模式 claude.env 热生效：inherit 由每任务 buildTaskEnv 并入子进程 env 即可；
+    // managed 走托管 settings.json 通道（CLI 侧 settings.json env 优先于进程 env），
+    // 此处即时重写盘保证两通道同值——不写盘则手改 env 会被盘上旧值覆盖而静默失效
+    if (claudeEnvChanged && config.claude?.mode === 'managed') {
+      try {
+        initManagedClaudeDir(config);
+      } catch (e) {
+        console.warn('[配置热重载] claude.env 变更但托管 settings.json 重写失败，重启 bridge 后生效：', e instanceof Error ? e.message : e);
+      }
+    }
+    // app 数量变化属需重启的变更（上面 sameApps 长度比较已警告），仅等长时逐位 mutate。
+    // env 依赖 createBridge 的 app 参数与 config.apps[i] 为同一对象引用（startBridge 传数组
+    // 元素本体）——改为拷贝传入会让 env 热生效静默失效，勿动
     if (fresh.apps.length === config.apps.length) {
       fresh.apps.forEach((fa, i) => {
         config.apps[i].triggers = fa.triggers;
         config.apps[i].plugins = fa.plugins;
+        config.apps[i].env = fa.env;
       });
     }
   };

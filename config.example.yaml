@@ -12,8 +12,8 @@ apps:
     # default_workspace: demo # 该机器人的默认工作区（须在 workspaces 列表内），缺省用全局 defaults.workspace
     # concurrency: 2          # 该机器人的并发上限（1-100），缺省用全局 concurrency
     # append_system_prompt: '你是我的素材收集助手'  # 可选人格补充（多机器人差异化定位的主要手段）
-    # env:                    # per-app 环境变量（注意：~/.claude/settings.json 的 env 优先级更高，
-    #                           此处适合放 settings.json 里没有的键）
+    # env:                    # per-app 环境变量（改后下一条消息热生效；注意：生效目录 settings.json
+    #                           的 env 优先级更高，此处适合放 settings.json 里没有的键）
     #   SOME_PLUGIN_KEY: xxx
     # triggers:               # 触发词映射：命中即把消息改写为 rewrite 再入队（按序首个命中生效）。
     #                          # 通常无须配置：未命中触发词的 /xxx 消息会原文透传给 Claude Code
@@ -75,6 +75,13 @@ concurrency: 3                 # 全局并发上限（未单独配置的 app 沿
 #   # api_key: sk-ant-xxx     # ANTHROPIC_API_KEY（官方，x-api-key）
 #   base_url: https://relay.example    # 中转站端点（ANTHROPIC_BASE_URL）；官方 API 留空
 #   model: claude-sonnet-5    # 模型（写入托管目录 ~/.lark-claudecode-bridge/claude/settings.json）
+#   env:                      # 全局环境变量（全部机器人共享，改后下一条消息热生效）。MCP 工具
+#                             # 依赖的变量（如插件 lark-all-mcp 的 LARK_APP_ID/LARK_APP_SECRET）
+#                             # 推荐配在这里而非 apps[].env（后者仅单个机器人可见）。inherit 模式
+#                             # 并入每任务子进程 env；managed 模式写入托管 settings.json。
+#                             # 认证四键（ANTHROPIC_AUTH_TOKEN/API_KEY/BASE_URL/MODEL）不在此生效
+#     LARK_APP_ID: cli_xxxx
+#     LARK_APP_SECRET: xxxx
 # slash_commands:             # 飞书斜杠命令同步（配置页「斜杠命令」tab 一键同步到开放平台；
 #                             # 内置命令 help/new/resume/stop/status/ws/model/skills/plugins/mcp/plugin 恒参与，
 #                             # 此处仅配置自定义透传命令；需开通 application:app_slash_command 读写权限）
