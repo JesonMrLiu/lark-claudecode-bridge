@@ -2,7 +2,9 @@
 // 桥接器启停 / 版本更新（宿主进程管理：embedded 页面随进程生死，独立页面经 PID 跨进程操作）
 import { S, $, esc, toast, api, refresh } from '../core.js';
 import { bindDialogKeys, confirmDialog, mountDialog, progressDialog } from '../ui.js';
-import { openLarkCliDeviceDialog } from './larkcli-device.js';
+// larkNotConfigured 与后端 needsLarkCliConfig 同源（detail 含 not_configured 即「未配置应用」），
+// 判定只有一份、放在弹窗模块里，避免两处漂移
+import { larkNotConfigured, openLarkCliDeviceDialog } from './larkcli-device.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const UPD = { checkedAt: 0, data: null };
@@ -138,11 +140,6 @@ async function runUpdateFlow() {
   }
 }
 
-/** 纯函数（可测）：与后端 needsLarkCliConfig 同源——detail 含 not_configured 即「未配置应用」 */
-function larkCliNotConfigured(r) {
-  return r?.auth?.state === 'unauthorized' && /not_configured/i.test(r?.auth?.detail || '');
-}
-
 /** 纯函数（可测）：概览表格行里「飞书 CLI」的状态 HTML（不含操作按钮，按钮由 render 按需挂） */
 export function larkCliStatHtml(r) {
   if (!r) return '<span class="hint">未检查</span>';
@@ -163,18 +160,29 @@ export function larkCliStatHtml(r) {
 }
 
 /**
- * 扫码授权弹窗（授权主路径）。弹窗里的「改用终端窗口」接回既有终端链路——
- * 那条路一行没改，仍是拉不起无桌面环境时的兜底，也保留了在终端里补跑命令的能力。
+ * 纯函数（可测）：概览行主入口按钮的文案——按「点开后会先走哪一步」命名，
+ * 不出现「按钮写扫码授权、点开弹窗却是配置二维码」的错位。
+ * 未配置应用时弹窗从 config 阶段起步（见 openDeviceDialog 与 larkcli-device.js），故叫「配置应用」。
+ * 探测不出（unknown）**不**算未配置：误判会把已配好应用的用户反复推去重配，按「扫码授权」处理。
+ */
+export function larkCliPrimaryLabel(r) {
+  if (r?.auth?.state === 'authorized') return '重新授权';
+  return larkNotConfigured(r) ? '配置应用' : '扫码授权';
+}
+
+/**
+ * 扫码弹窗（配置 + 授权的主路径）。未配置应用时它从**配置阶段**起步：页面内直接出示
+ * 配置二维码，用户扫完在浏览器里建好应用，弹窗自动接续出示授权二维码——全程不切窗口，
+ * 无桌面 / SSH 环境下同样走得通（那条路上「去终端向导」原本是无出口的死路）。
+ * 两个阶段的「改用终端窗口」都接回既有终端链路：那条路一行没改，保留补跑命令的能力。
  */
 function openDeviceDialog() {
   openLarkCliDeviceDialog({
     wasAuthorized: LARKCLI.data?.auth?.state === 'authorized',
-    // 未配置应用时 device flow 必然被后端挡下（「请先点配置应用」）：把这个前置条件
-    // 交给弹窗直接讲明白，而不是让用户点一次、收一个红色的失败
-    notConfigured: larkCliNotConfigured(LARKCLI.data),
+    notConfigured: larkNotConfigured(LARKCLI.data),
     onChange: (r) => { LARKCLI.data = r; LARKCLI.checkedAt = Date.now(); renderLarkCliResult(); },
     onTerminal: () => void larkCliActionFlow('auth'),
-    onConfig: () => void larkCliActionFlow('config'),
+    onConfigTerminal: () => void larkCliActionFlow('config'),
   });
 }
 
@@ -195,13 +203,13 @@ function renderLarkCliResult() {
   };
   if (!r.installed) { add('安装', 'install'); return; }
   if (r.hasUpdate) add('更新', 'update');
-  // 授权入口常驻，且已授权也给（token 会过期，随时可重走一遍 device flow 刷新）。
-  // 授权走**页面内二维码**（主路径，无桌面环境同样可用）；终端窗口降级为弹窗里的备选。
-  // 应用未配置（not_configured）时**不在这里换按钮**——那会把唯一的授权入口顶掉，
-  // 用户看到「配置应用」只会更困惑「那我怎么授权」。改由弹窗先讲清「得先配应用」
-  // 并给出向导入口（见 openDeviceDialog 与 larkcli-device.js）。
-  if (r.auth?.state === 'authorized') add('重新授权', 'auth-device');
-  else add('扫码授权', 'auth-device');
+  // 入口常驻，且已授权也给（token 会过期，随时可重走一遍 device flow 刷新）。
+  // 走**页面内二维码**（主路径，无桌面环境同样可用）；终端窗口降级为弹窗里的备选。
+  // 文案跟着「弹窗会先走哪一步」走（见 larkCliPrimaryLabel）：未配置应用时弹窗从配置阶段
+  // 起步、先出配置二维码，按钮就叫「配置应用」；已配置才是「扫码授权」。
+  // **入口数量不变**——三种状态都是同一个弹窗（op 一律 auth-device），只是弹窗按前置条件
+  // 决定先出哪种二维码（见 openDeviceDialog 与 larkcli-device.js）。
+  add(larkCliPrimaryLabel(r), 'auth-device');
   if (r.skill && !r.skill.installed) add('装 SKILL', 'skill');
 }
 
@@ -337,6 +345,8 @@ async function larkCliActionFlow(op = 'install') {
     },
     config: {
       what: '配置应用',
+      // 这是**备选**路径：主路径已改成弹窗里的配置二维码（见 larkcli-device.js 的 config 阶段），
+      // 只有用户在弹窗里显式点「改用终端窗口」才会走到这里
       msg: '将打开一个终端窗口执行 <code>lark-cli config init --new</code>：按窗口打印的链接在浏览器完成飞书应用创建，'
         + '完成后会自动进入授权登录。'
         + '<br><br>若本机没有可用终端（无桌面 / SSH 会话），需在服务器上手动执行该命令。',

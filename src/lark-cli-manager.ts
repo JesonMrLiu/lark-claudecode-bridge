@@ -18,7 +18,7 @@
 // 自动进入「Agent 凭证绑定」分支（要求 config bind 而拒绝 config init）。bridge 是
 // 飞书+ClaudeCode 专用进程，与这些 Agent 无关——lcb start 入口统一剔除（见 bin/lcb.ts），
 // 本模块探测也走剔除后的 env，保证 lark-cli 始终走标准 init/login 路径。
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -782,10 +782,14 @@ export function getLarkCliDeviceStatus(now = Date.now()): LarkCliDeviceSessionIn
   return deviceInfo(now);
 }
 
-/** 清掉临时二维码文件（尽力而为，失败不影响流程） */
-function removeQrFile(log: (m: string) => void): void {
+/**
+ * 清掉临时二维码文件（尽力而为，失败不影响流程）。
+ * **必须带文件名**：设备流与配置流各用各的文件，否则一边 abandon 会把另一边
+ * 正在生成/读回的二维码删掉，或两条流互相覆盖同一文件导致画面张冠李戴。
+ */
+function removeQrFile(log: (m: string) => void, fileName = 'qr.png'): void {
   try {
-    rmSync(join(larkCliQrDir(), 'qr.png'), { force: true });
+    rmSync(join(larkCliQrDir(), fileName), { force: true });
   } catch (e) {
     log(`清理二维码临时文件失败：${e instanceof Error ? e.message : String(e)}`);
   }
@@ -834,9 +838,10 @@ export async function defaultMakeQr(
   runner: AuthRunner = defaultAuthRunner,
   log: (m: string) => void = () => { /* 默认静默 */ },
   tmpDir?: string,
+  fileName = 'qr.png',
 ): Promise<string | undefined> {
   const dir = larkCliQrDir(tmpDir);
-  const args = ['auth', 'qrcode', url, '-o', 'qr.png', '--size', '512'];
+  const args = ['auth', 'qrcode', url, '-o', fileName, '--size', '512'];
   const opts = { timeout: 10_000, windowsHide: true, encoding: 'utf8' as const, env: stripAgentContextEnv(process.env), cwd: dir };
   try {
     mkdirSync(dir, { recursive: true });
@@ -851,9 +856,9 @@ export async function defaultMakeQr(
     if (!done) {
       // 兜底路径要转义——这里没有 node 可锚定，只能经 cmd
       const d = larkCliDirect();
-      await runner(d.file, [...d.prefixArgs, 'auth', 'qrcode', cmdEscapeArg(url), '-o', 'qr.png', '--size', '512'], opts);
+      await runner(d.file, [...d.prefixArgs, 'auth', 'qrcode', cmdEscapeArg(url), '-o', fileName, '--size', '512'], opts);
     }
-    return `data:image/png;base64,${readFileSync(join(dir, 'qr.png')).toString('base64')}`;
+    return `data:image/png;base64,${readFileSync(join(dir, fileName)).toString('base64')}`;
   } catch (e) {
     log(`二维码生成失败（降级为只显示链接）：${e instanceof Error ? e.message : String(e)}`);
     return undefined;
@@ -996,6 +1001,422 @@ export async function startLarkCliDeviceAuth(
   }
 }
 
+// ============ 配置应用（页面二维码） ============
+//
+// 官方安装流程的第 ③ 步 `lark-cli config init --new` 同样搬进配置页：未配置应用的用户
+// 直接扫码创建，不用切终端窗口（无桌面 / SSH 环境下那条路原本根本没有出口）。
+//
+// **这不是「换个地方跑」，而是回到官方设计的用法**：lark-cli 的 README.zh.md 与内置 skill
+// （lark-shared/references/lark-shared-config-init.md）都明确规定——后台运行该命令，
+// 从输出里解析授权链接发给用户，用户在浏览器完成后命令自动退出。bridge 早先把它丢给
+// 独立终端，链接因此永远回传不了本进程（终端里的 stdout 不属于 bridge）。
+//
+// 与设备流的**唯一机制差异**：`config init` 没有 `--no-wait`，会一直阻塞到用户完成或过期，
+// 所以不能用 execFile（那要等进程退出才拿得到输出）——必须 spawn 后**流式**监听
+// stdout/stderr，边读边找链接。其余（幂等复用 / 并发合并 / gen 代号 / 出网挑字段）
+// 全部沿用设备流已验证的骨架。
+
+export type LarkCliConfigState = 'pending' | 'done' | 'failed' | 'expired' | 'none';
+
+interface ConfigSession {
+  /** 代号：新一轮发起时 +1；在飞的老子进程回来后靠它丢弃过期结果（不依赖 kill） */
+  gen: number;
+  state: Exclude<LarkCliConfigState, 'none'>;
+  /** 从子进程输出里解析到的链接；还没解析到时为 undefined（前端显示「正在申请…」） */
+  verificationUrl?: string;
+  /** 人可读短码（手输兜底）；从链接的 query 里取 */
+  userCode?: string;
+  /** 约 2KB data URL */
+  qrDataUrl?: string;
+  startedAt: number;
+  error?: string;
+}
+
+export interface LarkCliConfigSessionInfo {
+  ok: boolean;
+  state?: LarkCliConfigState;
+  verificationUrl?: string;
+  userCode?: string;
+  qrDataUrl?: string;
+  reused?: boolean;
+  error?: string;
+  /** 未安装——让前端把用户导到「安装」入口而不是干瞪眼 */
+  hint?: 'install';
+}
+
+/**
+ * 子进程最小结构（便于测试注入假实现）。
+ * 真实实现由 defaultConfigSpawn 把 node 的 ChildProcess 收窄成它。
+ */
+export interface LarkCliConfigChild {
+  stdout: { on(ev: 'data', cb: (chunk: Buffer) => void): unknown } | null;
+  stderr: { on(ev: 'data', cb: (chunk: Buffer) => void): unknown } | null;
+  on(ev: 'exit', cb: (code: number | null) => void): unknown;
+  on(ev: 'error', cb: (err: Error) => void): unknown;
+}
+
+export interface LarkCliConfigDeps {
+  spawn: (file: string, args: string[], opts: { windowsHide: boolean; env: NodeJS.ProcessEnv }) => LarkCliConfigChild;
+  detect(): Promise<LarkCliDetect>;
+  checkAuth(): Promise<LarkCliAuthStatus>;
+  makeQr(url: string): Promise<string | undefined>;
+  now(): number;
+  log(msg: string): void;
+}
+
+let configSession: ConfigSession | null = null;
+let configGen = 0;
+let configStartInflight: Promise<LarkCliConfigSessionInfo> | null = null;
+
+/**
+ * 迟迟解析不到链接的上限。它只负责**给前端一个出口**（UI 不留无出口死角）：
+ * 走到这里说明命令既没吐链接、也没退出（网络卡住 / 输出形态和预期不一样）。
+ */
+const CONFIG_URL_WAIT_MS = 120_000;
+/** start 请求内等待链接的时间：正常就是一次网络往返，超了就改为让前端轮询 status */
+const CONFIG_START_WAIT_MS = 30_000;
+/** 子进程输出缓冲上限（防无限增长；链接只有几百字节，余量充足） */
+const CONFIG_OUTPUT_CAP = 64 * 1024;
+/** 输出安静这么久就认为最后那行写完了（见 watchLarkCliConfig 的行缓冲注释） */
+const CONFIG_QUIET_MS = 500;
+/**
+ * 配置流专用二维码文件名。**必须与设备流的 qr.png 分开**：两边各写各的文件，
+ * 否则并发时后写的一次会覆盖前一次，把二维码画成另一条流的链接
+ * （abandon 时的清理也会误删对方正在读回的文件）。
+ */
+const CONFIG_QR_FILE = 'qr-config.png';
+
+/** 可在外部 resolve 的 Promise（避免把 resolve 引用深埋进 spawn 回调） */
+function makeDeferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
+/** URL 字符集刻意收窄到 ASCII：中文、全角括号、引号天然是终止符，不会落进链接 */
+const CONFIG_URL_RE = /https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/;
+
+/**
+ * 纯函数（可测）：取首个 URL，并剔除从散文 / 成对括号里粘来的尾部标点。
+ * 收尾括号只在**不成对**时剔除——`…?a=(x)` 这种自带配对的链接不能被误伤。
+ */
+function firstUrl(text: string): string | undefined {
+  const m = CONFIG_URL_RE.exec(text);
+  if (!m) return undefined;
+  let url = m[0].replace(/[.,;:!?'"）】」』]+$/, '');
+  if (!url.includes('(')) url = url.replace(/\)+$/, '');
+  if (!url.includes('[')) url = url.replace(/\]+$/, '');
+  return url;
+}
+
+/**
+ * 纯函数（可测）：从 `config init --new` 的输出里提取授权链接。
+ *
+ * **真实输出形态尚未用真机钉死**（本机已配置，直接跑不带 --name 的 config init 会覆盖它；
+ * 抓取步骤见 docs/e2e-checklist.md 的「页面内配置应用」一节），因此解析刻意宽容，
+ * 三层依次退让，保证形态猜错时也只是退化成更弱的匹配、而不是彻底解析不出来：
+ *   ① JSON（兼容 {ok,data} 信封与 verification_uri / console_url 等字段别名）
+ *   ② 裸 URL（从散文里抓首个 http(s) 链接）
+ *   ③ 折行 URL（输出方按显示宽度插了换行时的尽力补救）
+ *
+ * **URL 一律视为 opaque string**：不编码、不解码、不重拼 query——lark-cli 内置 skill 明文要求。
+ */
+export function extractConfigUrl(text: string): string | undefined {
+  const clean = stripAnsiAndBom(text);
+  const obj = firstJsonObject(clean);
+  if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+    const url = str(pickField(obj as Record<string, unknown>, [
+      'verification_url', 'verification_uri', 'verification_uri_complete',
+      'verificationUrl', 'verificationUri', 'console_url', 'consoleUrl', 'url',
+    ]));
+    if (url && /^https?:\/\//i.test(url)) return url;
+  }
+  const direct = firstUrl(clean);
+  // 折行补救：链接若被输出方按显示宽度折断，直接匹配只能拿到**前半截**——那是一个错的
+  // 链接，比拿不到更糟。所以只在「去换行后的结果以直接匹配为前缀且更长」时才采用它：
+  // 这个启发式只会把链接补全，绝不会把它换成另一段无关文本。
+  const joinedText = clean.replace(/\r?\n(?=[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%])/g, '');
+  // 拼接可能把上下文里的另一条 URL 接上来，那样得到的仍是错的——只认「整段只有一条 URL」
+  if ((joinedText.match(/https?:\/\//gi) ?? []).length !== 1) return direct;
+  const joined = firstUrl(joinedText);
+  if (joined && (!direct || (joined.length > direct.length && joined.startsWith(direct)))) return joined;
+  return direct;
+}
+
+export interface LarkCliConfigOutcome {
+  phase: 'done' | 'failed' | 'expired';
+  error?: string;
+}
+
+/**
+ * 纯函数（可测）：配置子进程结束后判定结果。
+ *
+ * **正向判据优先于退出码**：以「应用是否真的配置上了」为准（`!needsLarkCliConfig(authAfter)`），
+ * 而不是退出码——退出码 0 却什么都没配上，比直接报错更糟（用户以为配好了，下一步授权必然失败）。
+ *
+ * 判据还必须是**明确的**探测结果：`unknown`（探测失败）不算已配置，否则一次探测抖动
+ * 就会把没配上的机器报成配好了——这与 decideDeviceFinishOutcome 的「反向兜底绝不能有」同源。
+ */
+export function decideConfigOutcome(a: {
+  exitCode: number | null;
+  output: string;
+  spawnError?: string;
+  authAfter?: LarkCliAuthStatus;
+}): LarkCliConfigOutcome {
+  const auth = a.authAfter;
+  if (auth && auth.state !== 'unknown' && !needsLarkCliConfig(auth)) return { phase: 'done' };
+  if (a.spawnError) return { phase: 'failed', error: `配置命令未能启动：${a.spawnError}` };
+  const text = a.output.replace(/\s+/g, ' ').trim();
+  if (/begin timed out|timed out|expired/i.test(text)) {
+    return { phase: 'expired', error: '配置链接已失效，请重新生成二维码' };
+  }
+  if (/cancel/i.test(text)) return { phase: 'failed', error: '配置已取消' };
+  // 探测失败（authAfter 缺失）时不能报成功，但也不该含糊其辞——把「没法确认」讲清楚
+  if (!auth) {
+    return {
+      phase: 'failed',
+      error: `配置命令已结束，但无法确认配置结果（状态探测失败）${text ? `：${text.slice(0, 120)}` : ''}`,
+    };
+  }
+  if (a.exitCode === 0) {
+    return { phase: 'failed', error: '配置命令已结束，但仍检测不到飞书应用（可能没在浏览器里完成创建）' };
+  }
+  return {
+    phase: 'failed',
+    error: text ? `配置未完成：${text.slice(0, 120)}` : `配置未完成（退出码 ${a.exitCode ?? '未知'}）`,
+  };
+}
+
+/**
+ * 唯一的出网构造点：**显式挑字段**（不是 {...session} 展开），与 deviceInfo 同源约定——
+ * 配置流眼下没有 secret 类字段，但这条约定要一并继承，免得日后加字段时悄悄破防。
+ * 顺带做懒超时：迟迟拿不到链接的 pending 就地转 failed，前端不会永远转圈。
+ */
+function configInfo(now = Date.now()): LarkCliConfigSessionInfo {
+  const s = configSession;
+  if (!s) return { ok: true, state: 'none' };
+  if (s.state === 'pending' && !s.verificationUrl && now - s.startedAt > CONFIG_URL_WAIT_MS) {
+    s.state = 'failed';
+    s.error = s.error ?? `等待配置链接超时（${Math.round(CONFIG_URL_WAIT_MS / 1000)} 秒内未从 lark-cli 输出中解析到链接）`;
+  }
+  const base: LarkCliConfigSessionInfo = { ok: true, state: s.state, userCode: s.userCode, error: s.error };
+  if (s.state === 'pending') {
+    base.verificationUrl = s.verificationUrl;
+    // 与设备流不同，这里 **status 也带二维码**：设备流的链接是 start 同步拿到的；
+    // 配置流的链接要等子进程输出，start 有可能等不到就返回（见 CONFIG_START_WAIT_MS），
+    // status 不带图的话那种情况下前端将永远拿不到二维码。
+    // 代价是 pending 期间每 2s 多传约 2KB，且只走 localhost、弹窗生命周期很短——划算。
+    base.qrDataUrl = s.qrDataUrl;
+  }
+  return base;
+}
+
+/** 内存态查询（零副作用、亚毫秒）——撑住前端 2s 轮询 */
+export function getLarkCliConfigStatus(now = Date.now()): LarkCliConfigSessionInfo {
+  return configInfo(now);
+}
+
+/**
+ * 放弃当前配置会话（改用终端 / 新一轮发起前）。
+ * **不 kill 子进程**——与 abandonLarkCliDeviceSession 同源：Windows 上
+ * cmd → node → lark-cli.exe 的进程树 kill 会留孤儿，靠 gen 失配丢弃结果即可，
+ * 孤儿最多空转到 registration 过期后自行退出。
+ */
+export function abandonLarkCliConfigSession(): void {
+  if (!configSession) return;
+  configGen++;
+  configSession = null;
+  removeQrFile(() => { /* 静默：放弃路径不打扰用户 */ }, CONFIG_QR_FILE);
+}
+
+/** 重置配置会话状态（测试用） */
+export function resetLarkCliConfigState(): void {
+  configSession = null;
+  configGen = 0;
+  configStartInflight = null;
+}
+
+/** 生产 spawn：stdin 接 /dev/null——官方要求「后台运行」，此路无人在终端应答交互输入 */
+export const defaultConfigSpawn = (
+  file: string,
+  args: string[],
+  opts: { windowsHide: boolean; env: NodeJS.ProcessEnv },
+): LarkCliConfigChild =>
+  spawn(file, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] }) as unknown as LarkCliConfigChild;
+
+/**
+ * 解析该用哪条路启动 config init。
+ * 优先 node + 包内入口（锚定本机真实安装、不依赖 PATH），与 defaultMakeQr 同序。
+ */
+async function resolveConfigCommand(): Promise<{ file: string; prefixArgs: string[] }> {
+  try {
+    const entry = larkCliEntryPath(await npmGlobalPrefix());
+    if (existsSync(entry)) return { file: process.execPath, prefixArgs: [entry] };
+  } catch { /* 取不到 npm 前缀就落 PATH 直调 */ }
+  return larkCliDirect();
+}
+
+/** 子进程结束后写回会话（gen 失配即丢弃，绝不污染新会话） */
+async function finishConfig(
+  s: ConfigSession,
+  deps: LarkCliConfigDeps,
+  output: string,
+  code: number | null,
+  spawnError?: string,
+): Promise<void> {
+  if (configSession?.gen !== s.gen || s.state !== 'pending') return;
+  let authAfter: LarkCliAuthStatus | undefined;
+  try { authAfter = await deps.checkAuth(); } catch { /* 探测失败留 undefined，判据会拒绝它 */ }
+  if (configSession?.gen !== s.gen || s.state !== 'pending') return;
+  const out = decideConfigOutcome({ exitCode: code, output, spawnError, authAfter });
+  s.state = out.phase;
+  s.error = out.error;
+  deps.log(`配置应用会话结束：${out.phase}${out.error ? `（${out.error}）` : ''}`);
+}
+
+/**
+ * 后台守候配置子进程：流式抓链接 + 退出收尾。**同步返回、不 await**——
+ * 用户可能几分钟后才在浏览器里完成。
+ */
+function watchLarkCliConfig(
+  s: ConfigSession,
+  deps: LarkCliConfigDeps,
+  cmd: { file: string; prefixArgs: string[] },
+  urlReady: (url: string | undefined) => void,
+): void {
+  let buf = '';
+  let settled = false;
+  let quietTimer: NodeJS.Timeout | undefined;
+  const settle = (code: number | null, spawnError?: string): void => {
+    if (settled) return; // 'error' 与 'exit' 可能都触发；且只有第一次算数
+    settled = true;
+    if (quietTimer) { clearTimeout(quietTimer); quietTimer = undefined; }
+    urlReady(s.verificationUrl); // 没抓到链接也要放行 start，别让它空等到超时
+    void finishConfig(s, deps, buf, code, spawnError);
+  };
+
+  /** 认下这段文本里的链接；已认过或没找到就返回 false（不改状态） */
+  const tryLatch = (text: string): boolean => {
+    if (s.verificationUrl) return false;
+    const url = extractConfigUrl(text);
+    if (!url) return false;
+    s.verificationUrl = url;
+    s.userCode = userCodeFromUrl(url); // 只读提取；URL 本身仍按 opaque string 原样使用
+    deps.log(`已从 lark-cli 输出中解析到配置链接（${buf.length} 字节输出内）`);
+    urlReady(url);
+    return true;
+  };
+
+  let child: LarkCliConfigChild;
+  try {
+    child = deps.spawn(cmd.file, [...cmd.prefixArgs, 'config', 'init', '--new'], {
+      windowsHide: true,
+      env: stripAgentContextEnv(process.env),
+    });
+  } catch (e) {
+    settle(null, e instanceof Error ? e.message : String(e));
+    return;
+  }
+
+  const onChunk = (d: Buffer): void => {
+    buf += String(d);
+    if (quietTimer) { clearTimeout(quietTimer); quietTimer = undefined; } // 又来数据了，重新计时
+    if (!s.verificationUrl) {
+      // ① 先只认「已完整到达的行」：chunk 边界可能正好把链接劈成两半，拿半截 URL 去生成
+      //    二维码会得到一张**指向错误地址**的图——比拿不到更糟。所以等换行到了再认。
+      const complete = buf.slice(0, buf.lastIndexOf('\n') + 1);
+      if (!complete || !tryLatch(complete)) {
+        // ② 最后那行还没换行，先不认；但也别一直等——输出安静下来就说明这行写完了
+        //    （CLI 若不给链接补换行，光靠 ① 会永远等不到）。认的仍是同一段文本，
+        //    不是在赌另一个 URL。
+        quietTimer = setTimeout(() => { quietTimer = undefined; tryLatch(buf); }, CONFIG_QUIET_MS);
+      }
+    }
+    // 截断放在解析之后：先解析再丢，才不会把刚到的链接连同旧输出一起切掉
+    if (buf.length > CONFIG_OUTPUT_CAP) buf = buf.slice(-CONFIG_OUTPUT_CAP);
+  };
+  child.stdout?.on('data', onChunk);
+  child.stderr?.on('data', onChunk);
+  child.on('error', (e: Error) => settle(null, e instanceof Error ? e.message : String(e)));
+  child.on('exit', (code: number | null) => settle(code));
+}
+
+/**
+ * 发起「配置应用」流程（页面二维码的主入口）。
+ *
+ * 四道闸与 startLarkCliDeviceAuth 同构：
+ *   ① 幂等复用：pending 会话直接返回（挡住刷新页面 / 关弹窗再开）
+ *   ② in-flight 合并：并发调用 await 同一个 promise（挡住双击）
+ *   ③ regenerate：用户显式要求时才新建
+ *   ④ gen 代号：新建时 +1，在飞的老子进程靠它丢弃过期结果
+ *
+ * 与设备流的一处**有意不同**：没有「剩余不足 X 秒就换新」——CLI 不吐有效期，
+ * 我们也就无从编造倒计时；会话的终结一律由子进程退出（或 CONFIG_URL_WAIT_MS 兜底）驱动。
+ */
+export async function startLarkCliConfigFlow(
+  opts: { regenerate?: boolean; deps?: Partial<LarkCliConfigDeps> } = {},
+): Promise<LarkCliConfigSessionInfo> {
+  const deps: LarkCliConfigDeps = {
+    spawn: opts.deps?.spawn ?? defaultConfigSpawn,
+    detect: opts.deps?.detect ?? (() => detectLarkCli()),
+    checkAuth: opts.deps?.checkAuth ?? (() => checkLarkCliAuth()),
+    makeQr: opts.deps?.makeQr ?? ((url) => defaultMakeQr(url, defaultAuthRunner, deps.log, undefined, CONFIG_QR_FILE)),
+    now: opts.deps?.now ?? (() => Date.now()),
+    log: opts.deps?.log ?? ((m: string) => console.log('[lark-cli]', m)),
+  };
+
+  // ① 幂等复用（regenerate 时跳过）
+  if (!opts.regenerate && configSession?.state === 'pending') {
+    return { ...configInfo(deps.now()), reused: true };
+  }
+  // ② 并发合并
+  if (configStartInflight) return configStartInflight;
+
+  const task = (async (): Promise<LarkCliConfigSessionInfo> => {
+    const d = await deps.detect();
+    if (!d.installed) return { ok: false, hint: 'install', error: 'lark-cli 未安装，请先安装后再配置应用' };
+    const before = await deps.checkAuth();
+    // 探测不出就无从判断该不该配——给一条能照做的出路，而不是含糊的「已配置」把用户堵死
+    if (before.state === 'unknown') {
+      return { ok: false, error: `无法确认飞书应用配置状态（${before.detail ?? '探测失败'}），请稍后重试` };
+    }
+    // 已配置时拒绝重复发起：覆盖配置是破坏性动作，会把已有应用顶掉（与 runLarkCliActionFlow 同判据）
+    if (!needsLarkCliConfig(before)) {
+      return { ok: false, error: '应用已配置，无需重复配置（如确需重配请在终端执行 lark-cli config init --new）' };
+    }
+
+    abandonLarkCliConfigSession(); // ③ gen++
+
+    const s: ConfigSession = { gen: ++configGen, state: 'pending', startedAt: deps.now() };
+    configSession = s;
+
+    const ready = makeDeferred<string | undefined>();
+    watchLarkCliConfig(s, deps, await resolveConfigCommand(), ready.resolve);
+
+    // 等链接到位：正常情况就是一次网络往返。等不到也照常返回 pending（此时无链接），
+    // 前端继续轮询 status——链接一旦到手会随轮询补上，不会丢。
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<undefined>((r) => { timer = setTimeout(() => r(undefined), CONFIG_START_WAIT_MS); });
+    let url: string | undefined;
+    try {
+      url = await Promise.race([ready.promise, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (configSession?.gen !== s.gen) return configInfo(deps.now()); // 期间被新一轮取代
+    // 二维码只是展示层，生成失败不阻塞配置（降级为只显示可复制链接）
+    if (url) s.qrDataUrl = await deps.makeQr(url).catch(() => undefined);
+    return configInfo(deps.now());
+  })();
+
+  configStartInflight = task;
+  try {
+    return await task;
+  } finally {
+    configStartInflight = null;
+  }
+}
+
 // ============ 安装/更新/授权 的动作编排 ============
 
 export type LarkCliOp = 'install' | 'update' | 'auth' | 'config' | 'skill';
@@ -1028,8 +1449,9 @@ export function resetLarkCliActionState(): void {
   delete lastLaunchAt.update;
   delete lastLaunchAt.auth;
   delete lastLaunchAt.config;
-  // 设备流会话也在同一进程内，跟着一起清——既有 30+ 处 beforeEach 无需逐条补
+  // 设备流与配置会话也在同一进程内，跟着一起清——既有 30+ 处 beforeEach 无需逐条补
   resetLarkCliDeviceState();
+  resetLarkCliConfigState();
 }
 
 export interface LarkCliActionDeps {
@@ -1122,10 +1544,11 @@ export async function runLarkCliActionFlow(
         };
       }
       lastLaunchAt[op] = now();
-      // 用户改用终端了：作废页面上那轮设备流，避免后台收尾与终端里的 auth login
-      // 同时往 token store 写。放在 r.ok 之后而非函数入口——否则「点了更新又取消确认框」
-      // 会把用户正在扫的二维码搞没。
+      // 用户改用终端了：作废页面上那两轮会话（设备流 / 配置应用），避免后台进程与终端里的
+      // lark-cli 同时往 token store、config 文件写。放在 r.ok 之后而非函数入口——否则
+      // 「点了更新又取消确认框」会把用户正在扫的二维码搞没。
       abandonLarkCliDeviceSession();
+      abandonLarkCliConfigSession();
       return { ok: true, mode: 'terminal', terminal: r.terminal, scriptPath: r.scriptPath };
     }
 

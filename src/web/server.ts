@@ -36,8 +36,10 @@ import {
   checkLarkCliLatest,
   detectLarkCli,
   detectLarkCliSkill,
+  getLarkCliConfigStatus,
   getLarkCliDeviceStatus,
   runLarkCliActionFlow,
+  startLarkCliConfigFlow,
   startLarkCliDeviceAuth,
   type LarkCliOp,
 } from '../lark-cli-manager.js';
@@ -1030,6 +1032,20 @@ async function handle(
   // 「从未发起 / 桥接器重启后内存已清」是可控业务态（state:'none'），不是错误。
   if (path === '/api/lark-cli/device/status' && req.method === 'GET') {
     return json(res, 200, getLarkCliDeviceStatus());
+  }
+  // ---- 配置应用（页面二维码）：同样是长生命周期有状态会话 ----
+  // 与设备流分开一对端点而非加 phase 字段：两个会话的字段集不同（配置流没有
+  // device_code / interval），共用一个端点会让 manager 侧「显式挑字段」的防泄漏结构变模糊。
+  if (path === '/api/lark-cli/config/start' && req.method === 'POST') {
+    const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>);
+    const r = await startLarkCliConfigFlow({ regenerate: body.regenerate === true });
+    if (!r.ok) return json(res, 502, { error: r.error, ...(r.hint ? { hint: r.hint } : {}) });
+    return json(res, 200, r);
+  }
+  // 永远 200，理由同 device/status：core.js 的 api() 对非 2xx 一律 throw，
+  // 「从未发起 / 桥接器重启后内存已清」是可控业务态（state:'none'），不是错误
+  if (path === '/api/lark-cli/config/status' && req.method === 'GET') {
+    return json(res, 200, getLarkCliConfigStatus());
   }
   return json(res, 404, { error: `未知端点 ${req.method} ${path}` });
 }
