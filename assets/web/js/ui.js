@@ -200,8 +200,11 @@ export function initDrawer() {
  * 观感与 plugins.js 的 runOpDialog 一致，但那个与插件页的 busyText / report / update-all 的
  * 真实 i/N 推进深度耦合，泛化它等于改一个正在工作的界面（`main.css` 明确要求向后兼容）。
  * 这里单独实现语义单一的版本，重复记为可接受代价。
+ *
+ * @param {number} [opts.reportMaxHeight] 输出区最大高度（px）。默认 220 适合几行总结；
+ *   要展示成片清单（如 SKILL 名单）的调用方传更大的值。
  */
-export function progressDialog({ title = '执行中', note = '请稍候…' } = {}) {
+export function progressDialog({ title = '执行中', note = '请稍候…', reportMaxHeight = 220 } = {}) {
   const { mask, unmount } = mountDialog(`
     <div class="modal" role="dialog" aria-modal="true" style="width:min(640px,94vw)">
       <div style="display:flex;align-items:center;gap:10px">
@@ -209,7 +212,7 @@ export function progressDialog({ title = '执行中', note = '请稍候…' } = 
         <b class="pd-title">${esc(title)}</b>
       </div>
       <div class="prog"><div class="prog-bar"></div></div>
-      <pre class="report" style="margin-top:12px;max-height:220px"></pre>
+      <pre class="report" style="margin-top:12px;max-height:${Number(reportMaxHeight) || 220}px"></pre>
       <div class="savebar" style="justify-content:flex-end">
         <button class="btn primary" hidden>关闭</button>
       </div>

@@ -37,8 +37,6 @@ import {
   detectLarkCli,
   detectLarkCliSkill,
   getLarkCliDeviceStatus,
-  installLarkCli,
-  installLarkCliSkill,
   runLarkCliActionFlow,
   startLarkCliDeviceAuth,
   type LarkCliOp,
@@ -973,29 +971,12 @@ async function handle(
     if (installMode() !== 'global') {
       return json(res, 400, { error: '检测到当前非 npm 安装目录运行（如源码运行），一键更新会装出另一份全局副本而非更新当前实例，请手动更新' });
     }
-    const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>);
+    // 只更新 bridge 自身。飞书 CLI（@larksuite/cli）的更新是概览页里一个独立的动作
+    // （lark-cli 行内的「更新」按钮），两条更新各走各的按钮——不要一个操作把两件事
+    // 一起做掉：用户看不见 CLI 那半程的进展，失败时还只能拿到一句附注。
     try {
       const output = await runUpdate();
-      let extra = '';
-      // 一键更新联动升级飞书官方 CLI（前端 confirm 已告知）；失败仅附警告不影响 bridge 更新结果
-      if (body.larkCli === true) {
-        try {
-          // 更新刚重启/排空过进程，此刻文件句柄最可能尚未释放（win32 上会让 npm 升级撞 EBUSY），先让一步
-          await new Promise((r) => setTimeout(r, 1000));
-          await installLarkCli();
-          extra = '\nlark-cli 已同步更新';
-          // 官方 SKILL 顺势刷新（skills add 幂等重装）；失败仅警告——SKILL 缺失不影响 CLI 本体
-          try {
-            await installLarkCliSkill();
-            extra += '，官方 SKILL 已同步更新（重启桥接器后生效）';
-          } catch (se) {
-            extra += `\n⚠️ 官方 SKILL 同步更新失败（不影响 CLI）：${se instanceof Error ? se.message : String(se)}`;
-          }
-        } catch (e) {
-          extra = `\n⚠️ lark-cli 同步更新失败（不影响桥接器）：${e instanceof Error ? e.message : String(e)}`;
-        }
-      }
-      return json(res, 200, { ok: true, output: `${output}${extra}` });
+      return json(res, 200, { ok: true, output });
     } catch (e) {
       return json(res, 502, { error: `更新失败：${e instanceof Error ? e.message : String(e)}` });
     }

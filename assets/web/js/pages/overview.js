@@ -122,11 +122,12 @@ async function doCheckUpdate() {
 async function runUpdateFlow() {
   const running = S.status?.embedded || S.status?.bridge?.running;
   const extra = running ? '，完成后自动重启桥接器（页面将短暂失联后自动恢复）' : '（桥接器未在运行，下次启动生效）';
-  if (!(await confirmDialog({ title: '一键更新', message: `将通过 npm 安装最新版本并同步更新飞书 CLI（@larksuite/cli）${extra}，可能需要 1-2 分钟。`, confirmText: '开始更新' }))) return;
+  if (!(await confirmDialog({ title: '一键更新', message: `将通过 npm 安装桥接器最新版本${extra}，可能需要 1-2 分钟。`, confirmText: '开始更新' }))) return;
   const btn = $('#btnUpdRun');
   if (btn) { btn.disabled = true; btn.textContent = '更新中…'; }
   try {
-    await api('POST', '/api/update/run', { larkCli: true });
+    // 只更新桥接器自身：飞书 CLI 的更新在它自己那一行点「更新」，两条更新各自独立
+    await api('POST', '/api/update/run');
     UPD.checkedAt = 0; LARKCLI.checkedAt = 0;
     if (running) await restartFlow();
     else toast('✅ 更新完成，下次启动生效');
@@ -168,8 +169,12 @@ export function larkCliStatHtml(r) {
 function openDeviceDialog() {
   openLarkCliDeviceDialog({
     wasAuthorized: LARKCLI.data?.auth?.state === 'authorized',
+    // 未配置应用时 device flow 必然被后端挡下（「请先点配置应用」）：把这个前置条件
+    // 交给弹窗直接讲明白，而不是让用户点一次、收一个红色的失败
+    notConfigured: larkCliNotConfigured(LARKCLI.data),
     onChange: (r) => { LARKCLI.data = r; LARKCLI.checkedAt = Date.now(); renderLarkCliResult(); },
     onTerminal: () => void larkCliActionFlow('auth'),
+    onConfig: () => void larkCliActionFlow('config'),
   });
 }
 
@@ -190,11 +195,12 @@ function renderLarkCliResult() {
   };
   if (!r.installed) { add('安装', 'install'); return; }
   if (r.hasUpdate) add('更新', 'update');
-  // 未配置应用（not_configured）优先给「配置应用」向导；其余一律给授权入口——
-  // 已授权也给（token 会过期，随时可重走一遍 device flow 刷新）。
+  // 授权入口常驻，且已授权也给（token 会过期，随时可重走一遍 device flow 刷新）。
   // 授权走**页面内二维码**（主路径，无桌面环境同样可用）；终端窗口降级为弹窗里的备选。
-  if (larkCliNotConfigured(r)) add('配置应用', 'config');
-  else if (r.auth?.state === 'authorized') add('重新授权', 'auth-device');
+  // 应用未配置（not_configured）时**不在这里换按钮**——那会把唯一的授权入口顶掉，
+  // 用户看到「配置应用」只会更困惑「那我怎么授权」。改由弹窗先讲清「得先配应用」
+  // 并给出向导入口（见 openDeviceDialog 与 larkcli-device.js）。
+  if (r.auth?.state === 'authorized') add('重新授权', 'auth-device');
   else add('扫码授权', 'auth-device');
   if (r.skill && !r.skill.installed) add('装 SKILL', 'skill');
 }
@@ -346,7 +352,11 @@ async function larkCliActionFlow(op = 'install') {
   const rowBtn = $('#larkCliArea button');
   if (rowBtn) rowBtn.disabled = true;
   // 先弹进度框再发请求：静默降级那条路最长 5 分钟，没有它页面会静默无反馈
-  const dlg = progressDialog({ title: `飞书 CLI ${what}`, note: op === 'skill' ? '正在安装 SKILL…' : '正在探测可用终端…' });
+  const dlg = progressDialog({
+    title: `飞书 CLI ${what}`,
+    note: op === 'skill' ? '正在安装 SKILL…' : '正在探测可用终端…',
+    reportMaxHeight: op === 'skill' ? 360 : 220, // SKILL 要列 28 条名单，默认 220px 只够十来行
+  });
   try {
     const r = await api('POST', '/api/lark-cli/action', { op });
     if (r.mode === 'terminal') {
@@ -354,7 +364,14 @@ async function larkCliActionFlow(op = 'install') {
       openLarkCliTerminalDialog(op);
       toast('已拉起终端窗口，请在终端里完成操作');
     } else {
-      dlg.setNote(String(r.output || '').trim().slice(-600) || '完成');
+      // SKILL 装完展示扫盘得到的名单，而不是 npx 那段带 ANSI 的进度表原文
+      // （名单由后端 listLarkCliSkills 扫 ~/.claude/skills 得出，比解析输出可靠）
+      if (op === 'skill' && Array.isArray(r.skills) && r.skills.length) {
+        dlg.setNote(`已同步 ${r.skills.length} 个 SKILL\n\n`
+          + r.skills.map((s) => `• ${s}`).join('\n'));
+      } else {
+        dlg.setNote(String(r.output || '').trim().slice(-600) || '完成');
+      }
       if (r.reason) dlg.appendLog(`⚠️ 未使用终端：${r.reason}`);
       const done = op === 'skill' ? '✅ SKILL 安装完成，重启桥接器后飞书会话可见' : `✅ 飞书 CLI ${what}完成`;
       dlg.finish(true, done);

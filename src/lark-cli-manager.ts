@@ -238,24 +238,45 @@ export interface LarkCliSkillDetect {
   name?: string;
 }
 
+/** skill 目录扫描的注入点（测试用）；缺省读真实文件系统 */
+export interface SkillDirFs {
+  exists(p: string): boolean;
+  readdir(d: string): string[];
+}
+
+const defaultSkillFs: SkillDirFs = {
+  exists: existsSync,
+  readdir: (d) => { try { return readdirSync(d); } catch { return []; } },
+};
+
 /**
- * 检测飞书官方 SKILL 是否已装（默认 ~/.claude/skills，与安装动作同源）。
+ * 列出已装的飞书官方 SKILL 目录名（默认 ~/.claude/skills，与安装动作同源）。
  * 判据：目录名命中 feishu/lark **且** 内含 SKILL.md（防同名散目录误报）。
  * managed 会话的可见性由 bridgeUserSkills() 启动桥接保证，这里不查托管目录。
+ *
+ * 以扫盘而非解析 `npx skills add` 的输出来确定「装了什么」：那份输出是带 ANSI 的
+ * 进度表，既难读也不可靠；目录才是既成事实。
  */
-export async function detectLarkCliSkill(
+export async function listLarkCliSkills(
   skillsDir: string = join(homedir(), '.claude', 'skills'),
-  fs: { exists(p: string): boolean; readdir(d: string): string[] } = {
-    exists: existsSync,
-    readdir: (d) => { try { return readdirSync(d); } catch { return []; } },
-  },
-): Promise<LarkCliSkillDetect> {
-  if (!fs.exists(skillsDir)) return { installed: false };
+  fs: SkillDirFs = defaultSkillFs,
+): Promise<string[]> {
+  if (!fs.exists(skillsDir)) return [];
+  const names: string[] = [];
   for (const name of fs.readdir(skillsDir)) {
     if (!isFeishuSkillDirName(name)) continue;
-    if (fs.exists(join(skillsDir, name, 'SKILL.md'))) return { installed: true, name };
+    if (fs.exists(join(skillsDir, name, 'SKILL.md'))) names.push(name);
   }
-  return { installed: false };
+  return names;
+}
+
+/** 检测飞书官方 SKILL 是否已装：取扫盘结果的首个（保持既有返回结构不变） */
+export async function detectLarkCliSkill(
+  skillsDir: string = join(homedir(), '.claude', 'skills'),
+  fs: SkillDirFs = defaultSkillFs,
+): Promise<LarkCliSkillDetect> {
+  const [name] = await listLarkCliSkills(skillsDir, fs);
+  return name ? { installed: true, name } : { installed: false };
 }
 
 export interface InstallSkillOpts {
@@ -298,52 +319,41 @@ export function needsLarkCliConfig(auth: LarkCliAuthStatus): boolean {
   return auth.state === 'unauthorized' && /not_configured/i.test(auth.detail ?? '');
 }
 
-/**
- * 核心编排（依赖注入可测）：已装 → 直接返回；未装 → install → 复检；
- * install 抛错 → warn 后返回未装态，**绝不抛出**（桥接器启动不能被外部工具安装失败拖垮）
- */
-export async function ensureLarkCliFlow(deps: {
+export interface StartupCheckDeps {
   detect(): Promise<LarkCliDetect>;
-  install(log?: (msg: string) => void): Promise<string>;
-  log?: (msg: string) => void;
-}): Promise<LarkCliDetect> {
-  const log = deps.log ?? (() => {});
-  const first = await deps.detect();
-  if (first.installed) {
-    log(`✅ lark-cli 已安装${first.version ? ` v${first.version}` : '（版本未知）'}`);
-    return first;
-  }
-  log('未检测到飞书官方 CLI，自动安装中（npm install -g @larksuite/cli，遵循 .npmrc 镜像）…');
-  try {
-    await deps.install(log);
-  } catch (e) {
-    log(`⚠️ 自动安装失败（不影响桥接器运行，可手动 npm i -g @larksuite/cli）：${e instanceof Error ? e.message : String(e)}`);
-    return { installed: false };
-  }
-  const again = await deps.detect();
-  log(again.installed
-    ? `✅ lark-cli 安装完成${again.version ? ` v${again.version}` : ''}`
-    : '⚠️ 安装命令已执行但仍未检测到 lark-cli（可手动 npm i -g @larksuite/cli 后重试）');
-  return again;
+  detectSkill(): Promise<LarkCliSkillDetect>;
+  log(msg: string): void;
 }
 
-/** 生产入口：console 反馈（[lark-cli] 前缀），后台异步调用（lcb start 里 void + catch） */
-export async function ensureLarkCli(): Promise<LarkCliDetect> {
-  const detect = await ensureLarkCliFlow({
-    detect: () => detectLarkCli(),
-    install: () => installLarkCli(),
-    log: (msg) => console.log('[lark-cli]', msg),
-  });
+/**
+ * 启动时的飞书 CLI 检查（依赖注入可测）——**只探测，绝不安装**。
+ *
+ * 安装统一下沉到 Web 配置页（用户决策）：启动时静默装会让用户对安装过程无感，
+ * 也就跳过了官方流程的后三步（SKILL / config init / auth login）——等打开配置页时
+ * CLI 已就绪却从未配置过飞书应用，直接卡在「未授权」而无从下手；用户此时若自己点
+ * 「安装」，还会和后台那次抢 npm 文件锁。这里只把现状与去处讲清楚。
+ *
+ * **绝不抛出**：桥接器启动不能被外部工具的探测异常拖垮。
+ */
+export async function checkLarkCliAtStartup(deps: Partial<StartupCheckDeps> = {}): Promise<LarkCliDetect> {
+  const detect = deps.detect ?? (() => detectLarkCli());
+  const detectSkill = deps.detectSkill ?? (() => detectLarkCliSkill());
+  const log = deps.log ?? ((msg: string) => console.log('[lark-cli]', msg));
+  const d = await detect();
+  if (!d.installed) {
+    log('未检测到飞书官方 CLI（@larksuite/cli）。安装统一由配置页发起，启动时不自动装——'
+      + '请打开 Web 配置页（lcb ui），在「飞书 CLI」一栏点「安装」');
+    return d;
+  }
+  log(`✅ lark-cli 已安装${d.version ? ` v${d.version}` : '（版本未知）'}`);
   // 官方安装第 ② 步（SKILL）：启动链只告警不自动装——skills add 要走网络下载，
   // 不能让桥接器启动背这个任务；Web 概览页提供「装 SKILL」按钮
-  if (detect.installed) {
-    const skill = await detectLarkCliSkill().catch(() => ({ installed: false } as LarkCliSkillDetect));
-    if (!skill.installed) {
-      console.log('[lark-cli] ⚠️ 官方 SKILL 未安装（教 AI 怎么用 lark-cli 的说明书）：'
-        + '请在 Web 配置页概览区点「装 SKILL」，或手动执行 npx -y skills add https://open.feishu.cn --skill \'*\' -g -a claude-code --copy -y');
-    }
+  const skill = await detectSkill().catch(() => ({ installed: false } as LarkCliSkillDetect));
+  if (!skill.installed) {
+    log('⚠️ 官方 SKILL 未安装（教 AI 怎么用 lark-cli 的说明书）：'
+      + '请在 Web 配置页概览区点「装 SKILL」，或手动执行 npx -y skills add https://open.feishu.cn --skill \'*\' -g -a claude-code --copy -y');
   }
-  return detect;
+  return d;
 }
 
 // ============ 授权状态探测 ============
@@ -998,6 +1008,8 @@ export interface LarkCliActionResult {
   terminal?: string;
   scriptPath?: string;
   output?: string;
+  /** skill op 专用：装完后扫盘得到的 SKILL 名单（前端列清单用，比 npx 原始输出可靠） */
+  skills?: string[];
   /** 为何没用终端（降级说明，前端展示用） */
   reason?: string;
   error?: string;
@@ -1025,6 +1037,8 @@ export interface LarkCliActionDeps {
   install(): Promise<string>;
   /** SKILL 静默安装（op:'skill'）；缺省真实 installLarkCliSkill */
   installSkill(): Promise<string>;
+  /** SKILL 装完后的落盘扫描（op:'skill' 回传名单用）；缺省真实 listLarkCliSkills */
+  listSkills(): Promise<string[]>;
   /** 授权/配置态探测：config op 用它拒绝重复向导；install op 用它决定脚本是否插 config init 段 */
   checkAuth(): Promise<LarkCliAuthStatus>;
   launch(task: TerminalTask, opts?: { needConfig?: boolean }): Promise<LaunchTerminalResult>;
@@ -1075,6 +1089,7 @@ export async function runLarkCliActionFlow(
   const detect = deps.detect ?? (() => detectLarkCli());
   const install = deps.install ?? (() => installLarkCli());
   const installSkill = deps.installSkill ?? (() => installLarkCliSkill());
+  const listSkills = deps.listSkills ?? (() => listLarkCliSkills());
   const checkAuth = deps.checkAuth ?? (() => checkLarkCliAuth());
   const launch = deps.launch ?? defaultLaunch;
   const now = deps.now ?? (() => Date.now());
@@ -1117,7 +1132,11 @@ export async function runLarkCliActionFlow(
     if (op === 'skill') {
       try {
         const output = await installSkill();
-        return { ok: true, mode: 'silent', output };
+        // 装完扫盘列出实际落盘的名单交给前端渲染：npx 那段输出是带 ANSI 的进度表，
+        // 直接展示既难读又易误导（同名散目录 / 部分失败都看不出来）。output 仍回传
+        // 供排查，但剥掉 ANSI 与控制字符再给出去；扫盘失败不算安装失败，退空数组。
+        const skills = await listSkills().catch(() => [] as string[]);
+        return { ok: true, mode: 'silent', output: stripAnsiAndBom(output), skills };
       } catch (e) {
         return { ok: false, mode: 'silent', error: `SKILL 安装失败：${e instanceof Error ? e.message : String(e)}` };
       }
@@ -1135,7 +1154,8 @@ export async function runLarkCliActionFlow(
     log(`未找到可用终端（${r.reason}），降级为静默安装`);
     try {
       const output = await install();
-      return { ok: true, mode: 'silent', output, reason: r.reason };
+      // 降级路径的输出同样要经前端展示，先剥 ANSI（npm 的彩色输出在 <pre> 里是乱码）
+      return { ok: true, mode: 'silent', output: stripAnsiAndBom(output), reason: r.reason };
     } catch (e) {
       return { ok: false, mode: 'silent', error: `lark-cli 安装失败：${e instanceof Error ? e.message : String(e)}` };
     }

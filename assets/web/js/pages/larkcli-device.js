@@ -39,17 +39,22 @@ export function deviceStateHint(state, error) {
  * @param {(r:any)=>void} [opts.onChange]   收到最新 /api/lark-cli 结果时回调，用于同步刷新概览行
  * @param {()=>void}      [opts.onTerminal] 用户选「改用终端窗口」时回调，接回既有终端链路
  * @param {boolean}       [opts.wasAuthorized] 打开时的授权态快照：区分「本来就好」与「本次扫码完成」
+ * @param {boolean}       [opts.notConfigured] 应用未配置（not_configured）：不发码，直接给配置向导
+ * @param {()=>void}      [opts.onConfig]   用户选「打开配置向导」时回调
  */
-export function openLarkCliDeviceDialog({ onChange, onTerminal, wasAuthorized = false } = {}) {
+export function openLarkCliDeviceDialog({
+  onChange, onTerminal, wasAuthorized = false, notConfigured = false, onConfig,
+} = {}) {
   const { mask, unmount } = mountDialog(`
     <div class="modal dlg" role="dialog" aria-modal="true" style="width:min(520px,94vw)">
       <h3 class="dlg-title">飞书授权（扫码完成）</h3>
-      <div class="dlg-msg">用飞书 App 扫描下方二维码，按提示确认授权。授权成功后本页会自动更新。</div>
+      <div class="dlg-msg" id="lqdLead">用飞书 App 扫描下方二维码，按提示确认授权。授权成功后本页会自动更新。</div>
       <div id="lqdBody"><div class="hint">正在向飞书申请授权二维码…</div></div>
       <div class="dlg-foot">
         <button class="btn" data-lqd="terminal">改用终端窗口</button>
         <button class="btn" data-lqd="copy" hidden>复制链接</button>
         <button class="btn" data-lqd="regen" hidden>重新生成二维码</button>
+        <button class="btn primary" data-lqd="config" hidden>打开配置向导</button>
         <button class="btn primary" data-lqd="close">关闭</button>
       </div>
     </div>`);
@@ -57,6 +62,9 @@ export function openLarkCliDeviceDialog({ onChange, onTerminal, wasAuthorized = 
   const body = mask.querySelector('#lqdBody');
   const btnCopy = mask.querySelector('[data-lqd="copy"]');
   const btnRegen = mask.querySelector('[data-lqd="regen"]');
+  const btnConfig = mask.querySelector('[data-lqd="config"]');
+  const btnTerminal = mask.querySelector('[data-lqd="terminal"]');
+  const btnClose = mask.querySelector('[data-lqd="close"]');
   let session = null;   // 最近一次 start 的响应（存链接与二维码）
   let baseLeft = 0;     // 服务端给的剩余秒数
   let baseAt = 0;       // 收到该秒数时的本地时刻
@@ -97,6 +105,24 @@ export function openLarkCliDeviceDialog({ onChange, onTerminal, wasAuthorized = 
     btnRegen.hidden = state === 'done';
   };
 
+  /**
+   * 应用未配置的引导态：device flow 必然被后端挡下（startLarkCliDeviceAuth 的前置检查），
+   * 所以连请求都不发——直接把「为什么发不了码」和「下一步去哪」摆出来。
+   * 「改用终端窗口」一并收起：那条路同样会撞上未配置守卫。
+   */
+  const paintNeedConfig = () => {
+    body.innerHTML = '<div><span class="tag warn">无法发起</span></div>'
+      + '<div class="hint" style="margin-top:8px">飞书 CLI 还没配置过飞书应用，扫码授权无处可挂。</div>'
+      + '<div class="hint" style="margin-top:6px">点下方「打开配置向导」：向导会创建或绑定飞书应用，'
+      + '完成后<b>自动接着走授权登录</b>，不用回到本页重来。</div>';
+    mask.querySelector('#lqdLead').textContent = '首次使用需先配置飞书应用，之后才能扫码授权。';
+    btnTerminal.hidden = true;
+    btnCopy.hidden = true;
+    btnRegen.hidden = true;
+    btnConfig.hidden = false;
+    btnClose.classList.remove('primary'); // 主按钮让位给「打开配置向导」
+  };
+
   /** 拉一次概览数据同步行内状态（拿不到就算了，别让弹窗崩） */
   const syncRow = async () => {
     if (!onChange) return;
@@ -135,6 +161,7 @@ export function openLarkCliDeviceDialog({ onChange, onTerminal, wasAuthorized = 
 
   const doStart = async (regenerate) => {
     stopTimers();
+    if (notConfigured) { paintNeedConfig(); return; } // 不发请求：后端必然以 not_configured 拒绝
     body.innerHTML = '<div class="hint">正在向飞书申请授权二维码…</div>';
     btnCopy.hidden = true;
     btnRegen.hidden = true;
@@ -166,11 +193,12 @@ export function openLarkCliDeviceDialog({ onChange, onTerminal, wasAuthorized = 
   };
   const unbind = bindDialogKeys((k) => { if (k === 'Escape') close(); });
 
-  mask.querySelector('[data-lqd="close"]').onclick = close;
+  btnClose.onclick = close;
   mask.querySelector('[data-lqd="regen"]').onclick = () => void doStart(true);
   // 关弹窗**不动后端会话**（沿用终端弹窗「关弹窗不中断流程」的既有理念）：
   // 重新打开时 start 不带 regenerate → 后端幂等复用同一个 device code，二维码原样回来
-  mask.querySelector('[data-lqd="terminal"]').onclick = () => { close(); onTerminal?.(); };
+  btnTerminal.onclick = () => { close(); onTerminal?.(); };
+  btnConfig.onclick = () => { close(); onConfig?.(); };
   btnCopy.onclick = async () => {
     const url = session?.verificationUrl;
     if (!url) return;

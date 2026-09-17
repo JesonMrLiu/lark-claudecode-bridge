@@ -16,7 +16,7 @@ import { VERSION } from '../version.js';
 import { join } from 'node:path';
 import { ensureRuntimeDirs } from '../util/runtime-dirs.js';
 import { installLogTee, cleanupOldLogs } from '../util/log-tee.js';
-import { ensureLarkCli, AGENT_CONTEXT_ENV_KEYS } from '../lark-cli-manager.js';
+import { checkLarkCliAtStartup, AGENT_CONTEXT_ENV_KEYS } from '../lark-cli-manager.js';
 
 function showPending(access: AccessControl): void {
   const pending = access.listPending();
@@ -63,9 +63,10 @@ async function main(): Promise<void> {
       // 报 not bound。bridge 是飞书+ClaudeCode 专用进程，与这些 Agent 无关，进程级剔除后
       // claude 会话（飞书里跑 lark-cli 命令）、web API 探测等所有下游子进程一并干净
       for (const k of AGENT_CONTEXT_ENV_KEYS) delete process.env[k];
-      // 深度拥抱飞书：后台检测/安装官方 Lark CLI（@larksuite/cli），不 await 不阻塞启动；
-      // 失败仅告警（npm 源不可达等不影响桥接器本身）
-      void ensureLarkCli().catch((e) =>
+      // 深度拥抱飞书：后台**只检测**官方 Lark CLI（@larksuite/cli）并提示去处，不 await
+      // 不阻塞启动。安装/更新/授权统一下沉到 Web 配置页——启动时静默装会让用户跳过
+      // 官方流程的 config/auth 两步，打开配置页时 CLI 就绪却无从授权（见 checkLarkCliAtStartup）
+      void checkLarkCliAtStartup().catch((e) =>
         console.warn('[lark-cli] 检测流程异常（不影响启动）：', e instanceof Error ? e.message : e));
       await startBridge(CONFIG_PATH);
       // 前台监听 stdin：管理员可直接在运行终端输入配对码批准。
