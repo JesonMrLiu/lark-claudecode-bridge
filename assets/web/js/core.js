@@ -20,7 +20,9 @@ export async function api(method, path, body) {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  // 把响应体一并挂到 Error 上（message 不变，向后兼容）：调用方常需要 error 之外的结构化字段，
+  // 如扫码授权的 hint:'install'|'config'——丢了它前端就只能干瞪眼
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), data);
   return data;
 }
 /** doc 深拷贝快照（抽屉取消回滚 / 打开前留存） */

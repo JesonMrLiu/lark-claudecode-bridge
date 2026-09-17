@@ -3,7 +3,7 @@
 // 长操作（安装含 git clone）立即 ack、完成后经 deps.send 异步推送结果——不阻塞 gateway 事件链。
 // managed 模式双目录：list 合并自管目录 + 本机 ~/.claude；变更操作按插件所在目录定向执行，
 // install 默认装 ~/.claude（与本机 claude CLI 共用一份），--dir=managed 装 bridge 自管目录
-import { runPluginCli } from '../executor/plugin-manager.js';
+import { removeMarketplaceIfUnused, resolvePluginMarketplace, runPluginCli } from '../executor/plugin-manager.js';
 import { invalidatePluginCache, listInstalledPlugins } from '../executor/plugin-discovery.js';
 
 export interface PluginCommandDeps {
@@ -79,16 +79,32 @@ export async function handlePluginCommand(args: string[], deps: PluginCommandDep
     ? [installDir]
     : locatePluginDirs(name, bridgeDir, dual ? userDir : null);
   const label = args.join(' ');
+  // 卸载连带清市场：mp 必须在 uninstall 执行前解析（卸载后 installed_plugins.json 记录已消失）
+  const isUninstall = sub === 'uninstall';
+  const mp = isUninstall
+    ? resolvePluginMarketplace(name, dual ? [bridgeDir, userDir] : [bridgeDir])
+    : undefined;
   void (async () => {
     const results: string[] = [];
+    let anyOk = false;
     for (const dir of dirs) {
       const r = await runPluginCli(cliArgs, { claudeConfigDir: dir });
+      anyOk ||= r.ok;
       results.push(r.ok
         ? `✅ ${dual ? `[${dir === bridgeDir ? 'bridge' : 'user'}] ` : ''}完成：\`\`\`\n${r.text}\n\`\`\``
         : `❌ ${dual ? `[${dir === bridgeDir ? 'bridge' : 'user'}] ` : ''}失败：${r.text}`);
     }
-    invalidateAll();
+    // 市场下再无其他已装插件（双目录都查）→ 自动移除市场，不让市场清单积累死条目
+    let mpNote = '';
+    if (isUninstall && mp && anyOk) {
+      const rm = await removeMarketplaceIfUnused(mp, dual ? [bridgeDir, userDir] : [bridgeDir]);
+      mpNote = rm.removed
+        ? `\n🧹 市场 \`${mp}\` 下已无其他插件，已自动移除（需要时可 /plugin marketplace add 重新添加）`
+        : rm.note ? `\nℹ️ 市场 \`${mp}\` 保留：${rm.note}` : '';
+    }
+    invalidateAll(); // 移到市场移除之后：remove 也会改市场缓存
     await deps.send((results.length ? results.join('\n') : '❌ 未找到该插件（两处目录均无安装记录）')
+      + mpNote
       + '\n下一条消息起自动加载；/plugins 可查看实际加载清单');
   })().catch((e) => deps.send(`❌ 插件操作异常（\`/plugin ${label}\`）：${e instanceof Error ? e.message : String(e)}`));
   return `⏳ 正在执行 \`/plugin ${label}\`（可能需要拉取仓库，稍候推送结果）`;

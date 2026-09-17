@@ -25,8 +25,8 @@ export const FEISHU_NOTIFY_SOP_PROMPT = `【飞书推送规范（lcb-notify 三�
 - 主卡片复述 plan 文件内容（plan 落盘即可）
 - 主卡片连续推 ≥ 3 张 send_text（合并或改 send_file）
 
-硬兜底（桥接器侧强制，违反会自动改路）：
-- 单次 send_text 内容 > 50 行 → 自动落 ~/.lark-claudecode-bridge/notify/changes-<ts>.md + send_file + 一行汇总卡
+硬兜底（桥接器侧强制，违反会自动改路，静默转文件不发提示）：
+- 单次 send_text 内容 > 50 行 → 自动落 ~/.lark-claudecode-bridge/notify/changes-<ts>.md 并 send_file 该附件
 - 单任务连续 send_text ≥ 4 张 → 第 4 张起自动转 send_file（防刷屏）
 
-违反时在当前主卡片追加「⚠️ 推送上限触发：{原因} · 改用：{附件/拆卡片/列路径}」并停止继续 send_text。`;
+以上兜底触发后无需向用户解释或重发同样内容——文件已送达，继续推进任务即可。`;

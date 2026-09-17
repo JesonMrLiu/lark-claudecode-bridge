@@ -27,10 +27,22 @@ import { DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMAND_SOURCES } from '../
 import { openBrowser } from '../util/open-browser.js';
 import { ensureRuntimeDirs } from '../util/runtime-dirs.js';
 import { builtinCommands, createSlashApiClient, ensureBuiltins, expectedCommands, syncSlashCommands } from '../feishu/slash-commands.js';
-import { runPluginCli, updateAllPlugins } from '../executor/plugin-manager.js';
+import { removeMarketplaceIfUnused, resolvePluginMarketplace, runPluginCli, updateAllPlugins } from '../executor/plugin-manager.js';
 import { invalidatePluginCache, listAvailablePlugins, listInstalledPlugins, loadEnabledPlugins } from '../executor/plugin-discovery.js';
 import { bridgeStatus, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDetached, stopBridgeByPid } from './lifecycle.js';
-import { checkUpdate, installMode, runUpdate } from './update.js';
+import { checkUpdate, hasNewerVersion, installMode, runUpdate } from './update.js';
+import {
+  checkLarkCliAuth,
+  checkLarkCliLatest,
+  detectLarkCli,
+  detectLarkCliSkill,
+  getLarkCliDeviceStatus,
+  installLarkCli,
+  installLarkCliSkill,
+  runLarkCliActionFlow,
+  startLarkCliDeviceAuth,
+  type LarkCliOp,
+} from '../lark-cli-manager.js';
 
 /** PUT /api/config 参与整段替换的顶级键；body 未携带的键保持磁盘原文（含注释） */
 const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'server', 'claude', 'slash_commands', 'transcripts', 'session', 'card'] as const;
@@ -523,6 +535,10 @@ async function handle(
       }
       const args = argsTable[op];
       if (!args || args.length === 0) return json(res, 400, { error: `操作 ${op || '(空)'} 需要参数或未知` });
+      // 卸载连带清市场：mp 必须在 uninstall 执行前解析（卸载后安装清单记录已消失）
+      const mp = op === 'uninstall'
+        ? resolvePluginMarketplace(arg, sameDir ? [dir] : [bridgeDir, userDir])
+        : undefined;
       const r = await runPluginCli(args, { claudeConfigDir: dir });
       invalidatePluginCache(bridgeDir);
       if (!sameDir) invalidatePluginCache(userDir);
@@ -535,7 +551,15 @@ async function handle(
           text: `卸载后 ${arg} 仍存在于安装清单（installed_plugins.json 未清除，可能仅被禁用）。CLI 输出：\n${r.text}\n可尝试在本机 claude CLI 中执行 /plugins 手动卸载，或检查目录是否选对（user/bridge 双目录可能各装有一份）。`,
         });
       }
-      return json(res, 200, r);
+      // 卸载成功且市场清空 → 自动移除市场（半完成分支提前返回不做：插件记录仍在，保留市场更安全）
+      let result = r;
+      if (op === 'uninstall' && mp && r.ok && !listInstalledPlugins(dir).some((p) => p.key === arg)) {
+        const rm = await removeMarketplaceIfUnused(mp, sameDir ? [dir] : [bridgeDir, userDir]);
+        invalidatePluginCache(bridgeDir);
+        if (!sameDir) invalidatePluginCache(userDir);
+        if (rm.removed) result = { ...r, text: `${r.text}\n🧹 已自动移除无剩余插件的市场 ${mp}` };
+      }
+      return json(res, 200, result);
     }
   }
   // ---- Skills 管理（#12）：三来源聚合（用户级·本机 / 用户级·bridge / 项目级·工作区）+ create/delete + zip 导入。
@@ -949,12 +973,82 @@ async function handle(
     if (installMode() !== 'global') {
       return json(res, 400, { error: '检测到当前非 npm 安装目录运行（如源码运行），一键更新会装出另一份全局副本而非更新当前实例，请手动更新' });
     }
+    const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>);
     try {
       const output = await runUpdate();
-      return json(res, 200, { ok: true, output });
+      let extra = '';
+      // 一键更新联动升级飞书官方 CLI（前端 confirm 已告知）；失败仅附警告不影响 bridge 更新结果
+      if (body.larkCli === true) {
+        try {
+          // 更新刚重启/排空过进程，此刻文件句柄最可能尚未释放（win32 上会让 npm 升级撞 EBUSY），先让一步
+          await new Promise((r) => setTimeout(r, 1000));
+          await installLarkCli();
+          extra = '\nlark-cli 已同步更新';
+          // 官方 SKILL 顺势刷新（skills add 幂等重装）；失败仅警告——SKILL 缺失不影响 CLI 本体
+          try {
+            await installLarkCliSkill();
+            extra += '，官方 SKILL 已同步更新（重启桥接器后生效）';
+          } catch (se) {
+            extra += `\n⚠️ 官方 SKILL 同步更新失败（不影响 CLI）：${se instanceof Error ? se.message : String(se)}`;
+          }
+        } catch (e) {
+          extra = `\n⚠️ lark-cli 同步更新失败（不影响桥接器）：${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
+      return json(res, 200, { ok: true, output: `${output}${extra}` });
     } catch (e) {
       return json(res, 502, { error: `更新失败：${e instanceof Error ? e.message : String(e)}` });
     }
+  }
+  // ---- 飞书官方 CLI（@larksuite/cli）状态 / 授权 / 安装 ----
+  if (path === '/api/lark-cli' && req.method === 'GET') {
+    const d = await detectLarkCli().catch((): { installed: boolean; version?: string } => ({ installed: false }));
+    const withCheck = url.searchParams.get('check') === '1';
+    const latest = withCheck ? await checkLarkCliLatest().catch(() => undefined) : undefined;
+    // 授权状态与 check=1 解耦：auth status 是纯本地探测（约百毫秒），要撑住弹窗的 5s 轮询；
+    // npm view 走网络，只在 check=1 时打。未安装时完全不探测（零开销）。
+    const auth = d.installed
+      ? await checkLarkCliAuth().catch((e: unknown) => ({
+          state: 'unknown' as const,
+          detail: `探测异常：${e instanceof Error ? e.message : String(e)}`,
+        }))
+      : undefined;
+    // SKILL 状态：纯本地目录扫描；与安装动作同源查 ~/.claude/skills（managed 会话的
+    // 可见性由启动时 bridgeUserSkills 桥接保证，前端在装完 skill 后提示重启桥接器）
+    const skill = d.installed
+      ? await detectLarkCliSkill().catch(() => ({ installed: false }))
+      : { installed: false };
+    return json(res, 200, {
+      ...d,
+      ...(auth ? { auth } : {}),
+      ...{ skill },
+      ...(latest ? { latest, hasUpdate: d.version ? hasNewerVersion(latest, d.version) : true } : {}),
+    });
+  }
+  if (path === '/api/lark-cli/action' && req.method === 'POST') {
+    const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>);
+    const op = String(body.op ?? '');
+    if (op !== 'install' && op !== 'update' && op !== 'auth' && op !== 'config' && op !== 'skill') {
+      return json(res, 400, { error: 'op 仅支持 install / update / auth / config / skill' });
+    }
+    // 编排（拉起终端 / 降级静默 / 互斥 / 冷却）全部在 manager 里，这里只做薄路由
+    const r = await runLarkCliActionFlow(op as LarkCliOp);
+    if (r.busy) return json(res, 409, { error: r.error, busy: true });
+    if (!r.ok) return json(res, 502, { error: r.error });
+    return json(res, 200, r);
+  }
+  // ---- 飞书扫码授权（设备流）：长生命周期有状态会话，独立于上面的即发即忘 action ----
+  // device_code 只存后端内存，**任何响应都不下发**（见 manager 的 deviceInfo）
+  if (path === '/api/lark-cli/device/start' && req.method === 'POST') {
+    const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>);
+    const r = await startLarkCliDeviceAuth({ regenerate: body.regenerate === true });
+    if (!r.ok) return json(res, 502, { error: r.error, ...(r.hint ? { hint: r.hint } : {}) });
+    return json(res, 200, r);
+  }
+  // 永远 200：core.js 的 api() 对非 2xx 一律 throw，会被前端当成故障弹 toast；
+  // 「从未发起 / 桥接器重启后内存已清」是可控业务态（state:'none'），不是错误。
+  if (path === '/api/lark-cli/device/status' && req.method === 'GET') {
+    return json(res, 200, getLarkCliDeviceStatus());
   }
   return json(res, 404, { error: `未知端点 ${req.method} ${path}` });
 }

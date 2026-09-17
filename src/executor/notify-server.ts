@@ -160,15 +160,12 @@ export function createGatewaySender(args: {
   lineLimit?: number;
   sequentialLimit?: number;
   notifyDir?: string;
-  /** sendText 升档「已降级」提示用的提示文案；由 index.ts 注入 SOP 摘要行 */
-  sopTag?: string;
 }): NotifySender {
   const { chatId, sentPaths } = args;
   const sopEnabled = sopOptions?.enabled !== false;
   const lineLimit = sopOptions?.lineLimit ?? 50;
   const sequentialLimit = sopOptions?.sequentialLimit ?? 4;
   const notifyDir = sopOptions?.notifyDir ?? join(CONFIG_DIR, 'notify');
-  const sopTag = sopOptions?.sopTag ?? '【#11 SOP】';
   // 顺序计数：递增写入；上限仅作判定，超阈值 → 后续全部走降级
   let textCallCount = 0;
   let downgradedByLines = false;
@@ -199,7 +196,6 @@ export function createGatewaySender(args: {
           await mkdir(notifyDir, { recursive: true });
         } catch { /* 极端权限异常：继续走提示卡，但 send_file 会失败由调用方兜底 */ }
         if (!downgradeFilePath) downgradeFilePath = join(notifyDir, `changes-${renderTitle()}.md`);
-        const filename = basename(downgradeFilePath);
         try {
           writeFileSync(downgradeFilePath, `${md}\n\n---\n\n`, { flag: 'a' });
           downgradeDirty = true;
@@ -209,14 +205,10 @@ export function createGatewaySender(args: {
           await args.sendText(chatId, md);
           return;
         }
-        const reason = overLines
-          ? `内容 ${lines} 行超阈值 ${lineLimit}`
-          : `连续 ${textCallCount} 张超阈值 ${sequentialLimit}`;
         if (!downgradeSent) {
-          // 首次降级：提示卡说明合并策略 + 立即发当前文件（长任务也有阶段性内容可看）；
-          // 后续追加静默——不逐次刷附件，收尾 flushDowngradedFile 补发完整版
+          // 首次降级：直接发当前文件（长任务也有阶段性内容可看），静默化——不发提示文案卡；
+          // 后续追加同样静默，收尾 flushDowngradedFile 有新内容才补发完整文件
           downgradeSent = true;
-          await args.sendText(chatId, `${sopTag} 推送上限触发：${reason} · 已合并为单文件附件（${filename}），后续超限内容追加进同一文件，任务结束时补发完整版`).catch(() => {});
           await args.sendFileTo(chatId, downgradeFilePath).catch((e) => {
             console.error('[notify-server] SOP 降级 send_file 失败：', e);
           });
@@ -226,11 +218,10 @@ export function createGatewaySender(args: {
       }
       await args.sendText(chatId, md);
     },
-    // 任务收尾补发：首次降级后又有新追加时才重发完整文件（至多 2 条附件消息）
+    // 任务收尾补发：首次降级后又有新追加时才重发完整文件（至多 2 条附件消息，同样静默不发文案）
     flushDowngradedFile: async () => {
       if (!downgradeFilePath || !downgradeDirty) return;
       downgradeDirty = false;
-      await args.sendText(chatId, `${sopTag} 任务结束，补发合并后的完整附件（${basename(downgradeFilePath)}）`).catch(() => {});
       await args.sendFileTo(chatId, downgradeFilePath).catch((e) => {
         console.error('[notify-server] SOP 收尾补发 send_file 失败：', e);
       });

@@ -4,7 +4,7 @@ import { S, $, esc, toast, api, saveDoc, refresh, hooks } from './core.js';
 // ============ 风格化弹窗（替代浏览器原生 confirm / prompt） ============
 let openDialogs = 0; // 打开中的弹窗计数：ESC 只关最上层弹窗，不误触抽屉
 /** 挂载弹窗遮罩（.modal-mask + .dlg）；返回卸载函数 */
-function mountDialog(innerHTML) {
+export function mountDialog(innerHTML) {
   const mask = document.createElement('div');
   mask.className = 'modal-mask';
   mask.innerHTML = innerHTML;
@@ -13,7 +13,7 @@ function mountDialog(innerHTML) {
   return { mask, unmount() { openDialogs--; mask.remove(); } };
 }
 /** 捕获阶段拦截 ESC / Enter（先于抽屉的冒泡监听），弹窗关闭后自动解绑 */
-function bindDialogKeys(onKey) {
+export function bindDialogKeys(onKey) {
   const handler = (e) => {
     if (e.key !== 'Escape' && e.key !== 'Enter') return;
     e.stopPropagation();
@@ -191,4 +191,68 @@ export function initDrawer() {
   $('#drawerMask').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) dismissDrawer(); });
   // ESC 有风格化弹窗打开时归弹窗（其自身在捕获阶段拦截并 stopPropagation，此处计数兜底）
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !openDialogs) dismissDrawer(); });
+}
+
+// ============ 长耗时单请求的进度弹窗 ============
+/**
+ * 进度弹窗（时间缓动模拟，完成前不可关闭）。
+ *
+ * 观感与 plugins.js 的 runOpDialog 一致，但那个与插件页的 busyText / report / update-all 的
+ * 真实 i/N 推进深度耦合，泛化它等于改一个正在工作的界面（`main.css` 明确要求向后兼容）。
+ * 这里单独实现语义单一的版本，重复记为可接受代价。
+ */
+export function progressDialog({ title = '执行中', note = '请稍候…' } = {}) {
+  const { mask, unmount } = mountDialog(`
+    <div class="modal" role="dialog" aria-modal="true" style="width:min(640px,94vw)">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div class="br-spin" style="margin:0"></div>
+        <b class="pd-title">${esc(title)}</b>
+      </div>
+      <div class="prog"><div class="prog-bar"></div></div>
+      <pre class="report" style="margin-top:12px;max-height:220px"></pre>
+      <div class="savebar" style="justify-content:flex-end">
+        <button class="btn primary" hidden>关闭</button>
+      </div>
+    </div>`);
+  const bar = mask.querySelector('.prog-bar');
+  const log = mask.querySelector('pre.report');
+  const spin = mask.querySelector('.br-spin');
+  const titleEl = mask.querySelector('.pd-title');
+  const closeBtn = mask.querySelector('button');
+  log.textContent = note;
+  let done = false;
+  let onCloseFn = null;
+  // 单请求拿不到内部进度：前 2s 线性到 70%，之后渐缓封顶 90%，完成跳 100%（同 runOpDialog 曲线）
+  let pct = 0;
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    const elapsed = Date.now() - startedAt;
+    pct = elapsed < 2000 ? Math.min(70, (elapsed / 2000) * 70) : Math.min(90, pct + 1);
+    bar.style.width = `${pct}%`;
+  }, 300);
+  const close = () => {
+    if (!done) return; // 完成前没有关闭途径，避免把进行中的操作关成「不知道跑没跑」
+    unbind();
+    unmount();
+    onCloseFn?.();
+  };
+  const unbind = bindDialogKeys((k) => { if (k === 'Escape') close(); });
+  closeBtn.onclick = close;
+  mask.onclick = (e) => { if (e.target === mask) close(); };
+  return {
+    setNote(t) { log.textContent = t; },
+    appendLog(line) { log.textContent += `\n${line}`; log.scrollTop = log.scrollHeight; },
+    finish(ok, text) {
+      done = true;
+      clearInterval(timer);
+      bar.style.width = '100%';
+      if (ok) bar.classList.add('done');
+      spin.style.display = 'none';
+      titleEl.textContent = text || (ok ? `✅ ${title}` : `❌ ${title}`);
+      closeBtn.hidden = false;
+      closeBtn.focus();
+    },
+    onClose(fn) { onCloseFn = fn; },
+    unmount() { clearInterval(timer); unbind(); unmount(); },
+  };
 }

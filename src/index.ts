@@ -1,7 +1,7 @@
 // 装配主流程：消息 → 访问控制 → 命令 → 通道队列 → 执行 → 确认卡片 → 回传
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { basename, join, resolve, sep } from 'node:path';
+import { basename, join, relative, resolve, sep } from 'node:path';
 import type {
   BridgeConfig, CardActionEvent, CardActionResponse, CardDecision, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
   IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory,
@@ -23,8 +23,9 @@ import {
   type PlanCardRequest, type LongOutputCardRequest,
   type QuestionCardRequest, type QuestionCardAnswers,
 } from './gateway/card-builder.js';
-import { buildDiffSummaryCards } from './gateway/diff-card.js';
 import { runTask } from './executor/claude-executor.js';
+import { buildFileDiffCards, DIFF_INLINE_MAX_CHARS } from './gateway/diff-card.js';
+import { collectFileDiff } from './util/workspace-diff.js';
 import type { McpServerStatus } from '@anthropic-ai/claude-agent-sdk';
 import {
   PermissionGate, DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMANDS,
@@ -34,7 +35,6 @@ import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery
 import { createGatewaySender, createNotifyServer, NOTIFY_SERVER_NAME } from './executor/notify-server.js';
 import { BRIDGE_MCP_JSON, readMcpServersFromJsonFile } from './web/skills-mcp-api.js';
 import { FEISHU_NOTIFY_SOP_PROMPT } from './notify-sop.js';
-import { collectWorkspaceDiff } from './util/workspace-diff.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
@@ -108,6 +108,11 @@ interface ChannelRuntime {
   queuedCount?: number;
   /** 代际计数：/new 时自增；enqueue 捕获当前值传入 executeTask；不匹配则 no-op（丢弃旧代际排队消息） */
   epoch?: number;
+  /** 指针代际：任何 currentSessionId 变更（/new、/resume <n>、/ws use）时自增。
+   *  与 epoch 分工：epoch 会丢弃旧代际排队消息（/new 才有此语义）；pointerGen 只用于
+   *  「任务收尾归档是否回写指针」——executeTask 抓指针时快照，收尾不匹配则只入历史
+   *  不覆盖指针（否则 /new 后被中止任务的迟到归档会把指针写回旧会话，下个任务又续接它） */
+  pointerGen?: number;
 }
 
 export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真实实现
@@ -232,6 +237,7 @@ export function createBridge(
   function enqueue(key: string, msg: IncomingMessage, prompt: string, wsName: string): void {
     const rt = runtimes.get(key) ?? { queue: Promise.resolve() };
     if (rt.epoch === undefined) rt.epoch = 0; // 旧状态无 epoch 字段的运行期兜底
+    if (rt.pointerGen === undefined) rt.pointerGen = 0;
     runtimes.set(key, rt);
     rt.queuedCount = (rt.queuedCount ?? 0) + 1;
     if (rt.busy) {
@@ -276,10 +282,60 @@ export function createBridge(
     return true;
   }
 
+  /**
+   * 用户按数字取 diff：任务收尾发过数字编号文件清单后，回复纯数字即视为查看对应文件的
+   * 本次改动（unified diff）。范围外提示；diff 短发卡片、长发 .md 文件附件。
+   * 仅在本通道存在清单时拦截（否则纯数字放行为普通任务，如「3」也可能是发给模型的内容）。
+   * 返回 true 表示已处理（processMessage 应拦截，不再交给 Claude Code）。
+   */
+  async function tryDeliverNumberedDiff(msg: IncomingMessage, key: string): Promise<boolean> {
+    const t = msg.text.trim();
+    if (!/^\d+$/.test(t)) return false;
+    const files = fileTracker.get(key);
+    if (files.length === 0) return false; // 无清单：数字按普通消息进任务
+    const n = Number(t);
+    const ws = fileTracker.getWorkspace(key);
+    if (!(n >= 1 && n <= files.length) || !ws) {
+      await deps.gateway.sendTextTo(msg.chatId, `🔢 编号超出范围（1-${files.length}），请对应上方文件清单回复`);
+      return true;
+    }
+    const file = files[n - 1];
+    const rel = relative(ws, file);
+    const displayName = rel.startsWith('..') ? basename(file) : rel;
+    const diff = await collectFileDiff(ws, file).catch(() => null);
+    if (diff === null || !diff.trim()) {
+      await deps.gateway.sendTextTo(msg.chatId, `📊 ${displayName} 本次无可展示的改动（非 git 仓库 / 未改动 / 二进制）`);
+      return true;
+    }
+    const widthMode = config.card?.width ?? 'default';
+    if (diff.length <= DIFF_INLINE_MAX_CHARS) {
+      for (const c of buildFileDiffCards(diff, { fileName: displayName }, widthMode)) {
+        await deps.gateway.sendCardTo(msg.chatId, c);
+      }
+    } else {
+      // 超 6000 字：卡片口径防爆，落盘 .md 发文件附件；落盘失败兜底截断发卡（不静默丢内容）
+      const p = writeRuntimeMarkdown(
+        'diffs', basename(file),
+        `# 改动详情 · ${displayName} · ${new Date().toLocaleString('zh-CN', { hour12: false })}\n\n\`\`\`diff\n${diff}\n\`\`\`\n`,
+        `${tag}[diff 落盘失败]：`,
+      );
+      if (p) {
+        await deps.gateway.uploadAndSendFile(msg.chatId, p);
+      } else {
+        for (const c of buildFileDiffCards(diff.slice(0, 12000), { fileName: displayName }, widthMode)) {
+          await deps.gateway.sendCardTo(msg.chatId, c);
+        }
+      }
+    }
+    return true;
+  }
+
   async function processMessage(msg: IncomingMessage): Promise<void> {
     const key = channelKey(msg.chatId, msg.userId);
-    // 0. 用户主动拿文件：消息中包含本通道非图片文件清单的 basename 即发 + ack，
-    // 命中后拦截不再交给 Claude Code——避免模型重复 send_file 同一文件造成轰炸
+    // 0. 用户主动拿文件/看改动：先按纯数字取 diff（清单序号），再按 basename 点名取本体；
+    // 命中后拦截不再交给 Claude Code——避免模型重复 send_file 同一文件造成轰炸。
+    // 纯数字永不命中 basename 规则（basename ≥4 字符且须被包含），两者无冲突
+    if (await tryDeliverNumberedDiff(msg, key)) return;
     if (await tryDeliverRequestedFiles(msg, key)) return;
     // 1. 访问控制：白名单外首个使用者自动成为 admin（免配对），其后未知用户发配对码
     // 每条消息先重读 access.json：lcb pair / 运行终端等独立进程批准写盘后，
@@ -352,6 +408,12 @@ export function createBridge(
     });
     if (cmd.handled) {
       if (cmd.reply) await deps.gateway.sendTextTo(msg.chatId, cmd.reply);
+      // 指针变更代际 bump：/new、/resume <n>、/ws use 都改写了 currentSessionId——
+      // 运行中/收尾窗口内任务的迟到归档据 pointerGen 放弃回写指针（archive 闭包比对）
+      if (cmd.pointerTouched) {
+        const rt = runtimes.get(key);
+        if (rt) rt.pointerGen = (rt.pointerGen ?? 0) + 1;
+      }
       // /new 开启新会话：
       // 1) 清空旧代际排队消息（epoch 自增，旧任务入 executeTask 即 no-op）
       // 2) abort 正在执行的任务
@@ -581,13 +643,21 @@ planAsk: async (req) => {
       },
     }, {
       enabled: sopEnabled,
-      // #11 SOP 提示文案前缀（用户看到的「为什么自动转附件」提示）
-      sopTag: '⚠️ 推送上限',
     });
     activeProgress.set(key, progress);
+    // 指针代际快照：任务运行期间 /new、/resume <n>、/ws use 都会 bump pointerGen，本任务
+    // 收尾归档据此放弃回写指针（只入历史不覆盖用户选择）。定义在 try 外：catch 路径同样调用
+    const myPointerGen = rt.pointerGen ?? 0;
+    const archive = (sid: string | undefined | null): void => {
+      if (!sid) return;
+      deps.store.archiveSession(key, sid, prompt, {
+        updatePointer: myPointerGen === (runtimes.get(key)?.pointerGen ?? myPointerGen),
+      });
+    };
     try {
       await progress.start();
       const state = deps.store.getChannelState(key);
+
       // 续接指针三态：undefined=旧版存量数据 → 回退 sessions[0]（旧语义 sessions[0] 即当前）；
       // null=/new 或 /ws use 已清指针 → 新开会话；字符串 → resume 该会话。
       // 不能用 ??：null 会被 ?? 当成空值回退 sessions[0]，/new 的意图就被吞掉了
@@ -689,7 +759,7 @@ planAsk: async (req) => {
         // /stop（或硬超时）中止后 SDK 流仍会正常收尾走成功分支——按停止处理，不误报「完成」。
         // 会话归档保留（中断任务的会话上下文仍有价值），但跳过结果与产出文件回传
         await progress.finish('🛑 已停止');
-        deps.store.archiveSession(key, outcome.sessionId, prompt);
+        archive(outcome.sessionId);
         deps.transcript?.result({
           v: 1, ts: now(), kind: 'result', app: app.appId,
           chatId: msg.chatId, userId: msg.userId, sessionId: outcome.sessionId, subtype: 'stopped', text: '',
@@ -697,7 +767,7 @@ planAsk: async (req) => {
         return;
       }
       await progress.finish(`✅ 完成`);
-      deps.store.archiveSession(key, outcome.sessionId, prompt);
+      archive(outcome.sessionId);
       deps.transcript?.result({
         v: 1, ts: now(), kind: 'result', app: app.appId,
         chatId: msg.chatId, userId: msg.userId, workspace: wsName,
@@ -746,7 +816,7 @@ planAsk: async (req) => {
               // 防无界增长：清最老的条目（Map 迭代序即插入序；被清卡片的确认按钮会提示已过期）
               outputPending.delete(outputPending.keys().next().value as string);
             }
-            await deps.gateway.sendCardTo(msg.chatId, buildLongOutputCard(outReq));
+            await deps.gateway.sendCardTo(msg.chatId, buildLongOutputCard(outReq, config.card?.width ?? 'default'));
           } else {
             await deps.gateway.sendTextTo(msg.chatId, text.slice(0, 4000)); // 落盘失败兜底：维持旧截断行为
           }
@@ -764,27 +834,25 @@ planAsk: async (req) => {
           await deps.gateway.uploadAndSendFile(msg.chatId, f);
         }
       };
-      // 把非图片文件记入通道，供后续用户消息按 basename 命中匹配（图片已自动发，不进 tracker）
-      fileTracker.record(
-        key,
-        outcome.producedFiles.filter((f) => !isImageFile(f)),
-      );
-      // 收尾文件清单（纯文本索引）：用户从这里知道改了哪些文件、可点名 basename 取本体。
-      // 文件本体（非图片）默认不发——用户主动点名才发；计划文件等工作区外路径已被
+      // 把非图片文件记入通道（含工作区根，数字取 diff 时用），供后续用户消息按 basename
+      // 点名取本体、或按清单序号取该文件 diff（图片已自动发，不进 tracker）
+      const wsRoot = workspacePath(wsName);
+      const nonImageFiles = outcome.producedFiles.filter((f) => !isImageFile(f));
+      fileTracker.record(key, nonImageFiles, { workspace: wsRoot });
+      // 收尾文件清单（数字编号 + 相对路径）：用户从这里知道改了哪些文件——回复数字看该文件
+      // 本次改动（diff），点名 basename 取文件本体；计划文件等工作区外路径已被
       // OutputCollector 按 cwd 过滤，不会混进清单
-      if (outcome.producedFiles.length > 0) {
-        const list = outcome.producedFiles.map((f) => `- ${f}`).join('\n');
-        await deps.gateway.sendTextTo(msg.chatId, `📁 本次修改/新增的文件（共 ${outcome.producedFiles.length} 个）：\n${list}`);
+      if (nonImageFiles.length > 0) {
+        const list = nonImageFiles.map((f, i) => {
+          const rel = relative(wsRoot, f);
+          return `${i + 1}. ${rel.startsWith('..') ? f : rel}`; // 工作区外（理论不出现）回退绝对路径
+        }).join('\n');
+        await deps.gateway.sendTextTo(msg.chatId,
+          `📁 本次修改/新增的文件（共 ${nonImageFiles.length} 个）：\n${list}\n\n💡 回复数字可查看对应文件的本次改动`);
       }
       await uploadProducedImages();
-      // 汇总 diff 收尾卡片（#6 起不再依赖工作区类型）：工作区是 git 仓库且有改动才发——
-      // git 仓库即「代码工作区」的客观信号；非 git 仓库（内容生产类目录）天然跳过
-      const wsDiff = await collectWorkspaceDiff(workspacePath(wsName));
-      if (wsDiff !== null && wsDiff.diff.trim()) {
-        for (const c of buildDiffSummaryCards(wsDiff.diff, { workspaceName: wsName, files: wsDiff.files })) {
-          await deps.gateway.sendCardTo(msg.chatId, c);
-        }
-      }
+      // 「改动汇总」卡已移除（用户反馈）：改动详情改为按需查看——用户对文件清单回复数字
+      // 即发该文件的本次 diff（tryDeliverNumberedDiff，Phase 2），不再收尾主动铺汇总卡
     } catch (e) {
       // 主动中止（/stop 或 4h 硬超时）：SDK 多数场景把 AbortError("Operation aborted") 抛进消息循环
       // 而非正常收尾——按停止处理不误报「出错」，与上方 executor 正常 return 后的 aborted 判断二选一命中
@@ -792,7 +860,7 @@ planAsk: async (req) => {
         const hardTimedOut = abort.signal.reason instanceof Error && abort.signal.reason.message === 'hard-timeout';
         await progress.finish(hardTimedOut ? '🛑 已停止（超过 4 小时上限自动停止）' : '🛑 已停止');
         const stoppedSessionId = (e as { sessionId?: string })?.sessionId;
-        if (stoppedSessionId) deps.store.archiveSession(key, stoppedSessionId, prompt);
+        archive(stoppedSessionId);
         deps.transcript?.result({
           v: 1, ts: nowBeijingISO(), kind: 'result', app: app.appId,
           chatId: msg.chatId, userId: msg.userId, sessionId: stoppedSessionId ?? '', subtype: 'stopped', text: '',
@@ -818,7 +886,7 @@ planAsk: async (req) => {
       // 出错任务的会话同样归档：错误轮的上下文对追问「刚才为什么错」有价值，
       // 也让 /resume 历史随真实使用持续积累（executor 抛错时携带 sessionId）
       const errSessionId = (e as { sessionId?: string })?.sessionId;
-      if (errSessionId) deps.store.archiveSession(key, errSessionId, prompt);
+      archive(errSessionId);
       deps.transcript?.result({
         v: 1, ts: nowBeijingISO(), kind: 'result', app: app.appId,
         chatId: msg.chatId, userId: msg.userId, sessionId: '',
@@ -991,7 +1059,7 @@ planAsk: async (req) => {
           return {
             toast: { type: 'success', content: settledText },
             // 回调响应内联换卡：决策按钮区收为一行文案（查看按钮保留，全文仍可回看）
-            card: { type: 'raw', data: buildLongOutputSettledCard(out.req, settledText) },
+            card: { type: 'raw', data: buildLongOutputSettledCard(out.req, settledText, config.card?.width ?? 'default') },
           };
         }
         return { toast: { type: 'info', content: '该操作无效或已过期' } };
@@ -1088,6 +1156,9 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     config.slashCommands = fresh.slashCommands;
     // 会话行为热应用：超长提醒阈值每任务收尾现读，改盘后下一条消息即用新值
     config.session = fresh.session;
+    // 卡片宽度热应用：gateway 的 cardWidth getter 与各处发卡传参都现读 config.card，
+    // 原地替换后下一条消息的所有卡片即用新宽度（0.x 遗漏导致改宽度须重启的修复）
+    config.card = fresh.card;
     // managed 模式 claude.env 热生效：inherit 由每任务 buildTaskEnv 并入子进程 env 即可；
     // managed 走托管 settings.json 通道（CLI 侧 settings.json env 优先于进程 env），
     // 此处即时重写盘保证两通道同值——不写盘则手改 env 会被盘上旧值覆盖而静默失效
@@ -1147,6 +1218,8 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
       log: { warn: (...a: unknown[]) => console.warn(tag, ...a), error: (...a: unknown[]) => console.error(tag, ...a) },
       // 多机器人部署：botOpenId 拉取失败时宁丢群消息不猜（防同群双触发）
       strictGroupMention: config.apps.length > 1,
+      // 卡片宽度热生效：getter 现读 config.card（reloader 原地 mutate 同一对象）
+      cardWidth: () => config.card?.width ?? 'default',
     });
     const deps: BridgeDeps = {
       gateway: {

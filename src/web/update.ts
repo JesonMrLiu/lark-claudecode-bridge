@@ -1,18 +1,13 @@
 // 版本检查与自更新：统一走 npm CLI（npm view / npm install -g），天然尊重用户
 // .npmrc 的 registry 镜像与代理配置（国内 npmmirror 场景），不做直连 registry.npmjs.org
-import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { sep } from 'node:path';
 import { VERSION } from '../version.js';
+import { runNpm } from '../util/npm.js';
+
+export { npmCommand, runNpm } from '../util/npm.js'; // 兼容旧导入方（tests/web/update.test.ts 等）
 
 export const PKG_NAME = '@jesonliu/lark-claudecode-bridge';
-
-/** win32 下 npm 是 npm.cmd（execFile 无 PATHEXT 处理），走 cmd /c——open-browser.ts 同款先例 */
-export function npmCommand(): { file: string; prefixArgs: string[] } {
-  return process.platform === 'win32'
-    ? { file: 'cmd', prefixArgs: ['/c', 'npm'] }
-    : { file: 'npm', prefixArgs: [] };
-}
 
 export interface UpdateCheck { current: string; latest: string; hasUpdate: boolean }
 
@@ -57,23 +52,4 @@ export function detectInstallMode(moduleDir: string): InstallMode {
  */
 export function installMode(): InstallMode {
   return detectInstallMode(fileURLToPath(new URL('./', import.meta.url)));
-}
-
-function runNpm(args: string[], timeoutMs: number): Promise<string> {
-  const { file, prefixArgs } = npmCommand();
-  return new Promise((resolve, reject) => {
-    execFile(
-      file,
-      [...prefixArgs, ...args],
-      { timeout: timeoutMs, windowsHide: true, encoding: 'utf8' },
-      (e, stdout, stderr) => {
-        if (e) {
-          const detail = String(stderr || stdout || '').trim().slice(0, 500);
-          reject(new Error(detail || `npm ${args[0]} 执行失败（${(e as NodeJS.ErrnoException).code ?? '超时或退出码非 0'}）`));
-          return;
-        }
-        resolve(String(stdout).trim());
-      },
-    );
-  });
 }

@@ -53,8 +53,9 @@ function card(elements: unknown[], widthMode: 'default' | 'fill' = 'default'): u
 function md(content: string): unknown {
   return { tag: 'markdown', content };
 }
-export function buildTextCard(markdown: string): unknown {
-  return card([md(markdown)]);
+/** 纯文本卡：宽度跟随调用方传入（gateway 层注入 config.card.width，缺省 default） */
+export function buildTextCard(markdown: string, widthMode: 'default' | 'fill' = 'default'): unknown {
+  return card([md(markdown)], widthMode);
 }
 /** 进度卡终态结果尾部的字符上限（防爆卡片）。运行中不展示过程文本（产品决策：主卡只留
  *  关键信息——状态/工具/子代理/确认区/计时；思考内容与过程文本一律不进卡），仅任务收尾
@@ -65,12 +66,12 @@ export const PROGRESS_TAIL_CHARS = 400;
  *  + 「查看完整内容」按钮 + 确认/按意见修改引导——飞书单卡 30KB 上限与可读性都不允许长文
  *  铺卡片，旧版 4000 字硬截断会静默丢内容。400~2000 字区间仍直接发全文卡片 */
 export const LONG_OUTPUT_THRESHOLD = 2000;
-/** 图片卡片：caption（可选）显示在图片上方——逐张发图时带编号说明用 */
-export function buildImageCard(caption: string | undefined, imgKey: string): unknown {
+/** 图片卡片：caption（可选）显示在图片上方——逐张发图时带编号说明用；宽度同 buildTextCard */
+export function buildImageCard(caption: string | undefined, imgKey: string, widthMode: 'default' | 'fill' = 'default'): unknown {
   const elements: unknown[] = [];
   if (caption) elements.push(md(caption));
   elements.push({ tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: caption ?? '图片' } });
-  return card(elements);
+  return card(elements, widthMode);
 }
 /** 进度卡局部更新的固定组件 ID（cardkit element_id，长度限 1-20）：状态主块 + 计时行。
  *  局部更新只替换这两个 markdown 组件的 content，不触碰 form 组件定义——但真机实测
@@ -362,7 +363,7 @@ export interface LongOutputCardRequest {
  * 下方 form 提供后续引导——「确认方案 / 按意见修改」（点击即以对应 prompt 发起新一轮任务，
  * wiring 侧经 outputPending 挂起项校验发起人），也可直接回复消息。
  */
-export function buildLongOutputCard(req: LongOutputCardRequest): unknown {
+export function buildLongOutputCard(req: LongOutputCardRequest, widthMode: 'default' | 'fill' = 'default'): unknown {
   const elements: unknown[] = [
     md(`**📄 回复较长已收起**（共 ${req.charCount} 字）· 工作区 \`${req.workspaceName}\`\n\n请先点击「📂 查看完整内容」阅读全文，再选择后续操作；也可直接回复消息（确认或提意见均可）`),
     {
@@ -387,11 +388,11 @@ export function buildLongOutputCard(req: LongOutputCardRequest): unknown {
       ],
     },
   ];
-  return card(elements);
+  return card(elements, widthMode);
 }
 
 /** 长回复卡已处理态（确认/提意见后的回调响应内联换卡）：保留查看按钮，决策按钮区收为一行文案 */
-export function buildLongOutputSettledCard(req: LongOutputCardRequest, settledText: string): unknown {
+export function buildLongOutputSettledCard(req: LongOutputCardRequest, settledText: string, widthMode: 'default' | 'fill' = 'default'): unknown {
   return card([
     md(`**📄 回复较长已收起**（共 ${req.charCount} 字）· 工作区 \`${req.workspaceName}\``),
     {
@@ -401,5 +402,5 @@ export function buildLongOutputSettledCard(req: LongOutputCardRequest, settledTe
       behaviors: [{ type: 'callback', value: { requestId: req.requestId, decision: 'view-output-file' as CardDecision, filePath: req.filePath } }],
     },
     md(settledText),
-  ]);
+  ], widthMode);
 }

@@ -16,6 +16,7 @@ import { VERSION } from '../version.js';
 import { join } from 'node:path';
 import { ensureRuntimeDirs } from '../util/runtime-dirs.js';
 import { installLogTee, cleanupOldLogs } from '../util/log-tee.js';
+import { ensureLarkCli, AGENT_CONTEXT_ENV_KEYS } from '../lark-cli-manager.js';
 
 function showPending(access: AccessControl): void {
   const pending = access.listPending();
@@ -57,6 +58,15 @@ async function main(): Promise<void> {
       }
       // managed 模式：把 claude 段最新认证/模型值合并进自管目录 settings.json（首条消息前就位）
       initManagedClaudeDir(config);
+      // Agent 上下文清场：本机若设了 HERMES_HOME / OPENCLAW_HOME / LARK_CHANNEL（其它 AI 工具
+      // 留下的），lark-cli 会自动进入「Agent 凭证绑定」分支——拒绝 config init、auth status
+      // 报 not bound。bridge 是飞书+ClaudeCode 专用进程，与这些 Agent 无关，进程级剔除后
+      // claude 会话（飞书里跑 lark-cli 命令）、web API 探测等所有下游子进程一并干净
+      for (const k of AGENT_CONTEXT_ENV_KEYS) delete process.env[k];
+      // 深度拥抱飞书：后台检测/安装官方 Lark CLI（@larksuite/cli），不 await 不阻塞启动；
+      // 失败仅告警（npm 源不可达等不影响桥接器本身）
+      void ensureLarkCli().catch((e) =>
+        console.warn('[lark-cli] 检测流程异常（不影响启动）：', e instanceof Error ? e.message : e));
       await startBridge(CONFIG_PATH);
       // 前台监听 stdin：管理员可直接在运行终端输入配对码批准。
       // 现读现批（每次 load 新实例再 approve）：桥运行中 beginPairing 写入的新 pending

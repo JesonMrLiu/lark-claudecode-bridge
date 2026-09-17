@@ -509,3 +509,16 @@ tr.empty-row td { text-align: center; padding: 22px 10px; color: var(--muted); }
 /* 实心危险按钮（弹窗确认键）：与 .btn.danger（描边）区分 */
 .btn.danger-solid { background: var(--danger); border-color: var(--danger); color: #fff; }
 .btn.danger-solid:hover { background: var(--danger); border-color: var(--danger); color: #fff; filter: brightness(1.07); }
+
+/* ---------- 扫码授权二维码（设备流） ---------- */
+/* 白底是刻意的：lark-cli 生成的 PNG 本身是白底黑码，容器若跟随暗色主题就会在图片
+   周围露出一圈深色，看着像二维码被裁掉。固定白底在任何主题下都与图片本身一致，
+   也保证手机扫得出来。 */
+.qr-box {
+  display: flex; justify-content: center; align-items: center;
+  margin-top: 12px; padding: 12px; background: #fff;
+  border: 1px solid var(--border); border-radius: 12px; color-scheme: light;
+}
+.qr-box img { display: block; width: 220px; height: 220px; }
+/* 链接可整段选中复制；长 URL 必须能折行，否则会把弹窗撑爆 */
+.qr-url { margin-top: 8px; line-height: 1.6; word-break: break-all; user-select: all; }

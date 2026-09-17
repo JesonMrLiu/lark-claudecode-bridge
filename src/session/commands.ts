@@ -62,6 +62,9 @@ export interface CommandResult {
   handled: boolean;
   reply?: string;
   taskText?: string;
+  /** 本次命令改写了 currentSessionId（/new、/resume <n>、/ws use）——wiring 据此 bump
+   *  pointerGen，让运行中/收尾窗口内任务的迟到归档不回写指针（覆盖用户选择的老 bug） */
+  pointerTouched?: boolean;
 }
 
 const HELP = `**可用命令**
@@ -123,7 +126,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       // 仅清除「当前续接指针」，历史会话列表保留（/resume 仍可切回）——
       // 旧版清空整个 sessions 导致开新会话后历史「消失」，列表永远积累不起来
       store.setCurrentSession(key, null, st?.workspaceName || ws);
-      return { handled: true, reply: `✅ 已开启新会话（工作区：${ws}）。历史会话未清空，/resume 可随时切回` };
+      return { handled: true, pointerTouched: true, reply: `✅ 已开启新会话（工作区：${ws}）。历史会话未清空，/resume 可随时切回` };
     }
     case 'resume': {
       const sessions = store.listSessions(key); // 内部新→旧（sessions[0] 最新）
@@ -160,7 +163,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       const target = sessions[n - 1]; // 倒序全局编号：n=1 → 最新（sessions[0]），跨页直接可用
       // 恢复 = 当前续接指针指向选中会话（列表顺序不动，历史保持归档时间序）
       store.setCurrentSession(key, target.sessionId);
-      return { handled: true, reply: `↩️ 已恢复会话：${target.summary || target.sessionId}\n下一条任务将从该会话继续` };
+      return { handled: true, pointerTouched: true, reply: `↩️ 已恢复会话：${target.summary || target.sessionId}\n下一条任务将从该会话继续` };
     }
     case 'stop':
       return { handled: true, reply: ctx.stopCurrentTask() ? '🛑 已发送停止信号' : '当前没有运行中的任务' };
@@ -210,7 +213,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
           ...(st?.planMode ? { planMode: st.planMode } : {}),
         });
         store.setCurrentSession(key, null, target.name);
-        return { handled: true, reply: `✅ 已切换工作区：**${target.name}**（${target.path}）。已自动开启新会话（/resume 可切回历史）` };
+        return { handled: true, pointerTouched: true, reply: `✅ 已切换工作区：**${target.name}**（${target.path}）。已自动开启新会话（/resume 可切回历史）` };
       }
       return { handled: true, reply: '用法：/ws list | /ws use <名字>' };
     }

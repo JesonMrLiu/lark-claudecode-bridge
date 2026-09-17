@@ -262,6 +262,10 @@ export class FeishuGateway {
   private strictGroupMention: boolean;
   /** 入站图片落盘目录（默认 ~/.lark-claudecode-bridge/inbox/，测试可注入临时目录） */
   private inboxDir: string;
+  /** 卡片宽度 getter：wiring 注入 config.card.width 闭包（reloader 原地 mutate 同一 config
+   *  对象，getter 每次发卡现读 → 热生效）。sendText/sendImage 的文本卡与图片卡都消费它，
+   *  进度卡/长回复卡由 wiring 直接传参（同一 config 源）。缺省 default 与旧行为一致 */
+  private cardWidth: () => 'default' | 'fill';
   // 入站消息去重：飞书 WS 长连接 at-least-once 投递，重连窗口内同一消息可能重投——
   // 不去重会导致整个任务跑两遍（两张进度卡 + 两条结果）。Map 迭代序即插入序，容量超限删最旧。
   private seenMessageIds = new Map<string, number>();
@@ -277,6 +281,8 @@ export class FeishuGateway {
       strictGroupMention?: boolean;
       /** 入站图片下载目录，缺省 CONFIG_DIR/inbox */
       inboxDir?: string;
+      /** 卡片宽度 getter（config.card.width），缺省恒 default */
+      cardWidth?: () => 'default' | 'fill';
     } = {},
   ) {
     this.cfg = cfg;
@@ -288,6 +294,7 @@ export class FeishuGateway {
     };
     this.strictGroupMention = deps.strictGroupMention ?? false;
     this.inboxDir = deps.inboxDir ?? join(CONFIG_DIR, 'inbox');
+    this.cardWidth = deps.cardWidth ?? (() => 'default');
     const domain = cfg.domain === 'lark' ? this.sdk.Domain.Lark : this.sdk.Domain.Feishu;
     this.client = new this.sdk.Client({ appId: cfg.appId, appSecret: cfg.appSecret, domain });
   }
@@ -515,9 +522,9 @@ export class FeishuGateway {
     return res.data.message_id;
   }
 
-  /** 以卡片形态发送 markdown 文本 */
+  /** 以卡片形态发送 markdown 文本（宽度跟随 cardWidth getter） */
   async sendText(chatId: string, markdown: string): Promise<string> {
-    return this.sendCard(chatId, buildTextCard(markdown));
+    return this.sendCard(chatId, buildTextCard(markdown, this.cardWidth()));
   }
 
   /** 更新已发送卡片（流式进度刷新） */
@@ -585,7 +592,7 @@ export class FeishuGateway {
     const imageKey = up?.image_key;
     if (!imageKey) throw new Error(`上传图片失败: ${JSON.stringify(up)}`);
     try {
-      return await this.sendCard(chatId, buildImageCard(caption, imageKey));
+      return await this.sendCard(chatId, buildImageCard(caption, imageKey, this.cardWidth()));
     } catch (e) {
       this.log.warn('图片卡片发送失败，降级为说明文本 + 图片消息两条：', e);
       if (caption) await this.sendText(chatId, caption).catch(() => {});

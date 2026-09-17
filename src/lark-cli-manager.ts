@@ -1,0 +1,1145 @@
+// 飞书官方 CLI（@larksuite/cli，命令 lark-cli）自动管理：深度拥抱飞书——
+// lcb start 时检测，缺失则后台自动安装（npm install -g，尊重 .npmrc 镜像/代理），
+// 失败仅告警不阻断桥接器；Web 配置页提供状态查询 / 手动安装更新（/api/lark-cli）。
+//
+// 对齐官方安装四步（open.feishu.cn 安装指南）：① npm 装包 → ② 装 SKILL
+// （npx skills add https://open.feishu.cn，官方标"必需"，教 AI 工具怎么用 lark-cli）
+// → ③ `lark-cli config init --new` 配置应用 → ④ `lark-cli auth login --recommend` 登录。
+// SKILL 只装到 ~/.claude/skills（skills CLI 不支持自定义目标目录）；managed 会话的可见性
+// 由既有 bridgeUserSkills() 在 lcb start 时 junction 桥接保证，本模块不做任何拷贝。
+//
+// 关于登录：lcb 仍然不代管凭证，但**负责把用户送到能完成授权的地方**——
+// 手动安装/更新改为拉起真实终端窗口跑 `npm i -g` + `config init --new`（未配置时）+
+// `lark-cli auth login --recommend`，用户能看见输出、并在同一个窗口里顺势完成
+// device flow 授权（拉不起终端则安装降级静默；config/auth 是交互式向导，不降级）。
+// 授权状态经 `auth status --json` 探测后在概览页展示，未授权时给「去终端授权」入口。
+//
+// Agent 上下文隔离：lark-cli 会按 HERMES_HOME / OPENCLAW_HOME / LARK_CHANNEL 三个环境变量
+// 自动进入「Agent 凭证绑定」分支（要求 config bind 而拒绝 config init）。bridge 是
+// 飞书+ClaudeCode 专用进程，与这些 Agent 无关——lcb start 入口统一剔除（见 bin/lcb.ts），
+// 本模块探测也走剔除后的 env，保证 lark-cli 始终走标准 init/login 路径。
+import { execFile } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runNpm, runNpx } from './util/npm.js';
+import { launchInTerminal, type LaunchTerminalResult, type ScriptBake, type TerminalTask } from './util/terminal-window.js';
+
+/** 飞书官方 CLI 的 npm 包名（命令名 lark-cli；注意 @larksuiteoapi 作用域是 lark-mcp，勿混淆） */
+export const LARK_CLI_PACKAGE = '@larksuite/cli';
+
+/** 飞书 CLI 官方 SKILL 的来源 URL（`npx skills add` 的 well-known discovery 入口） */
+export const LARK_CLI_SKILL_SOURCE = 'https://open.feishu.cn';
+
+/**
+ * 触发 lark-cli「Agent 上下文」分支的环境变量（来源：`lark-cli config bind --help` 自述
+ * --source 由 OPENCLAW_HOME / HERMES_HOME / LARK_CHANNEL 自动探测）。实测本机设了
+ * HERMES_HOME 时 auth status 报 "hermes not bound"、config init 被拒——与 bridge 无关的
+ * 上下文不能劫持标准安装流程，入口与探测处统一剔除。
+ */
+export const AGENT_CONTEXT_ENV_KEYS = ['HERMES_HOME', 'OPENCLAW_HOME', 'LARK_CHANNEL'] as const;
+
+/** 返回剔除 Agent 上下文变量后的 env 副本（不改传入对象；纯函数可测） */
+export function stripAgentContextEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const copy: NodeJS.ProcessEnv = { ...env };
+  for (const k of AGENT_CONTEXT_ENV_KEYS) delete copy[k];
+  return copy;
+}
+
+export interface LarkCliDetect {
+  installed: boolean;
+  /** 解析不到时缺省（已安装但版本未知，不算未装） */
+  version?: string;
+}
+
+/** 纯函数（可测）：从 `lark-cli --version` 输出解析语义化版本（如 1.2.3 / 1.2.3-beta.1） */
+export function parseLarkCliVersion(out: string): string | undefined {
+  // 遇空白 / 引号 / 逗号 / 花括号即止——同一条正则也用于宽松场景，避免把 JSON 尾巴吞进版本号
+  const m = out.match(/(\d+\.\d+\.\d+[^\s"',}]*)/);
+  return m?.[1];
+}
+
+/**
+ * 纯函数（可测）：从 `npm ls -g @larksuite/cli --json` 输出解析已装版本。
+ * JSON.parse 的结果可能是 null（字面量 "null" 也合法），必须挡住非对象再取属性
+ */
+export function parseNpmLsVersion(out: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(out);
+    if (!parsed || typeof parsed !== 'object') return undefined;
+    const v = (parsed as { dependencies?: Record<string, { version?: unknown }> })
+      .dependencies?.[LARK_CLI_PACKAGE]?.version;
+    return typeof v === 'string' && v ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 纯函数（可测）：包内 CLI 入口绝对路径（不依赖 PATH 的检测/调用锚点）；实测 execFile 正反斜杠均可执行，用平台原生形式即可 */
+export function larkCliEntryPath(prefix: string): string {
+  return join(prefix, 'node_modules', LARK_CLI_PACKAGE, 'scripts', 'run.js');
+}
+
+type ExecRunner = (file: string, args: string[], opts: { timeout: number; windowsHide: boolean; encoding: 'utf8'; env?: NodeJS.ProcessEnv }) => Promise<string>;
+
+/** 生产 runner：execFile promisify；win32 走 cmd /c（.cmd shim，同 npmCommand 先例） */
+const defaultRunner: ExecRunner = (file, args, opts) =>
+  new Promise((resolve, reject) => {
+    execFile(file, args, opts as Parameters<typeof execFile>[2], (e, stdout) => {
+      if (e) reject(e);
+      else resolve(String(stdout));
+    });
+  });
+
+/**
+ * npm 全局前缀：同一进程内稳定，故缓存一次。
+ * 但安装完 CLI 前后会变（此前可能压根没有 node_modules），install 成功后主动弃缓存重取。
+ * 失败不缓存（下次可重试）。
+ */
+let prefixCache: string | undefined;
+
+/** npm 全局安装前缀（`npm prefix -g`）；供不依赖 PATH 的检测/调用锚定包位置 */
+export async function npmGlobalPrefix(timeoutMs = 15_000): Promise<string> {
+  if (prefixCache) return prefixCache;
+  const out = await runNpm(['prefix', '-g'], timeoutMs);
+  const p = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).pop();
+  if (!p) throw new Error('npm prefix -g 无输出');
+  prefixCache = p;
+  return p;
+}
+
+/** 弃掉前缀缓存（安装成功后调用；测试用同一入口重置） */
+export function resetNpmGlobalPrefixCache(): void {
+  prefixCache = undefined;
+}
+
+/**
+ * 检测 lark-cli 是否已安装 + 版本。**多路兜底，任一命中即已安装**（顺序固定，全部不依赖调用方的 PATH）：
+ *   ① `lark-cli` 直接调用（快路径：PATH 正常时一次到位，含非默认安装位置）
+ *   ② npm 全局前缀下的包内入口 `scripts/run.js`（主力兜底：绕开 PATH，锁定本机真实安装）
+ *   ③ `npm ls -g @larksuite/cli --json`（最后兜底：包在但入口跑不起来时仍能给出已装 + 版本）
+ * 历史教训：旧实现只有 ①，PATH 查不到就误报「未安装」，前端据此给出安装按钮，
+ * 用户点了反而撞上 npm 重装的文件锁（EBUSY）——已安装的 CLI 被误判成裸机。
+ */
+export async function detectLarkCli(
+  timeoutMs = 10_000,
+  runner: ExecRunner = defaultRunner,
+  getPrefix: () => Promise<string> = npmGlobalPrefix,
+): Promise<LarkCliDetect> {
+  const opts = { timeout: timeoutMs, windowsHide: true, encoding: 'utf8' as const, env: stripAgentContextEnv(process.env) };
+  // ① PATH 直调（win32 下 lark-cli 是 .cmd shim，execFile 无 PATHEXT 处理，复用 cmd /c 前缀）
+  const direct = process.platform === 'win32'
+    ? { file: 'cmd', prefixArgs: ['/c', 'lark-cli'] }
+    : { file: 'lark-cli', prefixArgs: [] as string[] };
+  // 判据统一为「跑通 **且** 解析出版本」：只凭「没抛错」就认已安装，遇到任何不含版本号的
+  // 输出都会误报（反向的误判同样有害——页面会显示「已安装/版本未知」而不再给安装入口）
+  try {
+    const version = parseLarkCliVersion(await runner(direct.file, [...direct.prefixArgs, '--version'], opts));
+    if (version) return { installed: true, version };
+  } catch { /* 落 ②③ */ }
+  // ②③ 需先知道 npm 全局前缀（② 锚定包内入口，③ 锚定 npm 全局装了什么）
+  let prefix: string | undefined;
+  try { prefix = await getPrefix(); } catch { return { installed: false }; }
+  // ② 用 node 绝对路径跑包内入口（不依赖 PATH）
+  try {
+    const version = parseLarkCliVersion(await runner(process.execPath, [larkCliEntryPath(prefix), '--version'], opts));
+    if (version) return { installed: true, version };
+  } catch { /* 落 ③ */ }
+  // ③ npm 全局装了什么（包在但入口跑不起来时仍能给出已装 + 版本）
+  try {
+    const out = await runner('cmd', ['/c', 'npm', 'ls', '-g', LARK_CLI_PACKAGE, '--json'], opts);
+    const version = parseNpmLsVersion(out);
+    // npm ls 在某些情况下对缺失包仍输出 `{"dependencies":{}}`（退出码 0）——**无版本一律视为未安装**，
+    // 否则「未安装」会被误报成已装（版本 undefined），前端就不再提供安装入口
+    if (version) return { installed: true, version };
+  } catch { /* 未装/超时 */ }
+  return { installed: false };
+}
+
+/** 纯函数（可测）：win32 上 npm 就地重装全局包被文件锁挡住的瞬时错误——退避重试可自愈 */
+export function isTransientNpmLockError(message: string): boolean {
+  return /EBUSY|EPERM|resource busy or locked|errno -4082|-4094/i.test(message);
+}
+
+/** 默认退避：setTimeout 包装（unref 避免拖住进程退出） */
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); });
+}
+
+/** install 的重试参数（测试注入 attempts=1 + 零退避即可关掉重试） */
+export interface InstallRetryOpts {
+  attempts?: number;
+  delaysMs?: number[];
+  /** 覆盖 npm 执行（测试注入用）；缺省真实 runNpm */
+  runNpmFn?: (args: string[], timeoutMs: number) => Promise<string>;
+  sleep?: (ms: number) => Promise<void>;
+  log?: (msg: string) => void;
+}
+
+/**
+ * npm install -g @larksuite/cli（安装与升级同一命令）；返回 npm 输出。
+ *
+ * win32 下「就地升级」要先 rename 旧目录再解包，杀毒实时扫描 / 并发 npm / 刚跑过的
+ * lark-cli 进程都可能瞬时锁住该目录 → EBUSY。实测该场景下 rename 未留下任何残留、
+ * 旧版本毫发无伤，只是这一次没换成——故对**锁类错误**退避重试（共 3 次，1.5s / 3s）；
+ * 网络/404 等确定性失败立即抛出，不浪费用户时间。
+ */
+export async function installLarkCli(timeoutMs = 5 * 60_000, opts: InstallRetryOpts = {}): Promise<string> {
+  const attempts = Math.max(1, opts.attempts ?? 3);
+  const delaysMs = opts.delaysMs ?? [1500, 3000];
+  const run = opts.runNpmFn ?? runNpm;
+  const sleep = opts.sleep ?? delay;
+  const log = opts.log ?? ((msg: string) => console.log('[lark-cli]', msg));
+  const args = ['install', '-g', `${LARK_CLI_PACKAGE}@latest`];
+  let lastMsg = '';
+  let lockRelated = false;
+  let tried = 0; // 实际尝试次数（非锁类失败会提前放弃，报「3 次」是误导）
+  for (let i = 1; i <= attempts; i++) {
+    tried = i;
+    try {
+      const out = await run(args, timeoutMs);
+      resetNpmGlobalPrefixCache(); // 装上了 ⇒ 此前缓存的「包不存在」判断作废
+      return out;
+    } catch (e) {
+      lastMsg = e instanceof Error ? e.message : String(e);
+      lockRelated = isTransientNpmLockError(lastMsg);
+      // 非锁类错误（网络不可达 / 404 / 无权限装全局）确定性失败，重试没有意义
+      if (!lockRelated || i >= attempts) break;
+      const wait = delaysMs[Math.min(i - 1, delaysMs.length - 1)] ?? 0;
+      log(`⚠️ 安装被文件锁挡住（第 ${i}/${attempts} 次），${wait}ms 后重试…`);
+      await sleep(wait);
+    }
+  }
+  // 建议只对锁类失败给出（网络超时却让人去关 lark-cli 终端是误导）
+  const hint = lockRelated
+    ? '\n若为 Windows 文件锁冲突，请关闭正在运行的 lark-cli 终端及其它 npm 进程后重试（杀毒软件实时扫描也可能短暂占用）。'
+    : '';
+  throw new Error(`lark-cli 安装失败（尝试 ${tried} 次后放弃）：${lastMsg}${hint}`);
+}
+
+/** npm view 查询最新版本（页面「有新版本」提示用） */
+export async function checkLarkCliLatest(timeoutMs = 15_000): Promise<string> {
+  const out = await runNpm(['view', LARK_CLI_PACKAGE, 'version'], timeoutMs);
+  const v = (out.split(/\r?\n/).filter(Boolean).pop() ?? '').trim().replace(/^"|"$/g, '');
+  if (!/^\d+\.\d+\.\d+/.test(v)) throw new Error(`无法解析 npm 返回的版本号："${v.slice(0, 50)}"`);
+  return v;
+}
+
+// ============ 官方 SKILL 安装（官方安装四步的第 ② 步，官方标注"必需"） ============
+
+/** 纯函数（可测）：skill 目录名是否为飞书系 SKILL（feishu / lark 子串均命中） */
+export function isFeishuSkillDirName(name: string): boolean {
+  return /feishu|lark/i.test(name);
+}
+
+export interface LarkCliSkillDetect {
+  installed: boolean;
+  /** 命中的 skill 目录名（首个） */
+  name?: string;
+}
+
+/**
+ * 检测飞书官方 SKILL 是否已装（默认 ~/.claude/skills，与安装动作同源）。
+ * 判据：目录名命中 feishu/lark **且** 内含 SKILL.md（防同名散目录误报）。
+ * managed 会话的可见性由 bridgeUserSkills() 启动桥接保证，这里不查托管目录。
+ */
+export async function detectLarkCliSkill(
+  skillsDir: string = join(homedir(), '.claude', 'skills'),
+  fs: { exists(p: string): boolean; readdir(d: string): string[] } = {
+    exists: existsSync,
+    readdir: (d) => { try { return readdirSync(d); } catch { return []; } },
+  },
+): Promise<LarkCliSkillDetect> {
+  if (!fs.exists(skillsDir)) return { installed: false };
+  for (const name of fs.readdir(skillsDir)) {
+    if (!isFeishuSkillDirName(name)) continue;
+    if (fs.exists(join(skillsDir, name, 'SKILL.md'))) return { installed: true, name };
+  }
+  return { installed: false };
+}
+
+export interface InstallSkillOpts {
+  /** 覆盖 npx 执行（测试注入）；缺省真实 runNpx */
+  runNpxFn?: (args: string[], timeoutMs: number) => Promise<string>;
+  /** 装好后复扫的目标目录（测试注入用） */
+  skillsDir?: string;
+  log?: (msg: string) => void;
+}
+
+/**
+ * 安装飞书官方 SKILL（`npx skills add`，落盘 ~/.claude/skills）：
+ *  - `--copy` 必须——skills CLI 默认 symlink，Windows 上需开发者模式/管理员权限，必挂；
+ *  - 装完复扫确认落盘，扫不到视为失败（npx 静默空转的场景不能谎报成功）；
+ *  - **不做任何拷贝**：managed 会话由既有 bridgeUserSkills() 在 lcb start 时 junction 桥接，
+ *    装完需重启桥接器生效。
+ */
+export async function installLarkCliSkill(timeoutMs = 3 * 60_000, opts: InstallSkillOpts = {}): Promise<string> {
+  const run = opts.runNpxFn ?? runNpx;
+  const log = opts.log ?? ((msg: string) => console.log('[lark-cli]', msg));
+  log(`安装飞书 CLI 官方 SKILL（npx skills add ${LARK_CLI_SKILL_SOURCE}）…`);
+  const output = await run(
+    ['-y', 'skills', 'add', LARK_CLI_SKILL_SOURCE, '--skill', '*', '-g', '-a', 'claude-code', '--copy', '-y'],
+    timeoutMs,
+  );
+  const skillsDir = opts.skillsDir ?? join(homedir(), '.claude', 'skills');
+  const after = await detectLarkCliSkill(skillsDir);
+  if (!after.installed) {
+    throw new Error(`SKILL 安装命令已执行但在 ${skillsDir} 未发现飞书 skill（npx 输出：${String(output).slice(0, 200) || '空'}）`);
+  }
+  log(`✅ SKILL 安装完成：${after.name}（重启桥接器后 managed 会话可见）`);
+  return output;
+}
+
+/**
+ * 纯函数（可测）：授权状态是否为「应用未配置」——决定概览页给「配置应用」还是「去终端授权」。
+ * detail 的两个来源（error.subtype / reason）实测均含 not_configured 字样。
+ */
+export function needsLarkCliConfig(auth: LarkCliAuthStatus): boolean {
+  return auth.state === 'unauthorized' && /not_configured/i.test(auth.detail ?? '');
+}
+
+/**
+ * 核心编排（依赖注入可测）：已装 → 直接返回；未装 → install → 复检；
+ * install 抛错 → warn 后返回未装态，**绝不抛出**（桥接器启动不能被外部工具安装失败拖垮）
+ */
+export async function ensureLarkCliFlow(deps: {
+  detect(): Promise<LarkCliDetect>;
+  install(log?: (msg: string) => void): Promise<string>;
+  log?: (msg: string) => void;
+}): Promise<LarkCliDetect> {
+  const log = deps.log ?? (() => {});
+  const first = await deps.detect();
+  if (first.installed) {
+    log(`✅ lark-cli 已安装${first.version ? ` v${first.version}` : '（版本未知）'}`);
+    return first;
+  }
+  log('未检测到飞书官方 CLI，自动安装中（npm install -g @larksuite/cli，遵循 .npmrc 镜像）…');
+  try {
+    await deps.install(log);
+  } catch (e) {
+    log(`⚠️ 自动安装失败（不影响桥接器运行，可手动 npm i -g @larksuite/cli）：${e instanceof Error ? e.message : String(e)}`);
+    return { installed: false };
+  }
+  const again = await deps.detect();
+  log(again.installed
+    ? `✅ lark-cli 安装完成${again.version ? ` v${again.version}` : ''}`
+    : '⚠️ 安装命令已执行但仍未检测到 lark-cli（可手动 npm i -g @larksuite/cli 后重试）');
+  return again;
+}
+
+/** 生产入口：console 反馈（[lark-cli] 前缀），后台异步调用（lcb start 里 void + catch） */
+export async function ensureLarkCli(): Promise<LarkCliDetect> {
+  const detect = await ensureLarkCliFlow({
+    detect: () => detectLarkCli(),
+    install: () => installLarkCli(),
+    log: (msg) => console.log('[lark-cli]', msg),
+  });
+  // 官方安装第 ② 步（SKILL）：启动链只告警不自动装——skills add 要走网络下载，
+  // 不能让桥接器启动背这个任务；Web 概览页提供「装 SKILL」按钮
+  if (detect.installed) {
+    const skill = await detectLarkCliSkill().catch(() => ({ installed: false } as LarkCliSkillDetect));
+    if (!skill.installed) {
+      console.log('[lark-cli] ⚠️ 官方 SKILL 未安装（教 AI 怎么用 lark-cli 的说明书）：'
+        + '请在 Web 配置页概览区点「装 SKILL」，或手动执行 npx -y skills add https://open.feishu.cn --skill \'*\' -g -a claude-code --copy -y');
+    }
+  }
+  return detect;
+}
+
+// ============ 授权状态探测 ============
+
+export type LarkCliAuthState = 'authorized' | 'unauthorized' | 'unknown';
+
+export interface LarkCliAuthStatus {
+  state: LarkCliAuthState;
+  /** 未授权的原因（error.subtype / message / reason），供 UI 悬浮提示 */
+  detail?: string;
+  /** 已授权时的可读身份（账号名 / 邮箱） */
+  identity?: string;
+}
+
+/** 未授权类信号（ok:true 也可能带这些 reason —— 见 parseLarkCliAuth 的第二个实测陷阱） */
+const NEGATIVE_REASON = /not_configured|not_authenticated|unauthenticated|no_credential|expired/i;
+
+/**
+ * 纯函数（可测）：取文本里第一个**大括号平衡**的 JSON 对象。
+ * lark-cli 的输出前后可能夹日志，且未授权时整个 JSON 走 stderr——两个流都要能扫。
+ */
+export function firstJsonObject(text: string): unknown {
+  const start = text.indexOf('{');
+  if (start < 0) return undefined;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { if (inStr) esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(text.slice(start, i + 1)); } catch { return undefined; }
+      }
+    }
+  }
+  return undefined;
+}
+
+function str(v: unknown): string | undefined {
+  return typeof v === 'string' && v ? v : undefined;
+}
+
+function pickIdentity(u: unknown): string | undefined {
+  if (!u || typeof u !== 'object') return undefined;
+  const o = u as Record<string, unknown>;
+  // 蛇形（旧格式）与驼峰（v1.0.96 identities）并存：两种形状都用同一套候选
+  return str(o.name) ?? str(o.user_name) ?? str(o.userName)
+    ?? str(o.email) ?? str(o.open_id) ?? str(o.openId) ?? str(o.user_id);
+}
+
+/** 解析不出结构时的诊断线索：正文首片段（压缩空白 + 截断），供前端 tooltip 自查 */
+function unknownDetail(raw: { stdout: string; stderr: string }): string {
+  const text = (raw.stdout.trim() || raw.stderr.trim()).replace(/\s+/g, ' ');
+  return text ? `无法识别的输出：${text.slice(0, 120)}` : '命令没有任何输出（lark-cli 可能未正常运行）';
+}
+
+/**
+ * 纯函数（可测）：解析 v1.0.96 的 `identities` 结构。
+ * 非该形状（无 identities / 空对象）返回 undefined——交给旧格式判定，不在这里下结论。
+ *
+ * 实测形状（已授权）：`{appId, brand, defaultAs, identities:{bot:{status},user:{status:"ready",userName,...}}, identity}`
+ */
+function parseIdentities(v: unknown): LarkCliAuthStatus | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const ids = v as Record<string, unknown>;
+  const user = ids.user;
+  if (!user || typeof user !== 'object') {
+    // 只有 bot 就绪、没有 user 键：auth login 授权的是 **user 身份**，bot ready 不等于已登录
+    if (ids.bot && typeof ids.bot === 'object') {
+      return { state: 'unauthorized', detail: '未登录用户身份（仅 bot 就绪，需执行 lark-cli auth login）' };
+    }
+    return undefined;
+  }
+  const u = user as Record<string, unknown>;
+  if (str(u.status) === 'ready') return { state: 'authorized', identity: pickIdentity(u) };
+  return { state: 'unauthorized', detail: str(u.status) ?? str(u.message) ?? '用户身份未就绪' };
+}
+
+/**
+ * 纯函数（可测）：从 auth status 的原始输出判定登录态。
+ *
+ * 两个**实测**陷阱（都不可靠地凭直觉推导）：
+ *  ① 未授权时 JSON 写在 **stderr**、退出码 **3**、stdout 空 —— 判据绝不能看退出码；
+ *  ② `auth list` 未登录时返回 `{ok:true, reason:"not_configured", users:[]}` ——
+ *     `ok:true` 不等于已授权，必须找正向证据（users 非空）。
+ *
+ * 反向误判同样有害：解析不出来时退 **unknown** 而非 unauthorized ——
+ * 把「不知道」说成「未授权」会让用户白跑一趟终端。
+ */
+export function parseLarkCliAuth(raw: { stdout: string; stderr: string; code: number | null }): LarkCliAuthStatus {
+  const obj = firstJsonObject(raw.stdout) ?? firstJsonObject(raw.stderr);
+  if (!obj || typeof obj !== 'object') return { state: 'unknown', detail: unknownDetail(raw) };
+  const o = obj as Record<string, unknown>;
+  // ③ v1.0.96 实测：已授权时输出 identities 结构，**没有** ok/users/reason 三个旧字段——
+  // 只认旧字段会把「已授权」误报成「授权未知」。
+  const viaIdentities = parseIdentities(o.identities);
+  if (viaIdentities) return viaIdentities;
+  if (o.ok === false) {
+    const err = (o.error ?? {}) as Record<string, unknown>;
+    return { state: 'unauthorized', detail: str(err.subtype) ?? str(err.message) };
+  }
+  const reason = str(o.reason);
+  if (reason && NEGATIVE_REASON.test(reason)) return { state: 'unauthorized', detail: reason };
+  if (Array.isArray(o.users)) {
+    const first = o.users[0];
+    return first
+      ? { state: 'authorized', identity: pickIdentity(first) }
+      : { state: 'unauthorized', detail: reason ?? '未登录任何账号' };
+  }
+  if (o.ok === true) {
+    const identity = str(o.identity) ?? str(o.user) ?? str(o.name) ?? str(o.email);
+    return identity ? { state: 'authorized', identity } : { state: 'authorized' };
+  }
+  return { state: 'unknown', detail: unknownDetail(raw) };
+}
+
+export type AuthRunner = (
+  file: string,
+  args: string[],
+  opts: { timeout: number; windowsHide: boolean; encoding: 'utf8'; env?: NodeJS.ProcessEnv; cwd?: string },
+) => Promise<{ stdout: string; stderr: string; code: number | null }>;
+
+/** 双流捕获。字符串 code（ENOENT/EACCES）才算「没跑起来」→ reject；数字退出码一律 resolve 交给解析 */
+export const defaultAuthRunner: AuthRunner = (file, args, opts) =>
+  new Promise((resolve, reject) => {
+    execFile(file, args, opts as Parameters<typeof execFile>[2], (e, stdout, stderr) => {
+      const code = (e as { code?: unknown } | null)?.code;
+      if (e && typeof code === 'string') { reject(e); return; }
+      resolve({
+        stdout: String(stdout ?? ''),
+        stderr: String(stderr ?? ''),
+        code: typeof code === 'number' ? code : null,
+      });
+    });
+  });
+
+/**
+ * 探测授权状态（纯本地，约百毫秒级——页面轮询靠它，因此**不加 `--verify`**：那需要联网）。
+ * 命令跑不起来时退到 node + 包内入口，与 detectLarkCli 第 ② 路同源。
+ */
+export async function checkLarkCliAuth(timeoutMs = 8_000, runner: AuthRunner = defaultAuthRunner): Promise<LarkCliAuthStatus> {
+  const opts = { timeout: timeoutMs, windowsHide: true, encoding: 'utf8' as const, env: stripAgentContextEnv(process.env) };
+  const direct = process.platform === 'win32'
+    ? { file: 'cmd', prefixArgs: ['/c', 'lark-cli'] }
+    : { file: 'lark-cli', prefixArgs: [] as string[] };
+  try {
+    return parseLarkCliAuth(await runner(direct.file, [...direct.prefixArgs, 'auth', 'status', '--json'], opts));
+  } catch { /* 落②：命令没跑起来 */ }
+  try {
+    const prefix = await npmGlobalPrefix();
+    return parseLarkCliAuth(await runner(process.execPath, [larkCliEntryPath(prefix), 'auth', 'status', '--json'], opts));
+  } catch (e) {
+    return { state: 'unknown', detail: `探测命令未能运行：${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+// ============ 设备流授权（页面二维码） ============
+//
+// 与「拉终端」那条路并列的第二种授权方式：把 lark-cli 的 device flow 搬到配置页里，
+// 用户直接扫码完成，不用切窗口。**比终端路径更通用**——它不经过终端探测，因此
+// 无桌面 / SSH 环境同样可用（那条路上「去终端授权」原本是无出口的死路）。
+//
+// 三段式（实测 v1.0.96 的真实输出，见 parseLarkCliDeviceStart 注释）：
+//   ① `auth login --recommend --no-wait --json` → device_code + verification_url（立即返回）
+//   ② `auth qrcode <url> -o qr.png` → 二维码（cwd 落在 lark-cli 的允许根内，故可落盘）
+//   ③ `auth login --device-code <code> --json` → 用户扫完后收尾换 token（阻塞轮询，放后台跑）
+//
+// 收尾必须后台跑：token 是 ③ 那次调用去飞书换回来并落盘的，不跑它 auth status 永远停在
+// unauthorized；而让前端在用户扫完后触发一个阻塞请求也不可行（请求被吊住数分钟、前端
+// 无从知道用户何时扫完）。故 ③ 在后台自行轮询，前端只轮询一个零成本的内存态端点。
+
+/**
+ * 纯函数（可测）：剥掉 ANSI SGR 序列与 BOM。
+ * `--json` 理论上不带色，但 lark-cli changelog #169「Correct URL formatting in login --no-wait
+ * output」说明这个位置历史上出过 URL 格式事故；ANSI 混进 JSON 字符串会直接毁掉 JSON.parse。
+ */
+export function stripAnsiAndBom(text: string): string {
+  // 用 \x1b / \uFEFF 转义而非字面控制字符：后者在源码里不可见，会被编辑器或工具链悄悄吃掉
+  return text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').replace(/\uFEFF/, '');
+}
+
+/** win32 下 lark-cli 是 .cmd shim，execFile 无 PATHEXT 处理，统一走 cmd /c */
+function larkCliDirect(): { file: string; prefixArgs: string[] } {
+  return process.platform === 'win32'
+    ? { file: 'cmd', prefixArgs: ['/c', 'lark-cli'] }
+    : { file: 'lark-cli', prefixArgs: [] };
+}
+
+export interface LarkCliDeviceStart {
+  /** ★ 只进内存，绝不出 HTTP */
+  deviceCode: string;
+  verificationUrl: string;
+  /** 人可读短码（手输兜底）；实测无独立字段，从 URL 的 query 里取 */
+  userCode?: string;
+  expiresInSec: number;
+  intervalSec: number;
+}
+
+/** 字段取值：先顶层再 data 包装——实测 login 是平铺的，但也兼容 README 的 {ok,data} 信封 */
+function pickField(o: Record<string, unknown>, keys: string[]): unknown {
+  const data = o.data && typeof o.data === 'object' ? (o.data as Record<string, unknown>) : undefined;
+  for (const k of keys) {
+    if (o[k] !== undefined) return o[k];
+    if (data && data[k] !== undefined) return data[k];
+  }
+  return undefined;
+}
+
+function num(v: unknown): number | undefined {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim()) {
+    const n = Number(v.trim());
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, n));
+}
+
+/** 从 verification_url 里取 user_code（只读提取，URL 本身仍按 opaque string 原样使用） */
+function userCodeFromUrl(url: string): string | undefined {
+  const m = /[?&]user_code=([^&\s]+)/.exec(url);
+  return m ? m[1] : undefined;
+}
+
+/** 首个片段（压缩空白 + 截断），供失败时的诊断线索 */
+function snippet(stdout: string, stderr: string): string {
+  return (stdout.trim() || stderr.trim()).replace(/\s+/g, ' ').slice(0, 120);
+}
+
+/**
+ * 纯函数（可测）：解析 `auth login --no-wait --json` 的输出。
+ *
+ * **实测形状（v1.0.96）——平铺，没有 ok/data 信封**，与 lark-cli README 的「JSON Output Contract」
+ * 不一致（该契约显然不覆盖本命令）：
+ *   {"device_code":"…","expires_in":600,"hint":"…",
+ *    "verification_url":"https://accounts.feishu.cn/oauth/v1/device/verify?flow_id=…&user_code=WAFK-BYM3"}
+ * 注意实测**没有** interval、也**没有**独立的 user_code 字段（只在 URL 的 query 里）。
+ * 解析器仍对文件级信封与 verification_uri 命名做兼容，不赌单一形状。
+ *
+ * deviceCode 或 URL 任一缺失即失败——半成品会让前端显示一个扫了没反应的二维码，
+ * 比直接报错难排查十倍。
+ */
+export function parseLarkCliDeviceStart(
+  raw: { stdout: string; stderr: string; code: number | null },
+): { ok: true; value: LarkCliDeviceStart } | { ok: false; error: string } {
+  // 两个流都扫：与 parseLarkCliAuth 同源——lark-cli 出错时 JSON 可能整个走 stderr
+  const obj = firstJsonObject(stripAnsiAndBom(raw.stdout)) ?? firstJsonObject(stripAnsiAndBom(raw.stderr));
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    const s = snippet(raw.stdout, raw.stderr);
+    return { ok: false, error: s ? `无法识别的输出：${s}` : '命令没有任何输出（lark-cli 可能未正常运行）' };
+  }
+  const o = obj as Record<string, unknown>;
+  if (o.ok === false) {
+    const err = (o.error ?? {}) as Record<string, unknown>;
+    return { ok: false, error: str(err.subtype) ?? str(err.message) ?? str(err.hint) ?? 'lark-cli 未返回设备流信息' };
+  }
+  const deviceCode = str(pickField(o, ['device_code', 'deviceCode']));
+  const url = str(pickField(o, [
+    'verification_url', 'verification_uri', 'verification_uri_complete',
+    'verificationUrl', 'verificationUri',
+  ]));
+  if (!deviceCode || !url) {
+    const missing = !deviceCode ? 'device_code' : '授权链接';
+    return { ok: false, error: `设备流信息不完整（缺 ${missing}）：${snippet(raw.stdout, raw.stderr)}` };
+  }
+  return {
+    ok: true,
+    value: {
+      deviceCode,
+      verificationUrl: url,
+      userCode: str(pickField(o, ['user_code', 'userCode'])) ?? userCodeFromUrl(url),
+      // 实测 expires_in=600、无 interval 字段；取值做缺省与 clamp，防异常值把倒计时搞乱
+      expiresInSec: clamp(num(pickField(o, ['expires_in', 'expiresIn'])) ?? 600, 30, 3600),
+      intervalSec: clamp(num(pickField(o, ['interval'])) ?? 5, 1, 60),
+    },
+  };
+}
+
+/** 设备流失败时的人话映射（subtype → 用户能看懂的话） */
+const DEVICE_ERR_TEXT: Record<string, string> = {
+  expired_token: '二维码已过期，请重新生成',
+  access_denied: '已拒绝本次授权',
+  authorization_pending: '授权尚未完成',
+  slow_down: '授权尚未完成',
+};
+
+function parseDeviceError(stdout: string, stderr: string): { subtype?: string; message?: string } {
+  const obj = firstJsonObject(stripAnsiAndBom(stderr)) ?? firstJsonObject(stripAnsiAndBom(stdout));
+  if (obj && typeof obj === 'object') {
+    const o = obj as Record<string, unknown>;
+    const e = (o.error ?? {}) as Record<string, unknown>;
+    return {
+      subtype: str(e.subtype) ?? str(o.subtype),
+      message: str(e.message) ?? str(o.message) ?? str(e.hint),
+    };
+  }
+  return { message: snippet(stdout, stderr) || undefined };
+}
+
+export interface LarkCliDeviceOutcome {
+  phase: 'done' | 'failed' | 'expired';
+  identity?: string;
+  error?: string;
+}
+
+/**
+ * 纯函数（可测）：收尾进程结束后判定本次设备流的结果。
+ *
+ * **这是整个设备流最容易出错的地方**：已授权用户点「重新授权」再扫一次码时，
+ * checkAuth() 前后都是 authorized——**状态探测无法区分「本来就好」与「本次扫码完成」**。
+ * 唯一可靠的正向信号是收尾进程的退出码。
+ *
+ * 正向兜底可以有（未授权 → 已授权的跃迁必然意味着本次扫码成功），
+ * 但**反向兜底绝不能有**：wasAuthorized=true 且 exit≠0 时必须 failed，
+ * 否则会把「本来就已授权」误报成「本次扫码成功」——已授权用户一打开弹窗就会看到
+ * "✅ 授权完成"，而他其实什么都没扫。
+ */
+export function decideDeviceFinishOutcome(a: {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  wasAuthorized: boolean;
+  authAfter?: LarkCliAuthStatus;
+}): LarkCliDeviceOutcome {
+  if (a.exitCode === 0) return { phase: 'done', identity: a.authAfter?.identity };
+  if (!a.wasAuthorized && a.authAfter?.state === 'authorized') {
+    return { phase: 'done', identity: a.authAfter.identity };
+  }
+  const err = parseDeviceError(a.stdout, a.stderr);
+  const mapped = err.subtype ? DEVICE_ERR_TEXT[err.subtype] : undefined;
+  return {
+    phase: err.subtype === 'expired_token' ? 'expired' : 'failed',
+    error: mapped ?? err.message ?? err.subtype ?? '授权失败',
+  };
+}
+
+// ---- 内存会话状态（进程内单例） ----
+
+export type LarkCliDeviceState = 'pending' | 'done' | 'failed' | 'expired' | 'none';
+
+interface DeviceSession {
+  /** 代号：新一轮发起时 +1；在飞的收尾进程回来后靠它丢弃过期结果（不依赖 kill） */
+  gen: number;
+  state: Exclude<LarkCliDeviceState, 'none'>;
+  /** ★ 只存这里，任何出网构造都不带它 */
+  deviceCode: string;
+  verificationUrl: string;
+  userCode?: string;
+  /** 约 2KB data URL；存进会话，重开弹窗命中幂等复用时连图一起返回 */
+  qrDataUrl?: string;
+  expiresAt: number;
+  intervalSec: number;
+  /** 发起时的授权态快照——区分「本来就好」与「本次扫码完成」的唯一依据 */
+  wasAuthorized: boolean;
+  identity?: string;
+  error?: string;
+}
+
+export interface LarkCliDeviceSessionInfo {
+  ok: boolean;
+  state?: LarkCliDeviceState;
+  verificationUrl?: string;
+  /** 仅 start 返回（status 每 2s 轮询，不重复传几 KB 图） */
+  qrDataUrl?: string;
+  userCode?: string;
+  /** 每次现算的剩余秒数 */
+  expiresInSec?: number;
+  intervalSec?: number;
+  reused?: boolean;
+  identity?: string;
+  error?: string;
+  /** 未装 / 未配置——让前端把用户导到对应入口而不是干瞪眼 */
+  hint?: 'install' | 'config';
+}
+
+let deviceSession: DeviceSession | null = null;
+let deviceGen = 0;
+let deviceStartInflight: Promise<LarkCliDeviceSessionInfo> | null = null;
+
+/** 剩余不足此值视为已过期：与其返回一个马上失效的二维码，不如直接新建一轮 */
+const DEVICE_MIN_REMAIN_MS = 30_000;
+/** 收尾进程超时 = 设备码寿命 + 此余量 */
+const DEVICE_FINISH_SLACK_MS = 30_000;
+const DEVICE_MAX_LIFETIME_MS = 3_600_000;
+
+/** 二维码临时目录（与 terminal-window.ts 的 tmp 用法同源） */
+export function larkCliQrDir(tmpDir?: string): string {
+  return join(tmpDir ?? tmpdir(), 'lcb-larkcli-qr');
+}
+
+/**
+ * 唯一的出网构造点：**显式挑字段**（不是 {...session} 展开）——结构上杜绝 device_code 泄漏。
+ * 顺带做懒过期：pending 且已超期就地转 expired，且 expired 不再返回 URL/二维码。
+ */
+function deviceInfo(now = Date.now(), withQr = false): LarkCliDeviceSessionInfo {
+  const s = deviceSession;
+  if (!s) return { ok: true, state: 'none' };
+  if (s.state === 'pending' && now > s.expiresAt + DEVICE_FINISH_SLACK_MS) s.state = 'expired';
+  const base: LarkCliDeviceSessionInfo = {
+    ok: true,
+    state: s.state,
+    userCode: s.userCode,
+    intervalSec: s.intervalSec,
+    identity: s.identity,
+    error: s.error,
+  };
+  if (s.state === 'pending') {
+    base.verificationUrl = s.verificationUrl;
+    base.expiresInSec = Math.max(0, Math.round((s.expiresAt - now) / 1000));
+    if (withQr) base.qrDataUrl = s.qrDataUrl;
+  }
+  return base;
+}
+
+/** 内存态查询（零副作用、亚毫秒）——撑住前端 2s 轮询 */
+export function getLarkCliDeviceStatus(now = Date.now()): LarkCliDeviceSessionInfo {
+  return deviceInfo(now);
+}
+
+/** 清掉临时二维码文件（尽力而为，失败不影响流程） */
+function removeQrFile(log: (m: string) => void): void {
+  try {
+    rmSync(join(larkCliQrDir(), 'qr.png'), { force: true });
+  } catch (e) {
+    log(`清理二维码临时文件失败：${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * 放弃当前会话（改用终端 / 新一轮发起前）。
+ * **不 kill 子进程**：Windows 上 execFile('cmd', …) 的进程树是 cmd → node → lark-cli.exe，
+ * kill 直接子进程往往留下孤儿。靠 gen 失配丢弃结果 + execFile 的 timeout 自灭即可——
+ * 孤儿最多空转到 device code 过期后自行退出。
+ */
+export function abandonLarkCliDeviceSession(): void {
+  if (!deviceSession) return;
+  deviceGen++;
+  deviceSession = null;
+  removeQrFile(() => { /* 静默：放弃路径不打扰用户 */ });
+}
+
+/** 重置编排 + 设备流状态（测试用） */
+export function resetLarkCliDeviceState(): void {
+  deviceSession = null;
+  deviceGen = 0;
+  deviceStartInflight = null;
+}
+
+/**
+ * 纯函数（可测）：cmd.exe 下的参数转义。
+ *
+ * **这不是洁癖，是实测踩出来的**：verification_url 必然含 `&`（`?flow_id=…&user_code=…`），
+ * 而 `cmd /c lark-cli … <url>` 会把 `&` 当成**命令分隔符**，命令被截断成两条，
+ * 二维码文件压根不生成（只留一个莫名其妙的 ENOENT）。
+ * 注意：Node 只在参数含空格/制表符时才加引号，飞书 URL 不含空格，所以 `&` 是裸奔到 cmd 的。
+ */
+export function cmdEscapeArg(s: string): string {
+  return s.replace(/[&|<>^()]/g, (c) => `^${c}`);
+}
+
+/**
+ * 生成二维码 data URL。失败返回 undefined——**二维码只是展示层**，生成不出来就降级为
+ * 只显示可复制链接，设备流照常进行。
+ * cwd 设为专用 tmp 子目录：lark-cli 的写路径允许根是 cwd / /tmp / ~/files（实测 cwd 生效），
+ * 故 -o 用相对名即可落进允许根。
+ */
+export async function defaultMakeQr(
+  url: string,
+  runner: AuthRunner = defaultAuthRunner,
+  log: (m: string) => void = () => { /* 默认静默 */ },
+  tmpDir?: string,
+): Promise<string | undefined> {
+  const dir = larkCliQrDir(tmpDir);
+  const args = ['auth', 'qrcode', url, '-o', 'qr.png', '--size', '512'];
+  const opts = { timeout: 10_000, windowsHide: true, encoding: 'utf8' as const, env: stripAgentContextEnv(process.env), cwd: dir };
+  try {
+    mkdirSync(dir, { recursive: true });
+    // ★ 优先走 node + 包内入口：**不经过任何 shell 重解析**，天然免疫上面那个 `&` 陷阱。
+    // 与 checkLarkCliAuth 的第 ② 路同源（绕开 PATH，锚定本机真实安装）。
+    let done = false;
+    try {
+      const prefix = await npmGlobalPrefix();
+      await runner(process.execPath, [larkCliEntryPath(prefix), ...args], opts);
+      done = true;
+    } catch { /* 落 cmd 兜底 */ }
+    if (!done) {
+      // 兜底路径要转义——这里没有 node 可锚定，只能经 cmd
+      const d = larkCliDirect();
+      await runner(d.file, [...d.prefixArgs, 'auth', 'qrcode', cmdEscapeArg(url), '-o', 'qr.png', '--size', '512'], opts);
+    }
+    return `data:image/png;base64,${readFileSync(join(dir, 'qr.png')).toString('base64')}`;
+  } catch (e) {
+    log(`二维码生成失败（降级为只显示链接）：${e instanceof Error ? e.message : String(e)}`);
+    return undefined;
+  }
+}
+
+export interface LarkCliDeviceDeps {
+  runner: AuthRunner;
+  finishRunner: AuthRunner;
+  detect(): Promise<LarkCliDetect>;
+  checkAuth(): Promise<LarkCliAuthStatus>;
+  makeQr(url: string): Promise<string | undefined>;
+  now(): number;
+  log(msg: string): void;
+}
+
+/**
+ * 后台收尾：spawn `auth login --device-code <CODE>` 让它自己按 interval 轮询，
+ * 用户扫码（或超时）后自然返回。结果写回会话。
+ * 超时 = 设备码寿命 + 30s，1 小时封顶——不设的话用户不扫时这个进程会挂满整段时间。
+ */
+async function runLarkCliDeviceFinish(s: DeviceSession, deps: LarkCliDeviceDeps): Promise<void> {
+  const remain = Math.max(s.expiresAt - deps.now(), DEVICE_FINISH_SLACK_MS);
+  const timeoutMs = Math.min(remain + DEVICE_FINISH_SLACK_MS, DEVICE_MAX_LIFETIME_MS);
+  // device code 实测是 base64url 字符集（无元字符），转义对它是 no-op——纯防御：
+  // 万一将来格式变了，也不至于在 cmd 下被 `&` 截断成另一个命令
+  const args = ['auth', 'login', '--device-code', cmdEscapeArg(s.deviceCode), '--json'];
+  const opts = { timeout: timeoutMs, windowsHide: true, encoding: 'utf8' as const, env: stripAgentContextEnv(process.env) };
+  try {
+    let raw: { stdout: string; stderr: string; code: number | null };
+    try {
+      const d = larkCliDirect();
+      raw = await deps.finishRunner(d.file, [...d.prefixArgs, ...args], opts);
+    } catch (e) {
+      if (typeof (e as { code?: unknown })?.code !== 'string') {
+        const prefix = await npmGlobalPrefix();
+        raw = await deps.finishRunner(process.execPath, [larkCliEntryPath(prefix), ...args], opts);
+      } else { throw e; }
+    }
+    // gen 失配 = 已被新一轮取代 → 丢弃结果，绝不污染新会话
+    if (deviceSession?.gen !== s.gen) return;
+    const authAfter = raw.code === 0 ? await deps.checkAuth().catch(() => undefined) : undefined;
+    const out = decideDeviceFinishOutcome({
+      exitCode: raw.code, stdout: raw.stdout, stderr: raw.stderr,
+      wasAuthorized: s.wasAuthorized, authAfter,
+    });
+    s.state = out.phase;
+    s.identity = out.identity;
+    s.error = out.error;
+  } catch (e) {
+    if (deviceSession?.gen !== s.gen) return;
+    // 含 execFile timeout kill：超期就说过期，否则是执行失败
+    s.state = deps.now() >= s.expiresAt ? 'expired' : 'failed';
+    s.error = e instanceof Error ? e.message : String(e);
+  }
+}
+
+/**
+ * 发起设备流授权（页面二维码的主入口）。
+ *
+ * 四道闸挡住「每点一次就多一个 flow」：
+ *   ① 幂等复用：未过期的 pending 会话直接返回同一个 URL（挡住刷新页面 / 关弹窗再开）
+ *   ② in-flight 合并：并发调用 await 同一个 promise（挡住双击）
+ *   ③ regenerate：用户显式要求时才新建
+ *   ④ gen 代号：新建时 +1，在飞的老收尾进程靠它丢弃过期结果
+ */
+export async function startLarkCliDeviceAuth(
+  opts: { regenerate?: boolean; deps?: Partial<LarkCliDeviceDeps> } = {},
+): Promise<LarkCliDeviceSessionInfo> {
+  const deps: LarkCliDeviceDeps = {
+    runner: opts.deps?.runner ?? defaultAuthRunner,
+    finishRunner: opts.deps?.finishRunner ?? defaultAuthRunner,
+    detect: opts.deps?.detect ?? (() => detectLarkCli()),
+    checkAuth: opts.deps?.checkAuth ?? (() => checkLarkCliAuth()),
+    makeQr: opts.deps?.makeQr ?? ((url) => defaultMakeQr(url, opts.deps?.runner ?? defaultAuthRunner, deps.log)),
+    now: opts.deps?.now ?? (() => Date.now()),
+    log: opts.deps?.log ?? ((m: string) => console.log('[lark-cli]', m)),
+  };
+  const now = deps.now();
+
+  // ① 幂等复用（regenerate 时跳过）
+  if (!opts.regenerate && deviceSession?.state === 'pending' && deviceSession.expiresAt - now > DEVICE_MIN_REMAIN_MS) {
+    return { ...deviceInfo(now, true), reused: true };
+  }
+  // ② 并发合并
+  if (deviceStartInflight) return deviceStartInflight;
+
+  const task = (async (): Promise<LarkCliDeviceSessionInfo> => {
+    const d = await deps.detect();
+    if (!d.installed) {
+      return { ok: false, hint: 'install', error: 'lark-cli 未安装，请先安装后再授权' };
+    }
+    // 未配置应用时 --no-wait 必然失败：提前拦，给出准确引导而不是一个费解的 API 错误
+    const before = await deps.checkAuth();
+    if (needsLarkCliConfig(before)) {
+      return { ok: false, hint: 'config', error: '飞书应用尚未配置，无法发起扫码授权（请先点「配置应用」）' };
+    }
+
+    abandonLarkCliDeviceSession(); // ③ gen++
+
+    const args = ['auth', 'login', '--recommend', '--no-wait', '--json'];
+    const runnerOpts = { timeout: 20_000, windowsHide: true, encoding: 'utf8' as const, env: stripAgentContextEnv(process.env) };
+    let raw: { stdout: string; stderr: string; code: number | null };
+    try {
+      const direct = larkCliDirect();
+      raw = await deps.runner(direct.file, [...direct.prefixArgs, ...args], runnerOpts);
+    } catch {
+      try {
+        const prefix = await npmGlobalPrefix();
+        raw = await deps.runner(process.execPath, [larkCliEntryPath(prefix), ...args], runnerOpts);
+      } catch (e) {
+        return { ok: false, error: `设备流命令未能运行：${e instanceof Error ? e.message : String(e)}` };
+      }
+    }
+    const parsed = parseLarkCliDeviceStart(raw);
+    if (!parsed.ok) return { ok: false, error: parsed.error };
+
+    const s: DeviceSession = {
+      gen: ++deviceGen,
+      state: 'pending',
+      deviceCode: parsed.value.deviceCode,
+      verificationUrl: parsed.value.verificationUrl,
+      userCode: parsed.value.userCode,
+      expiresAt: now + parsed.value.expiresInSec * 1000,
+      intervalSec: parsed.value.intervalSec,
+      wasAuthorized: before.state === 'authorized',
+    };
+    deviceSession = s;
+    // 二维码只是展示层，生成失败不阻塞授权
+    s.qrDataUrl = await deps.makeQr(s.verificationUrl).catch(() => undefined);
+    void runLarkCliDeviceFinish(s, deps); // ④ 后台收尾，不 await
+    return deviceInfo(deps.now(), true);
+  })();
+
+  deviceStartInflight = task;
+  try {
+    return await task;
+  } finally {
+    deviceStartInflight = null;
+  }
+}
+
+// ============ 安装/更新/授权 的动作编排 ============
+
+export type LarkCliOp = 'install' | 'update' | 'auth' | 'config' | 'skill';
+
+export interface LarkCliActionResult {
+  ok: boolean;
+  /** 已有操作在进行 / 刚拉起过终端 */
+  busy?: boolean;
+  mode: 'terminal' | 'silent' | 'none';
+  terminal?: string;
+  scriptPath?: string;
+  output?: string;
+  /** 为何没用终端（降级说明，前端展示用） */
+  reason?: string;
+  error?: string;
+}
+
+/** 同一 op 两次拉起终端的最小间隔：挡住连点开出两个终端窗口 */
+const LAUNCH_COOLDOWN_MS = 10_000;
+
+let inFlight = false;
+const lastLaunchAt: Partial<Record<LarkCliOp, number>> = {};
+
+/** 重置编排状态（测试用）。进程内单例：并发 npm 必撞 Windows 文件锁，这里必须互斥 */
+export function resetLarkCliActionState(): void {
+  inFlight = false;
+  delete lastLaunchAt.install;
+  delete lastLaunchAt.update;
+  delete lastLaunchAt.auth;
+  delete lastLaunchAt.config;
+  // 设备流会话也在同一进程内，跟着一起清——既有 30+ 处 beforeEach 无需逐条补
+  resetLarkCliDeviceState();
+}
+
+export interface LarkCliActionDeps {
+  detect(): Promise<LarkCliDetect>;
+  install(): Promise<string>;
+  /** SKILL 静默安装（op:'skill'）；缺省真实 installLarkCliSkill */
+  installSkill(): Promise<string>;
+  /** 授权/配置态探测：config op 用它拒绝重复向导；install op 用它决定脚本是否插 config init 段 */
+  checkAuth(): Promise<LarkCliAuthStatus>;
+  launch(task: TerminalTask, opts?: { needConfig?: boolean }): Promise<LaunchTerminalResult>;
+  now(): number;
+  log(msg: string): void;
+}
+
+/** 构造烘焙值：全部来自 OS，不含任何用户输入；取不到包内入口只是少一道兜底，不致命 */
+async function defaultLaunch(task: TerminalTask, opts?: { needConfig?: boolean }): Promise<LaunchTerminalResult> {
+  const bake: ScriptBake = { pathEnv: process.env.PATH, nodePath: process.execPath };
+  try { bake.larkEntry = larkCliEntryPath(await npmGlobalPrefix()); } catch { /* 见上 */ }
+  return launchInTerminal(task, { bake, needConfig: opts?.needConfig });
+}
+
+/**
+ * install 任务的 config 段开关：未配置则插 `config init --new`（官方第 ③ 步顺势完成）。
+ * 探测失败保守按「已配置」处理（false）——宁可让用户装完点「配置应用」按钮，
+ * 也不对偶发超时的已配置机器弹出重复向导。
+ */
+async function needConfigQuietly(
+  checkAuth: () => Promise<LarkCliAuthStatus>,
+  log: (m: string) => void,
+): Promise<boolean> {
+  try {
+    return needsLarkCliConfig(await checkAuth());
+  } catch (e) {
+    log(`授权态探测失败（按已配置处理，跳过 config init 段）：${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+}
+
+/**
+ * 安装/更新/授权/配置/SKILL 五条动作的统一编排。
+ *
+ * - install / update：优先拉起终端（用户能看见 npm 输出并顺势完成配置与授权）；
+ *   拉不起终端（SSH / 无桌面）则降级静默安装，`reason` 带回降级原因。
+ * - auth / config：**不降级** —— 交互式向导没有静默等价物，拉不起终端就如实报错。
+ *   config 额外要求当前确属「未配置」态（needsLarkCliConfig），已配置时拒绝重复向导。
+ * - skill：静默安装（npx skills add，无交互），不拉终端；失败仅返回错误不抛出。
+ *
+ * 互斥覆盖「探测 + 拉起」的亚秒窗口；终端存活期由 10s 冷却兜（否则用户 3 分钟后
+ * 想再授权会被自己锁死）。
+ */
+export async function runLarkCliActionFlow(
+  op: LarkCliOp,
+  deps: Partial<LarkCliActionDeps> = {},
+): Promise<LarkCliActionResult> {
+  const detect = deps.detect ?? (() => detectLarkCli());
+  const install = deps.install ?? (() => installLarkCli());
+  const installSkill = deps.installSkill ?? (() => installLarkCliSkill());
+  const checkAuth = deps.checkAuth ?? (() => checkLarkCliAuth());
+  const launch = deps.launch ?? defaultLaunch;
+  const now = deps.now ?? (() => Date.now());
+  const log = deps.log ?? ((m: string) => console.log('[lark-cli]', m));
+
+  if (inFlight) return { ok: false, busy: true, mode: 'none', error: '已有 lark-cli 操作正在进行，请稍候' };
+  inFlight = true;
+  try {
+    const last = lastLaunchAt[op];
+    if (last !== undefined && now() - last < LAUNCH_COOLDOWN_MS) {
+      return { ok: false, busy: true, mode: 'none', error: '终端窗口刚刚已经打开，请等它跑完再试' };
+    }
+
+    if (op === 'auth' || op === 'config') {
+      const d = await detect();
+      if (!d.installed) return { ok: false, mode: 'none', error: `lark-cli 未安装，请先安装后再${op === 'auth' ? '授权' : '配置'}` };
+      if (op === 'config') {
+        // 已配置时拒绝重复向导：覆盖配置是破坏性动作，且 TUI 向导会把已有 profile 顶掉
+        const auth = await checkAuth();
+        if (!needsLarkCliConfig(auth)) {
+          return { ok: false, mode: 'none', error: '应用已配置，无需重复配置（如确需重配请在终端执行 lark-cli config init --new）' };
+        }
+      }
+      const r = await launch(op);
+      if (!r.ok) {
+        return {
+          ok: false,
+          mode: 'none',
+          error: `未找到可用终端（${r.reason}）：请在服务器本机终端执行 ${op === 'auth' ? 'lark-cli auth login --recommend' : 'lark-cli config init --new'}`,
+        };
+      }
+      lastLaunchAt[op] = now();
+      // 用户改用终端了：作废页面上那轮设备流，避免后台收尾与终端里的 auth login
+      // 同时往 token store 写。放在 r.ok 之后而非函数入口——否则「点了更新又取消确认框」
+      // 会把用户正在扫的二维码搞没。
+      abandonLarkCliDeviceSession();
+      return { ok: true, mode: 'terminal', terminal: r.terminal, scriptPath: r.scriptPath };
+    }
+
+    if (op === 'skill') {
+      try {
+        const output = await installSkill();
+        return { ok: true, mode: 'silent', output };
+      } catch (e) {
+        return { ok: false, mode: 'silent', error: `SKILL 安装失败：${e instanceof Error ? e.message : String(e)}` };
+      }
+    }
+
+    const r = await launch('install', { needConfig: await needConfigQuietly(checkAuth, log) });
+    if (r.ok) {
+      lastLaunchAt[op] = now();
+      // 用户改用终端了：作废页面上那轮设备流，避免后台收尾与终端里的 auth login
+      // 同时往 token store 写。放在 r.ok 之后而非函数入口——否则「点了更新又取消确认框」
+      // 会把用户正在扫的二维码搞没。
+      abandonLarkCliDeviceSession();
+      return { ok: true, mode: 'terminal', terminal: r.terminal, scriptPath: r.scriptPath };
+    }
+    log(`未找到可用终端（${r.reason}），降级为静默安装`);
+    try {
+      const output = await install();
+      return { ok: true, mode: 'silent', output, reason: r.reason };
+    } catch (e) {
+      return { ok: false, mode: 'silent', error: `lark-cli 安装失败：${e instanceof Error ? e.message : String(e)}` };
+    }
+  } finally {
+    inFlight = false;
+  }
+}

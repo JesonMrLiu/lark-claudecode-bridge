@@ -4,7 +4,7 @@
 // 环境仅白名单透传 + CLAUDE_CONFIG_DIR：插件装到 bridge 解析的配置目录（managed 模式与 ~/.claude 隔离）
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { listInstalledPlugins } from './plugin-discovery.js';
+import { listAvailablePlugins, listInstalledPlugins } from './plugin-discovery.js';
 
 /** 平台二进制包候选（与 sdk.mjs 解析序一致：linux 优先 musl 变体；win32 带 .exe） */
 function cliCandidates(): string[] {
@@ -129,4 +129,43 @@ export async function updateAllPlugins(claudeConfigDir: string): Promise<PluginU
   if (!installed.length) lines.push('（该目录尚未安装任何插件，仅刷新了市场索引）');
   const allOk = market.ok && details.every((d) => d.ok);
   return { ok: allOk, text: lines.join('\n'), details };
+}
+
+/**
+ * 解析插件所属市场：'name@mp' 直取 @ 后段；裸名从 dirs 的安装清单反查。
+ * 显式插件（config apps[].plugins 指源码目录，不在 installed_plugins.json）返回
+ * undefined——不适用「卸载连带移除市场」。必须在 uninstall 执行前调用：
+ * 卸载后 installed_plugins.json 记录已消失，反查不到。
+ */
+export function resolvePluginMarketplace(name: string, dirs: string[]): string | undefined {
+  const at = name.indexOf('@');
+  if (at > 0) return name.slice(at + 1);
+  for (const d of dirs) {
+    const hit = listInstalledPlugins(d).find((p) => p.name === name || p.key === name);
+    if (hit?.marketplace) return hit.marketplace;
+  }
+  return undefined;
+}
+
+/**
+ * uninstall 后的市场联动清理：dirs 任一目录仍装有该市场的插件 → 保留（返回未移除注记）；
+ * 否则对「注册了该市场的目录」（listAvailablePlugins 命中同名 catalog）逐个执行
+ * claude plugin marketplace remove。单目录失败仅 warn 不中断，不影响卸载本身的成功语义。
+ */
+export async function removeMarketplaceIfUnused(
+  marketplace: string,
+  dirs: string[],
+): Promise<{ removed: boolean; note: string }> {
+  const remaining = dirs.reduce((n, d) =>
+    n + listInstalledPlugins(d).filter((p) => p.marketplace === marketplace).length, 0);
+  if (remaining > 0) return { removed: false, note: `仍有 ${remaining} 个插件在使用` };
+  let removedAny = false;
+  for (const d of dirs) {
+    // 该目录未注册此市场（无 clone 目录也无本地登记）→ 无须 remove
+    if (!listAvailablePlugins(d).some((m) => m.name === marketplace)) continue;
+    const r = await runPluginCli(['marketplace', 'remove', marketplace], { claudeConfigDir: d });
+    if (r.ok) removedAny = true;
+    else console.warn(`[plugin] 移除市场 ${marketplace}（${d}）失败：${r.text}`);
+  }
+  return { removed: removedAny, note: removedAny ? '' : '市场未注册或移除失败' };
 }

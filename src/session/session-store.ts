@@ -66,12 +66,17 @@ export class SessionStore {
     this.save();
   }
 
-  /** 归档会话并置为当前（头插，去重；summary 截断到 60 字） */
-  archiveSession(key: string, sessionId: string, summary: string): void {
+  /**
+   * 归档会话（头插，去重；summary 截断到 60 字）。
+   * updatePointer=false：只进历史列表、不回写 currentSessionId——任务运行期间用户已
+   * /new、/resume <n>、/ws use 改指针时，迟到收尾的归档不得覆盖用户的选择
+   * （老 bug：任务在跑时发 /new，被中止任务收尾把指针写回旧会话，下个任务又续接旧会话）
+   */
+  archiveSession(key: string, sessionId: string, summary: string, opts?: { updatePointer?: boolean }): void {
     const st = this.data[key] ?? { workspaceName: '', sessions: [] };
     const rest = st.sessions.filter((s) => s.sessionId !== sessionId);
     st.sessions = [{ sessionId, summary: summary.slice(0, 60), updatedAt: new Date().toISOString() }, ...rest];
-    st.currentSessionId = sessionId;
+    if (opts?.updatePointer !== false) st.currentSessionId = sessionId;
     this.data[key] = st;
     this.save();
   }

@@ -1,15 +1,12 @@
-// 工作区改动收集：git 仓库工作区任务收尾时用 git diff 生成全量 unified diff。
-// 不做文件快照——git 是代码工作区的既有事实（非 git 仓库返回 null，由调用方跳过）
+// 工作区单文件改动收集：用户对收尾文件清单回复数字时，按需生成该文件的本次 unified diff。
+// 不做文件快照——git 是代码工作区的既有事实（非 git 仓库返回 null，由调用方给出提示文案）
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { createTwoFilesPatch } from 'diff';
 
 const execFileP = promisify(execFile);
-
-// untracked 合成新增 diff 的文件数上限：防 node_modules 误入 status 时 diff 爆炸
-const MAX_UNTRACKED_FILES = 20;
 
 function isGitRepo(wsPath: string): Promise<boolean> {
   return execFileP('git', ['rev-parse', '--is-inside-work-tree'], { cwd: wsPath })
@@ -21,41 +18,33 @@ function normalizeEol(s: string): string {
   return s.replace(/\r\n/g, '\n');
 }
 
-/** untracked 文件合成为「全新增」diff（git diff 不覆盖未跟踪文件） */
-async function untrackedDiff(wsPath: string): Promise<string> {
-  const status = await execFileP('git', ['status', '--porcelain'], { cwd: wsPath }).catch(() => ({ stdout: '' }));
-  const files = status.stdout
-    .split('\n')
-    .filter((l) => l.startsWith('??'))
-    .map((l) => l.slice(3).trim())
-    .filter((f) => f && !f.endsWith('/')) // 目录条目（?? dir/）无法按文件读取，跳过
-    .slice(0, MAX_UNTRACKED_FILES);
-  const patches: string[] = [];
-  for (const f of files) {
-    const content = await readFile(join(wsPath, f), 'utf8').then(normalizeEol).catch(() => null);
-    if (content === null) continue;
-    patches.push(createTwoFilesPatch('/dev/null', f, '', content, undefined, undefined, { context: 3 })
-      .replace(/^(Index: [^\n]*\n)?(===+[^\n]*\n)?/, ''));
-  }
-  return patches.join('\n');
-}
-
-export interface WorkspaceDiff { diff: string; files: number }
-
 /**
- * 收集工作区全部未提交改动（staged + unstaged + untracked）为 unified diff 文本与文件数。
- * 返回 null = 非 git 仓库（调用方回退旧行为）；diff 空串 = git 仓库但无改动。
+ * 收集单个文件的未提交改动（staged + unstaged + untracked）为 unified diff 文本。
+ * - 返回 null = 非 git 仓库 / 路径在工作区外 / 文件不可读（二进制、untracked 已删等）
+ * - 返回空串 = git 仓库内该文件无改动
  */
-export async function collectWorkspaceDiff(wsPath: string): Promise<WorkspaceDiff | null> {
+export async function collectFileDiff(wsPath: string, file: string): Promise<string | null> {
+  const abs = resolve(wsPath, file);
+  const rel = relative(wsPath, abs);
+  // 工作区外（含绝对路径指向别处）不取 diff：清单来自 OutputCollector 的 cwd 内过滤，双保险
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
   if (!(await isGitRepo(wsPath))) return null;
-  const tracked = await execFileP('git', ['diff', 'HEAD', '--unified=3'], { cwd: wsPath, maxBuffer: 16 * 1024 * 1024 })
+  const relPosix = rel.split(sep).join('/'); // win32 反斜杠归一（git 输出/参数统一正斜杠）
+  // untracked 判定走 status 单文件查询（git diff 不覆盖未跟踪文件）
+  const status = await execFileP('git', ['status', '--porcelain', '--', relPosix], { cwd: wsPath })
     .then((r) => r.stdout)
     .catch(() => '');
-  const untracked = await untrackedDiff(wsPath);
-  const trackedFiles = (tracked.match(/^diff --git /gm) ?? []).length;
-  const untrackedFiles = (untracked.match(/^\+\+\+ /gm) ?? []).length;
-  return {
-    diff: [tracked.trimEnd(), untracked.trimEnd()].filter(Boolean).join('\n'),
-    files: trackedFiles + untrackedFiles,
-  };
+  const first = status.split('\n').find((l) => l.trim());
+  if (first?.startsWith('??')) {
+    const content = await readFile(abs, 'utf8').then(normalizeEol).catch(() => null);
+    if (content === null) return null; // 二进制 / 已删除的 untracked 文件
+    return createTwoFilesPatch('/dev/null', relPosix, '', content, undefined, undefined, { context: 3 })
+      .replace(/^(Index: [^\n]*\n)?(===+[^\n]*\n)?/, '');
+  }
+  const r = await execFileP('git', ['diff', 'HEAD', '--unified=3', '--', relPosix], {
+    cwd: wsPath,
+    maxBuffer: 8 * 1024 * 1024,
+  }).catch(() => null);
+  if (r === null) return null;
+  return r.stdout.trim();
 }

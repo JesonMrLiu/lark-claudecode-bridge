@@ -4,7 +4,7 @@
 写操作以卡片按钮确认（长连接回调），结果文本与产出文件回传飞书。
 **无需公网 IP、无需内网穿透；无需预装 Claude Code CLI，一键安装 + 网页配置即可使用。**
 
-![配置页概览](deploy/images/1.overview.png)
+![配置页概览](docs/images/1.overview.png)
 
 ## 快速开始
 
