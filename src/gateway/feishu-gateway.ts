@@ -221,8 +221,8 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
 
 interface RawCardActionPayload {
   action?: {
-    value?: { requestId?: string; decision?: string; feedback?: string; qIndex?: number; option?: string; filePath?: string; ws?: string };
-    // 卡片 form 容器提交时回传的全部输入项（name → 值）：plan/output 表单的 feedback、
+    value?: { requestId?: string; decision?: string; feedback?: string; qIndex?: number; option?: string; ws?: string };
+    // 卡片 form 容器提交时回传的全部输入项（name → 值）：plan 表单的 feedback、
     // qa 表单的 custom_N；不同飞书客户端/版本落点可能是 form_value 或并入 value，两处兜底
     form_value?: Record<string, unknown>;
   };
@@ -236,12 +236,14 @@ const VALID_DECISIONS: ReadonlySet<string> = new Set([
   'allow', 'deny', 'allow-session',
   'plan-approve', 'plan-revise', 'plan-reject', 'plan-view-file',
   'qa-pick', 'qa-submit',
-  'output-confirm', 'output-revise',
   'ws-switch',
+  // legacy：结论尾卡（1.3.0 起）已无「确认方案/按意见修改」按钮，仅为升级前发出的旧卡
+  // 迟到点击能落到孤儿卡 toast（而非静默无响应）保留解析，勿在新卡使用
+  'output-confirm', 'output-revise',
 ]);
 
 /** 解析 card.action.trigger 回调；不完整或 decision 不在合法枚举内返回 null */
-function parseCardAction(data: unknown): { value: { requestId: string; decision: CardDecision; feedback?: string; qIndex?: number; option?: string; formValue?: Record<string, string>; filePath?: string }; operatorId: string; openMessageId: string } | null {
+function parseCardAction(data: unknown): { value: { requestId: string; decision: CardDecision; feedback?: string; qIndex?: number; option?: string; formValue?: Record<string, string> }; operatorId: string; openMessageId: string } | null {
   try {
     if (data === null || typeof data !== 'object') return null;
     const d = data as RawCardActionPayload;
@@ -249,7 +251,7 @@ function parseCardAction(data: unknown): { value: { requestId: string; decision:
     // decision 必须严格匹配枚举：畸形字符串（如 'ALLOW'）不能流入 CardActionValue.decision
     if (!value?.requestId || typeof value.decision !== 'string' || !VALID_DECISIONS.has(value.decision) || !d.operator?.open_id) return null;
     // form 容器提交的全部输入项整体透传（0.20.0 泛化）：qa_form 的 custom_N 自定义答案、
-    // plan_form/output_form 的 feedback 均由 wiring 按 name 取用；仅收集字符串值
+    // plan_form 的 feedback 均由 wiring 按 name 取用；仅收集字符串值
     const rawForm = d.action?.form_value;
     const formValue = rawForm && typeof rawForm === 'object'
       ? Object.fromEntries(Object.entries(rawForm).filter(([, v]) => typeof v === 'string' && v !== '') as [string, string][])
@@ -260,8 +262,6 @@ function parseCardAction(data: unknown): { value: { requestId: string; decision:
     // 提问卡选项透传（qa-pick 依赖 qIndex/option 定位选项；qa-submit 不带）
     const qIndex = typeof value.qIndex === 'number' ? value.qIndex : undefined;
     const option = typeof value.option === 'string' ? value.option : undefined;
-    // 长回复卡查看按钮透传的落盘文件路径
-    const filePath = typeof value.filePath === 'string' && value.filePath ? value.filePath : undefined;
     // /ws 工作区卡切换按钮透传的目标工作区名
     const ws = typeof value.ws === 'string' && value.ws ? value.ws : undefined;
     return {
@@ -272,7 +272,6 @@ function parseCardAction(data: unknown): { value: { requestId: string; decision:
         ...(qIndex !== undefined ? { qIndex } : {}),
         ...(option ? { option } : {}),
         ...(formValue && Object.keys(formValue).length > 0 ? { formValue } : {}),
-        ...(filePath ? { filePath } : {}),
         ...(ws ? { ws } : {}),
       },
       operatorId: d.operator.open_id,

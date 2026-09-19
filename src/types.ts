@@ -155,19 +155,17 @@ export interface RejectedMessage {
 }
 /** 卡片回调决策：allow/deny/allow-session 为写工具确认卡；plan-* 为计划确认卡（feedback = 按意见修改时的用户输入）；
  *  plan-view-file = 计划「查看完整方案」按钮触发，原文 md 直接 send_file 而非塞入卡片正文；
- *  qa-* 为提问卡；output-* 为结论尾卡（完整回复多卡的最后一张：确认方案 / 按意见修改
- *  引导，点击即发起新一轮任务） */
+ *  qa-* 为提问卡；ws-switch 为工作区切换卡 */
 export type CardDecision = 'allow' | 'deny' | 'allow-session'
   | 'plan-approve' | 'plan-revise' | 'plan-reject' | 'plan-view-file'
   | 'qa-pick' | 'qa-submit'
-  | 'output-confirm' | 'output-revise'
   | 'ws-switch';
 export interface CardActionValue {
   requestId: string; decision: CardDecision; feedback?: string;
   /** qa-pick：问题下标与选项 label */
   qIndex?: number; option?: string;
   /** form 容器提交时回传的全部输入项（name → 值）：qa_form 的 custom_N、
-   *  plan_form/result_form 的 feedback 均在此（0.20.0 泛化，取代只解析 feedback 单键） */
+   *  plan_form 的 feedback 均在此（0.20.0 泛化，取代只解析 feedback 单键） */
   formValue?: Record<string, string>;
   /** ws-switch：目标工作区名（/ws 工作区卡片的切换按钮） */
   ws?: string;

@@ -336,10 +336,9 @@ export interface QuestionCardRequest {
 /** 已选答案的中间态（wiring 侧维护）：问题下标 → 选中的 option label（multiSelect 为数组） */
 export type QuestionCardAnswers = Record<number, string | string[]>;
 
-// ---------- 结论多卡（完整回复分块直接展示；尾卡带确认/提意见引导） ----------
+// ---------- 结论多卡（完整回复分块直接展示） ----------
 
 export interface ResultCardRequest {
-  requestId: string;
   charCount: number;
   workspaceName: string;
 }
@@ -350,42 +349,16 @@ export function resultChunkHeader(req: ResultCardRequest, index: number, total: 
 }
 
 /**
- * 结论尾卡：完整回复多卡的最后一张——末块正文 + form「确认方案 / 按意见修改」引导
- * （点击以对应 prompt 合成用户消息入队，走完整排队/resume 链路发起新一轮任务，wiring 侧
- * 经 outputPending 挂起项校验发起人），也可直接回复消息。
- * settled 态（决策后回调响应内联换卡）：正文保留，按钮区收为一行文案。
+ * 结论尾卡：完整回复多卡的最后一张——末块正文（头部标号行 + 正文，纯展示无交互组件；
+ * 想继续对话/提意见直接回复消息即可）。仍走消息卡通道以支持 config.card.width 与头部加粗渲染。
  */
 export function buildResultTailCard(
   req: ResultCardRequest,
   chunkContent: string,
   pos: { index: number; total: number },
-  settledText?: string,
   widthMode: 'default' | 'fill' = 'default',
 ): unknown {
-  const elements: unknown[] = [md(`${resultChunkHeader(req, pos.index, pos.total)}\n\n${chunkContent}`)];
-  if (settledText) {
-    elements.push(md(settledText));
-  } else {
-    elements.push({
-      tag: 'form',
-      name: 'result_form',
-      elements: [
-        {
-          tag: 'column_set',
-          flex_mode: 'flow',
-          columns: [
-            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('output-confirm', '✅ 确认方案', 'primary', req.requestId, 'out_btn_confirm')] },
-            { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('output-revise', '✏️ 按意见修改', 'default', req.requestId, 'out_btn_revise')] },
-          ],
-        },
-        // 意见框不带 multiline/rows：消息卡通道（im.message.create）卡片校验拒绝该属性
-        // （飞书 230099/200621 "unknown property" 实锤）——multiline 仅 cardkit 实体卡可用；
-        // 复杂意见走「直接回复消息」（placeholder 已引导）
-        { tag: 'input', name: 'feedback', width: 'fill', max_length: 1000, placeholder: { tag: 'plain_text', content: '修改意见（点「按意见修改」时生效）；复杂意见可直接回复消息' } },
-      ],
-    });
-  }
-  return card(elements, widthMode);
+  return card([md(`${resultChunkHeader(req, pos.index, pos.total)}\n\n${chunkContent}`)], widthMode);
 }
 
 // ---------- 工作区切换卡（裸 /ws）：左按钮右路径一行一工作区，点击即切换，切换后整卡终态 ----------

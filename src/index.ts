@@ -202,20 +202,8 @@ export function createBridge(
     chatId: string;
     answers: QuestionCardAnswers;
   }>();
-  // 结论尾卡挂起项：requestId → 结论卡上下文。与 planPending 不同——无 Promise 要 resolve
-  // （任务已结束，确认/提意见是「发起新一轮」），条目仅用于：发起人校验（仅任务发起人可
-  // 操作）、settled 防重（确认/提意见只生效一次）、尾卡正文快照（settled 回调响应内联换卡
-  // 替换整卡，必须带回正文）。条目常驻供回看历史（每次有回复的任务一条；超 500 条清最老）
-  const outputPending = new Map<string, {
-    req: ResultCardRequest;
-    /** 尾卡正文快照与位置标号：settled 内联换卡重建用 */
-    tail: { content: string; index: number; total: number };
-    ownerId: string;
-    chatId: string;
-    settled: boolean;
-  }>();
-  // 工作区切换卡挂起项（裸 /ws）：requestId → 发卡上下文。与 outputPending 同为「无 Promise
-  // 挂起」的常驻条目，仅用于：发起记录、切换落盘目标通道（channelKey）、工作区快照（回调按
+  // 工作区切换卡挂起项（裸 /ws）：requestId → 发卡上下文。「无 Promise 挂起」的常驻条目，
+  // 仅用于：发起记录、切换落盘目标通道（channelKey）、工作区快照（回调按
   // 名查找目标）。stale 失效语义：同通道后发的新卡上完成切换后，旧卡点击一律回「已过期」——
   // 否则旧卡显示的当前项是错的，用户会在旧卡上误切回旧工作区。上限 100 条删最老（防无界增长）
   const wsPending = new Map<string, {
@@ -351,7 +339,7 @@ export function createBridge(
     if (!deps.access.isAllowed(msg.userId)) {
       if (app.role === 'deputy') {
         // 分身机器人艾特即用（用户决策）：不走配对——首条消息自动补录 member（access.json
-        // 保留审计记录，outputPending 等处的 isAllowed 纵深校验天然兼容）；无 admin 权限，
+        // 保留审计记录，isAllowed 后续校验天然兼容）；无 admin 权限，
         // 管理命令与工作区切换在各自入口被拒，能力范围由分身配置限定
         deps.access.addUser(msg.userId, msg.userId, 'member', app.appId);
         console.log(`${tag}[接入] 分身应用 ${app.appId} 新用户 ${msg.userId} 已自动加入（member，能力按分身配置限定）`);
@@ -503,11 +491,6 @@ export function createBridge(
           if (p.channelKey !== key) continue;
           qaPending.delete(id);
           p.resolve({});
-        }
-        // 本用户在本会话的长回复卡确认/提意见按钮一并失效（保留查看全文）：新会话已无
-        // 「上一轮方案」上下文，旧确认按钮再触发只会得到脱离语境的新一轮任务
-        for (const o of outputPending.values()) {
-          if (o.chatId === msg.chatId && o.ownerId === msg.userId) o.settled = true;
         }
         gates.get(key)?.reset();
         if (cancelled > 0) {
@@ -872,29 +855,19 @@ planAsk: async (req) => {
       }
       // 结果回传两段式：finalText 非空即独立多卡直接展示（~3000 字/块，连发间隔 300ms 防飞书
       // 消息限流）——不论长短都不再进进度卡正文（主卡只留提示行），彻底消除「折叠看不到全文」
-      // 与「卡片/消息两边重复」（旧三段式 ≤400 终态自载的边界问题）。最后一张卡带「确认方案/
-      // 按意见修改」引导：点击合成用户消息入队发起新一轮任务（resume 上一会话，上下文天然在场）
+      // 与「卡片/消息两边重复」（旧三段式 ≤400 终态自载的边界问题）。尾卡纯展示，想继续对话/
+      // 提意见直接回复消息即可
       if (finalText) {
         const chunks = chunkText(finalText);
         const total = chunks.length;
         const resultReq: ResultCardRequest = {
-          requestId: randomUUID(), charCount: finalText.length, workspaceName: wsName,
+          charCount: finalText.length, workspaceName: wsName,
         };
-        outputPending.set(resultReq.requestId, {
-          req: resultReq,
-          // 尾卡正文快照：settled 回调响应内联换卡替换整卡，须带回正文重建
-          tail: { content: chunks[total - 1], index: total, total },
-          ownerId: msg.userId, chatId: msg.chatId, settled: false,
-        });
-        if (outputPending.size > 500) {
-          // 防无界增长：清最老的条目（Map 迭代序即插入序；被清卡片的确认按钮会提示已处理）
-          outputPending.delete(outputPending.keys().next().value as string);
-        }
         for (let i = 0; i < total; i++) {
           if (i > 0) await new Promise((r) => setTimeout(r, 300));
           if (i === total - 1) {
             await deps.gateway.sendCardTo(msg.chatId,
-              buildResultTailCard(resultReq, chunks[i], { index: total, total }, undefined, config.card?.width ?? 'default'));
+              buildResultTailCard(resultReq, chunks[i], { index: total, total }, config.card?.width ?? 'default'));
           } else {
             await deps.gateway.sendTextTo(msg.chatId, `${resultChunkHeader(resultReq, i + 1, total)}\n\n${chunks[i]}`);
           }
@@ -1084,51 +1057,6 @@ planAsk: async (req) => {
           return { toast: { type: 'success', content: '✅ 答案已提交' } };
         }
         return { toast: { type: 'info', content: '该提问已被处理或已过期' } };
-      }
-      // 长回复收起卡（0.20.0）：任务已结束，无 Promise 挂起——outputPending 提供发起人校验、
-      // settled 防重与文件上下文。「查看完整内容」可反复点击；「确认方案 / 按意见修改」合成
-      // 一条用户消息入队，走与真实消息完全相同的排队/resume/进度卡链路发起新一轮任务
-      const out = outputPending.get(action.value.requestId);
-      if (out) {
-        if (action.operatorId !== out.ownerId) {
-          console.log(tag, `[卡片回调] 非发起人 ${action.operatorId} 点击长回复卡 ${action.value.requestId}，已忽略`);
-          return { toast: { type: 'info', content: '仅任务发起人可操作' } };
-        }
-        const decision = action.value.decision;
-        if (out.settled) {
-          return { toast: { type: 'info', content: '该回复的处理已提交，无需重复操作' } };
-        }
-        if (decision === 'output-confirm' || decision === 'output-revise') {
-          const feedback = (action.value.feedback ?? '').trim();
-          if (decision === 'output-revise' && !feedback) {
-            return { toast: { type: 'warning', content: '请先在输入框填写修改意见（或点「确认方案」）' } };
-          }
-          out.settled = true;
-          const prompt = decision === 'output-confirm'
-            ? '用户已在飞书点击「确认方案」，确认了上一轮的完整回复（方案），请继续按该方案推进执行。'
-            : `用户要求按以下意见调整上一轮完整回复中的方案：\n${feedback}`;
-          // 合成用户消息入队：新一轮会 resume 上一会话（「上一轮方案」上下文天然在场）。
-          // 发起人必在访问白名单（能发起任务才拿得到卡片），仍做 isAllowed 纵深校验；
-          // chatType 不参与任务链路（仅 gateway 消息解析用），合成消息固定 p2p
-          if (deps.access.isAllowed(action.operatorId)) {
-            const key = channelKey(out.chatId, action.operatorId);
-            enqueue(key, {
-              chatId: out.chatId, chatType: 'p2p', userId: action.operatorId,
-              text: prompt, messageId: `output-${action.value.requestId}`,
-            }, prompt, out.req.workspaceName);
-          } else {
-            console.warn(tag, '[结论尾卡] 发起人不在访问白名单，已忽略新一轮请求：', action.operatorId);
-          }
-          const settledText = decision === 'output-confirm'
-            ? '✅ 已确认该方案，正在发起新一轮任务（详情见下方新进度卡）'
-            : '✏️ 修改意见已收到，正在发起新一轮任务（详情见下方新进度卡）';
-          return {
-            toast: { type: 'success', content: settledText },
-            // 回调响应内联换卡：替换整张尾卡，正文快照带回（按钮区收为一行 settled 文案）
-            card: { type: 'raw', data: buildResultTailCard(out.req, out.tail.content, { index: out.tail.index, total: out.tail.total }, settledText, config.card?.width ?? 'default') },
-          };
-        }
-        return { toast: { type: 'info', content: '该操作无效或已过期' } };
       }
       // 工作区切换卡（裸 /ws）：无 Promise 挂起——wsPending 提供 admin 校验、stale 失效
       // 与工作区快照。权限语义与 /ws use 一致是「admin 可切换」而非「仅发起人」：member
