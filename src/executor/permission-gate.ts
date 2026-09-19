@@ -1,6 +1,8 @@
-// 权限闸：白名单工具直通（读工具 + Bash，Bash 另过危险命令黑名单），写操作经 ask 回调
-// 询问（飞书卡片确认，带 diff 展示），超时自动拒绝 + 会话级记忆；plan mode 的 ExitPlanMode
-// 经 planAsk 回调走计划确认卡片；AskUserQuestion 经 askQuestion 回调走问题选项卡片
+// 权限闸：「全部免确认」开关（permissions.allow_all_tools，缺省开）或白名单命中即直通，
+// 未直通的写操作经 ask 回调询问（飞书卡片确认，带 diff 展示），超时自动拒绝 + 会话级记忆；
+// Bash 另过危险命令黑名单——它优先于开关与白名单，是免确认模式下的安全底线。
+// plan mode 的 ExitPlanMode 经 planAsk 回调走计划确认卡片；AskUserQuestion 经 askQuestion
+// 回调走问题选项卡片——两者是交互路由而非工具确认，不受开关影响
 import { randomUUID } from 'node:crypto';
 import type { ConfirmationRequest, PermissionDecision } from '../types.js';
 import { NOTIFY_TOOL_PREFIX } from './notify-server.js';
@@ -21,6 +23,14 @@ export const DEFAULT_ALLOW_TOOLS: ReadonlySet<string> = new Set(DEFAULT_ALLOW_TO
 export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   'Read', 'Glob', 'Grep', 'LS', 'TodoRead', 'TodoWrite', 'WebFetch', 'WebSearch',
 ]);
+
+/**
+ * 内置默认：全部工具免确认（config.yaml permissions.allow_all_tools 缺省值）。
+ * 开启后除命中 DEFAULT_DANGEROUS_COMMANDS（现读配置的 dangerous_commands）的 Bash 外，
+ * 所有工具（含 Write/Edit/NotebookEdit）直通不弹确认卡；关闭则回落到 allow_tools 白名单语义。
+ * 注意：只对 Bash 的 command 生效的黑名单是本模式唯一安全网——Write/Edit 等写工具在开启态裸奔。
+ */
+export const DEFAULT_ALLOW_ALL_TOOLS = true;
 
 /**
  * 内置 Bash 危险命令正则源串（permissions.dangerous_commands 缺省值；运行期统一 i flag 编译）。
@@ -108,6 +118,7 @@ export class PermissionGate {
   // decide 时现读——gate 按通道永久复用，静态快照会让改白名单后已有通道继续用旧名单，
   // 直到新通道/重启才生效（0.17.0「配了免确认工具仍弹卡/被拒」根因）。也接受静态值（测试）。
   private allowTools: () => ReadonlySet<string>;
+  private allowAllTools: () => boolean;
   private dangerousCommands: () => readonly RegExp[];
 
   constructor(
@@ -120,6 +131,8 @@ export class PermissionGate {
       timeoutMs?: number;
       /** 免确认白名单（静态值或 getter）；缺省 DEFAULT_ALLOW_TOOLS */
       allowTools?: ReadonlySet<string> | (() => ReadonlySet<string>);
+      /** 全部工具免确认（静态值或 getter）；缺省 DEFAULT_ALLOW_ALL_TOOLS（开） */
+      allowAllTools?: boolean | (() => boolean);
       /** Bash 危险命令正则（静态值或 getter）；缺省 DEFAULT_DANGEROUS_COMMANDS */
       dangerousCommands?: readonly RegExp[] | (() => readonly RegExp[]);
     },
@@ -127,6 +140,11 @@ export class PermissionGate {
     this.allowTools = typeof opts.allowTools === 'function' ? opts.allowTools
       : opts.allowTools ? () => opts.allowTools as ReadonlySet<string>
         : () => DEFAULT_ALLOW_TOOLS;
+    // 必须用 !== undefined 判空：allowAllTools 的 false 是有效配置（用户主动关闭），
+    // 照搬 allowTools 的真值判断会把 false 误当「未配置」而回落到缺省的 true
+    this.allowAllTools = typeof opts.allowAllTools === 'function' ? opts.allowAllTools
+      : opts.allowAllTools !== undefined ? () => opts.allowAllTools as boolean
+        : () => DEFAULT_ALLOW_ALL_TOOLS;
     this.dangerousCommands = typeof opts.dangerousCommands === 'function' ? opts.dangerousCommands
       : opts.dangerousCommands ? () => opts.dangerousCommands as readonly RegExp[]
         : () => DEFAULT_DANGEROUS_COMMANDS;
@@ -177,13 +195,15 @@ export class PermissionGate {
       }
       return { behavior: 'allow', updatedInput: { questions: input.questions, answers } };
     }
-    // 白名单直通（decide 时经 getter 现读：热重载改配置后已有通道的下一个工具调用即生效）；
-    // Bash 命中危险命令正则时落到确认卡（安全优先于白名单）
-    if (this.allowTools().has(toolName) && !(toolName === 'Bash' && this.isDangerousCommand(input))) {
+    // 「全部免确认」或白名单直通（decide 时经 getter 现读：热重载改配置后已有通道的
+    // 下一个工具调用即生效）；Bash 命中危险命令正则时落到确认卡——安全优先于两者，
+    // 开关与白名单都不是绕过黑名单的后门
+    const dangerous = toolName === 'Bash' && this.isDangerousCommand(input);
+    if (!dangerous && (this.allowAllTools() || this.allowTools().has(toolName))) {
       return { behavior: 'allow' };
     }
     // 会话记忆同样不能绕过危险命令黑名单（用户对 Bash 点过「不再询问」≠ 授权 rm -rf）
-    if (this.remembered.has(toolName) && !(toolName === 'Bash' && this.isDangerousCommand(input))) {
+    if (!dangerous && this.remembered.has(toolName)) {
       return { behavior: 'allow' };
     }
     const req: ConfirmationRequest = {

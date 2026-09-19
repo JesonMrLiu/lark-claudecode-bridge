@@ -2,7 +2,7 @@
 // 无 IO（读写盘在 server.ts），tests/web/config-api.test.ts 直接单测
 import type { BridgeConfig, FeishuAppConfig } from '../types.js';
 import { sameApps } from '../config.js';
-import { DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMAND_SOURCES } from '../executor/permission-gate.js';
+import { DEFAULT_ALLOW_ALL_TOOLS, DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMAND_SOURCES } from '../executor/permission-gate.js';
 
 /** secret 字段的脱敏回显形状（真实值永不离开本机进程） */
 export interface SecretHint { secretSet: boolean; secretHint?: string }
@@ -153,11 +153,20 @@ export function appStatusSummary(apps: FeishuAppConfig[], started?: Array<{ name
 export function applyPermissionDisplayDefaults(doc: Record<string, unknown>): Record<string, unknown> {
   const p = doc.permissions;
   if (p === undefined || p === null) {
-    return { ...doc, permissions: { allow_tools: [...DEFAULT_ALLOW_TOOLS_LIST], dangerous_commands: [...DEFAULT_DANGEROUS_COMMAND_SOURCES] } };
+    return {
+      ...doc,
+      permissions: {
+        allow_all_tools: DEFAULT_ALLOW_ALL_TOOLS,
+        allow_tools: [...DEFAULT_ALLOW_TOOLS_LIST],
+        dangerous_commands: [...DEFAULT_DANGEROUS_COMMAND_SOURCES],
+      },
+    };
   }
   if (typeof p !== 'object' || Array.isArray(p)) return doc; // 脏形状：loadConfig/parseConfigText 会拦，GET 原样透出
   const np = { ...(p as Record<string, unknown>) };
   let changed = false;
+  // 判空用 undefined/null 而非真值：显式 false（用户主动关闭开关）必须原样回显，不能被缺省 true 覆盖
+  if (np.allow_all_tools === undefined || np.allow_all_tools === null) { np.allow_all_tools = DEFAULT_ALLOW_ALL_TOOLS; changed = true; }
   if (np.allow_tools === undefined || np.allow_tools === null) { np.allow_tools = [...DEFAULT_ALLOW_TOOLS_LIST]; changed = true; }
   if (np.dangerous_commands === undefined || np.dangerous_commands === null) { np.dangerous_commands = [...DEFAULT_DANGEROUS_COMMAND_SOURCES]; changed = true; }
   return changed ? { ...doc, permissions: np } : doc;

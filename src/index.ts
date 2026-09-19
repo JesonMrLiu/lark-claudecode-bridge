@@ -28,7 +28,7 @@ import { buildFileDiffCards, DIFF_INLINE_MAX_CHARS } from './gateway/diff-card.j
 import { collectFileDiff } from './util/workspace-diff.js';
 import type { McpServerStatus } from '@anthropic-ai/claude-agent-sdk';
 import {
-  PermissionGate, DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMANDS,
+  PermissionGate, DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMANDS, DEFAULT_ALLOW_ALL_TOOLS,
   type PlanAskResult, type AskQuestionResult,
 } from './executor/permission-gate.js';
 import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery.js';
@@ -500,6 +500,8 @@ export function createBridge(
     if (!gate) {
       gate = new PermissionGate({
         allowTools: () => new Set(config.permissions?.allowTools ?? DEFAULT_ALLOW_TOOLS_LIST),
+        // ?? 而非 ||：显式 false（用户主动关闭全部免确认）不能被回落到缺省的 true
+        allowAllTools: () => config.permissions?.allowAllTools ?? DEFAULT_ALLOW_ALL_TOOLS,
         dangerousCommands: () => config.permissions?.dangerousCommands ?? DEFAULT_DANGEROUS_COMMANDS,
         ask: async (req) => {
           // 工具确认嵌入当前任务的进度卡（按钮在计时行上方、正文收敛）——不再单独发确认卡：

@@ -121,13 +121,20 @@ function normalizeWorkspaces(raw: unknown): Workspace[] {
 /**
  * 归一化 permissions 白名单块（整体可选）：allow_tools 为免确认直通工具名（配置即整体替换内置默认，
  * 不与默认合并）；dangerous_commands 为 Bash 危险命令正则源串（此处 new RegExp 预编译校验，
- * 非法正则硬抛——带permissions[i]定位，运行期再抛会让所有 Bash 意外弹卡）。
+ * 非法正则硬抛——带permissions[i]定位，运行期再抛会让所有 Bash 意外弹卡）；
+ * allow_all_tools 为「全部工具免确认」开关（缺省开，消费侧回退 DEFAULT_ALLOW_ALL_TOOLS）。
  */
 function normalizePermissions(doc: Record<string, unknown>): PermissionsConfig | undefined {
   const raw = doc.permissions;
   if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== 'object') throw new Error('permissions 必须为对象（含 allow_tools / dangerous_commands），请检查 config.yaml');
-  const p = raw as { allow_tools?: unknown; dangerous_commands?: unknown };
+  if (typeof raw !== 'object') throw new Error('permissions 必须为对象（含 allow_all_tools / allow_tools / dangerous_commands），请检查 config.yaml');
+  const p = raw as { allow_tools?: unknown; dangerous_commands?: unknown; allow_all_tools?: unknown };
+  const allowAllTools = p.allow_all_tools;
+  // 缺省/null 视为未配置（消费侧回退内置默认「开」）；其余非布尔一律硬抛——
+  // 引号包裹的 'false' 在 YAML 里是字符串，若被静默当真值处理会让用户以为已关闭而实际全放行
+  if (allowAllTools !== undefined && allowAllTools !== null && typeof allowAllTools !== 'boolean') {
+    throw new Error('permissions.allow_all_tools 必须为布尔值（true / false，勿加引号），请检查 config.yaml');
+  }
   const allowTools = p.allow_tools;
   if (allowTools !== undefined) {
     if (!Array.isArray(allowTools) || allowTools.some((t) => typeof t !== 'string' || !t.trim())) {
@@ -149,6 +156,7 @@ function normalizePermissions(doc: Record<string, unknown>): PermissionsConfig |
     });
   }
   return {
+    ...(typeof allowAllTools === 'boolean' ? { allowAllTools } : {}),
     ...(allowTools !== undefined ? { allowTools: allowTools as string[] } : {}),
     ...(dangerous !== undefined ? { dangerousCommands } : {}),
   };

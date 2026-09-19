@@ -44,8 +44,12 @@ workspaces:                    # 工作区白名单：名字 + 路径（所有�
 defaults:
   workspace: demo
 concurrency: 3                 # 全局并发上限（未单独配置的 app 沿用此值）
-# permissions:                # 工具白名单（整块可选；未配置的字段用内置默认）。改后重启 bridge 生效
-#   allow_tools:              # 免确认直通工具名。配置即整体替换内置默认（不与默认合并）！
+# permissions:                # 工具确认与危险命令（整块可选；未配置的字段用内置默认）。改后热生效
+#   allow_all_tools: true     # 全部工具免确认（缺省开）。开启后除命中 dangerous_commands 的
+#                             # Bash 外，所有工具（含 Write/Edit）都不再弹确认卡；
+#                             # 关闭则回落下面的 allow_tools 白名单语义
+#   allow_tools:              # 免确认直通工具名（仅 allow_all_tools 关闭时生效）。
+#                             # 配置即整体替换内置默认（不与默认合并）！
 #                             # 内置默认 = Read/Glob/Grep/LS/TodoRead/TodoWrite/WebFetch/WebSearch/Bash
 #                             # （Bash 默认放行读命令；安全性由 dangerous_commands 黑名单兜底）
 #   - Read
@@ -60,6 +64,7 @@ concurrency: 3                 # 全局并发上限（未单独配置的 app 沿
 #   dangerous_commands:       # Bash 危险命令正则（对命令全文匹配，命中弹确认卡）；缺省内置
 #                             # rm -rf / sudo / git push --force / git reset --hard / mkfs /
 #                             # dd if= / chmod 777 / curl|wget 管道执行脚本 / shutdown|reboot
+#                             # allow_all_tools 开启时本表是唯一的安全网，删条目前请三思
 #   - 'rm\s+-rf'
 #   - 'sudo\s'
 # server:                     # Web 配置页（随 lcb start 常驻，浏览器打开 http://127.0.0.1:17317 随时改配置；

@@ -52,7 +52,7 @@ lcb start
 - **飞书应用** —— 多机器人管理：App ID / Secret（脱敏回显）、默认工作区、并发上限、人格补充（`append_system_prompt`）、触发词、环境变量。
 - **工作区** —— 工作区白名单（名称 / 路径）与全局默认工作区，改动热生效。
 - **Claude 认证** —— inherit / managed 双模式切换、认证凭证（API Key / Auth Token / Base URL）、模型、厂商档案（多套凭证一键切换）、托管环境变量。
-- **权限** —— 免确认工具白名单（`permissions.allow_tools`）与危险命令黑名单，保存后热生效。
+- **权限** —— 全部工具免确认开关（`permissions.allow_all_tools`，缺省开）、免确认工具白名单（`permissions.allow_tools`）与危险命令黑名单，保存后热生效。
 - **斜杠命令** —— 把内置命令（`/new` `/status` …）+ 自定义透传命令一键同步为飞书输入框斜杠指令（输入 `/` 弹面板，选中后可继续输入描述再发送）。
 - **插件** —— Claude Code 插件清单（启停 / 卸载，本机 `~/.claude` 与托管目录带来源标记）、从 marketplace 安装、管理市场。
 - **Skills** —— 四来源技能聚合清单（本机用户级 / bridge 托管 / 工作区项目级 / 插件内只读），支持新建、删除、zip 导入。
@@ -122,12 +122,14 @@ workspaces:                # 工作区白名单（列表全局共享；「当前
 defaults:
   workspace: demo
 concurrency: 3             # 通道间并发上限（未单独配置的 app 沿用）
-# permissions:             # 工具白名单（整块可选；setup / 配置页新建时预置完整默认值，页面可增删）
-#   allow_tools:           # 免确认直通工具；配置即整体替换内置默认
+# permissions:             # 工具确认与危险命令（整块可选；setup / 配置页新建时预置完整默认值，页面可增删）
+#   allow_all_tools: true  # 全部工具免确认（缺省开）：开启后除命中 dangerous_commands 的 Bash 外，
+#                          #   所有工具（含 Write/Edit）都不再弹确认卡；关闭则回落 allow_tools 白名单语义
+#   allow_tools:           # 免确认直通工具（仅 allow_all_tools 关闭时生效）；配置即整体替换内置默认
 #                          # 内置默认：Read/Glob/Grep/LS/TodoRead/TodoWrite/WebFetch/WebSearch/Bash
 #   dangerous_commands:    # Bash 危险命令正则（不区分大小写），命中弹确认卡
 #   - 'rm\s+-rf'           # 内置默认覆盖 rm -rf/sudo/git push --force/git reset --hard/mkfs/dd if=/
-#                          #   chmod 777/管道执行远程脚本/shutdown 等
+#                          #   chmod 777/管道执行远程脚本/shutdown 等；allow_all_tools 开启时是唯一安全网
 # server:                  # Web 配置页（随 lcb start 常驻；也可 lcb ui 单独启动）
 #   enabled: true          # 缺省 true；false 则不启动
 #   host: 127.0.0.1        # 仅绑回环（改非回环 = 局域网可见，注意安全）

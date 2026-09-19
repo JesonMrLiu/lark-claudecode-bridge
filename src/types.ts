@@ -30,8 +30,14 @@ export interface FeishuAppConfig {
  *  通道级 /plan 命令切换，diff 收尾改为 git 仓库自动判定；旧配置携带 type 仅 warn 忽略 */
 export interface Workspace { name: string; path: string }
 /** 权限白名单配置：字段可选——未配置的字段回退内置默认（读工具 + Bash + 危险命令表，见 permission-gate）。
- *  allowTools 配置即整体替换内置默认（不与默认合并）；dangerousCommands 为 Bash 危险命令正则（命中弹确认卡） */
-export interface PermissionsConfig { allowTools?: string[]; dangerousCommands?: RegExp[] }
+ *  allowTools 配置即整体替换内置默认（不与默认合并）；dangerousCommands 为 Bash 危险命令正则（命中弹确认卡）；
+ *  allowAllTools 为「全部工具免确认」开关，缺省开——开启后除命中 dangerousCommands 的 Bash 外一律直通，
+ *  关闭则回落 allowTools 白名单语义 */
+export interface PermissionsConfig {
+  allowTools?: string[];
+  dangerousCommands?: RegExp[];
+  allowAllTools?: boolean;
+}
 /** Web 配置页服务器（lcb start / lcb ui 内嵌，node:http 零依赖）：enabled/host/port 均为启动时读取，改动需重启 */
 export interface ServerConfig { enabled?: boolean; host?: string; port?: number }
 export type ClaudeAuthMode = 'inherit' | 'managed';
