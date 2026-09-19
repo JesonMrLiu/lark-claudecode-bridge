@@ -185,12 +185,57 @@ export function cancelDrawer() {
 }
 // X / ESC / 点遮罩 = 取消：本地编辑抽屉（有快照）回滚未保存修改；远端 CRUD 抽屉直接关闭
 const dismissDrawer = () => (drawerSnap ? cancelDrawer() : closeDrawer());
+
+// ============ 抽屉宽度拖拽（localStorage 记忆；双击手柄恢复默认 min(980px,94vw)） ============
+const DRAWER_WIDTH_KEY = 'lcb-drawer-width';
+export const DRAWER_MIN_WIDTH = 420;
+/** 纯函数（可测）：期望宽度钳进 [420, 94vw] */
+export function clampDrawerWidth(px, vw) {
+  const max = Math.floor(vw * 0.94);
+  return Math.max(DRAWER_MIN_WIDTH, Math.min(Math.round(px), max));
+}
+const drawerEl = () => document.querySelector('.drawer');
+/** min() 包裹：窗口变窄后自动回落到 94vw，不会出现横向溢出 */
+const applyDrawerWidth = (px) => { drawerEl().style.width = `min(${px}px, 94vw)`; };
+const resetDrawerWidth = () => {
+  try { localStorage.removeItem(DRAWER_WIDTH_KEY); } catch { /* 隐私模式等：可容忍 */ }
+  drawerEl().style.width = ''; // 清内联样式 → 回落 CSS 默认 min(980px,94vw)
+};
+function initDrawerResize() {
+  let saved = NaN;
+  try { saved = Number(localStorage.getItem(DRAWER_WIDTH_KEY)); } catch { /* 读失败视同无记忆 */ }
+  if (Number.isFinite(saved) && saved >= DRAWER_MIN_WIDTH) applyDrawerWidth(saved);
+  const handle = $('#drawerResize');
+  handle.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    // 捕获后 move/up 均派发给手柄：指针移出窗口/抽屉不丢事件
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add('dragging');
+    document.body.classList.add('drawer-resizing');
+    const startWidth = drawerEl().getBoundingClientRect().width;
+    const startX = e.clientX;
+    const move = (ev) => applyDrawerWidth(clampDrawerWidth(startWidth + (startX - ev.clientX), window.innerWidth));
+    const up = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.classList.remove('dragging');
+      document.body.classList.remove('drawer-resizing');
+      const w = clampDrawerWidth(drawerEl().getBoundingClientRect().width, window.innerWidth);
+      try { localStorage.setItem(DRAWER_WIDTH_KEY, String(w)); } catch { /* 写失败可容忍（同 theme.js） */ }
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+  });
+  handle.addEventListener('dblclick', resetDrawerWidth);
+}
+
 /** 抽屉全局监听一次性注册（main.js 启动时调用；模块顶层零副作用） */
 export function initDrawer() {
   $('#drawerClose').onclick = dismissDrawer;
   $('#drawerMask').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) dismissDrawer(); });
   // ESC 有风格化弹窗打开时归弹窗（其自身在捕获阶段拦截并 stopPropagation，此处计数兜底）
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !openDialogs) dismissDrawer(); });
+  initDrawerResize();
 }
 
 // ============ 长耗时单请求的进度弹窗 ============
@@ -257,5 +302,127 @@ export function progressDialog({ title = '执行中', note = '请稍候…', rep
     },
     onClose(fn) { onCloseFn = fn; },
     unmount() { clearInterval(timer); unbind(); unmount(); },
+  };
+}
+
+// ============ 可搜索多选字段（分身白名单等；仅限候选内选择，遗留值保留可删） ============
+/** 纯函数（可测）：候选过滤——大小写不敏感子串匹配 value+label+desc；>50 项截断（面板尾行提示） */
+export function filterMselOptions(options, query) {
+  const q = String(query || '').trim().toLowerCase();
+  const hit = q
+    ? options.filter((o) => `${o.value}\n${o.label || ''}\n${o.desc || ''}`.toLowerCase().includes(q))
+    : options.slice();
+  const MAX = 50;
+  return hit.length > MAX ? { list: hit.slice(0, MAX), truncated: true } : { list: hit, truncated: false };
+}
+
+// 活跃实例登记 + 单一全局监听：抽屉 closeDrawer 只隐藏不清 innerHTML、组件没有 teardown
+// 钩子——外点 handler 内以 root.isConnected 懒剪枝，离场实例自动出清，监听器全程只注册一次
+const mselLive = new Set();
+let mselDocBound = false;
+function ensureMselDocListener() {
+  if (mselDocBound) return;
+  mselDocBound = true;
+  document.addEventListener('click', (e) => {
+    for (const inst of [...mselLive]) {
+      if (!inst.root.isConnected) { mselLive.delete(inst); continue; } // 抽屉被替换：僵尸实例出清
+      if (!inst.root.contains(e.target)) inst.hidePanel();
+    }
+  });
+}
+
+/**
+ * 可搜索多选字段：chips 展示已选（.chip + × 删除），输入框过滤候选，面板点选切换
+ * （再点已选项 = 取消）。值只能来自候选 options；初始 value 里不在候选中的遗留值
+ * （如技能已卸载）以虚线 chip 保留展示、可删，不进候选面板。
+ *
+ * 事件边界：候选用 mousedown+preventDefault（沿 plugins.js 先例，输入框不失焦，无 blur
+ * 竞态）；ESC 分层——面板开时仅关面板（stopPropagation 防误关抽屉），面板已关放行关抽屉；
+ * Enter/方向键在过滤结果内导航并切换（面板保持开，支持连续选取）。
+ *
+ * @returns {{root: Element, setValue(v: string[]): void, setOptions(list: Array, emptyText?: string): void, destroy(): void}}
+ */
+export function multiSelectField({ mount, options = [], value = [], placeholder = '', emptyText = '暂无可选项', onChange = () => {} }) {
+  ensureMselDocListener();
+  const root = document.createElement('div');
+  root.className = 'msel';
+  root.innerHTML = `
+    <div class="chips msel-chips"></div>
+    <input type="text" class="msel-input" placeholder="${esc(placeholder)}" autocomplete="off">
+    <div class="combo-panel msel-panel" hidden></div>`;
+  mount.appendChild(root);
+  const chipsBox = root.querySelector('.msel-chips');
+  const input = root.querySelector('.msel-input');
+  const panel = root.querySelector('.msel-panel');
+  let opts = options.slice();
+  let emptyTextCur = emptyText;
+  let selected = [...new Set(value)]; // 添加序保持；遗留值（不在候选）随初始序保留
+  let highlight = 0;
+
+  const renderChips = () => {
+    chipsBox.innerHTML = selected.map((v) => {
+      const ghost = !opts.some((o) => o.value === v);
+      return `<span class="chip${ghost ? ' ghost' : ''}"${ghost ? ' title="已不在候选列表（可能已卸载），可删除"' : ''}>${esc(v)}<button type="button" aria-label="删除">×</button></span>`;
+    }).join('');
+    chipsBox.querySelectorAll('button').forEach((b, i) => {
+      b.onclick = () => { selected.splice(i, 1); emit(); };
+    });
+  };
+  const paintPanel = () => {
+    if (!opts.length) { panel.innerHTML = `<div class="combo-empty">${esc(emptyTextCur)}</div>`; return; }
+    const { list, truncated } = filterMselOptions(opts, input.value);
+    if (!list.length) { panel.innerHTML = '<div class="combo-empty">无匹配项</div>'; return; }
+    panel.innerHTML = list.map((o, i) => `
+      <div class="combo-item${i === highlight ? ' active' : ''}" data-val="${esc(o.value)}">
+        <b>${esc(o.label || o.value)}</b>${o.tag ? ` <span class="tag off"${o.tagTitle ? ` title="${esc(o.tagTitle)}"` : ''}>${esc(o.tag)}</span>` : ''}${selected.includes(o.value) ? '<span class="msel-check">✓</span>' : ''}
+        ${o.desc ? `<div class="hint">${esc(o.desc)}</div>` : ''}
+      </div>`).join('')
+      + (truncated ? '<div class="combo-empty">仅显示前 50 项，继续输入缩小范围</div>' : '');
+    panel.querySelectorAll('.combo-item').forEach((el) => {
+      el.addEventListener('mousedown', (e) => { e.preventDefault(); toggle(el.dataset.val); });
+    });
+  };
+  const showPanel = () => { if (panel.hidden) { panel.hidden = false; } paintPanel(); };
+  const hidePanel = () => { panel.hidden = true; };
+  const toggle = (v) => {
+    const i = selected.indexOf(v);
+    if (i >= 0) selected.splice(i, 1); else selected.push(v);
+    emit();
+  };
+  const emit = () => { renderChips(); paintPanel(); onChange([...selected]); };
+
+  input.addEventListener('focus', showPanel);
+  input.addEventListener('input', () => { highlight = 0; showPanel(); });
+  input.addEventListener('keydown', (e) => {
+    // 面板开时 ESC 只关面板：阻止冒泡到 document 的抽屉关闭监听（面板已关则放行，符合直觉）
+    if (e.key === 'Escape' && !panel.hidden) { e.stopPropagation(); hidePanel(); return; }
+    if (!opts.length) return;
+    if (e.key === 'Backspace' && !input.value && selected.length) { e.preventDefault(); selected.pop(); emit(); return; }
+    const { list } = filterMselOptions(opts, input.value);
+    if (!list.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      highlight = panel.hidden ? 0 : (highlight + (e.key === 'ArrowDown' ? 1 : -1) + list.length) % list.length;
+      showPanel();
+      panel.querySelector('.combo-item.active')?.scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter' && !panel.hidden) {
+      e.preventDefault();
+      toggle(list[highlight]?.value ?? list[0].value); // 面板保持开：连续选取，焦点留输入框
+    }
+  });
+
+  const inst = { root, hidePanel };
+  mselLive.add(inst);
+  renderChips();
+  return {
+    root,
+    setValue(v) { selected = [...new Set(v)]; renderChips(); },
+    setOptions(list, nextEmptyText) {
+      opts = list.slice();
+      if (nextEmptyText !== undefined) emptyTextCur = nextEmptyText;
+      renderChips(); // ghost 态随候选变化（如遗留值重新出现在候选里则转实线）
+      if (!panel.hidden) paintPanel();
+    },
+    destroy() { mselLive.delete(inst); root.remove(); },
   };
 }

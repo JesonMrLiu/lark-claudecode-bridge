@@ -15,16 +15,16 @@ import { startWebServer } from './web/server.js';
 import { clearPidFile, writePidFile, stopExistingBridgeAndWait } from './web/lifecycle.js';
 import { AccessControl } from './access/access-control.js';
 import { FeishuGateway } from './gateway/feishu-gateway.js';
-import { ProgressCard } from './gateway/progress-card.js';
+import { ProgressCard, feishuErrorBody } from './gateway/progress-card.js';
 import {
   DECISION_TEXT,
-  PROGRESS_TAIL_CHARS, LONG_OUTPUT_THRESHOLD,
-  buildLongOutputCard, buildLongOutputSettledCard,
-  type PlanCardRequest, type LongOutputCardRequest,
+  buildResultTailCard, buildWorkspaceSwitchedCard, resultChunkHeader,
+  type PlanCardRequest, type ResultCardRequest,
   type QuestionCardRequest, type QuestionCardAnswers,
 } from './gateway/card-builder.js';
+import { chunkText } from './util/chunk-text.js';
 import { runTask } from './executor/claude-executor.js';
-import { buildFileDiffCards, DIFF_INLINE_MAX_CHARS } from './gateway/diff-card.js';
+import { buildFileDiffCards } from './gateway/diff-card.js';
 import { collectFileDiff } from './util/workspace-diff.js';
 import type { McpServerStatus } from '@anthropic-ai/claude-agent-sdk';
 import {
@@ -38,7 +38,7 @@ import { FEISHU_NOTIFY_SOP_PROMPT } from './notify-sop.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
-import { handleCommand } from './session/commands.js';
+import { handleCommand, applyWorkspaceSwitch, workspaceListMarkdown } from './session/commands.js';
 import { rewriteByTrigger } from './session/triggers.js';
 import { Semaphore, channelKey } from './session/channel.js';
 import { TranscriptWriter, sweepTranscripts, type TranscriptRecorder } from './transcript/transcript-writer.js';
@@ -202,16 +202,30 @@ export function createBridge(
     chatId: string;
     answers: QuestionCardAnswers;
   }>();
-  // 长回复卡挂起项（0.20.0）：requestId → 收起卡的查看/确认/提意见上下文。与 planPending
-  // 不同——无 Promise 要 resolve（任务已结束，确认/提意见是「发起新一轮」），条目仅用于：
-  // 发起人校验（仅任务发起人可操作）、settled 防重（确认/提意见只生效一次，查看可反复）、
-  // filePath/workspaceName 上下文。条目常驻供用户回看历史卡片时再次查看全文（量级：每次
-  // 超长回复一条，几十字节；超 500 条清最老，防无界增长）
+  // 结论尾卡挂起项：requestId → 结论卡上下文。与 planPending 不同——无 Promise 要 resolve
+  // （任务已结束，确认/提意见是「发起新一轮」），条目仅用于：发起人校验（仅任务发起人可
+  // 操作）、settled 防重（确认/提意见只生效一次）、尾卡正文快照（settled 回调响应内联换卡
+  // 替换整卡，必须带回正文）。条目常驻供回看历史（每次有回复的任务一条；超 500 条清最老）
   const outputPending = new Map<string, {
-    req: LongOutputCardRequest;
+    req: ResultCardRequest;
+    /** 尾卡正文快照与位置标号：settled 内联换卡重建用 */
+    tail: { content: string; index: number; total: number };
     ownerId: string;
     chatId: string;
     settled: boolean;
+  }>();
+  // 工作区切换卡挂起项（裸 /ws）：requestId → 发卡上下文。与 outputPending 同为「无 Promise
+  // 挂起」的常驻条目，仅用于：发起记录、切换落盘目标通道（channelKey）、工作区快照（回调按
+  // 名查找目标）。stale 失效语义：同通道后发的新卡上完成切换后，旧卡点击一律回「已过期」——
+  // 否则旧卡显示的当前项是错的，用户会在旧卡上误切回旧工作区。上限 100 条删最老（防无界增长）
+  const wsPending = new Map<string, {
+    ownerId: string;
+    channelKey: string;
+    chatId: string;
+    workspaces: Array<{ name: string; path: string }>;
+    /** 发卡时的当前工作区（跟随默认未显式切换时 channelState 无 workspaceName，兜底判定用） */
+    currentName: string;
+    stale: boolean;
   }>();
   // 通道当前任务的进度卡：gate 的 ask/planAsk/askQuestion 闭包随 gate 通道级复用，
   // 不能捕获任务级 progress 实例（会是首个任务的旧卡）——经此间接引用每次任务的新卡
@@ -307,25 +321,16 @@ export function createBridge(
       await deps.gateway.sendTextTo(msg.chatId, `📊 ${displayName} 本次无可展示的改动（非 git 仓库 / 未改动 / 二进制）`);
       return true;
     }
+    // 全面卡片化（用户决策）：不论多长一律多卡展示（~2800 字/块），不再落盘 .md 发文件附件；
+    // 连发间隔 300ms 防飞书消息频率限制；极长 diff（>10 万字 ≈ 35+ 张卡）先提示总卡数再发
     const widthMode = config.card?.width ?? 'default';
-    if (diff.length <= DIFF_INLINE_MAX_CHARS) {
-      for (const c of buildFileDiffCards(diff, { fileName: displayName }, widthMode)) {
-        await deps.gateway.sendCardTo(msg.chatId, c);
-      }
-    } else {
-      // 超 6000 字：卡片口径防爆，落盘 .md 发文件附件；落盘失败兜底截断发卡（不静默丢内容）
-      const p = writeRuntimeMarkdown(
-        'diffs', basename(file),
-        `# 改动详情 · ${displayName} · ${new Date().toLocaleString('zh-CN', { hour12: false })}\n\n\`\`\`diff\n${diff}\n\`\`\`\n`,
-        `${tag}[diff 落盘失败]：`,
-      );
-      if (p) {
-        await deps.gateway.uploadAndSendFile(msg.chatId, p);
-      } else {
-        for (const c of buildFileDiffCards(diff.slice(0, 12000), { fileName: displayName }, widthMode)) {
-          await deps.gateway.sendCardTo(msg.chatId, c);
-        }
-      }
+    const cards = buildFileDiffCards(diff, { fileName: displayName }, widthMode);
+    if (diff.length > 100_000) {
+      await deps.gateway.sendTextTo(msg.chatId, `📊 ${displayName} 的 diff 极长（约 ${diff.length.toLocaleString()} 字符），将分 ${cards.length} 张卡片陆续发送，请稍候`);
+    }
+    for (let i = 0; i < cards.length; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 300));
+      await deps.gateway.sendCardTo(msg.chatId, cards[i]);
     }
     return true;
   }
@@ -344,9 +349,17 @@ export function createBridge(
     // 配置热重载：lcb ws add/remove 独立进程写盘后，本实例下一条消息即读到新工作区
     opts.reloadConfig?.();
     if (!deps.access.isAllowed(msg.userId)) {
-      // 首个使用者免配对直接成为 admin——按应用判定：多应用部署下 open_id 按应用隔离，
-      // 新应用的第一个使用者同样是「首个」，不应因别的应用已有用户而被配对码拦住
-      if (!deps.access.hasUsers(app.appId)) {
+      if (app.role === 'deputy') {
+        // 分身机器人艾特即用（用户决策）：不走配对——首条消息自动补录 member（access.json
+        // 保留审计记录，outputPending 等处的 isAllowed 纵深校验天然兼容）；无 admin 权限，
+        // 管理命令与工作区切换在各自入口被拒，能力范围由分身配置限定
+        deps.access.addUser(msg.userId, msg.userId, 'member', app.appId);
+        console.log(`${tag}[接入] 分身应用 ${app.appId} 新用户 ${msg.userId} 已自动加入（member，能力按分身配置限定）`);
+        // 不 return：本条消息照常进入命令/任务处理
+      } else if (!deps.access.hasUsers(app.appId)) {
+        // 首个使用者免配对直接成为 admin——按应用判定：多应用部署下 open_id 按应用隔离，
+        // 新应用的第一个使用者同样是「首个」，不应因别的应用已有用户而被配对码拦住
+        deps.access.addUser(msg.userId, msg.userId, 'admin', app.appId);
         deps.access.addUser(msg.userId, msg.userId, 'admin', app.appId);
         console.log(`${tag}[接入] 应用 ${app.appId} 首位用户 ${msg.userId} 已自动成为 admin（后续用户需配对）`);
         await deps.gateway.sendTextTo(msg.chatId,
@@ -367,8 +380,12 @@ export function createBridge(
     const st = deps.store.getChannelState(key);
     // currentWorkspace 语义：store 中已设置的工作区优先，否则 app 默认，最后全局默认——
     // 保证 /new、/status 回复与实际一致。用 || 而非 ??：archiveSession 为新通道建档时
-    // workspaceName 存 ''（归档时不知工作区），空串必须回退默认，否则 inventory 键错位
-    const currentWorkspace = st?.workspaceName || app.defaultWorkspace || config.defaults.workspace;
+    // workspaceName 存 ''（归档时不知工作区），空串必须回退默认，否则 inventory 键错位。
+    // 分身角色恒锁首个允许的工作区（config 已校验非空）：命令上下文、inventory 键与任务
+    // wsName 同源锁定，通道 state 旧存的 workspaceName 一律不采信
+    const currentWorkspace = app.role === 'deputy'
+      ? app.allowedWorkspaces![0]
+      : (st?.workspaceName || app.defaultWorkspace || config.defaults.workspace);
     // 2.5 触发词映射：必须放在本地命令之前——斜杠触发词（如 /produce）会被 handleCommand
     // 的未知命令分支吞掉；rewriteByTrigger 对本地命令（/stop 等）直接放行，不会被劫持
     const triggered = rewriteByTrigger(msg.text, app.triggers);
@@ -382,9 +399,13 @@ export function createBridge(
       store: deps.store,
       config,
       appName: app.name,
-      isAdmin: deps.access.isAdmin(msg.userId),
+      // 管理命令闸（ctx.isAdmin 唯一入口，/ws use、/model-profile、/plugin 变更类经此流经）：
+      // 分身机器人一律 false——管理面（工作区/模型档案/插件）全局共享，分身用户不该触碰，
+      // 连 admin 本人艾特分身也不放行（要用管理命令请找主机器人）
+      isAdmin: app.role !== 'deputy' && deps.access.isAdmin(msg.userId),
+      isDeputy: app.role === 'deputy',
       currentWorkspace: () => currentWorkspace,
-      getInventory: () => inventories.get(currentWorkspace),
+      getInventory: () => inventories.get(`${app.appId}:${currentWorkspace}`),
       // /mcp 实时拉取：当前工作区有存活 query 才有实时数据（5s 超时），否则回退 init/收尾快照
       getLiveMcpStatus: async () => {
         try {
@@ -407,7 +428,46 @@ export function createBridge(
       },
     });
     if (cmd.handled) {
-      if (cmd.reply) await deps.gateway.sendTextTo(msg.chatId, cmd.reply);
+      if (cmd.card) {
+        // 交互卡片命令（裸 /ws）：发卡并注册挂起项供回调切换。快照工作区清单——回调按
+        // 名查找目标，配置热重载改清单不影响已发出卡片的自洽性
+        const requestId = cmd.cardRequestId ?? randomUUID();
+        wsPending.set(requestId, {
+          ownerId: msg.userId,
+          channelKey: key,
+          chatId: msg.chatId,
+          workspaces: config.workspaces.map((w) => ({ name: w.name, path: w.path })),
+          currentName: currentWorkspace,
+          stale: false,
+        });
+        // 上限 100 条删最老（Map 迭代序 = 插入序，首个即最老），防长期运行无界增长
+        if (wsPending.size > 100) {
+          const oldest = wsPending.keys().next().value;
+          if (oldest !== undefined && oldest !== requestId) wsPending.delete(oldest);
+        }
+        // 发卡失败（卡片 schema 被飞书拒绝 / WS 偶发无响应挂起）降级文本清单——裸 /ws 的
+        // 唯一响应形态是卡片，静默吞错在用户侧就是「命令没反应」。raceFallback 同时覆盖
+        // 抛错与挂起（见 CARD_SEND_TIMEOUT_MS 注释），失败时 /ws use 文本命令兜底可用
+        const cardSent = await raceFallback(
+          deps.gateway.sendCardTo(msg.chatId, cmd.card).then(() => true, (e: unknown) => {
+            console.error(tag, '[/ws] 工作区卡片发送失败，降级为文本列表', e,
+              'code=', (e as { code?: number })?.code, 'msg=', (e as { msg?: string })?.msg);
+            return false;
+          }),
+          CARD_SEND_TIMEOUT_MS,
+          false,
+        );
+        if (!cardSent) {
+          wsPending.delete(requestId); // 卡未发出绝无回调，清挂起防占位
+          await deps.gateway.sendTextTo(
+            msg.chatId,
+            `**工作区列表**（当前：**${currentWorkspace}**）\n${workspaceListMarkdown(config.workspaces, currentWorkspace)}`
+              + '\n\n⚠️ 工作区卡片发送失败（详见桥接器日志），已降级为文本。切换：`/ws use <名字>`',
+          ).catch(() => { /* 文本也失败（连接断开等）：原错误已留日志，不再冒泡打断消息循环 */ });
+        }
+      } else if (cmd.reply) {
+        await deps.gateway.sendTextTo(msg.chatId, cmd.reply);
+      }
       // 指针变更代际 bump：/new、/resume <n>、/ws use 都改写了 currentSessionId——
       // 运行中/收尾窗口内任务的迟到归档据 pointerGen 放弃回写指针（archive 闭包比对）
       if (cmd.pointerTouched) {
@@ -620,7 +680,8 @@ planAsk: async (req) => {
     // lcb-notify 发送能力：chatId 硬绑定当前任务（权限闸直通的安全前提）；
     // sentPaths 记录中途已推送的文件，任务收尾的产出回传据此去重（用户已收过的不重发）。
     // 每次中途推送后进度卡沉底一次（删旧卡重发），保持「任务是否还在跑」始终可见于会话底部
-    // SOP 开关：本任务级现读 config.session.notifySop（缺省 true），决定后续 sendText 是否被强制降级
+    // SOP 开关：本任务级现读 config.session.notifySop（缺省 true），决定是否注入推送规范
+    // 提示词（v2 为纯内容分类软约束；旧「>50 行转文件」硬兜底已移除，send_text 恒多卡）
     const sopEnabled = config.session?.notifySop !== false;
     const sentPaths = new Set<string>();
     const sink = async (): Promise<void> => { await activeProgress.get(key)?.sinkToBottom(); };
@@ -643,8 +704,6 @@ planAsk: async (req) => {
         await deps.gateway.uploadAndSendFile(c, p);
         await sink();
       },
-    }, {
-      enabled: sopEnabled,
     });
     activeProgress.set(key, progress);
     // 指针代际快照：任务运行期间 /new、/resume <n>、/ws use 都会 bump pointerGen，本任务
@@ -687,11 +746,16 @@ planAsk: async (req) => {
         resumeSessionId: resumeId,
         signal: abort.signal,
         env: taskEnv,
-        // #11 SOP 软约束：app.appendSystemPrompt 后追加 SOP 摘要（关闭时仅传 app 原有部分）
+        // 人设 + SOP 软约束：人设裸文本追加在 Claude Code 长系统提示末尾，对模型的约束力
+        // 天然偏弱（resume 旧会话时历史风格会带偏）——包一层显式遵循框架语显著改善
+        // 称谓/口吻/能力定位的遵循度（提示工程手段，非硬约束）；SOP 摘要附后
         appendSystemPrompt: (() => {
-          const base = app.appendSystemPrompt?.trim() ?? '';
-          if (!sopEnabled) return base || undefined;
-          return base ? `${base}\n\n${FEISHU_NOTIFY_SOP_PROMPT}` : FEISHU_NOTIFY_SOP_PROMPT;
+          const raw = app.appendSystemPrompt?.trim() ?? '';
+          const persona = raw
+            ? `【机器人人设（用户为该机器人配置，须在每一轮回复中严格遵循，优先级高于默认回复风格）】\n${raw}\n【人设结束】以上人设适用于本会话每一轮回复——包括称呼、口吻、能力定位的自我介绍；即使历史回复风格不同，也从本轮起遵循。`
+            : '';
+          if (!sopEnabled) return persona || undefined;
+          return persona ? `${persona}\n\n${FEISHU_NOTIFY_SOP_PROMPT}` : FEISHU_NOTIFY_SOP_PROMPT;
         })(),
         // 计划模式（#6）：通道级 /plan 开关——模型先出计划（ExitPlanMode → planAsk 飞书卡片），
         // 用户批准后 SDK 自动切回可编辑模式继续执行（替代旧工作区 code-dev 类型）
@@ -705,31 +769,44 @@ planAsk: async (req) => {
         // 插件：config.yaml 显式配置（开发期指源码目录）+ Claude 配置目录已启用的 marketplace
         // 插件自动发现，同名显式优先；SDK 对无效路径静默跳过，实际加载以 init 清单（/plugins 命令）为准。
         // managed 模式合并发现两处目录（自管 + 本机 ~/.claude）：按绝对 installPath 传 SDK，
-        // 用户本机已装插件无须重装；resolvePluginPaths 按 name 去重，当前生效目录优先
+        // 用户本机已装插件无须重装；resolvePluginPaths 按 name 去重，当前生效目录优先。
+        // 分身角色按 allowed_plugins 白名单过滤（显式 app.plugins 始终保留——写在分身配置里
+        // 的就是要给的）；未配 allowed_plugins 时自动发现全剔除（分身不声明 = 不加载）
         ...(() => {
           const discovered = claudeDir === DEFAULT_CLAUDE_DIR
             ? discoverPlugins(claudeDir)
             : [...discoverPlugins(claudeDir), ...discoverPlugins(DEFAULT_CLAUDE_DIR)];
-          const merged = resolvePluginPaths(app.plugins, discovered);
+          let merged = resolvePluginPaths(app.plugins, discovered);
+          if (app.role === 'deputy') {
+            merged = merged.filter((p) =>
+              app.plugins?.some((e) => e.name === p.name) || app.allowedPlugins?.includes(p.name));
+          }
           return merged.length ? { plugins: merged.map((p) => ({ path: p.path })) } : {};
         })(),
+        // 分身技能白名单：透传 SDK Options.skills（官方上下文过滤器——未列出技能对模型不可见
+        // 且被 Skill 工具拒绝；非沙箱：技能文件仍在磁盘可被 Read/Bash 读到，用户已知悉此边界）
+        ...(app.role === 'deputy' && app.allowedSkills?.length ? { allowedSkills: app.allowedSkills } : {}),
         canUseTool: (toolName, input, ctx) => gate.decide(toolName, input, wsName, ctx),
         onQuery: (handle) => { activeQueries.set(key, { wsName, handle }); },
       }, {
         onInit: (inv) => {
-          inventories.set(wsName, { ...inv, workspace: wsName, loadedAt: new Date().toISOString() });
+          // inventory 键带 appId 前缀：分身机器人技能/插件集与主机器人不同，两个 app 共用
+          // 工作区时 /skills /plugins /mcp 清单不能互相污染
+          inventories.set(`${app.appId}:${wsName}`, { ...inv, workspace: wsName, loadedAt: new Date().toISOString() });
         },
         onMcpStatus: (servers) => {
           // 任务收尾时 executor 拉取的真实 MCP 状态回写 inventory——init 快照必为 pending，
           // 这是 /mcp 空闲期显示 connected/failed 的数据源（prev 不存在说明 init 未到，等 init 全量落盘）
-          const prev = inventories.get(wsName);
-          if (prev) inventories.set(wsName, { ...prev, mcpServers: servers, loadedAt: new Date().toISOString() });
+          const invKey = `${app.appId}:${wsName}`;
+          const prev = inventories.get(invKey);
+          if (prev) inventories.set(invKey, { ...prev, mcpServers: servers, loadedAt: new Date().toISOString() });
         },
         onProgress: (e: ProgressEvent) => {
           if (e.kind === 'status') {
             // CLI 状态心跳（等待模型响应/上下文压缩）：刷新进度卡状态行，避免静默期黑盒感
             progress.setStatus(e.content);
           } else if (e.kind === 'text') {
+            progress.markStarted();
             progress.appendText(e.content);
             // 落盘 · assistant：流式文本块全文（每块一行，天然增量）
             deps.transcript?.assistant({
@@ -738,6 +815,7 @@ planAsk: async (req) => {
             });
           } else if (e.kind === 'tool-start') {
             const [n, ...rest] = e.content.split(': ');
+            progress.markStarted();
             progress.toolStart(n, rest.join(': '));
             deps.transcript?.tool({
               v: 1, ts: now(), kind: 'tool', app: app.appId,
@@ -768,7 +846,9 @@ planAsk: async (req) => {
         });
         return;
       }
-      await progress.finish(`✅ 完成`);
+      // finalText 提前算好：finish 携带字数，终态进度卡据此显示「完整回复已单独发送」提示行
+      const finalText = outcome.finalText?.trim() ?? '';
+      await progress.finish('✅ 完成', finalText.length || undefined);
       archive(outcome.sessionId);
       deps.transcript?.result({
         v: 1, ts: now(), kind: 'result', app: app.appId,
@@ -790,40 +870,34 @@ planAsk: async (req) => {
           `💡 本会话上下文已较大${scale}，建议发送 /new 开启新会话（/resume 可随时切回）。阈值可在 config.yaml 的 session.context_remind_tokens 调整，设为 0 关闭`,
         );
       }
-      // 结果回传（超长截断，防飞书消息体超限）。
-      // 短回复（≤进度卡正文上限）跳过独立结果消息：finalText 是最后一个 assistant 消息的文本，
-      // 而 textTail 按序累积全部流式文本块、卡片取尾部 PROGRESS_TAIL_CHARS 字——finalText 不超上限时
-      // 必然完整落在进度卡终态里，再发一条就是内容几乎逐字相同的重复消息（0.11.0 修复的双推 bug）
-      if (outcome.finalText && outcome.finalText.length > PROGRESS_TAIL_CHARS) {
-        // 结果回传（0.20.0 三段式）：
-        // - 400 字内：进度卡终态已完整展示，不发独立消息（0.11.0 双推修复）
-        // - 400~2000 字：直接发全文卡片（旧 slice 上限对这段区间本就不触发）
-        // - >2000 字：落盘 md + 收起卡（查看全文按钮 + 确认方案/按意见修改引导，点击
-        //   即发起新一轮任务），替代旧版 4000 字硬截断——超长部分不再静默丢弃
-        const text = outcome.finalText;
-        if (text.length > LONG_OUTPUT_THRESHOLD) {
-          const outFilePath = writeRuntimeMarkdown(
-            'outputs',
-            wsName,
-            `# 完整回复 · ${wsName} · ${new Date().toLocaleString('zh-CN', { hour12: false })}\n\n${text}\n`,
-            `${tag}[长回复落盘失败，回退为截断发送]：`,
-          );
-          if (outFilePath) {
-            const outReq: LongOutputCardRequest = {
-              requestId: randomUUID(), filePath: outFilePath,
-              charCount: text.length, workspaceName: wsName,
-            };
-            outputPending.set(outReq.requestId, { req: outReq, ownerId: msg.userId, chatId: msg.chatId, settled: false });
-            if (outputPending.size > 500) {
-              // 防无界增长：清最老的条目（Map 迭代序即插入序；被清卡片的确认按钮会提示已过期）
-              outputPending.delete(outputPending.keys().next().value as string);
-            }
-            await deps.gateway.sendCardTo(msg.chatId, buildLongOutputCard(outReq, config.card?.width ?? 'default'));
+      // 结果回传两段式：finalText 非空即独立多卡直接展示（~3000 字/块，连发间隔 300ms 防飞书
+      // 消息限流）——不论长短都不再进进度卡正文（主卡只留提示行），彻底消除「折叠看不到全文」
+      // 与「卡片/消息两边重复」（旧三段式 ≤400 终态自载的边界问题）。最后一张卡带「确认方案/
+      // 按意见修改」引导：点击合成用户消息入队发起新一轮任务（resume 上一会话，上下文天然在场）
+      if (finalText) {
+        const chunks = chunkText(finalText);
+        const total = chunks.length;
+        const resultReq: ResultCardRequest = {
+          requestId: randomUUID(), charCount: finalText.length, workspaceName: wsName,
+        };
+        outputPending.set(resultReq.requestId, {
+          req: resultReq,
+          // 尾卡正文快照：settled 回调响应内联换卡替换整卡，须带回正文重建
+          tail: { content: chunks[total - 1], index: total, total },
+          ownerId: msg.userId, chatId: msg.chatId, settled: false,
+        });
+        if (outputPending.size > 500) {
+          // 防无界增长：清最老的条目（Map 迭代序即插入序；被清卡片的确认按钮会提示已处理）
+          outputPending.delete(outputPending.keys().next().value as string);
+        }
+        for (let i = 0; i < total; i++) {
+          if (i > 0) await new Promise((r) => setTimeout(r, 300));
+          if (i === total - 1) {
+            await deps.gateway.sendCardTo(msg.chatId,
+              buildResultTailCard(resultReq, chunks[i], { index: total, total }, undefined, config.card?.width ?? 'default'));
           } else {
-            await deps.gateway.sendTextTo(msg.chatId, text.slice(0, 4000)); // 落盘失败兜底：维持旧截断行为
+            await deps.gateway.sendTextTo(msg.chatId, `${resultChunkHeader(resultReq, i + 1, total)}\n\n${chunks[i]}`);
           }
-        } else {
-          await deps.gateway.sendTextTo(msg.chatId, text);
         }
       }
       // 图片自动发（im.image.create 通道），非图片文件不自动回传——
@@ -870,8 +944,10 @@ planAsk: async (req) => {
         return;
       }
       // 常见错误附配置指引（认证 hint 按模式分流：managed 指向配置页，inherit 指向 claude login）；
-      // No conversation found 多因旧版独立目录里的会话（本版起统一 Claude 配置目录，旧会话无法跨目录 resume）
-      const errText = String(e);
+      // No conversation found 多因旧版独立目录里的会话（本版起统一 Claude 配置目录，旧会话无法跨目录 resume）。
+      // 飞书 API 4xx 时 axios 的 message 只有裸 "status code 400"，业务错误码（230099/200621 等）
+      // 藏在 e.response.data——拼上响应体摘要，错误卡与日志可直接定位拒绝原因
+      const errText = `${String(e)}${feishuErrorBody(e) ? `\n（飞书：${feishuErrorBody(e)}）` : ''}`;
       const uiUrl = serverUrl(config);
       const hint = errText.includes('Not logged in')
         ? config.claude?.mode === 'managed'
@@ -892,11 +968,9 @@ planAsk: async (req) => {
       deps.transcript?.result({
         v: 1, ts: nowBeijingISO(), kind: 'result', app: app.appId,
         chatId: msg.chatId, userId: msg.userId, sessionId: '',
-        subtype: 'error', text: String(e).slice(0, 300),
+        subtype: 'error', text: errText.slice(0, 500), // 实录同带响应体摘要（排查飞书 4xx 不再依赖翻日志）
       });
     } finally {
-      // SOP 降级单文件补发（#7）：任务任何结局（完成/停止/出错）都在收尾补齐完整附件
-      await notifySender.flushDowngradedFile?.().catch(() => {});
       clearTimeout(hardTimeout);
       activeProgress.delete(key);
       activeQueries.delete(key);
@@ -1021,16 +1095,6 @@ planAsk: async (req) => {
           return { toast: { type: 'info', content: '仅任务发起人可操作' } };
         }
         const decision = action.value.decision;
-        if (decision === 'view-output-file') {
-          // 白名单校验：仅允许 outputs 目录内文件（value 虽由桥接器写入卡片，纵深防御不亏）
-          const outputsDir = join(CONFIG_DIR, 'outputs');
-          if (!out.req.filePath.startsWith(outputsDir + sep)) {
-            return { toast: { type: 'error', content: '文件路径校验失败，已忽略' } };
-          }
-          void deps.gateway.uploadAndSendFile(out.chatId, out.req.filePath)
-            .catch((e) => console.error('[完整回复发送失败]', action.value.requestId, e));
-          return { toast: { type: 'info', content: '正在发送完整回复…' } };
-        }
         if (out.settled) {
           return { toast: { type: 'info', content: '该回复的处理已提交，无需重复操作' } };
         }
@@ -1053,18 +1117,62 @@ planAsk: async (req) => {
               text: prompt, messageId: `output-${action.value.requestId}`,
             }, prompt, out.req.workspaceName);
           } else {
-            console.warn(tag, '[长回复卡] 发起人不在访问白名单，已忽略新一轮请求：', action.operatorId);
+            console.warn(tag, '[结论尾卡] 发起人不在访问白名单，已忽略新一轮请求：', action.operatorId);
           }
           const settledText = decision === 'output-confirm'
             ? '✅ 已确认该方案，正在发起新一轮任务（详情见下方新进度卡）'
             : '✏️ 修改意见已收到，正在发起新一轮任务（详情见下方新进度卡）';
           return {
             toast: { type: 'success', content: settledText },
-            // 回调响应内联换卡：决策按钮区收为一行文案（查看按钮保留，全文仍可回看）
-            card: { type: 'raw', data: buildLongOutputSettledCard(out.req, settledText, config.card?.width ?? 'default') },
+            // 回调响应内联换卡：替换整张尾卡，正文快照带回（按钮区收为一行 settled 文案）
+            card: { type: 'raw', data: buildResultTailCard(out.req, out.tail.content, { index: out.tail.index, total: out.tail.total }, settledText, config.card?.width ?? 'default') },
           };
         }
         return { toast: { type: 'info', content: '该操作无效或已过期' } };
+      }
+      // 工作区切换卡（裸 /ws）：无 Promise 挂起——wsPending 提供 admin 校验、stale 失效
+      // 与工作区快照。权限语义与 /ws use 一致是「admin 可切换」而非「仅发起人」：member
+      // 能拿卡看列表，点按钮被拒（卡片保持原样，admin 仍可点），与其它卡的 ownerId 校验刻意不同。
+      // 分身机器人工作区已锁定（allowed_workspaces），切换一律拒绝
+      const wsc = wsPending.get(action.value.requestId);
+      if (wsc) {
+        if (app.role === 'deputy') {
+          return { toast: { type: 'info', content: '⛔ 分身机器人已锁定工作区，不可切换' } };
+        }
+        if (wsc.stale) {
+          return { toast: { type: 'info', content: '该列表已过期，请以最新 /ws 卡片为准' } };
+        }
+        if (!deps.access.isAdmin(action.operatorId)) {
+          console.log(tag, `[卡片回调] 非 admin ${action.operatorId} 点击工作区卡 ${action.value.requestId}，已忽略`);
+          return { toast: { type: 'info', content: '⛔ 切换工作区仅管理员可用' } };
+        }
+        const target = wsc.workspaces.find((w) => w.name === action.value.ws);
+        if (!target) {
+          return { toast: { type: 'info', content: '该工作区不存在，请重新发送 /ws' } };
+        }
+        // 当前项判定（disabled 按钮不回调；不支持 disabled 的客户端点当前项时兜底，防冗余
+        // 切换清掉续接指针）：实时 workspaceName 优先，跟随默认未显式切换则回退发卡时快照
+        const wsSt = deps.store.getChannelState(wsc.channelKey);
+        const wsCurrent = wsSt?.workspaceName || wsc.currentName;
+        if (target.name === wsCurrent) {
+          return { toast: { type: 'info', content: '该工作区已是当前工作区' } };
+        }
+        applyWorkspaceSwitch(deps.store, wsc.channelKey, target);
+        // 等价 cmd.pointerTouched：切换清了续接指针，运行中/收尾窗口内任务的迟到归档不得回写
+        const wsRt = runtimes.get(wsc.channelKey);
+        if (wsRt) wsRt.pointerGen = (wsRt.pointerGen ?? 0) + 1;
+        // 同通道其余工作区卡置 stale：旧卡显示的当前项已过时，继续可点会诱导误切回旧工作区
+        for (const [id, e] of wsPending) {
+          if (e.channelKey === wsc.channelKey && id !== action.value.requestId) e.stale = true;
+        }
+        console.log(tag, `[工作区] 卡片切换 ${wsCurrent} → ${target.name}（${action.operatorId}）`);
+        // 一次性选择语义：本卡随即终态化（移除挂起项，迟到点击按孤儿卡 toast 提示），再切重发 /ws
+        wsPending.delete(action.value.requestId);
+        return {
+          toast: { type: 'success', content: `✅ 已切换工作区：${target.name}（已开启新会话，/resume 可切回历史）` },
+          // 回调响应内联换卡：整卡替换为终态提示（纯 markdown 无按钮），不能再点
+          card: { type: 'raw', data: buildWorkspaceSwitchedCard(target.name, target.path, config.card?.width ?? 'default') },
+        };
       }
       const pending = confirmPending.get(action.value.requestId);
       if (!pending) {
@@ -1089,7 +1197,8 @@ planAsk: async (req) => {
     } catch (e) {
       console.error(tag, '[卡片回调异常]', action.value.requestId, e);
       // resolve 之后的代码理论不可抛；若未来插入可抛代码，按条目是否仍在区分决策是否已生效
-      const retryable = confirmPending.has(action.value.requestId) || planPending.has(action.value.requestId) || qaPending.has(action.value.requestId);
+      const retryable = confirmPending.has(action.value.requestId) || planPending.has(action.value.requestId) || qaPending.has(action.value.requestId)
+        || (wsPending.get(action.value.requestId)?.stale === false);
       return { toast: { type: 'error', content: retryable ? '处理失败，请重试' : '处理出现异常，决策可能已生效，请勿盲目重试' } };
     }
   }

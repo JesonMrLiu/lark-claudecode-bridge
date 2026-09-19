@@ -3,13 +3,10 @@
 // 构造——chatId 在闭包内硬绑定，模型无法选择接收者，只能发到当前任务发起的聊天，
 // 因此权限闸对该前缀直通（见 permission-gate.ts）。
 import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance, type SdkMcpToolDefinition } from '@anthropic-ai/claude-agent-sdk';
-import { mkdir, stat } from 'node:fs/promises';
-import { writeFileSync } from 'node:fs';
-import { basename, extname, join, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { stat } from 'node:fs/promises';
+import { basename, extname, resolve } from 'node:path';
 import { z } from 'zod';
 import { chunkText } from '../util/chunk-text.js';
-import { CONFIG_DIR } from '../config.js';
 
 // 分块算法已抽到 util/chunk-text（gateway 卡片层复用）；此处 re-export 保持既有引用兼容
 export { chunkText };
@@ -18,17 +15,11 @@ export const NOTIFY_SERVER_NAME = 'lcb-notify';
 /** canUseTool 收到的工具全名形态：mcp__lcb-notify__send_text */
 export const NOTIFY_TOOL_PREFIX = `mcp__${NOTIFY_SERVER_NAME}__`;
 
-/** 发送能力抽象：executeTask 闭包内绑定当前任务的 chatId 实现（含降级路径） */
+/** 发送能力抽象：executeTask 闭包内绑定当前任务的 chatId 实现（含图片无 caption 通道降级） */
 export interface NotifySender {
   sendText(markdown: string): Promise<void>;
   sendImage(path: string, caption?: string): Promise<void>;
   sendFile(path: string, note?: string): Promise<void>;
-  /**
-   * SOP 降级单文件补发（#7）：任务收尾时调用——降级内容全部追加进同一文件，
-   * 首次降级已发过一次（阶段性内容），此后有新追加才在收尾补发完整版。
-   * 可选：旧实现/测试 mock 缺省时无降级文件可发，调用方 ?. 调用即可。
-   */
-  flushDowngradedFile?(): Promise<void>;
 }
 
 // 单块/单条失败重试一次的退避间隔（飞书偶发限流 / 网络抖动）
@@ -142,12 +133,9 @@ export function createNotifyServer(sender: NotifySender): McpSdkServerConfigWith
  * sendImageWithCaption 可选：缺省（旧 gateway / 测试 mock）时图片降级为
  * 「caption 文本卡 + 图片消息」两条；sentPaths 记录已推送路径供任务收尾去重。
  *
- * sopOptions=#11 SOP 硬兜底配置（仅 sendText 路径生效；图片/附件不强制）：
- *   - enabled=false 时跳过（保留旧行为）
- *   - lineLimit=50：单次 markdown > 50 行 → 追加进单文件 changes-<ts>.md（#7 合并策略：
- *     首次降级提示卡 + 立即发当前文件，后续静默追加，任务收尾 flushDowngradedFile 补发完整版）
- *   - sequentialLimit=4：本任务连续 sendText ≥ 第 4 张起 → 后续 sendText 同样进单文件
- *   计数属于本 sender 闭包，每任务新一次（createGatewaySender 由 executeTask 每任务调一次）
+ * #11 旧版 SOP 硬兜底（>50 行/连续 4 张转 changes-<ts>.md 单文件 send_file）已整体移除
+ * （用户决策）：send_text 永远按 ~3000 字/块多卡发送，不发文件；「只推用户需要查看的
+ * 内容」改由 notify-sop 提示词软约束引导（docs/feishu-notify-sop-v1.0.md 为旧版存档）
  */
 export function createGatewaySender(args: {
   chatId: string;
@@ -155,76 +143,11 @@ export function createGatewaySender(args: {
   sendText: (chatId: string, markdown: string) => Promise<unknown>;
   sendImageWithCaption?: (chatId: string, path: string, caption?: string) => Promise<unknown>;
   sendFileTo: (chatId: string, path: string) => Promise<unknown>;
-}, sopOptions?: {
-  enabled?: boolean;
-  lineLimit?: number;
-  sequentialLimit?: number;
-  notifyDir?: string;
 }): NotifySender {
   const { chatId, sentPaths } = args;
-  const sopEnabled = sopOptions?.enabled !== false;
-  const lineLimit = sopOptions?.lineLimit ?? 50;
-  const sequentialLimit = sopOptions?.sequentialLimit ?? 4;
-  const notifyDir = sopOptions?.notifyDir ?? join(CONFIG_DIR, 'notify');
-  // 顺序计数：递增写入；上限仅作判定，超阈值 → 后续全部走降级
-  let textCallCount = 0;
-  let downgradedByLines = false;
-  // #7 单文件合并：本任务所有降级内容追加进同一文件（旧行为每次降级一个新文件，
-  // 用户收到 N 个零散附件）。首次降级立即发一次（长任务也有阶段性内容可看），
-  // 之后静默追加；收尾 flushDowngradedFile 有新追加才补发完整版
-  let downgradeFilePath: string | undefined;
-  let downgradeDirty = false;
-  let downgradeSent = false;
-
-  function renderTitle(): string {
-    const d = new Date();
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-  }
-
   return {
     sendText: async (md) => {
-      textCallCount++;
-      const lines = md.split('\n').length;
-      const overLines = lines > lineLimit;
-      const overSequential = textCallCount > sequentialLimit;
-      // downgradedByLines 一旦置位，整个任务后续 sendText 全走降级——避免大块持续刷屏；
-      // sequentialLimit 则每张都判定（次数远超才逐张转），避免误伤正常 4 张内调用
-      if (sopEnabled && (downgradedByLines || overLines || overSequential)) {
-        if (overLines) downgradedByLines = true;
-        try {
-          await mkdir(notifyDir, { recursive: true });
-        } catch { /* 极端权限异常：继续走提示卡，但 send_file 会失败由调用方兜底 */ }
-        if (!downgradeFilePath) downgradeFilePath = join(notifyDir, `changes-${renderTitle()}.md`);
-        try {
-          writeFileSync(downgradeFilePath, `${md}\n\n---\n\n`, { flag: 'a' });
-          downgradeDirty = true;
-        } catch (e) {
-          // 落盘失败兜底：跳过降级，按原样 sendText——硬兜底不该把内容吞掉
-          console.warn(`[notify-server] SOP 降级落盘失败：${e instanceof Error ? e.message : e}（已按原内容发送）`);
-          await args.sendText(chatId, md);
-          return;
-        }
-        if (!downgradeSent) {
-          // 首次降级：直接发当前文件（长任务也有阶段性内容可看），静默化——不发提示文案卡；
-          // 后续追加同样静默，收尾 flushDowngradedFile 有新内容才补发完整文件
-          downgradeSent = true;
-          await args.sendFileTo(chatId, downgradeFilePath).catch((e) => {
-            console.error('[notify-server] SOP 降级 send_file 失败：', e);
-          });
-          downgradeDirty = false;
-        }
-        return;
-      }
       await args.sendText(chatId, md);
-    },
-    // 任务收尾补发：首次降级后又有新追加时才重发完整文件（至多 2 条附件消息，同样静默不发文案）
-    flushDowngradedFile: async () => {
-      if (!downgradeFilePath || !downgradeDirty) return;
-      downgradeDirty = false;
-      await args.sendFileTo(chatId, downgradeFilePath).catch((e) => {
-        console.error('[notify-server] SOP 收尾补发 send_file 失败：', e);
-      });
     },
     sendImage: async (p, caption) => {
       sentPaths.add(resolve(p));

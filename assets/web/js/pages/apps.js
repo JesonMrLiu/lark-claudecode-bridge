@@ -1,13 +1,69 @@
 // ============ 应用（列表 + 抽屉编辑；输入实时写回 S.doc.apps，抽屉「保存」一次落盘） ============
-import { S, $, esc, toast, snapDoc, saveDoc } from '../core.js';
-import { openDrawer, closeDrawer, cancelDrawer, confirmDialog } from '../ui.js';
+import { S, $, esc, toast, api, snapDoc, saveDoc } from '../core.js';
+import { openDrawer, closeDrawer, cancelDrawer, confirmDialog, multiSelectField } from '../ui.js';
+
+// ---- 分身白名单多选候选（/api/skills + /api/plugins；60s TTL + in-flight 去重 + stale-if-error） ----
+/** 纯函数（可测）：技能清单 → 多选候选。插件来源 value 用 `plugin:skill` 限定格式
+ *  （SDK Options.skills 契约，sdk.d.ts：插件技能须限定名），裸技能用目录名；按 value 去重首胜 */
+export function toSkillOptions(skills) {
+  const out = [];
+  const seen = new Set();
+  for (const s of skills || []) {
+    const value = s.source === 'plugin' ? `${s.pluginName}:${s.name}` : s.name;
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    const tag = s.source === 'plugin'
+      ? `插件${s.pluginEnabled ? '' : ' · 未启用'}`
+      : s.source === 'project' ? `项目 · ${s.workspaceName || '?'}`
+        : s.source === 'managed' ? 'bridge' : '本机';
+    out.push({ value, desc: s.description, tag });
+  }
+  return out;
+}
+
+/** 纯函数（可测）：已装插件清单 → 多选候选。value = name（installed_plugins.json 键的
+ *  @ 前段，与后端 allowedPlugins.includes(p.name) 匹配口径同源）；未启用插件标记提醒 */
+export function toPluginOptions(plugins) {
+  const out = [];
+  const seen = new Set();
+  for (const p of plugins || []) {
+    if (!p.name || seen.has(p.name)) continue;
+    seen.add(p.name);
+    out.push({
+      value: p.name,
+      desc: p.description,
+      tag: `${p.source === 'bridge' ? 'bridge' : '本机'}${p.enabled ? '' : ' · 未启用'}${p.version ? ` · v${p.version}` : ''}`,
+    });
+  }
+  return out;
+}
+
+const CAND = { at: 0, skills: null, plugins: null, skillsError: '', pluginsError: '', inflight: null };
+const CAND_TTL = 60_000;
+/** 拉候选（失败时保留旧缓存继续用；全新失败返回 error 字段，组件空候选但已选值不受影响） */
+function loadDeputyCandidates() {
+  if (Date.now() - CAND.at < CAND_TTL && (CAND.skills || CAND.plugins)) return Promise.resolve({ ...CAND });
+  if (CAND.inflight) return CAND.inflight;
+  CAND.inflight = (async () => {
+    const [sk, pl] = await Promise.allSettled([api('GET', '/api/skills'), api('GET', '/api/plugins')]);
+    CAND.at = Date.now();
+    // stale-if-error：失败且有旧缓存 → 沿用旧值（error 只在无缓存可退时向上暴露）
+    if (sk.status === 'fulfilled') { CAND.skills = sk.value?.skills ?? []; CAND.skillsError = ''; }
+    else if (!CAND.skills) CAND.skillsError = sk.reason?.message || '未知错误';
+    if (pl.status === 'fulfilled') { CAND.plugins = pl.value?.plugins ?? []; CAND.pluginsError = ''; }
+    else if (!CAND.plugins) CAND.pluginsError = pl.reason?.message || '未知错误';
+    CAND.inflight = null;
+    return { ...CAND };
+  })();
+  return CAND.inflight;
+}
 
 function renderApps(el) {
   const apps = S.doc.apps || (S.doc.apps = []);
   el.innerHTML = `
   <div class="card">
     <h3>飞书应用（机器人）</h3>
-    <div class="desc">每个应用一条独立长连接与会话池。点击行或「编辑」在抽屉中配置；App Secret 已脱敏，留空 = 保持不变。凭证 / 名称 / 域名 / 默认工作区 / 并发 / 人格 / 环境变量改动需重启 lcb start；触发词与显式插件热生效。</div>
+    <div class="desc">每个应用一条独立长连接与会话池。点击行或「编辑」在抽屉中配置；App Secret 已脱敏，留空 = 保持不变。凭证 / 名称 / 域名 / 默认工作区 / 并发 / 人格 / 角色改动需重启 lcb start；触发词、显式插件与环境变量改动下一条消息热生效。</div>
     <div class="list-toolbar">
       <button class="btn primary" id="addApp">+ 新增应用</button>
     </div>
@@ -25,7 +81,7 @@ function renderApps(el) {
   };
   $('#appsBody').innerHTML = apps.map((app, i) => `
     <tr data-i="${i}" style="cursor:pointer">
-      <td><b>${esc(app.name || app.app_id || '（未命名）')}</b></td>
+      <td><b>${esc(app.name || app.app_id || '（未命名）')}</b>${app.role === 'deputy' ? ' <span class="tag off">分身</span>' : ''}</td>
       <td><code>${esc(app.app_id || '')}</code></td>
       <td>${esc(app.domain === 'lark' ? 'lark' : 'feishu')}</td>
       <td>${esc(app.default_workspace || '（全局默认）')}</td>
@@ -77,8 +133,22 @@ function openAppDrawer(apps, idx, el, snap) {
         <div><label>并发上限（1-100）</label>
           <input type="number" data-f="concurrency" min="1" max="100" value="${esc(app.concurrency ?? '')}" placeholder="缺省用全局"></div>
       </div>
-      <label>人格补充（追加到该机器人每个会话的 system prompt，多机器人差异化定位；改动需重启生效）</label>
-      <textarea data-f="append_system_prompt" placeholder="你是一个素材收集助手…">${esc(app.append_system_prompt || '')}</textarea>
+      <label>角色（主机器人 = 全权限、首次使用需配对；分身机器人 = 限定能力、艾特即用供他人使用）</label>
+      <select data-f="role">
+        <option value="primary" ${app.role !== 'deputy' ? 'selected' : ''}>主机器人（全权限，配对码准入）</option>
+        <option value="deputy" ${app.role === 'deputy' ? 'selected' : ''}>分身机器人（限定技能 / 插件 / 工作区，艾特即用）</option>
+      </select>
+      <div id="deputyFields" style="${app.role === 'deputy' ? '' : 'display:none'}">
+        <div class="hint" style="margin:8px 0 2px">分身必填「允许的技能」与「允许的工作区」；未列入白名单的技能 / 插件不加载，任务锁定在第一个允许的工作区；管理命令在分身里一律不可用。改动需重启生效。</div>
+        <label>允许的技能（必填；输入关键词搜索选择，未列出的技能对模型不可见）</label>
+        <div data-msel="allowed_skills"></div>
+        <label>允许的工作区（必填；取值须在工作区列表内，任务锁定第一个）</label>
+        <div data-msel="allowed_workspaces"></div>
+        <label>允许的插件（可选；按名称过滤自动发现的插件，不配 = 不加载任何自动发现插件）</label>
+        <div data-msel="allowed_plugins"></div>
+      </div>
+      <label>人格补充（追加到该机器人每个会话的 system prompt，多机器人差异化定位）<span class="tag warn" style="margin-left:6px">改动需重启生效</span></label>
+      <textarea data-f="append_system_prompt" placeholder="你是我的超级助手，擅长代码开发、文案编写…（回复须带「主人」称谓等要求写在这里）">${esc(app.append_system_prompt || '')}</textarea>
       <h4 style="margin:18px 0 2px;font-size:13.5px">触发词（命中即改写消息后再发给 Claude；下一条消息热生效）</h4>
       <div class="hint" style="margin-bottom:6px">match 以 <code>/</code> 开头 = 消息首词精确匹配，否则 = 关键词包含；rewrite 可用 <code>{text}</code>=原文全文、<code>{args}</code>=首词后的参数；本地命令（/stop 等）不受影响；按序首个命中生效。</div>
       <table><thead><tr><th style="width:42%">match</th><th>rewrite</th><th style="width:44px"></th></tr></thead><tbody data-list="triggers"></tbody></table>
@@ -113,6 +183,41 @@ function openAppDrawer(apps, idx, el, snap) {
           if (input.value.trim() || f === 'name' || f === 'app_id') { app[f] = input.value; }
           else { delete app[f]; }
         };
+      });
+      // ---- 角色（主/分身）：切换 deputy 区块显示；选主时移除 role 键（yaml 干净，归一化仍为 primary） ----
+      const roleSel = body.querySelector('[data-f="role"]');
+      const deputyFields = body.querySelector('#deputyFields');
+      roleSel.addEventListener('change', () => {
+        if (roleSel.value === 'deputy') app.role = 'deputy';
+        else delete app.role;
+        deputyFields.style.display = roleSel.value === 'deputy' ? '' : 'none';
+      });
+      // ---- 分身白名单（可搜索多选）：onChange 实时写回 app——空数组删键，语义与旧 textarea 一致 ----
+      const mselInst = {};
+      for (const f of ['allowed_skills', 'allowed_workspaces', 'allowed_plugins']) {
+        mselInst[f] = multiSelectField({
+          mount: body.querySelector(`[data-msel="${f}"]`),
+          value: app[f] || [],
+          placeholder: '输入关键词搜索选择…',
+          emptyText: '候选加载中…',
+          onChange: (values) => { if (values.length) app[f] = values; else delete app[f]; },
+        });
+      }
+      // 工作区候选来自配置本身（refresh 后 S.doc 是新引用，无须缓存）
+      mselInst.allowed_workspaces.setOptions(
+        wsNames.map((n) => ({ value: n })),
+        wsNames.length ? undefined : '尚未配置工作区（先到「工作区」页添加）',
+      );
+      // 技能/插件候选走 API：组件先以空候选就位，数据到达（或失败提示）后回填，已选值不受影响
+      void loadDeputyCandidates().then((c) => {
+        mselInst.allowed_skills.setOptions(
+          toSkillOptions(c.skills),
+          c.skillsError ? `候选加载失败：${c.skillsError}（已选项不受影响）` : (c.skills?.length ? undefined : '暂无已安装技能'),
+        );
+        mselInst.allowed_plugins.setOptions(
+          toPluginOptions(c.plugins),
+          c.pluginsError ? `候选加载失败：${c.pluginsError}（已选项不受影响）` : (c.plugins?.length ? undefined : '暂无已安装插件'),
+        );
       });
       // ---- 触发词 / 显式插件：数组行编辑，实时写回 ----
       const LIST_DEFS = {
@@ -188,6 +293,13 @@ function openAppDrawer(apps, idx, el, snap) {
       };
       foot.querySelector('#dwCancel').onclick = cancelDrawer;
       foot.querySelector('#dwSave').onclick = async () => {
+        // 分身预校验（后端 loadConfig 校验兜底，前端提前拦截给出友好提示）
+        if (app.role === 'deputy') {
+          if (!(app.allowed_skills || []).length) return toast('分身机器人必须配置「允许的技能」（至少一个）', true);
+          if (!(app.allowed_workspaces || []).length) return toast('分身机器人必须配置「允许的工作区」（至少一个）', true);
+          const badWs = (app.allowed_workspaces || []).filter((w) => !wsNames.includes(w));
+          if (badWs.length) return toast(`「允许的工作区」含未定义的工作区：${badWs.join('、')}（请先在工作区列表中添加）`, true);
+        }
         // 清理半填的空行：triggers/plugins 行两列全空剔除；env 以 key 非空为准（syncEnv 已过滤）。数组空则整键删除
         for (const name of Object.keys(LIST_DEFS)) {
           const def = LIST_DEFS[name];

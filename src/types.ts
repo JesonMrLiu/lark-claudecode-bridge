@@ -25,6 +25,18 @@ export interface FeishuAppConfig {
    *  通常无须配置：~/.claude 已启用的 marketplace 插件由 plugin-discovery 自动加载；
    *  显式配置用于开发期直指源码目录（同名时优先于自动发现） */
   plugins?: PluginRef[];
+  /** 机器人角色：primary（缺省，主机器人——全技能/全插件/全工作区，配对码准入）；
+   *  deputy（分身——按用途限定能力，艾特即用，供他人使用）。存量配置未配 role 行为不变 */
+  role?: 'primary' | 'deputy';
+  /** deputy 专用：技能白名单（必填，透传 SDK Options.skills）——未列出的技能对模型不可见
+   *  且被 Skill 工具拒绝。注意 SDK 官方语义是「上下文过滤器非沙箱」：技能文件仍在磁盘、
+   *  可被 Read/Bash 读到，硬隔离需配合工具级限制（本期按用户决策不做） */
+  allowedSkills?: string[];
+  /** deputy 专用：插件白名单（可选）——自动发现的插件按 name 过滤，未列出的剔除；
+   *  显式 app.plugins 始终保留（开发期直指源码目录的场景） */
+  allowedPlugins?: string[];
+  /** deputy 专用：工作区锁定（必填）——任务强制运行在首个允许的工作区，/ws 切换被拒 */
+  allowedWorkspaces?: string[];
 }
 /** 工作区：name + path。旧版 type（code-dev/generic）已废弃（#6）——计划模式改为
  *  通道级 /plan 命令切换，diff 收尾改为 git 仓库自动判定；旧配置携带 type 仅 warn 忽略 */
@@ -108,6 +120,9 @@ export interface BridgeConfig {
   session?: SessionConfig;
   /** 卡片展示；缺省 width=default（飞书默认宽度） */
   card?: CardConfig;
+  /** 开机自启意图记录（整体可选）：仅保存用户的开关选择，实际注册状态以 OS 查询为权威
+   *  （概览页 GET /api/autostart 现查 Startup 文件夹/launchd/systemd） */
+  autostart?: { enabled?: boolean };
 }
 
 /** 卡片展示配置（整体可选） */
@@ -140,21 +155,22 @@ export interface RejectedMessage {
 }
 /** 卡片回调决策：allow/deny/allow-session 为写工具确认卡；plan-* 为计划确认卡（feedback = 按意见修改时的用户输入）；
  *  plan-view-file = 计划「查看完整方案」按钮触发，原文 md 直接 send_file 而非塞入卡片正文；
- *  qa-* 为提问卡；view-output-file/output-* 为长回复收起卡（0.20.0：>2000 字回复的
- *  查看全文 / 确认方案 / 按意见修改引导，后两者点击即发起新一轮任务） */
+ *  qa-* 为提问卡；output-* 为结论尾卡（完整回复多卡的最后一张：确认方案 / 按意见修改
+ *  引导，点击即发起新一轮任务） */
 export type CardDecision = 'allow' | 'deny' | 'allow-session'
   | 'plan-approve' | 'plan-revise' | 'plan-reject' | 'plan-view-file'
   | 'qa-pick' | 'qa-submit'
-  | 'view-output-file' | 'output-confirm' | 'output-revise';
+  | 'output-confirm' | 'output-revise'
+  | 'ws-switch';
 export interface CardActionValue {
   requestId: string; decision: CardDecision; feedback?: string;
   /** qa-pick：问题下标与选项 label */
   qIndex?: number; option?: string;
   /** form 容器提交时回传的全部输入项（name → 值）：qa_form 的 custom_N、
-   *  plan_form/output_form 的 feedback 均在此（0.20.0 泛化，取代只解析 feedback 单键） */
+   *  plan_form/result_form 的 feedback 均在此（0.20.0 泛化，取代只解析 feedback 单键） */
   formValue?: Record<string, string>;
-  /** view-output-file：落盘的完整回复文件路径（白名单校验 outputs 目录前缀后才发送） */
-  filePath?: string;
+  /** ws-switch：目标工作区名（/ws 工作区卡片的切换按钮） */
+  ws?: string;
 }
 export interface CardActionEvent { value: CardActionValue; operatorId: string; openMessageId: string }
 /**

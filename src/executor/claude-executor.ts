@@ -45,6 +45,9 @@ export interface RunTaskOptions {
   mcpServers?: Record<string, McpServerConfig>;
   /** 显式加载的本地插件目录（含 .claude-plugin/plugin.json），映射为 SDK 的 {type:'local', path} */
   plugins?: Array<{ path: string }>;
+  /** 技能白名单（分身机器人）：非空时透传 SDK Options.skills——未列出的技能对模型不可见
+   *  且被 Skill 工具拒绝（官方语义为「上下文过滤器非沙箱」）；缺省不传 = CLI 默认全量技能 */
+  allowedSkills?: string[];
   /** query 创建后回调：暴露 mcpServerStatus 窄句柄（wiring 存入 activeQueries，/mcp 命令实时拉取用）。
    *  句柄仅在该 query 存活期间有效，任务结束后调用会 reject——调用方须自行 catch */
   onQuery?(handle: { mcpServerStatus(): Promise<McpServerStatus[]> }): void;
@@ -108,6 +111,9 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
       // 转发子代理 text 块（默认只转发 tool_use/tool_result 心跳）——配合 parent_tool_use_id
       // 区分主/子代理输出，飞书进度卡能看到子代理在做什么
       forwardSubagentText: true,
+      // 分身技能白名单（RunTaskOptions.allowedSkills → Options.skills）：未列出技能对模型
+      // 不可见且被 Skill 工具拒绝；缺省不传 = CLI 默认全量（主机器人行为不变）
+      ...(opts.allowedSkills?.length ? { skills: opts.allowedSkills } : {}),
       ...(opts.resumeSessionId ? { resume: opts.resumeSessionId } : {}),
       ...(opts.canUseTool
         ? {

@@ -30,6 +30,7 @@ import { builtinCommands, createSlashApiClient, ensureBuiltins, expectedCommands
 import { removeMarketplaceIfUnused, resolvePluginMarketplace, runPluginCli, updateAllPlugins } from '../executor/plugin-manager.js';
 import { invalidatePluginCache, listAvailablePlugins, listInstalledPlugins, loadEnabledPlugins } from '../executor/plugin-discovery.js';
 import { bridgeStatus, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDetached, stopBridgeByPid } from './lifecycle.js';
+import { getAutostartStatus, setAutostartEnabled } from './autostart.js';
 import { checkUpdate, hasNewerVersion, installMode, runUpdate } from './update.js';
 import {
   checkLarkCliAuth,
@@ -45,7 +46,7 @@ import {
 } from '../lark-cli-manager.js';
 
 /** PUT /api/config 参与整段替换的顶级键；body 未携带的键保持磁盘原文（含注释） */
-const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'server', 'claude', 'slash_commands', 'transcripts', 'session', 'card'] as const;
+const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'server', 'claude', 'slash_commands', 'transcripts', 'session', 'card', 'autostart'] as const;
 
 export interface WebServerOptions {
   /** server 段配置；缺省用默认（firstRun 无配置文件场景） */
@@ -981,6 +982,39 @@ async function handle(
       return json(res, 200, { ok: true, output });
     } catch (e) {
       return json(res, 502, { error: `更新失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+  // ---- 开机自启（概览页开关）：GET 查 OS 实际状态；POST 注册/注销并回写意图 ----
+  if (path === '/api/autostart' && req.method === 'GET') {
+    const entry = resolveLcbEntry();
+    if (!entry.ok) {
+      return json(res, 200, { supported: false, enabled: false, platform: process.platform, detail: entry.error });
+    }
+    return json(res, 200, await getAutostartStatus({ entryPath: entry.entry })); // 查询失败走外层 catch → 500
+  }
+  if (path === '/api/autostart' && req.method === 'POST') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先完成 bootstrap 向导' });
+    const entry = resolveLcbEntry();
+    if (!entry.ok) return json(res, 400, { error: entry.error }); // tsx 源码模式：明确拒绝
+    const body = await readJsonBody(req);
+    const enabled = body.enabled === true;
+    try {
+      // 先 OS 注册（失败即中断、意图不落盘），再写 config 意图——写失败可容忍（下次开关自愈）。
+      // autostart 值未变时跳过重写：整段 set 会丢掉段内手写注释（同 PUT /api/config 的折损规避）
+      const status = await setAutostartEnabled(enabled, { entryPath: entry.entry });
+      const rawText = readFileSync(ctx.configPath, 'utf8');
+      const oldJs = parseDocument(rawText).toJS() as Record<string, unknown>;
+      const intent = { enabled };
+      if (JSON.stringify(oldJs.autostart ?? null) !== JSON.stringify(intent)) {
+        const doc = parseDocument(rawText);
+        doc.set('autostart', intent);
+        const text = doc.toString();
+        parseConfigText(text, ctx.configPath); // 写盘前内存校验：拒绝坏配置落盘
+        writeAtomic(ctx.configPath, text);
+      }
+      return json(res, 200, status);
+    } catch (e) {
+      return json(res, 502, { error: `开机自启${enabled ? '开启' : '关闭'}失败：${e instanceof Error ? e.message : String(e)}` });
     }
   }
   // ---- 飞书官方 CLI（@larksuite/cli）状态 / 授权 / 安装 ----

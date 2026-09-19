@@ -398,6 +398,45 @@ async function larkCliActionFlow(op = 'install') {
   }
 }
 
+// ============ 开机自启开关（GET/POST /api/autostart；注册状态以 OS 查询为权威） ============
+function paintAutostart(el, r) {
+  const tags = r.enabled
+    ? '<span class="tag ok">已开启</span>'
+    : '<span class="tag off">未开启</span>';
+  const stale = r.stale ? ' <span class="tag warn">启动命令已过期，关闭再开启可更新</span>' : '';
+  const hint = r.detail ? ` <span class="hint">${esc(r.detail)}</span>` : '';
+  el.innerHTML = `<span class="switch-row tight"><label class="switch"><input type="checkbox" id="asToggle" ${r.enabled ? 'checked' : ''}><span class="track"></span></label>${tags}${stale}${hint}</span>`;
+  $('#asToggle').onchange = async (e) => {
+    const on = e.target.checked;
+    try {
+      const res = await api('POST', '/api/autostart', { enabled: on });
+      toast(on ? '✅ 已注册开机自启（下次登录时自动启动）' : '已关闭开机自启');
+      paintAutostart(el, res);
+    } catch (err) {
+      toast(err.message, true);
+      e.target.checked = !on; // 失败回滚开关视觉态（注册失败不能显示为已开）
+    }
+  };
+}
+
+/** 概览页「开机自启」行：首次渲染拉状态；开关点击即生效（低风险，与权限页即时保存一致） */
+async function renderAutostart() {
+  const el = $('#asStat');
+  if (!el) return;
+  let r;
+  try {
+    r = await api('GET', '/api/autostart');
+  } catch (e) {
+    el.innerHTML = `<span class="hint">检测失败：${esc(e.message)}</span>`;
+    return;
+  }
+  if (!r.supported) {
+    el.innerHTML = `<span class="tag off">不支持</span><span class="hint">${esc(r.detail || '当前运行方式不支持开机自启，请手动运行 lcb start')}</span>`;
+    return;
+  }
+  paintAutostart(el, r);
+}
+
 export const page = {
   id: 'overview',
   title: '概览',
@@ -434,20 +473,29 @@ export const page = {
         <tr><td>配置文件</td><td><code>${esc(st.configPath)}</code></td></tr>
         <tr><td>配置页</td><td><code>${esc(location.host)}</code></td></tr>
         <tr><td>Claude 认证</td><td>${claudeTag}（模式：${esc(st.claude?.mode || 'inherit')}）</td></tr>
+        <tr><td>开机自启</td><td id="asStat"><span class="hint">检测中…</span></td></tr>
       </table>
       ${ctl}
       <div class="desc" style="margin-top:10px">${st.claude?.hasAuth === false ? '⚠️ 未检测到认证：到「Claude 认证」页填写，或在配置页所在机器执行 claude login。' : ''}</div>
     </div>
     <div class="card">
       <h3>版本与更新</h3>
-      <table>
-        <tr><td>当前版本</td><td><span class="chip">v${esc(st.version)}</span></td></tr>
-        <tr><td>最新版本</td><td id="updLatest"><span class="hint">未检查</span></td></tr>
-        <tr><td>飞书 CLI（lark-cli）</td><td id="larkCliStat"><span class="hint">检测中…</span></td></tr>
-      </table>
-      <div style="display:flex; gap:10px; margin-top:12px; align-items:center">
-        <button class="btn" id="btnUpdCheck">检查更新</button>
-        <span id="updArea"></span>
+      <div class="card-sub">
+        <h4 class="card-sub-title">▍LCB 桥接器</h4>
+        <table>
+          <tr><td>当前版本</td><td><span class="chip">v${esc(st.version)}</span></td></tr>
+          <tr><td>最新版本</td><td id="updLatest"><span class="hint">未检查</span></td></tr>
+        </table>
+        <div style="display:flex; gap:10px; margin-top:12px; align-items:center">
+          <button class="btn" id="btnUpdCheck">检查更新</button>
+          <span id="updArea"></span>
+        </div>
+      </div>
+      <div class="card-sub">
+        <h4 class="card-sub-title">▍飞书 CLI（lark-cli）</h4>
+        <table>
+          <tr><td>状态</td><td id="larkCliStat"><span class="hint">检测中…</span></td></tr>
+        </table>
       </div>
     </div>
     <div class="card">
@@ -477,5 +525,6 @@ export const page = {
     else doCheckUpdate();
     if (LARKCLI.data && Date.now() - LARKCLI.checkedAt < 30000) renderLarkCliResult();
     else doCheckLarkCli();
+    void renderAutostart();
   },
 };

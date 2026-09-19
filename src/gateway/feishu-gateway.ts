@@ -6,6 +6,32 @@ import { CONFIG_DIR } from '../config.js';
 import { buildImageCard, buildTextCard } from './card-builder.js';
 import { isImageFile } from '../util/file-types.js';
 
+/**
+ * 消息卡通道不支持的 cardkit 专属属性：im.message.create / im.message.patch 的卡片 JSON
+ * 校验对它们报 230099/200621 "unknown property"（2026-09-19 真机实锤 multiline 与
+ * disabled_reason 两例），而 cardkit 实体卡通道（sendCardEntity / batch_update）正常接受。
+ * rows 为 multiline 配套属性一并剥离；disabled 状态本身消息卡 2.0 通用，保留。
+ */
+const MESSAGE_CHANNEL_UNSUPPORTED_PROPS = new Set(['multiline', 'rows', 'disabled_reason']);
+
+/**
+ * 递归剥离消息卡通道不支持的属性（深拷贝返回，不改动入参）。
+ * 在 sendCard / updateCard 入口统一调用：进度卡降级路径（cardkit 不可用 → 整卡
+ * create/PATCH）与任何误带 cardkit 专属属性走消息通道的新卡在此免疫。
+ * 卡片体量 <30KB、调用频度秒级，深拷贝开销可忽略。
+ */
+function stripMessageChannelUnsupportedProps(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(stripMessageChannelUnsupportedProps);
+  if (node !== null && typeof node === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(node)) {
+      if (!MESSAGE_CHANNEL_UNSUPPORTED_PROPS.has(key)) out[key] = stripMessageChannelUnsupportedProps(value);
+    }
+    return out;
+  }
+  return node;
+}
+
 /** SDK 形状：仅用到 WSClient/EventDispatcher/Client/Domain 四个导出，测试注入假对象时按此约束 */
 export interface FeishuSdk {
   WSClient: new (params: { appId: string; appSecret?: string; domain?: unknown; loggerLevel?: number }) => {
@@ -195,7 +221,7 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
 
 interface RawCardActionPayload {
   action?: {
-    value?: { requestId?: string; decision?: string; feedback?: string; qIndex?: number; option?: string; filePath?: string };
+    value?: { requestId?: string; decision?: string; feedback?: string; qIndex?: number; option?: string; filePath?: string; ws?: string };
     // 卡片 form 容器提交时回传的全部输入项（name → 值）：plan/output 表单的 feedback、
     // qa 表单的 custom_N；不同飞书客户端/版本落点可能是 form_value 或并入 value，两处兜底
     form_value?: Record<string, unknown>;
@@ -210,7 +236,8 @@ const VALID_DECISIONS: ReadonlySet<string> = new Set([
   'allow', 'deny', 'allow-session',
   'plan-approve', 'plan-revise', 'plan-reject', 'plan-view-file',
   'qa-pick', 'qa-submit',
-  'view-output-file', 'output-confirm', 'output-revise',
+  'output-confirm', 'output-revise',
+  'ws-switch',
 ]);
 
 /** 解析 card.action.trigger 回调；不完整或 decision 不在合法枚举内返回 null */
@@ -235,6 +262,8 @@ function parseCardAction(data: unknown): { value: { requestId: string; decision:
     const option = typeof value.option === 'string' ? value.option : undefined;
     // 长回复卡查看按钮透传的落盘文件路径
     const filePath = typeof value.filePath === 'string' && value.filePath ? value.filePath : undefined;
+    // /ws 工作区卡切换按钮透传的目标工作区名
+    const ws = typeof value.ws === 'string' && value.ws ? value.ws : undefined;
     return {
       value: {
         requestId: value.requestId,
@@ -244,6 +273,7 @@ function parseCardAction(data: unknown): { value: { requestId: string; decision:
         ...(option ? { option } : {}),
         ...(formValue && Object.keys(formValue).length > 0 ? { formValue } : {}),
         ...(filePath ? { filePath } : {}),
+        ...(ws ? { ws } : {}),
       },
       operatorId: d.operator.open_id,
       openMessageId: d.context?.open_message_id ?? d.open_message_id ?? '',
@@ -512,11 +542,11 @@ export class FeishuGateway {
     }
   }
 
-  /** 发送卡片消息，返回 message_id */
+  /** 发送卡片消息，返回 message_id（消息卡通道：入口剥离 cardkit 专属属性，见 strip 函数注释） */
   async sendCard(chatId: string, card: unknown): Promise<string> {
     const res = await this.client.im.message.create({
       params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) },
+      data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(stripMessageChannelUnsupportedProps(card)) },
     });
     if (!res.data?.message_id) throw new Error(`发送卡片失败: ${JSON.stringify(res)}`);
     return res.data.message_id;
@@ -527,9 +557,9 @@ export class FeishuGateway {
     return this.sendCard(chatId, buildTextCard(markdown, this.cardWidth()));
   }
 
-  /** 更新已发送卡片（流式进度刷新） */
+  /** 更新已发送卡片（流式进度刷新；消息卡通道：入口剥离 cardkit 专属属性） */
   async updateCard(messageId: string, card: unknown): Promise<void> {
-    await this.client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(card) } });
+    await this.client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(stripMessageChannelUnsupportedProps(card)) } });
   }
 
   /**

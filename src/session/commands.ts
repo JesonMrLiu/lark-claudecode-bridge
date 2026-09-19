@@ -1,9 +1,11 @@
-import type { BridgeConfig, SessionInventory } from '../types.js';
+import { randomUUID } from 'node:crypto';
+import type { BridgeConfig, SessionInventory, Workspace } from '../types.js';
 import type { SessionStore } from './session-store.js';
 import { formatBeijingTime } from '../util/beijing-time.js';
 import { handlePluginCommand } from './plugin-command.js';
 import { handleModelProfileCommand } from './model-profile-command.js';
 import { invalidatePluginCache } from '../executor/plugin-discovery.js';
+import { buildWorkspaceCard } from '../gateway/card-builder.js';
 
 /**
  * bridge 本地命令首 token 清单（去 / 后比对）。单一来源：commands.ts 的 switch、
@@ -23,7 +25,7 @@ export const SLASH_COMMAND_META: Record<string, { description: string; icon: str
   resume: { description: '列出/恢复历史会话（支持翻页）', icon: 'update-ai_outlined' },
   stop: { description: '停止当前任务', icon: 'clear_outlined' },
   status: { description: '查看当前状态', icon: 'diagnosis-ai_outlined' },
-  ws: { description: '切换工作区（/ws list 列出）', icon: 'folder_outlined' },
+  ws: { description: '查看/切换工作区（/ws 出卡片，点击即切换）', icon: 'folder_outlined' },
   model: { description: '查看/切换模型', icon: 'ai-style_outlined' },
   'model-profile': { description: '查看/切换厂商档案（切换需管理员）', icon: 'switch-tracking_outlined' },
   plan: { description: '切换计划模式开关；[/plan 模式切换]、[/plan on 开启]、[/plan off 关闭]', icon: 'plan_outlined' },
@@ -40,8 +42,11 @@ export interface CommandContext {
   config: BridgeConfig;
   /** 本机器人显示名：多机器人同群/多会话时 /status 需要辨认对谁说话 */
   appName: string;
-  /** member 不能 /ws use 切换工作区（spec 权限分级） */
+  /** member 不能 /ws use 切换工作区（spec 权限分级）；分身机器人（deputy）恒 false——
+   *  管理面（工作区/模型档案/插件）全局共享，分身用户不该触碰，admin 本人在分身里同样不放行 */
   isAdmin: boolean;
+  /** 分身机器人标记：工作区已锁定（allowed_workspaces），/ws use、/reload-plugins 等直接拒绝 */
+  isDeputy?: boolean;
   currentWorkspace(): string;
   stopCurrentTask(): boolean;
   /** 本 app 当前工作区最近一次会话的加载清单（SDK init 消息缓存）；尚无会话时 undefined */
@@ -65,6 +70,9 @@ export interface CommandResult {
   /** 本次命令改写了 currentSessionId（/new、/resume <n>、/ws use）——wiring 据此 bump
    *  pointerGen，让运行中/收尾窗口内任务的迟到归档不回写指针（覆盖用户选择的老 bug） */
   pointerTouched?: boolean;
+  /** 交互卡片（裸 /ws）：有值时 wiring 走 sendCardTo 发送并按 cardRequestId 注册挂起项，不发 reply */
+  card?: unknown;
+  cardRequestId?: string;
 }
 
 const HELP = `**可用命令**
@@ -74,8 +82,9 @@ const HELP = `**可用命令**
 /resume page <页码> — 翻看更早的历史会话
 /stop — 停止当前任务
 /status — 查看当前状态
-/ws list — 列出工作区
-/ws use <名字> — 切换工作区
+/ws — 工作区卡片：列出全部工作区，点击即切换
+/ws list — 列出工作区（文本）
+/ws use <名字> — 切换工作区（文本）
 /model — 查看/切换模型（/model <名字> 切换，/model reset 恢复默认）
 /model-profile — 查看/切换厂商档案（/model-profile <名字> 切换，管理员）
 /plan — 切换计划模式（先出方案、批准后再执行；/plan on 开启，/plan off 关闭）
@@ -97,6 +106,30 @@ const RESUME_PAGE_SIZE = 20;
 /** 清单超过 30 项时截断展示 */
 function tail(items: string[]): string {
   return items.length > 30 ? `${items.slice(0, 30).join('、')} …等 ${items.length} 个` : items.join('、');
+}
+
+/**
+ * 切换工作区落盘语义（/ws use 文本命令与 /ws 卡片按钮回调共用，防两处漂移）：
+ * 保留历史会话记录与通道级 model/planMode 偏好，但清除续接指针——旧会话的上下文
+ * 绑定原工作区目录，跨工作区自动续接容易答非所问
+ */
+export function applyWorkspaceSwitch(store: SessionStore, key: string, target: Workspace): void {
+  const st = store.getChannelState(key);
+  store.setChannelState(key, {
+    workspaceName: target.name,
+    sessions: st?.sessions ?? [],
+    ...(st?.model ? { model: st.model } : {}),
+    ...(st?.planMode ? { planMode: st.planMode } : {}),
+  });
+  store.setCurrentSession(key, null, target.name);
+}
+
+/** 工作区清单 markdown（/ws list 与 /ws 卡片发送失败的降级文本共用，防两处漂移）；
+ *  currentName 有值时当前项打 ← 标记，缺省输出与旧版 /ws list 字节级一致 */
+export function workspaceListMarkdown(workspaces: Array<{ name: string; path: string }>, currentName?: string): string {
+  return workspaces
+    .map((w) => `- **${w.name}** \`${w.path}\`${w.name === currentName ? ' ← 当前' : ''}`)
+    .join('\n');
 }
 
 /** 清单类回复共用的头部（工作区 + 加载时间） */
@@ -126,7 +159,14 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       // 仅清除「当前续接指针」，历史会话列表保留（/resume 仍可切回）——
       // 旧版清空整个 sessions 导致开新会话后历史「消失」，列表永远积累不起来
       store.setCurrentSession(key, null, st?.workspaceName || ws);
-      return { handled: true, pointerTouched: true, reply: `✅ 已开启新会话（工作区：${ws}）。历史会话未清空，/resume 可随时切回` };
+      // 完整路径一并展示（任务将在此目录执行）；store 里的名字可能不在清单
+      // （清单被改/被删）→ find 落空不带路径，不硬抛
+      const wsPath = ctx.config.workspaces.find((w) => w.name === ws)?.path;
+      return {
+        handled: true,
+        pointerTouched: true,
+        reply: `✅ 已开启新会话（工作区：${ws}${wsPath ? `，路径 ${wsPath}` : ''}）。历史会话未清空，/resume 可随时切回`,
+      };
     }
     case 'resume': {
       const sessions = store.listSessions(key); // 内部新→旧（sessions[0] 最新）
@@ -195,27 +235,36 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
     }
     case 'ws': {
       const sub = args[0];
+      if (!sub) {
+        // 分身机器人工作区恒锁定（allowed_workspaces），卡片上全是点了必拒的按钮，不如直接回文本
+        if (ctx.isDeputy) {
+          return { handled: true, reply: `⛔ 分身机器人已锁定工作区：**${ctx.currentWorkspace()}**（allowed_workspaces），不可切换。` };
+        }
+        // 裸 /ws：卡片列出全部工作区，点击工作区名直接切换。
+        // 权限校验放回调时点（admin 可切、member 看卡被拒），与 /ws use 的语义一致
+        const requestId = randomUUID();
+        return {
+          handled: true,
+          cardRequestId: requestId,
+          card: buildWorkspaceCard(
+            { requestId, workspaces: ctx.config.workspaces, currentName: ctx.currentWorkspace() },
+            ctx.config.card?.width ?? 'default',
+          ),
+        };
+      }
       if (sub === 'list') {
-        const list = ctx.config.workspaces.map((w) => `- **${w.name}** \`${w.path}\``).join('\n');
+        const list = workspaceListMarkdown(ctx.config.workspaces, ctx.currentWorkspace());
         return { handled: true, reply: `**工作区列表**\n${list}` };
       }
       if (sub === 'use') {
+        if (ctx.isDeputy) return { handled: true, reply: '⛔ 分身机器人已锁定工作区（allowed_workspaces），不可切换；如需变更请修改 config.yaml' };
         if (!ctx.isAdmin) return { handled: true, reply: '⛔ 切换工作区仅管理员可用' };
         const target = ctx.config.workspaces.find((w) => w.name === args[1]);
-        if (!target) return { handled: true, reply: `工作区 "${args[1] ?? ''}" 不存在，/ws list 查看` };
-        const st = store.getChannelState(key);
-        // 切换工作区保留历史会话记录与通道级模型偏好，但清除续接指针——
-        // 旧会话的上下文绑定原工作区目录，跨工作区自动续接容易答非所问
-        store.setChannelState(key, {
-          workspaceName: target.name,
-          sessions: st?.sessions ?? [],
-          ...(st?.model ? { model: st.model } : {}),
-          ...(st?.planMode ? { planMode: st.planMode } : {}),
-        });
-        store.setCurrentSession(key, null, target.name);
+        if (!target) return { handled: true, reply: `工作区 "${args[1] ?? ''}" 不存在，/ws 查看` };
+        applyWorkspaceSwitch(store, key, target);
         return { handled: true, pointerTouched: true, reply: `✅ 已切换工作区：**${target.name}**（${target.path}）。已自动开启新会话（/resume 可切回历史）` };
       }
-      return { handled: true, reply: '用法：/ws list | /ws use <名字>' };
+      return { handled: true, reply: '用法：/ws（卡片切换）| /ws list | /ws use <名字>' };
     }
     case 'model': {
       const st = store.getChannelState(key);
@@ -303,6 +352,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
     case 'reload-plugins': {
       // 终端 /reload-plugins 的 bridge 等价物：插件由每任务启动时现扫描加载（mtime 缓存），
       // 清缓存即「重载」——下一条消息重新发现并传入 SDK（managed 模式双目录都清）
+      if (ctx.isDeputy) return { handled: true, reply: '⛔ 分身机器人不支持该命令（插件由分身配置 allowed_plugins / plugins 限定）' };
       const dirs = ctx.claudeConfigDir ? [ctx.claudeConfigDir, ...(ctx.userClaudeDir && ctx.userClaudeDir !== ctx.claudeConfigDir ? [ctx.userClaudeDir] : [])] : [];
       if (dirs.length === 0) return { handled: true, reply: '⛔ 当前部署未注入 Claude 配置目录，无法重载' };
       for (const d of dirs) invalidatePluginCache(d);

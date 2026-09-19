@@ -172,7 +172,6 @@ function renderClaude(el) {
         <td>${p.base_url ? `<code>${esc(p.base_url)}</code>` : '<span class="hint">官方</span>'}</td>
         <td>${modelChips(p, active, i)}</td>
         <td>
-          <button class="btn sm" data-op="use" data-i="${i}">设为当前</button>
           <button class="btn sm" data-op="edit" data-i="${i}">编辑</button>
           <button class="btn sm danger" data-op="del" data-i="${i}">删除</button>
         </td>
@@ -181,15 +180,13 @@ function renderClaude(el) {
     body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = async () => {
       const i = Number(b.dataset.i);
       const p = c.profiles[i];
-      if (b.dataset.op === 'use' || b.dataset.op === 'usemodel') {
-        // 切换走后端端点（档案凭证明文不出进程）；编辑中先收尾，未保存改动自动落盘再切（如认证模式切换）
+      if (b.dataset.op === 'usemodel') {
+        // 切换 = 点击模型 chip（「设为当前」按钮已移除：默认模型必在候选集内，点其 chip 等效激活）。
+        // 走后端端点（档案凭证明文不出进程）；编辑中先收尾，未保存改动自动落盘再切（如认证模式切换）
         if (!$('#drawerMask').hidden) return toast('请先完成档案编辑（保存或取消）', true);
         if (S.dirtyCards.size && !(await saveDoc())) return; // 保存失败已 toast 原因，保持编辑态不切换
         try {
-          const reqBody = { name: p.name };
-          if (b.dataset.op === 'usemodel') reqBody.model = b.dataset.m;
-          else if (p.model || (p.models || [])[0]) reqBody.model = p.model || p.models[0];
-          const r = await api('POST', '/api/claude/use-profile', reqBody);
+          const r = await api('POST', '/api/claude/use-profile', { name: p.name, model: b.dataset.m });
           toast(r.message || '已切换');
           await refresh();
         } catch (e) { toast(e.message, true); }

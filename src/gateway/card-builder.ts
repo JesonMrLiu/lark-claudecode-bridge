@@ -4,10 +4,12 @@ import type { AskQuestionRequest } from '../executor/permission-gate.js';
 export interface ProgressState {
   title: string;
   status: string;
-  textTail: string;
   toolLine: string;
   startedAt: number;
   done?: boolean;
+  /** 终态结果提示行：完整回复的字数（finish 传入）——终态不再渲染回复正文（由收尾独立
+   *  多卡直接展示），只留一行「已单独发送」指引，消除折叠看不到与两边重复 */
+  resultChars?: number;
   /** 挂起中的工具确认（非空时卡片底部渲染确认按钮区、正文收敛），决策后置回 undefined */
   confirm?: ConfirmationRequest;
   /** 子代理/后台任务清单（启动加入、落定标记保留到任务结束） */
@@ -57,15 +59,6 @@ function md(content: string): unknown {
 export function buildTextCard(markdown: string, widthMode: 'default' | 'fill' = 'default'): unknown {
   return card([md(markdown)], widthMode);
 }
-/** 进度卡终态结果尾部的字符上限（防爆卡片）。运行中不展示过程文本（产品决策：主卡只留
- *  关键信息——状态/工具/子代理/确认区/计时；思考内容与过程文本一律不进卡），仅任务收尾
- *  露出结果尾部。index.ts 以同一常量判断「短回复是否需要独立结果消息」，两处保持同值，
- *  否则 400–1200 区间内容会卡片/消息两边都不展示 */
-export const PROGRESS_TAIL_CHARS = 400;
-/** 独立结果消息的按钮化阈值（0.20.0）：最终回复超过此字数不再直接发全文卡片，改为落盘 md
- *  + 「查看完整内容」按钮 + 确认/按意见修改引导——飞书单卡 30KB 上限与可读性都不允许长文
- *  铺卡片，旧版 4000 字硬截断会静默丢内容。400~2000 字区间仍直接发全文卡片 */
-export const LONG_OUTPUT_THRESHOLD = 2000;
 /** 图片卡片：caption（可选）显示在图片上方——逐张发图时带编号说明用；宽度同 buildTextCard */
 export function buildImageCard(caption: string | undefined, imgKey: string, widthMode: 'default' | 'fill' = 'default'): unknown {
   const elements: unknown[] = [];
@@ -114,16 +107,11 @@ function buildMainLines(state: ProgressState): string[] {
   } else if (state.plan) {
     // 内嵌计划区同理收敛正文
     lines.push('---', `⏸ 正文已收起，等待下方计划确认后继续…`);
-  } else if (state.done && state.textTail) {
-    // 终态才展示结果尾部（产品决策：运行中过程文本不进卡片，主卡只留关键信息；思考内容
-    // 也不采集不展示）。textTail 仍保留全部内容（appendText 不断积累），超长部分由 index.ts
-    // 的独立结果消息承载（阈值与本常量同值），渲染层截断不丢内容
-    if (state.textTail.length > PROGRESS_TAIL_CHARS) {
-      const folded = state.textTail.length - PROGRESS_TAIL_CHARS;
-      lines.push('---', `**📝 结果**`, `<font color='grey'>⋯ 已折叠前面 ${folded} 字符</font>`, state.textTail.slice(-PROGRESS_TAIL_CHARS));
-    } else {
-      lines.push('---', `**📝 结果**`, state.textTail);
-    }
+  } else if (state.done && state.resultChars !== undefined) {
+    // 终态不再渲染回复正文：完整回复由收尾逻辑独立多卡直接展示（用户决策），主卡只留一行
+    // 指引——消除「折叠前面 N 字符看不到全文」与「卡片/消息两边内容重复」两类问题
+    // （原 textTail 尾部 400 字方案，P06 耦合随之消解）。停止/出错终态无 resultChars 不显示
+    lines.push('---', `📝 完整回复已单独发送（共 ${state.resultChars.toLocaleString()} 字），见下方消息卡片`);
   }
   return lines;
 }
@@ -348,33 +336,39 @@ export interface QuestionCardRequest {
 /** 已选答案的中间态（wiring 侧维护）：问题下标 → 选中的 option label（multiSelect 为数组） */
 export type QuestionCardAnswers = Record<number, string | string[]>;
 
-// ---------- 长回复收起卡（0.20.0：最终回复 > LONG_OUTPUT_THRESHOLD 时的呈现与后续引导） ----------
+// ---------- 结论多卡（完整回复分块直接展示；尾卡带确认/提意见引导） ----------
 
-export interface LongOutputCardRequest {
+export interface ResultCardRequest {
   requestId: string;
-  /** 落盘的完整回复 md 路径（「查看完整内容」回调 send_file 用） */
-  filePath: string;
   charCount: number;
   workspaceName: string;
 }
 
+/** 结论块头部标号行：非尾卡（sendTextTo 文本卡）与尾卡共用同一标题样式，仅位置标号不同 */
+export function resultChunkHeader(req: ResultCardRequest, index: number, total: number): string {
+  return `**📝 完整回复**（${total > 1 ? `${index}/${total} · ` : ''}共 ${req.charCount.toLocaleString()} 字）· 工作区 \`${req.workspaceName}\``;
+}
+
 /**
- * 长回复收起卡：正文不进卡片（30KB 上限与可读性），「查看完整内容」按钮 send_file 发原文；
- * 下方 form 提供后续引导——「确认方案 / 按意见修改」（点击即以对应 prompt 发起新一轮任务，
- * wiring 侧经 outputPending 挂起项校验发起人），也可直接回复消息。
+ * 结论尾卡：完整回复多卡的最后一张——末块正文 + form「确认方案 / 按意见修改」引导
+ * （点击以对应 prompt 合成用户消息入队，走完整排队/resume 链路发起新一轮任务，wiring 侧
+ * 经 outputPending 挂起项校验发起人），也可直接回复消息。
+ * settled 态（决策后回调响应内联换卡）：正文保留，按钮区收为一行文案。
  */
-export function buildLongOutputCard(req: LongOutputCardRequest, widthMode: 'default' | 'fill' = 'default'): unknown {
-  const elements: unknown[] = [
-    md(`**📄 回复较长已收起**（共 ${req.charCount} 字）· 工作区 \`${req.workspaceName}\`\n\n请先点击「📂 查看完整内容」阅读全文，再选择后续操作；也可直接回复消息（确认或提意见均可）`),
-    {
-      tag: 'button',
-      text: { tag: 'plain_text', content: '📂 查看完整内容' },
-      type: 'default',
-      behaviors: [{ type: 'callback', value: { requestId: req.requestId, decision: 'view-output-file' as CardDecision, filePath: req.filePath } }],
-    },
-    {
+export function buildResultTailCard(
+  req: ResultCardRequest,
+  chunkContent: string,
+  pos: { index: number; total: number },
+  settledText?: string,
+  widthMode: 'default' | 'fill' = 'default',
+): unknown {
+  const elements: unknown[] = [md(`${resultChunkHeader(req, pos.index, pos.total)}\n\n${chunkContent}`)];
+  if (settledText) {
+    elements.push(md(settledText));
+  } else {
+    elements.push({
       tag: 'form',
-      name: 'output_form',
+      name: 'result_form',
       elements: [
         {
           tag: 'column_set',
@@ -384,23 +378,63 @@ export function buildLongOutputCard(req: LongOutputCardRequest, widthMode: 'defa
             { tag: 'column', width: 'auto', weight: 1, vertical_align: 'top', elements: [planButton('output-revise', '✏️ 按意见修改', 'default', req.requestId, 'out_btn_revise')] },
           ],
         },
-        { tag: 'input', name: 'feedback', width: 'fill', multiline: true, rows: 2, max_length: 1000, placeholder: { tag: 'plain_text', content: '修改意见（点「按意见修改」时生效，可多行）' } },
+        // 意见框不带 multiline/rows：消息卡通道（im.message.create）卡片校验拒绝该属性
+        // （飞书 230099/200621 "unknown property" 实锤）——multiline 仅 cardkit 实体卡可用；
+        // 复杂意见走「直接回复消息」（placeholder 已引导）
+        { tag: 'input', name: 'feedback', width: 'fill', max_length: 1000, placeholder: { tag: 'plain_text', content: '修改意见（点「按意见修改」时生效）；复杂意见可直接回复消息' } },
       ],
-    },
-  ];
+    });
+  }
   return card(elements, widthMode);
 }
 
-/** 长回复卡已处理态（确认/提意见后的回调响应内联换卡）：保留查看按钮，决策按钮区收为一行文案 */
-export function buildLongOutputSettledCard(req: LongOutputCardRequest, settledText: string, widthMode: 'default' | 'fill' = 'default'): unknown {
+// ---------- 工作区切换卡（裸 /ws）：左按钮右路径一行一工作区，点击即切换，切换后整卡终态 ----------
+
+export interface WorkspaceCardRequest {
+  requestId: string;
+  workspaces: Array<{ name: string; path: string }>;
+  currentName: string;
+}
+
+/** 工作区按钮：文案即工作区名（点击即切换，同 QA 选项卡的「按钮即选项」模式），width fill
+ *  填满所在列保住点击面积；当前项 ✓+primary+disabled 不可点。只用 disabled（消息卡 2.0
+ *  通用），不带 disabled_reason 等 cardkit 实体卡专属字段——旧版 im.message.create 的
+ *  interactive 卡不识别未知字段 */
+function wsSwitchButton(requestId: string, name: string, current: boolean): unknown {
+  return {
+    tag: 'button',
+    width: 'fill',
+    text: { tag: 'plain_text', content: current ? `✓ ${name}（当前）` : name },
+    type: current ? 'primary' : 'default',
+    ...(current ? { disabled: true } : {}),
+    behaviors: [{ type: 'callback', value: { requestId, decision: 'ws-switch' as CardDecision, ws: name } }],
+  };
+}
+
+/** 工作区选择卡：每个工作区一行 column_set——左列 30% 整宽按钮（点击即切换），右列 70%
+ *  灰色路径（仅名字无法区分各工作区对应目录，路径上卡面后免切错），两列垂直居中、长路径
+ *  自动换行；固定百分比列宽（非 flow）保证多行按钮纵向对齐。回调侧按按钮 value.ws 定位
+ *  目标；卡片体量随工作区数线性增长（典型 2-5 个远低于单卡 30KB 上限，量级失控时再折叠
+ *  为 markdown 列表） */
+export function buildWorkspaceCard(req: WorkspaceCardRequest, widthMode: 'default' | 'fill' = 'default'): unknown {
+  const elements: unknown[] = [
+    md(`**📁 选择工作区**（当前：**${req.currentName}**）\n<font color='grey'>点击工作区名直接切换；切换后自动开启新会话（历史保留，/resume 可切回）</font>`),
+  ];
+  for (const w of req.workspaces) {
+    elements.push({
+      tag: 'column_set',
+      columns: [
+        { tag: 'column', width: '30%', vertical_align: 'center', elements: [wsSwitchButton(req.requestId, w.name, w.name === req.currentName)] },
+        { tag: 'column', width: '70%', vertical_align: 'center', elements: [md(`<font color='grey'>\`${w.path}\`</font>`)] },
+      ],
+    });
+  }
+  return card(elements, widthMode);
+}
+
+/** 工作区切换完成终态卡：纯 markdown 无交互组件——一次性选择语义（点过即定），再切重发 /ws */
+export function buildWorkspaceSwitchedCard(name: string, path: string, widthMode: 'default' | 'fill' = 'default'): unknown {
   return card([
-    md(`**📄 回复较长已收起**（共 ${req.charCount} 字）· 工作区 \`${req.workspaceName}\``),
-    {
-      tag: 'button',
-      text: { tag: 'plain_text', content: '📂 查看完整内容' },
-      type: 'default',
-      behaviors: [{ type: 'callback', value: { requestId: req.requestId, decision: 'view-output-file' as CardDecision, filePath: req.filePath } }],
-    },
-    md(settledText),
+    md(`✅ 已切换到工作区：**${name}**（\`${path}\`）\n<font color='grey'>已自动开启新会话（历史保留，/resume 可切回）；再次切换请重发 /ws</font>`),
   ], widthMode);
 }

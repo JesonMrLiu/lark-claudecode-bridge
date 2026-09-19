@@ -65,6 +65,19 @@ interface RawApp {
   env?: Record<string, string>;
   triggers?: Array<{ match?: string; rewrite?: string }>;
   plugins?: Array<{ name?: string; path?: string }>;
+  role?: string;
+  allowed_skills?: unknown;
+  allowed_plugins?: unknown;
+  allowed_workspaces?: unknown;
+}
+
+/** 字符串数组归一化：非数组硬抛（带定位），元素 trim 并剔除空串 */
+function normalizeStringArray(raw: unknown, where: string): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new Error(`${where} 必须为字符串数组，请检查 config.yaml`);
+  const arr = (raw as unknown[]).map((v) => (typeof v === 'string' ? v.trim() : '')).filter(Boolean);
+  if ((raw as unknown[]).length > 0 && arr.length === 0) throw new Error(`${where} 不能全为空字符串`);
+  return arr;
 }
 
 /** 触发词规则校验：match/rewrite 必须非空（错误消息带定位），顺序保持（按序首个命中生效） */
@@ -190,6 +203,18 @@ function normalizeServer(doc: Record<string, unknown>): ServerConfig | undefined
     }
   }
   return { enabled, host, port };
+}
+
+/** 开机自启意图段（整体可选）：仅记录用户开关选择；实际注册状态以 OS 查询为权威（web/autostart.ts） */
+function normalizeAutostart(doc: Record<string, unknown>): { enabled?: boolean } | undefined {
+  const raw = doc.autostart;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object') throw new Error('autostart 必须为对象（含 enabled），请检查 config.yaml');
+  const a = raw as { enabled?: unknown };
+  if (a.enabled !== undefined && a.enabled !== null && typeof a.enabled !== 'boolean') {
+    throw new Error('autostart.enabled 必须为布尔值，请检查 config.yaml');
+  }
+  return { ...(typeof a.enabled === 'boolean' ? { enabled: a.enabled } : {}) };
 }
 
 /** Claude 认证段（整体可选）：mode 缺省 inherit；managed 下两凭证并存硬抛（会被 API 拒绝且意图不明） */
@@ -376,6 +401,37 @@ function normalizeApps(doc: Record<string, unknown>, workspaceNames: string[]): 
         + `（共享本机模型设置/登录态/MCP/skills/插件，仅会话池隔离），该配置项将被忽略`,
       );
     }
+    // 角色模型：primary（缺省）主机器人——全技能/全插件/全工作区，配对码准入；
+    // deputy 分身——按用途限定能力（技能/插件白名单 + 工作区锁定），艾特即用供他人使用。
+    // deputy 必须显式配置 allowed_skills 与 allowed_workspaces：分身不限能力 = 把主权限
+    // 开放给所有艾特者（本机数据/认证泄露面），配置错误在启动时硬抛而非静默全开
+    let role: 'primary' | 'deputy' = 'primary';
+    if (raw.role !== undefined && raw.role !== null) {
+      if (raw.role !== 'primary' && raw.role !== 'deputy') {
+        throw new Error(`${where} 的 role 必须为 primary / deputy（当前值：${String(raw.role)}），请检查 config.yaml`);
+      }
+      role = raw.role;
+    }
+    let allowedSkills: string[] | undefined;
+    let allowedPlugins: string[] | undefined;
+    let allowedWorkspaces: string[] | undefined;
+    if (role === 'deputy') {
+      allowedSkills = normalizeStringArray(raw.allowed_skills, `${where} 的 allowed_skills`);
+      allowedWorkspaces = normalizeStringArray(raw.allowed_workspaces, `${where} 的 allowed_workspaces`);
+      allowedPlugins = normalizeStringArray(raw.allowed_plugins, `${where} 的 allowed_plugins`);
+      if (!allowedSkills?.length) {
+        throw new Error(`${where} 为 deputy（分身）角色，必须配置 allowed_skills（技能白名单，非空数组）——分身须显式限定能干什么，如 [sql-review]`);
+      }
+      if (!allowedWorkspaces?.length) {
+        throw new Error(`${where} 为 deputy（分身）角色，必须配置 allowed_workspaces（工作区锁定，非空数组）——分身任务将锁定在第一个允许的工作区运行`);
+      }
+      const unknownWs = allowedWorkspaces.filter((w) => !workspaceNames.includes(w));
+      if (unknownWs.length) {
+        throw new Error(`${where} 的 allowed_workspaces 含未在 workspaces 列表中定义的工作区：${unknownWs.join('、')}`);
+      }
+    } else if (raw.allowed_skills !== undefined || raw.allowed_plugins !== undefined || raw.allowed_workspaces !== undefined) {
+      console.warn(`[配置] ${where} 非 deputy 角色，allowed_skills / allowed_plugins / allowed_workspaces 不生效（仅分身角色支持能力限定），已忽略`);
+    }
     return {
       name,
       appId,
@@ -387,6 +443,10 @@ function normalizeApps(doc: Record<string, unknown>, workspaceNames: string[]): 
       env: raw.env && typeof raw.env === 'object' ? raw.env : undefined,
       triggers: normalizeTriggers(raw.triggers, where),
       plugins: normalizePlugins(raw.plugins, where),
+      role,
+      allowedSkills,
+      allowedPlugins,
+      allowedWorkspaces,
     };
   });
   // name 重复仅 warn：纯显示用途，不影响路由与隔离
@@ -452,11 +512,14 @@ export function parseConfigText(raw: string, pathForError: string = CONFIG_PATH)
     ...section(slashCommands, 'slashCommands'),
     ...section(session, 'session'),
     ...section(normalizeCard(doc), 'card'),
+    ...section(normalizeAutostart(doc), 'autostart'),
   };
 }
 
-/** 热重载比较：任一 app 的凭证/名称/工作区/并发/配置目录/人格变化即视为需重启的变更（顺序敏感）。
- *  env 不参与比较——已纳入热重载 mutate 清单，executeTask 每任务经 buildTaskEnv 现读生效 */
+/** 热重载比较：任一 app 的凭证/名称/工作区/并发/配置目录/人格/角色能力变化即视为需重启的变更（顺序敏感）。
+ *  env 不参与比较——已纳入热重载 mutate 清单，executeTask 每任务经 buildTaskEnv 现读生效。
+ *  role/allowed_* 必须参与比较：分身的准入/技能/插件/工作区锁定语义须与长连接生命周期一致，
+ *  热切换会造成「gateway 还是旧 app 语义、createBridge 已按新 role 收敛」的半新半旧状态 */
 export function sameApps(a: FeishuAppConfig[], b: FeishuAppConfig[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((x, i) => {
@@ -464,6 +527,10 @@ export function sameApps(a: FeishuAppConfig[], b: FeishuAppConfig[]): boolean {
     return x.appId === y.appId && x.appSecret === y.appSecret && x.name === y.name
       && x.domain === y.domain && x.defaultWorkspace === y.defaultWorkspace
       && x.concurrency === y.concurrency
-      && x.appendSystemPrompt === y.appendSystemPrompt;
+      && x.appendSystemPrompt === y.appendSystemPrompt
+      && x.role === y.role
+      && JSON.stringify(x.allowedSkills) === JSON.stringify(y.allowedSkills)
+      && JSON.stringify(x.allowedPlugins) === JSON.stringify(y.allowedPlugins)
+      && JSON.stringify(x.allowedWorkspaces) === JSON.stringify(y.allowedWorkspaces);
   });
 }

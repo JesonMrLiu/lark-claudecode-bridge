@@ -34,6 +34,17 @@ apps:
   # - name: 素材收集           # 再添一个机器人：复制上面的结构即可（会话池独立，配置共享 ~/.claude）
   #   app_id: cli_yyyy
   #   app_secret: yyyy
+  # - name: SQL 审核分身       # 分身机器人（role: deputy）：按用途限定能力、艾特即用（无需配对），
+  #   app_id: cli_zzzz         # 供他人使用。能力 = 技能白名单 + 插件白名单 + 工作区锁定；
+  #   app_secret: zzzz         # 工具权限跟全局 permissions 走。管理命令（/ws use、/model-profile、
+  #   role: deputy             # /plugin 变更类、/reload-plugins）在分身里一律拒绝（含 admin 本人）。
+  #   allowed_skills:          # 必填：技能白名单——未列出的技能对模型不可见且被 Skill 工具拒绝。
+  #     - sql-review           # 注意：SDK 官方语义为「上下文过滤器非沙箱」，技能文件仍可被
+  #     - sql-optimize         # Read/Bash 读到；硬隔离需工具级限制（当前版本不做，已知悉边界）
+  #   allowed_workspaces:      # 必填：工作区锁定——分身任务恒运行在第一个允许的工作区（本示例
+  #     - demo                 #   须替换为 workspaces 列表内的真实工作区）
+  #   allowed_plugins:         # 可选：插件白名单（按 name 过滤自动发现，未列出的不加载）；
+  #     - db-tools             #   未配置 = 不加载任何自动发现插件（显式 plugins 始终保留）
 workspaces:                    # 工作区白名单：名字 + 路径（所有机器人共享列表，当前使用哪个 per-app 隔离）
   - name: demo
     path: F:\workspace\demo
@@ -102,3 +113,5 @@ concurrency: 3                 # 全局并发上限（未单独配置的 app 沿
 # card:                       # 卡片展示（整块可选）；改后下一条消息热生效
 #   width: fill               # default = 飞书默认宽度（与消息等宽留边）；fill = 撑满聊天窗口。
 #                             # 作用于全部卡片：文本卡/图片卡/进度卡（含确认与问答区）/长回复卡等
+# autostart:                 # 开机自启意图记录（概览页「开机自启」开关写入；实际注册状态以 OS 查询
+#   enabled: true            # 为权威。Windows 用 Startup 文件夹 / macOS 用 LaunchAgent / Linux 用 systemd --user）

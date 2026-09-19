@@ -16,7 +16,8 @@ export interface CardSender {
   replaceCard?(cardId: string, sequence: number, card: unknown): Promise<void>;
 }
 
-const FLUSH_CHARS = 200;
+/** 进度卡初始文案：markStarted 据此识别「尚未进入执行阶段」——首个执行事件到达时切为执行中 */
+const INITIAL_STATUS = '🚀 已接收，启动中…';
 /** 单次卡片更新请求超时：飞书 SDK 的 axios 无超时（timeout=0），请求被网络黑洞时
  *  flush 串行链会无限期挂起（生产实测单次挂 7.4 分钟）——挂起期间计时/交互区全停，
  *  与任务卡死无从区分。到点按失败处理（seq 不推进）下轮重试；若超时请求实际已在
@@ -52,7 +53,6 @@ export class ProgressCard {
   private qaButtonsDirty = false;
   /** 挂起输入期间收到的沉底请求（sinkToBottom 会删卡重发清空输入态）：挂起解除后补执行 */
   private deferSink = false;
-  private buffer = '';
   private state: ProgressState;
   private flushTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
@@ -70,7 +70,7 @@ export class ProgressCard {
     title: string,
     private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number; cardWidthMode?: 'default' | 'fill'; updateTimeoutMs?: number } = {},
   ) {
-    this.state = { title, status: '🚀 已接收，启动中…', textTail: '', toolLine: '', startedAt: Date.now(), agents: [] };
+    this.state = { title, status: INITIAL_STATUS, toolLine: '', startedAt: Date.now(), agents: [] };
   }
 
   async start(): Promise<void> {
@@ -103,13 +103,12 @@ export class ProgressCard {
     }, 1000).unref();
   }
 
-  /** 过程文本累积（产品决策：运行中不在卡片渲染过程文本与思考内容，仅终态露出结果尾部——
-   *  见 card-builder buildProgressCard 的 done 分支；buffer 照常积累供终态使用，不丢内容） */
-  appendText(delta: string): void {
+  /** 流式文本块到达（活动信号）：产品决策——运行中与终态都不在主卡渲染过程文本/回复正文，
+   *  完整回复由 index.ts 收尾逻辑独立多卡直接展示；此方法仅刷新空闲计时（配合 wiring 侧
+   *  的 markStarted 切阶段文案），不再积累 buffer */
+  appendText(_delta: string): void {
     if (this.done) return;
-    this.buffer += delta;
     this.lastActivityAt = Date.now();
-    if (this.buffer.length >= FLUSH_CHARS) void this.flush();
   }
 
   toolStart(name: string, summary: string): void {
@@ -124,6 +123,16 @@ export class ProgressCard {
     // 失败时带首行原因（权限被拒/命令出错一眼可辨），不再让 ✘ 被误读成「工具没权限」
     this.state.toolLine = note ? `${ok ? '✔' : '✘'} ${name} — ${note}` : `${ok ? '✔' : '✘'} ${name}`;
     this.lastActivityAt = Date.now();
+  }
+
+  /**
+   * 首个执行事件（流式文本/工具调用）到达：初始「已接收，启动中…」切为「正在执行…」。
+   * 幂等且仅在状态行仍是初始文案时改写——CLI status 心跳（🌐 等待模型响应等）若先到
+   * 则不覆盖；解决长任务期间状态行一直停留在"启动中"与实际执行进度不符的问题
+   */
+  markStarted(): void {
+    if (this.done || this.state.status !== INITIAL_STATUS) return;
+    this.setStatus('🔄 正在执行…');
   }
 
   setStatus(status: string): void {
@@ -232,13 +241,18 @@ export class ProgressCard {
     void this.flush();
   }
 
-  async finish(summary: string): Promise<void> {
+  /**
+   * 终态收敛。resultChars：完整回复字数（有回复时传入）——终态不渲染回复正文，仅在该值
+   * 非空时显示一行「完整回复已单独发送」指引（正文由 index.ts 收尾独立多卡直接展示）。
+   */
+  async finish(summary: string, resultChars?: number): Promise<void> {
     this.done = true;
     this.state.done = true;
     clearInterval(this.flushTimer);
     clearInterval(this.heartbeatTimer);
     this.state.status = summary;
     this.state.toolLine = '';
+    this.state.resultChars = resultChars;
     // 终态不再带交互区（决策未落的最极端兜底；正常路径 plan/question/confirm 先于 finish settle）
     this.state.confirm = undefined;
     this.state.plan = undefined;
@@ -308,10 +322,6 @@ export class ProgressCard {
     this.flushChain = (async () => {
       for (;;) {
         this.dirty = false;
-        if (this.buffer) {
-          this.state.textTail += this.buffer;
-          this.buffer = '';
-        }
         const expectedSeq = this.seq + 1; // 仅期望值,await 成功才提交推进
         const timeoutMs = this.opts.updateTimeoutMs ?? UPDATE_TIMEOUT_MS;
         // 本轮是否携带 qa 按钮级更新：发送前快照并清零（先清后发）——await 期间新一轮
@@ -404,6 +414,11 @@ export class ProgressCard {
       }
     })().finally(() => {
       this.flushing = false;
+      // 竞态修复：并发 flush 在「循环最后一次 dirty 检查之后、finally 之前」的微任务窗口
+      // 置位 dirty 时，其 return flushChain 的补刷会被吞——终态 PATCH 丢失、进度卡停在
+      // 中间态（markStarted 紧邻 finish 的场景实测踩中）。finally 处再查一次：仍有
+      // 未消费的 dirty 则重启一轮（幂等：正常路径 dirty 已被循环消费，不会重启）
+      if (this.dirty && this.messageId) void this.flush();
     });
     return this.flushChain;
   }
