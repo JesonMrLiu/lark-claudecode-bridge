@@ -225,7 +225,8 @@ export function createBridge(
   // 触发词两段式（ask_detail）等待补充的挂起项：channelKey → 命中规则与原始消息。
   // 命中「需补充」规则时先追问不入队；同用户下一条非 / 消息视作补充内容，与 rewrite 合并后入队。
   // 超时（SUPPLEMENT_WAIT_MS）自动失效走原流程；任意本地命令（cmd.handled）即取消等待——
-  // /stop /new 天然是逃生口，与「本地命令永远优先」原则一致
+  // /stop /new 天然是逃生口，与「本地命令永远优先」原则一致；指向本地命令的触发词
+  // （关键词形态如「结束会话」→/stop）在补充拦截处同样放行，不被误吞作补充
   const supplementPending = new Map<string, {
     rule: TriggerRule;
     /** 命中触发词的原始消息（合并时作为前缀，补充内容视作其参数） */
@@ -407,11 +408,16 @@ export function createBridge(
     // 2.4 触发词两段式补充（ask_detail）：上一条消息命中「需补充」规则且正在等待时，本条
     // 非 / 消息（同一用户）视作补充内容——与原始消息拼接后对该规则重新改写：补充内容即
     // {args}（无占位符时按既有规则自动追加），零新合并逻辑。其他用户消息 / 斜杠消息 /
-    // 超时挂起均不在此列，照常走原流程（挂起过期在下方静默清除）
+    // 本地命令的触发词（关键词形态如「结束会话」→/stop，与 / 原文同样优先）/ 超时挂起
+    // 均不在此列，照常走原流程（挂起过期在下方静默清除）。
+    // matchTrigger 提前到本段调用，2.5 复用同一结果
     const pendingSup = supplementPending.get(key);
     if (pendingSup && Date.now() - pendingSup.at > SUPPLEMENT_WAIT_MS) supplementPending.delete(key);
     const trimmedText = msg.text.trim();
-    if (pendingSup && !trimmedText.startsWith('/') && msg.userId === pendingSup.userId) {
+    const hit = matchTrigger(msg.text, app.triggers);
+    if (pendingSup && !trimmedText.startsWith('/')
+        && !(hit && isLocalCommandRewrite(hit.rule.rewrite))
+        && msg.userId === pendingSup.userId) {
       supplementPending.delete(key);
       const combined = `${pendingSup.originalText} ${trimmedText}`;
       // ?? combined 兜底理论不可达：rule 本身按 combined 仍会命中（首 token/关键词都在）。
@@ -428,7 +434,6 @@ export function createBridge(
     // 当任务透传（Claude Code 侧没有该命令，headless 只会报未知命令错误）；改写成技能/插件
     // 命令或普通 prompt 时 handleCommand 不识别 → taskText 原样带出，文末照旧入队。
     // 本地命令原文（/stop 等）matchTrigger 直接放行返回 null，不会被劫持
-    const hit = matchTrigger(msg.text, app.triggers);
     const triggered = hit?.rewritten ?? null;
     const effectiveText = triggered ?? msg.text;
     const cmd = await handleCommand(effectiveText, {
