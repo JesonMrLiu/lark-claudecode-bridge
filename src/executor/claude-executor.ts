@@ -45,6 +45,10 @@ export interface RunTaskOptions {
   mcpServers?: Record<string, McpServerConfig>;
   /** 显式加载的本地插件目录（含 .claude-plugin/plugin.json），映射为 SDK 的 {type:'local', path} */
   plugins?: Array<{ path: string }>;
+  /** 额外 CLI 参数（键不带 -- 前缀），直通 SDK Options.extraArgs。
+   *  当前唯一用途：机器人级厂商档案的认证 settings 文件（--settings <path>）——
+   *  命令行层 env 优先级最高，不被生效目录 settings.json 的 env 块压制（Step 0 实测） */
+  extraArgs?: Record<string, string | null>;
   /** 技能白名单（分身机器人）：非空时透传 SDK Options.skills——未列出的技能对模型不可见
    *  且被 Skill 工具拒绝（官方语义为「上下文过滤器非沙箱」）；缺省不传 = CLI 默认全量技能 */
   allowedSkills?: string[];
@@ -140,6 +144,7 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
       ...(opts.plugins ? { plugins: opts.plugins.map((p) => ({ type: 'local' as const, path: p.path })) } : {}),
+      ...(opts.extraArgs && Object.keys(opts.extraArgs).length ? { extraArgs: opts.extraArgs } : {}),
     },
   });
   let finalText = '';
@@ -184,9 +189,16 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
       switch (message.type) {
         case 'system': {
           if (message.subtype === 'init') {
+            // init 即携带 session_id：全新会话在首轮 turn 结束前被 /stop 中止时不会有 result 消息，
+            // 不在此捕获则 sessionId 恒为空串 → catch 挂不上 err.sessionId → 归档 no-op，
+            // 会话指针停留 null，用户随后「继续」会开全新会话丢失上下文（resume 场景两值等价）
+            if (typeof message.session_id === 'string' && message.session_id) sessionId = message.session_id;
             inventory = {
               model: message.model,
               claudeCodeVersion: message.claude_code_version,
+              // 顶层已注册工具清单（dynamic tool loading 下核心工具在顶层、其余经 ToolSearch 按需加载，
+              // ToolSearch 索引不到顶层工具）：/status 展示与「工具不存在」误判诊断的数据源
+              tools: message.tools ?? [],
               skills: message.skills ?? [],
               slashCommands: message.slash_commands ?? [],
               plugins: (message.plugins ?? []).map((p) => ({ name: p.name, path: p.path, version: p.version })),

@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { basename, join, relative, resolve, sep } from 'node:path';
 import type {
   BridgeConfig, CardActionEvent, CardActionResponse, CardDecision, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
-  IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory,
+  IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory, TriggerRule,
 } from './types.js';
 import { CONFIG_DIR, CONFIG_PATH, DEFAULT_CONTEXT_REMIND_TOKENS, loadConfig, sameApps } from './config.js';
 import { DEFAULT_CLAUDE_DIR, initManagedClaudeDir, resolveClaudeDir } from './claude-config.js';
@@ -34,12 +34,13 @@ import {
 import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery.js';
 import { createGatewaySender, createNotifyServer, NOTIFY_SERVER_NAME } from './executor/notify-server.js';
 import { BRIDGE_MCP_JSON, readMcpServersFromJsonFile } from './web/skills-mcp-api.js';
-import { FEISHU_NOTIFY_SOP_PROMPT } from './notify-sop.js';
+import { FEISHU_NOTIFY_SOP_PROMPT, TOOL_HINT_PROMPT } from './notify-sop.js';
+import { ensureProfileSettingsFile, resolveAppProfile, resolveAppProfileModel } from './app-profile.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
 import { handleCommand, applyWorkspaceSwitch, workspaceListMarkdown } from './session/commands.js';
-import { rewriteByTrigger } from './session/triggers.js';
+import { isLocalCommandRewrite, matchTrigger, rewriteByTrigger } from './session/triggers.js';
 import { Semaphore, channelKey } from './session/channel.js';
 import { TranscriptWriter, sweepTranscripts, type TranscriptRecorder } from './transcript/transcript-writer.js';
 import { nowBeijingISO } from './util/beijing-time.js';
@@ -144,7 +145,7 @@ export function createBridge(
   config: BridgeConfig,
   app: FeishuAppConfig, // 本 bridge 绑定的飞书应用：并发/默认工作区/Claude Code 环境/人格均 per-app
   deps: BridgeDeps,
-  opts: { confirmTimeoutMs?: number; cardSendTimeoutMs?: number; reloadConfig?: () => void } = {}, // 测试可注入更短的确认等待窗 / 发卡超时 / 自定义配置重载
+  opts: { confirmTimeoutMs?: number; cardSendTimeoutMs?: number; reloadConfig?: () => string | void | null } = {}, // 测试可注入更短的确认等待窗 / 发卡超时 / 自定义配置重载（返回错误消息则聊天内显式提示）
 ): GatewayHandlers & {
   /** 测试/诊断入口：返回通道当前挂起的内嵌 plan / question requestId */
   _pendingAsk(channelKey: string): { planId?: string; questionId?: string };
@@ -221,6 +222,22 @@ export function createBridge(
   // 当前存活 query 的 MCP 状态拉取句柄（executor onQuery 注入、任务 finally 删除）：
   // /mcp 命令在任务运行中经此实时拉取；句柄随 query 结束失效，调用侧须 catch
   const activeQueries = new Map<string, { wsName: string; handle: { mcpServerStatus(): Promise<McpServerStatus[]> } }>();
+  // 触发词两段式（ask_detail）等待补充的挂起项：channelKey → 命中规则与原始消息。
+  // 命中「需补充」规则时先追问不入队；同用户下一条非 / 消息视作补充内容，与 rewrite 合并后入队。
+  // 超时（SUPPLEMENT_WAIT_MS）自动失效走原流程；任意本地命令（cmd.handled）即取消等待——
+  // /stop /new 天然是逃生口，与「本地命令永远优先」原则一致
+  const supplementPending = new Map<string, {
+    rule: TriggerRule;
+    /** 命中触发词的原始消息（合并时作为前缀，补充内容视作其参数） */
+    originalText: string;
+    userId: string;
+    at: number;
+  }>();
+  /** 补充等待窗口：超时后挂起项失效，下一条消息照常走原流程（不提示、静默过期） */
+  const SUPPLEMENT_WAIT_MS = 10 * 60_000;
+  // 配置热重载失败提示的去重标记：失败状态只在「成功 → 失败」跳变时向当前聊天提示一次，
+  // 避免配置持续损坏期间每条消息都刷屏；恢复成功后静默复位（不发恢复消息）
+  let reloadFailNotified = false;
 
   function workspacePath(name: string): string {
     return config.workspaces.find((w) => w.name === name)?.path ?? config.workspaces[0].path;
@@ -334,8 +351,21 @@ export function createBridge(
     // 每条消息先重读 access.json：lcb pair / 运行终端等独立进程批准写盘后，
     // 长存的内存实例不 reload 会查到旧白名单 → 反复发配对码且整盘覆写抹掉新用户（死循环）
     deps.access.reload();
-    // 配置热重载：lcb ws add/remove 独立进程写盘后，本实例下一条消息即读到新工作区
-    opts.reloadConfig?.();
+    // 配置热重载：lcb ws add/remove 独立进程写盘后，本实例下一条消息即读到新工作区。
+    // 读取失败沿用旧值继续跑（reloader 容错语义），但必须在用户侧显式提示——静默失败会让
+    // 「下一条消息热生效」变成「永不生效直到重启」且无从诊断。仅状态跳变时提示一次防刷屏
+    const reloadErr = opts.reloadConfig?.() ?? null;
+    if (reloadErr) {
+      console.warn('[配置热重载] 读取失败，沿用旧配置：', reloadErr);
+      if (!reloadFailNotified) {
+        reloadFailNotified = true;
+        await deps.gateway.sendTextTo(msg.chatId,
+          `⚠️ 配置热重载失败，本次沿用上次配置（修复 config.yaml 后下一条消息自动恢复）：${reloadErr}`)
+          .catch(() => { /* 提示发送失败不阻断消息循环，错误已留日志 */ });
+      }
+    } else {
+      reloadFailNotified = false;
+    }
     if (!deps.access.isAllowed(msg.userId)) {
       if (app.role === 'deputy') {
         // 分身机器人艾特即用（用户决策）：不走配对——首条消息自动补录 member（access.json
@@ -374,15 +404,34 @@ export function createBridge(
     const currentWorkspace = app.role === 'deputy'
       ? app.allowedWorkspaces![0]
       : (st?.workspaceName || app.defaultWorkspace || config.defaults.workspace);
-    // 2.5 触发词映射：必须放在本地命令之前——斜杠触发词（如 /produce）会被 handleCommand
-    // 的未知命令分支吞掉；rewriteByTrigger 对本地命令（/stop 等）直接放行，不会被劫持
-    const triggered = rewriteByTrigger(msg.text, app.triggers);
-    if (triggered !== null) {
-      await deps.gateway.sendTextTo(msg.chatId, '⚡ 已按触发词转入对应技能流程');
-      enqueue(key, msg, triggered, currentWorkspace);
+    // 2.4 触发词两段式补充（ask_detail）：上一条消息命中「需补充」规则且正在等待时，本条
+    // 非 / 消息（同一用户）视作补充内容——与原始消息拼接后对该规则重新改写：补充内容即
+    // {args}（无占位符时按既有规则自动追加），零新合并逻辑。其他用户消息 / 斜杠消息 /
+    // 超时挂起均不在此列，照常走原流程（挂起过期在下方静默清除）
+    const pendingSup = supplementPending.get(key);
+    if (pendingSup && Date.now() - pendingSup.at > SUPPLEMENT_WAIT_MS) supplementPending.delete(key);
+    const trimmedText = msg.text.trim();
+    if (pendingSup && !trimmedText.startsWith('/') && msg.userId === pendingSup.userId) {
+      supplementPending.delete(key);
+      const combined = `${pendingSup.originalText} ${trimmedText}`;
+      // ?? combined 兜底理论不可达：rule 本身按 combined 仍会命中（首 token/关键词都在）。
+      // 关键词形态的改写不含补充内容（matchTrigger 仅斜杠形态自动追加 args）——补充是本次
+      // 合并的核心增量，改写结果里没有就显式拼到末尾，绝不把用户刚给的链接/要求吞掉
+      const finalPrompt = rewriteByTrigger(combined, [pendingSup.rule]) ?? combined;
+      const merged = finalPrompt.includes(trimmedText) ? finalPrompt : `${finalPrompt} ${trimmedText}`;
+      await deps.gateway.sendTextTo(msg.chatId, '✅ 已收到补充，任务开始');
+      enqueue(key, msg, merged, currentWorkspace);
       return;
     }
-    const cmd = await handleCommand(msg.text, {
+    // 2.5 触发词映射：改写结果统一回灌 handleCommand 走同一条优先级链——rewrite 可指向
+    // bridge 本地命令（飞书菜单「新会话」→ match=新会话, rewrite=/new），此时本地执行而非
+    // 当任务透传（Claude Code 侧没有该命令，headless 只会报未知命令错误）；改写成技能/插件
+    // 命令或普通 prompt 时 handleCommand 不识别 → taskText 原样带出，文末照旧入队。
+    // 本地命令原文（/stop 等）matchTrigger 直接放行返回 null，不会被劫持
+    const hit = matchTrigger(msg.text, app.triggers);
+    const triggered = hit?.rewritten ?? null;
+    const effectiveText = triggered ?? msg.text;
+    const cmd = await handleCommand(effectiveText, {
       channelKey: key,
       store: deps.store,
       config,
@@ -416,6 +465,9 @@ export function createBridge(
       },
     });
     if (cmd.handled) {
+      // 本地命令处理即取消两段式补充等待（/stop /new 天然逃生口，见 supplementPending 定义）——
+      // 不清会让等待期后的下一条普通消息被错误当成「补充」合并入队
+      supplementPending.delete(key);
       if (cmd.card) {
         // 交互卡片命令（裸 /ws）：发卡并注册挂起项供回调切换。快照工作区清单——回调按
         // 名查找目标，配置热重载改清单不影响已发出卡片的自洽性
@@ -469,7 +521,9 @@ export function createBridge(
       // 4) 通道级权限闸 reset（spec：「本次会话不再询问」的记忆跨任务生效，直至 /new）
       // 5) 汇总已取消的排队消息数（用户能看到新建会话的真实影响面）
       // ——handleCommand 无权访问 wiring 的 runtime/pending map，统一在 wiring 侧做
-      if (/^\/new(?:\s|$)/.test(msg.text.trim())) {
+      // 以生效文本判定（触发词改写出的 /new 同样适用，如菜单「新会话」）——
+      // 否则菜单触发的新会话只清指针，排队消息/运行中任务/挂起条目全不清理，与手敲 /new 分叉
+      if (/^\/new(?:\s|$)/.test(effectiveText.trim())) {
         const rt = runtimes.get(key);
         const cancelled = rt?.queuedCount ?? 0;
         if (rt) {
@@ -499,7 +553,20 @@ export function createBridge(
       }
       return;
     }
-    // 3. 普通文本：通道内串行入队（每 key 一条 Promise 链），全局并发由 Semaphore 限制
+    // 3. 普通文本：通道内串行入队（每 key 一条 Promise 链），全局并发由 Semaphore 限制。
+    // cmd.taskText = handleCommand 未识别时原样带出的文本（触发词改写结果或原文）
+    if (triggered !== null && hit) {
+      // 两段式触发（ask_detail）：命中「需补充」规则先挂起追问、不入队——本通道同用户的
+      // 下一条非 / 消息在 2.4 被视作补充合并入队（超时 / 本地命令取消，见 supplementPending）。
+      // rewrite 指向本地命令的规则防呆跳过：/new 这类命令无参数可补，追问只会挡住命令执行
+      if (hit.rule.askDetail && !isLocalCommandRewrite(hit.rule.rewrite)) {
+        supplementPending.set(key, { rule: hit.rule, originalText: trimmedText, userId: msg.userId, at: Date.now() });
+        await deps.gateway.sendTextTo(msg.chatId,
+          `⚡ 已命中触发词「${hit.rule.match}」，请直接回复补充内容（如目标链接、具体要求），我会合并后开始任务（10 分钟内有效；发 /stop 取消）`);
+        return;
+      }
+      await deps.gateway.sendTextTo(msg.chatId, '⚡ 已按触发词转入对应技能流程');
+    }
     enqueue(key, msg, cmd.taskText ?? msg.text, currentWorkspace);
   }
 
@@ -666,6 +733,8 @@ planAsk: async (req) => {
     // SOP 开关：本任务级现读 config.session.notifySop（缺省 true），决定是否注入推送规范
     // 提示词（v2 为纯内容分类软约束；旧「>50 行转文件」硬兜底已移除，send_text 恒多卡）
     const sopEnabled = config.session?.notifySop !== false;
+    // 工具可用性说明开关（缺省 true）：对抗 dynamic tool loading 下的「核心工具不存在」自查误判
+    const toolHintEnabled = config.session?.toolHint !== false;
     const sentPaths = new Set<string>();
     const sink = async (): Promise<void> => { await activeProgress.get(key)?.sinkToBottom(); };
     const notifySender = createGatewaySender({
@@ -724,27 +793,50 @@ planAsk: async (req) => {
           if (v.includes('${')) console.warn(tag, `[env] ${k} 的值含未展开的 \${...} 引用（env 值不做变量展开），请确认是否误配`);
         }
       }
+      // 机器人级厂商档案（每任务现读解析，热生效）：认证经惰性生成的 per-bot settings 文件以
+      // CLI --settings 参数注入（命令行层优先级最高，不被生效目录 settings.json 的 env 块压制）；
+      // 模型并入 /model 优先级链走 opts.model。档案名不存在仅 warn 回退全局（档案可能后建）
+      const appProfile = resolveAppProfile(config, app);
+      if (app.profile && !appProfile) {
+        console.warn(tag, `[app-profile] 机器人 ${app.name || app.appId} 配置的厂商档案 "${app.profile}" 不存在，本任务跟随全局`);
+      }
+      const profileModel = resolveAppProfileModel(config, app);
+      let profileSettingsPath: string | undefined;
+      if (appProfile) {
+        try {
+          profileSettingsPath = ensureProfileSettingsFile(appProfile);
+        } catch (e) {
+          console.warn(tag, `[app-profile] 档案 "${appProfile.name}" 的 settings 文件生成失败，本任务认证跟随全局：`, e instanceof Error ? e.message : e);
+        }
+      }
       const outcome = await deps.executor(prompt, {
         cwd: workspacePath(wsName),
         resumeSessionId: resumeId,
         signal: abort.signal,
         env: taskEnv,
-        // 人设 + SOP 软约束：人设裸文本追加在 Claude Code 长系统提示末尾，对模型的约束力
-        // 天然偏弱（resume 旧会话时历史风格会带偏）——包一层显式遵循框架语显著改善
-        // 称谓/口吻/能力定位的遵循度（提示工程手段，非硬约束）；SOP 摘要附后
+        // 人设 + SOP + 工具说明三段软约束（各自独立，按开关参与）：人设裸文本追加在 Claude Code
+        // 长系统提示末尾，对模型的约束力天然偏弱（resume 旧会话时历史风格会带偏）——包一层
+        // 显式遵循框架语显著改善称谓/口吻/能力定位的遵循度（提示工程手段，非硬约束）
         appendSystemPrompt: (() => {
           const raw = app.appendSystemPrompt?.trim() ?? '';
           const persona = raw
             ? `【机器人人设（用户为该机器人配置，须在每一轮回复中严格遵循，优先级高于默认回复风格）】\n${raw}\n【人设结束】以上人设适用于本会话每一轮回复——包括称呼、口吻、能力定位的自我介绍；即使历史回复风格不同，也从本轮起遵循。`
             : '';
-          if (!sopEnabled) return persona || undefined;
-          return persona ? `${persona}\n\n${FEISHU_NOTIFY_SOP_PROMPT}` : FEISHU_NOTIFY_SOP_PROMPT;
+          return [
+            persona || undefined,
+            sopEnabled ? FEISHU_NOTIFY_SOP_PROMPT : undefined,
+            toolHintEnabled ? TOOL_HINT_PROMPT : undefined,
+          ].filter(Boolean).join('\n\n') || undefined;
         })(),
         // 计划模式（#6）：通道级 /plan 开关——模型先出计划（ExitPlanMode → planAsk 飞书卡片），
         // 用户批准后 SDK 自动切回可编辑模式继续执行（替代旧工作区 code-dev 类型）
         ...(state?.planMode ? { permissionMode: 'plan' as const } : {}),
-        // 通道级模型覆盖（/model 设置，每任务现读——改完下一条消息即生效）；未设 = 跟随 ~/.claude 全局
-        ...(state?.model ? { model: state.model } : {}),
+        // 模型优先级（每任务现读，改完下一条消息即生效）：通道 /model 覆盖 > 机器人档案
+        // （profile_model > 档案默认 model，经 --model 参数路由，不受 settings.json 遮蔽）>
+        // 不传（跟随生效目录 settings.json 全局配置）
+        ...(state?.model ? { model: state.model } : profileModel ? { model: profileModel } : {}),
+        // 机器人档案认证 settings 文件（--settings）：仅含认证键，命令行层压制生效目录 env
+        ...(profileSettingsPath ? { extraArgs: { settings: profileSettingsPath } } : {}),
         // 进程内通知工具（send_text/send_image/send_file）：中间产物实时推给当前聊天。
         // server 实例按任务构造，chatId 在 sender 闭包内硬绑定——模型无法选择接收者。
         // 配置页 MCP（#12）一并注入：bridge 自管 servers.json 每任务现读（热生效），notify 后展开保名
@@ -1155,30 +1247,33 @@ planAsk: async (req) => {
  * 原地 mutate 下一条消息即生效（env 变更不再要求重启）。
  * 不热应用（且不纳入 sameApps 比较）：FeishuGateway 与 Semaphore 均为启动时构造，
  * apps 凭证 / concurrency 变更无法热生效，打警告提示重启，避免「以为已生效」的坑。
- * 读失败（文件被写坏的中间态等）沿用旧值不崩。
+ * 读失败（文件被写坏的中间态等）沿用旧值不崩，并返回用户可读的错误消息（成功返回 null）——
+ * 调用方（processMessage）据此在聊天里显式提示「本次沿用旧配置」，不再静默。
  */
-export function createConfigReloader(config: BridgeConfig, configPath: string): () => void {
+export function createConfigReloader(config: BridgeConfig, configPath: string): () => string | null {
   return () => {
     let fresh: BridgeConfig;
     try {
       fresh = loadConfig(configPath);
     } catch (e) {
-      console.warn('[配置热重载] 读取失败，沿用旧配置：', e instanceof Error ? e.message : e);
-      return;
+      const message = e instanceof Error ? e.message : String(e);
+      console.warn('[配置热重载] 读取失败，沿用旧配置：', message);
+      return message;
     }
     if (!sameApps(fresh.apps, config.apps) || fresh.concurrency !== config.concurrency) {
       console.warn('[配置热重载] 检测到应用列表/凭证或 concurrency 变更，需重启后生效');
     }
-    // claude 段仅 mode/profiles 变更才需重启（CLAUDE_CONFIG_DIR 在 createBridge 构造时定妆）；
+    // claude 段仅 mode 变更才需重启（CLAUDE_CONFIG_DIR 在 createBridge 构造时定妆）；
     // env 变更热生效（每任务 buildTaskEnv 现读）不在此 warn；顶层四字段（auth_token/api_key/
     // base_url/model）变化无需重启——写入侧（配置页 PUT / use-profile / 飞书 /model-profile）
     // managed 模式下已即时 syncManagedClaude 重写托管 settings.json，下一条任务消息即生效，
-    // 此处再 warn 会误导「以为没生效」。server 段为启动时定妆照（startBridge 时监听），
-    // 运行中变更只能提示重启
+    // 此处再 warn 会误导「以为没生效」。profiles 变更同样热生效——bot 级档案每任务现读解析
+    // （app-profile.ts），全局顶层四字段亦经各写入侧即时落托管盘，此处不比较 profiles。
+    // server 段为启动时定妆照（startBridge 时监听），运行中变更只能提示重启
     const claudeRestartShape = (c: BridgeConfig['claude']) =>
-      JSON.stringify(c ? { mode: c.mode, profiles: c.profiles } : {});
+      JSON.stringify(c ? { mode: c.mode } : {});
     if (claudeRestartShape(fresh.claude) !== claudeRestartShape(config.claude)) {
-      console.warn('[配置热重载] 检测到 claude 模式 / 档案列表变更，需重启后生效');
+      console.warn('[配置热重载] 检测到 claude 认证模式变更，需重启后生效');
     }
     // claude.env 变更探测：托管盘重写要在 mutate config.claude 之前取旧值比较
     const claudeEnvChanged = JSON.stringify(fresh.claude?.env ?? {}) !== JSON.stringify(config.claude?.env ?? {});
@@ -1216,8 +1311,12 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
         config.apps[i].triggers = fa.triggers;
         config.apps[i].plugins = fa.plugins;
         config.apps[i].env = fa.env;
+        // 机器人级厂商档案热生效：executeTask 每任务经 app-profile.ts 现读解析
+        config.apps[i].profile = fa.profile;
+        config.apps[i].profileModel = fa.profileModel;
       });
     }
+    return null;
   };
 }
 

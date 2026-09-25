@@ -209,9 +209,19 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       return { handled: true, reply: ctx.stopCurrentTask() ? '🛑 已发送停止信号' : '当前没有运行中的任务' };
     case 'status': {
       const st = store.getChannelState(key);
+      const inv = ctx.getInventory();
+      // 模型三态（与 /model 查看口径一致）：通道覆盖 > 会话实测（含机器人档案 / profile_model
+      // 注入的 --model 值）> 跟随全局——bot 配了档案模型时 init.model 即该档案的模型
+      const curModel = st?.model ?? inv?.model ?? '跟随全局';
+      // 顶层已注册工具清单（init.tools）：dynamic tool loading 下核心工具在顶层、其余经 ToolSearch
+      // 按需加载（ToolSearch 索引不到顶层工具）——「Claude 自称 Read/Write 不存在」多为模型自查误判，
+      // 此行让用户直接看到核心工具确实在，与模型的说法相互印证
+      const toolsLine = inv?.tools?.length
+        ? `\n工具：${inv.tools.length} 个顶层已注册（${tail(inv.tools)}；其余按需加载，经 ToolSearch 检索）`
+        : '';
       return {
         handled: true,
-        reply: `机器人：**${ctx.appName}**\n工作区：**${st?.workspaceName || ctx.currentWorkspace()}**\n模型：**${st?.model ?? '跟随全局'}**\n计划模式：**${st?.planMode ? '开（先出方案再执行）' : '关'}**\n历史会话：${store.listSessions(key).length} 个`,
+        reply: `机器人：**${ctx.appName}**\n工作区：**${st?.workspaceName || ctx.currentWorkspace()}**\n模型：**${curModel}**\n计划模式：**${st?.planMode ? '开（先出方案再执行）' : '关'}**\n历史会话：${store.listSessions(key).length} 个${toolsLine}`,
       };
     }
     case 'plan': {

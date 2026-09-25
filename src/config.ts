@@ -20,7 +20,7 @@ function normalizeSession(doc: Record<string, unknown>): SessionConfig | undefin
   const raw = doc.session;
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== 'object') throw new Error('session 必须为对象（含 context_remind_tokens / notify_sop），请检查 config.yaml');
-  const s = raw as { context_remind_tokens?: unknown; notify_sop?: unknown };
+  const s = raw as { context_remind_tokens?: unknown; notify_sop?: unknown; tool_hint?: unknown };
   const out: SessionConfig = {};
   if (s.context_remind_tokens !== undefined && s.context_remind_tokens !== null) {
     const n = Number(s.context_remind_tokens);
@@ -35,6 +35,13 @@ function normalizeSession(doc: Record<string, unknown>): SessionConfig | undefin
       throw new Error(`session.notify_sop 必须为 boolean（true = 启用，false = 关闭；当前值：${String(s.notify_sop)}），请检查 config.yaml`);
     }
     out.notifySop = s.notify_sop;
+  }
+  // tool_hint：缺省=true（注入工具可用性说明，对抗 dynamic tool loading 自查误判），false = 关闭
+  if (s.tool_hint !== undefined && s.tool_hint !== null) {
+    if (typeof s.tool_hint !== 'boolean') {
+      throw new Error(`session.tool_hint 必须为 boolean（true = 启用，false = 关闭；当前值：${String(s.tool_hint)}），请检查 config.yaml`);
+    }
+    out.toolHint = s.tool_hint;
   }
   return out;
 }
@@ -63,9 +70,11 @@ interface RawApp {
   append_system_prompt?: string;
   claude_config_dir?: string;
   env?: Record<string, string>;
-  triggers?: Array<{ match?: string; rewrite?: string }>;
+  triggers?: Array<{ match?: string; rewrite?: string; ask_detail?: unknown }>;
   plugins?: Array<{ name?: string; path?: string }>;
   role?: string;
+  profile?: string;
+  profile_model?: string;
   allowed_skills?: unknown;
   allowed_plugins?: unknown;
   allowed_workspaces?: unknown;
@@ -93,6 +102,8 @@ function normalizeTriggers(raw: RawApp['triggers'], where: string): TriggerRule[
     if (!rewrite.includes('{text}') && !rewrite.includes('{args}')) {
       console.warn(`[配置] ${where} 的 triggers[${j}].rewrite 不含 {text} / {args} 占位符，斜杠命中时用户参数将自动追加在改写结果末尾（需精确控制位置请改用占位符）`);
     }
+    // ask_detail 两段式触发：仅 true 时写入（缺省/false 不产键，YAML 干净）；非布尔真值不认（宽松归一，误配不炸）
+    if (t?.ask_detail === true) return { match, rewrite, askDetail: true };
     return { match, rewrite };
   });
 }
@@ -236,6 +247,11 @@ function normalizeClaude(doc: Record<string, unknown>): ClaudeConfig | undefined
     const t = v.trim();
     return t ? t : undefined;
   };
+  // 模型名 1M 上下文后缀归一：统一折叠为官方小写格式 [1m]（如 glm-5.3[1M] → glm-5.3[1m]）。
+  // 顶层 model 与档案 model/models 全走此漏斗——保证 use-profile 候选集精确匹配两端一致，
+  // 折叠必须发生在 models 去重之前（否则 [1M]/[1m] 两条并存逃过去重）
+  const normModel = (s: string | undefined): string | undefined =>
+    s ? s.replace(/\[1m\]$/i, '[1m]') : s;
   const authToken = str(c.auth_token);
   const apiKey = str(c.api_key);
   if (authToken && apiKey) {
@@ -249,7 +265,7 @@ function normalizeClaude(doc: Record<string, unknown>): ClaudeConfig | undefined
   if (mode === 'managed' && !authToken && !apiKey) {
     console.warn('[配置] claude.mode = managed 但未配置 auth_token / api_key：请在 Web 配置页填写，否则 Claude 任务将无法认证');
   }
-  const model = str(c.model);
+  const model = normModel(str(c.model));
   // managed 模式显式环境变量（MCP 工具依赖的自定义变量；领土 4 键不在此生效，buildManagedSettings 入口过滤）
   const envRaw = (raw as { env?: unknown }).env;
   let env: Record<string, string> | undefined;
@@ -286,8 +302,9 @@ function normalizeClaude(doc: Record<string, unknown>): ClaudeConfig | undefined
       if (pBaseUrl && !/^https?:\/\//.test(pBaseUrl)) {
         console.warn(`[配置] ${where}（${name}）的 base_url = ${pBaseUrl} 不以 http(s):// 开头，请确认是否漏写协议`);
       }
-      const pModel = str(p.model);
-      // 候选模型集：字符串数组，trim 去空去重（页面点选切换用，不直接生效）
+      const pModel = normModel(str(p.model));
+      // 候选模型集：字符串数组，trim 去空去重（页面点选切换用，不直接生效）；
+      // 每条先经 normModel 折叠 [1m] 后缀再去重
       const pModelsRaw = p.models;
       let pModels: string[] | undefined;
       if (pModelsRaw !== undefined && pModelsRaw !== null) {
@@ -295,7 +312,7 @@ function normalizeClaude(doc: Record<string, unknown>): ClaudeConfig | undefined
         const seenModels = new Set<string>();
         for (const m of pModelsRaw) {
           if (typeof m !== 'string') throw new Error(`${where}（${name}）的 models 必须为字符串数组，请检查 config.yaml`);
-          const t = m.trim();
+          const t = normModel(m.trim());
           if (t) seenModels.add(t);
         }
         pModels = seenModels.size ? [...seenModels] : undefined;
@@ -443,6 +460,10 @@ function normalizeApps(doc: Record<string, unknown>, workspaceNames: string[]): 
       env: raw.env && typeof raw.env === 'object' ? raw.env : undefined,
       triggers: normalizeTriggers(raw.triggers, where),
       plugins: normalizePlugins(raw.plugins, where),
+      // 机器人级厂商档案：宽松归一（仅 trim）；档案名是否存在在运行期解析（app-profile.ts），
+      // 此处校验会让「先配 app 后建档案」的顺序成为非法（配置页两页独立保存）
+      profile: typeof raw.profile === 'string' && raw.profile.trim() ? raw.profile.trim() : undefined,
+      profileModel: typeof raw.profile_model === 'string' && raw.profile_model.trim() ? raw.profile_model.trim() : undefined,
       role,
       allowedSkills,
       allowedPlugins,
@@ -517,7 +538,8 @@ export function parseConfigText(raw: string, pathForError: string = CONFIG_PATH)
 }
 
 /** 热重载比较：任一 app 的凭证/名称/工作区/并发/配置目录/人格/角色能力变化即视为需重启的变更（顺序敏感）。
- *  env 不参与比较——已纳入热重载 mutate 清单，executeTask 每任务经 buildTaskEnv 现读生效。
+ *  env 与 profile/profileModel 不参与比较——均已纳入热重载 mutate 清单，executeTask 每任务
+ *  现读解析（app-profile.ts / buildTaskEnv），改完下一条消息即生效。
  *  role/allowed_* 必须参与比较：分身的准入/技能/插件/工作区锁定语义须与长连接生命周期一致，
  *  热切换会造成「gateway 还是旧 app 语义、createBridge 已按新 role 收敛」的半新半旧状态 */
 export function sameApps(a: FeishuAppConfig[], b: FeishuAppConfig[]): boolean {

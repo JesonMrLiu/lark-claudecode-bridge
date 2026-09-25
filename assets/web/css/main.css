@@ -311,6 +311,9 @@ tr.empty-row td { text-align: center; padding: 22px 10px; color: var(--muted); }
 .tag.off::before { opacity: .5; }
 .tag.warn { background: var(--warn-bg); color: var(--warn-tx); }
 .tag.err { background: var(--err-bg); color: var(--err-tx); }
+/* chip / 按钮内嵌徽标（模型 1M 标记等）：紧凑变体，去状态圆点 */
+.chip .tag, .btn .tag { font-size: 10px; padding: 1px 6px; gap: 0; }
+.chip .tag::before, .btn .tag::before { display: none; }
 
 /* ---------- 单选行 ---------- */
 .radio-row { display: flex; gap: 22px; margin: 8px 0; }

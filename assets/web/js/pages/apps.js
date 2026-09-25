@@ -81,7 +81,7 @@ function renderApps(el) {
   };
   $('#appsBody').innerHTML = apps.map((app, i) => `
     <tr data-i="${i}" style="cursor:pointer">
-      <td><b>${esc(app.name || app.app_id || '（未命名）')}</b>${app.role === 'deputy' ? ' <span class="tag off">分身</span>' : ''}</td>
+      <td><b>${esc(app.name || app.app_id || '（未命名）')}</b>${app.role === 'deputy' ? ' <span class="tag off">分身</span>' : ''}${app.profile ? ` <span class="tag warn">${esc(app.profile)}</span>` : ''}</td>
       <td><code>${esc(app.app_id || '')}</code></td>
       <td>${esc(app.domain === 'lark' ? 'lark' : 'feishu')}</td>
       <td>${esc(app.default_workspace || '（全局默认）')}</td>
@@ -108,6 +108,9 @@ function openAppDrawer(apps, idx, el, snap) {
   const secret = app.app_secret || {};
   const wsNames = (S.doc.workspaces || []).map((w) => w.name || '').filter(Boolean);
   const globalDef = S.doc.defaults?.workspace || '';
+  const profiles = (S.doc.claude && S.doc.claude.profiles) || [];
+  // 当前选中档案（drawer 打开时的初值；切换 select 时刷新模型 datalist）
+  const profileByName = (n) => profiles.find((p) => p.name === n);
   openDrawer({
     title: `应用：${app.name || app.app_id || '（新应用）'}`,
     snap: snap ?? snapDoc(),
@@ -138,6 +141,18 @@ function openAppDrawer(apps, idx, el, snap) {
         <option value="primary" ${app.role !== 'deputy' ? 'selected' : ''}>主机器人（全权限，配对码准入）</option>
         <option value="deputy" ${app.role === 'deputy' ? 'selected' : ''}>分身机器人（限定技能 / 插件 / 工作区，艾特即用）</option>
       </select>
+      <h4 style="margin:18px 0 2px;font-size:13.5px">厂商档案（该机器人专用的模型厂商；改动下一条消息热生效）</h4>
+      <div class="hint" style="margin-bottom:6px">未配置 = 跟随全局（「Claude 认证」页当前生效配置）。档案须先在「Claude 认证」页创建；认证经独立 settings 文件注入（优先级高于全局），模型经 --model 参数注入。</div>
+      <div class="row" style="align-items:end">
+        <div><label>档案</label>
+          <select data-f="profile">
+            <option value="" ${!app.profile ? 'selected' : ''}>（跟随全局）</option>
+            ${profiles.map((p) => `<option value="${esc(p.name)}" ${app.profile === p.name ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}
+          </select></div>
+        <div id="profileModelBox" style="flex:1;${app.profile ? '' : 'display:none'}"><label>模型（从该档案候选中选择；留空 = 档案默认模型）</label>
+          <input type="text" data-f="profile_model" list="profileModelList" value="${esc(app.profile_model || '')}" placeholder="留空 = 档案默认模型">
+          <datalist id="profileModelList"></datalist></div>
+      </div>
       <div id="deputyFields" style="${app.role === 'deputy' ? '' : 'display:none'}">
         <div class="hint" style="margin:8px 0 2px">分身必填「允许的技能」与「允许的工作区」；未列入白名单的技能 / 插件不加载，任务锁定在第一个允许的工作区；管理命令在分身里一律不可用。改动需重启生效。</div>
         <label>允许的技能（必填；输入关键词搜索选择，未列出的技能对模型不可见）</label>
@@ -149,14 +164,16 @@ function openAppDrawer(apps, idx, el, snap) {
       </div>
       <label>人格补充（追加到该机器人每个会话的 system prompt，多机器人差异化定位）<span class="tag warn" style="margin-left:6px">改动需重启生效</span></label>
       <textarea data-f="append_system_prompt" placeholder="你是我的超级助手，擅长代码开发、文案编写…（回复须带「主人」称谓等要求写在这里）">${esc(app.append_system_prompt || '')}</textarea>
-      <h4 style="margin:18px 0 2px;font-size:13.5px">触发词（命中即改写消息后再发给 Claude；下一条消息热生效）</h4>
-      <div class="hint" style="margin-bottom:6px">match 以 <code>/</code> 开头 = 消息首词精确匹配，否则 = 关键词包含；rewrite 可用 <code>{text}</code>=原文全文、<code>{args}</code>=首词后的参数；本地命令（/stop 等）不受影响；按序首个命中生效。</div>
-      <table><thead><tr><th style="width:42%">match</th><th>rewrite</th><th style="width:44px"></th></tr></thead><tbody data-list="triggers"></tbody></table>
+      <h4 style="margin:18px 0 2px;font-size:13.5px">触发词（命中即改写消息；rewrite 指向本地命令时由 bridge 执行、其余照旧入队；下一条消息热生效）</h4>
+      <div class="hint" style="margin-bottom:6px">match：以 <code>/</code> 开头 或 关键词 = 消息首词精确匹配;</br>rewrite：可用 <code>{text}</code>=原文全文、<code>{args}</code>=首词后的参数；</br>补充追问：命中先追问补充内容，你的下一条消息与原文合并后再改写入队（斜杠 / 等命令消息除外）。</br>PS. 可指向 bridge 本地命令（如 match=新会话、rewrite=/new，飞书菜单场景常用——bridge 本地执行，不透传给 Claude Code）；本地命令原文（/stop 等）不被劫持；按序首个命中生效。</div>
+      <table><thead><tr><th style="width:38%">match</th><th>rewrite</th><th style="width:76px" title="开启后命中先追问补充内容，下一条消息与原文合并再执行（两段式触发）">追问补充</th><th style="width:44px"></th></tr></thead><tbody data-list="triggers"></tbody></table>
       <button class="btn sm" data-add="triggers" style="margin-top:6px">+ 添加规则</button>
+      <!-- 飞书应用级插件 -->
       <h4 style="margin:18px 0 2px;font-size:13.5px">显式插件（本地插件源码目录；同名优先于 ~/.claude 自动发现；热生效）</h4>
       <div class="hint" style="margin-bottom:6px">须为包含 <code>.claude-plugin/plugin.json</code> 的目录；一般用户无须配置，多用于开发期直指源码。</div>
       <table><thead><tr><th style="width:30%">name</th><th>path</th><th style="width:44px"></th></tr></thead><tbody data-list="plugins"></tbody></table>
       <button class="btn sm" data-add="plugins" style="margin-top:6px">+ 添加插件</button>
+      
       <h4 style="margin:18px 0 2px;font-size:13.5px">环境变量（注入该机器人 Claude 子进程，覆盖本机同名值；改动需重启生效）</h4>
       <div class="hint" style="margin-bottom:6px">~/.claude/settings.json 已配置的键会被 CLI 自身应用且优先，无须在此重复。</div>
       <table><thead><tr><th style="width:38%">KEY</th><th>VALUE</th><th style="width:44px"></th></tr></thead><tbody data-list="env"></tbody></table>
@@ -192,6 +209,18 @@ function openAppDrawer(apps, idx, el, snap) {
         else delete app.role;
         deputyFields.style.display = roleSel.value === 'deputy' ? '' : 'none';
       });
+      // ---- 厂商档案：切换 select 联动「模型覆盖」框显隐 + datalist（所选档案的候选模型 + 默认模型） ----
+      // 通用 [data-f] 绑定负责赋值/删键，此处只管联动展示；模型值是否在候选集内由后端运行期 warn
+      const profileSel = body.querySelector('[data-f="profile"]');
+      const profileModelBox = body.querySelector('#profileModelBox');
+      const fillProfileModels = () => {
+        const prof = profileByName(profileSel.value);
+        const list = prof ? [...(prof.models || []), ...(prof.model && !(prof.models || []).includes(prof.model) ? [prof.model] : [])] : [];
+        body.querySelector('#profileModelList').innerHTML = list.map((m) => `<option value="${esc(m)}"></option>`).join('');
+        profileModelBox.style.display = profileSel.value ? '' : 'none';
+      };
+      profileSel.addEventListener('change', fillProfileModels);
+      fillProfileModels();
       // ---- 分身白名单（可搜索多选）：onChange 实时写回 app——空数组删键，语义与旧 textarea 一致 ----
       const mselInst = {};
       for (const f of ['allowed_skills', 'allowed_workspaces', 'allowed_plugins']) {
@@ -221,7 +250,7 @@ function openAppDrawer(apps, idx, el, snap) {
       });
       // ---- 触发词 / 显式插件：数组行编辑，实时写回 ----
       const LIST_DEFS = {
-        triggers: { key: 'triggers', cols: [['match', '/produce 或 关键词'], ['rewrite', '请执行内容生产流程：{args}']] },
+        triggers: { key: 'triggers', cols: [['match', '/produce 或 关键词'], ['rewrite', '请执行内容生产流程：{args}']], check: ['ask_detail', '补充'] },
         plugins: { key: 'plugins', cols: [['name', 'my-plugin'], ['path', 'F:/dev/my-plugin']] },
       };
       const renderPairList = (name) => {
@@ -231,10 +260,19 @@ function openAppDrawer(apps, idx, el, snap) {
         tb.innerHTML = list.map((item, i) => `
           <tr>
             ${def.cols.map(([col, ph]) => `<td><input type="text" data-l="${i}" data-c="${col}" value="${esc(item?.[col] ?? '')}" placeholder="${esc(ph)}"></td>`).join('')}
+            ${def.check ? `<td style="text-align:center;vertical-align:middle"><label class="switch" title="开启后命中先追问补充内容，下一条消息与原文合并再执行（两段式触发）"><input type="checkbox" data-l="${i}" data-ck="${def.check[0]}" ${item?.[def.check[0]] === true ? 'checked' : ''}><span class="track"></span></label></td>` : ''}
             <td><button class="btn sm danger" data-rm="${i}">删除</button></td>
           </tr>`).join('');
-        tb.querySelectorAll('input[data-l]').forEach((input) => input.oninput = () => {
-          app[def.key][Number(input.dataset.l)][input.dataset.c] = input.value;
+        tb.querySelectorAll('input[data-l]').forEach((input) => {
+          if (input.dataset.ck) { // 勾选列：未勾即删键，与后端「仅 true 时写入」语义一致（YAML 干净）
+            input.onchange = () => {
+              const row = app[def.key][Number(input.dataset.l)];
+              if (input.checked) row[input.dataset.ck] = true;
+              else delete row[input.dataset.ck];
+            };
+            return;
+          }
+          input.oninput = () => { app[def.key][Number(input.dataset.l)][input.dataset.c] = input.value; };
         });
         tb.querySelectorAll('button[data-rm]').forEach((b) => b.onclick = () => {
           app[def.key].splice(Number(b.dataset.rm), 1);
@@ -309,6 +347,8 @@ function openAppDrawer(apps, idx, el, snap) {
           if (filtered.length) app[def.key] = filtered;
           else delete app[def.key];
         }
+        // 档案未选时清掉残留的模型覆盖（profile_model 依附于 profile 存在）
+        if (!app.profile) delete app.profile_model;
         if (await saveDoc()) closeDrawer();
       };
     },

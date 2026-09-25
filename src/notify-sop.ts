@@ -25,3 +25,14 @@ export const FEISHU_NOTIFY_SOP_PROMPT = `【飞书推送规范（lcb-notify 三�
 
 send_file 严限：仅用户明确要求文件本体、或二进制类无法卡片化（zip 等）时使用；
 文本类内容一律 send_text（自动 ~3000 字/块分多卡，无长度限制）。`;
+
+/**
+ * 工具可用性说明（session.toolHint，缺省注入）：对抗 Claude Code 2.1.117+ dynamic tool loading
+ * 下的模型自查误判——核心工具保留在顶层直接可用，其余 defer 进 ToolSearch 注册表按需加载，
+ * 而 ToolSearch 索引不到顶层工具；第三方模型（GLM 等）用 ToolSearch 验证"我有哪些工具"时
+ * 搜不到 Read/Bash 便声称工具缺失（anthropics/claude-code#52004 同源现象）。
+ */
+export const TOOL_HINT_PROMPT = `【工具可用性说明】
+- Read / Write / Edit / Bash / Glob / Grep 等核心内置工具在本会话始终直接可用，直接调用即可，无需检索确认。
+- 部分低频工具经 ToolSearch 按需加载——在工具注册表（ToolSearch）里搜不到某个核心工具 ≠ 该工具不存在（索引只覆盖按需加载的部分）。
+- 被问及"你有哪些工具 / 某工具是否存在"时按上述事实回答，不要因检索无结果而声称核心工具缺失；仅当调用实际返回错误时才如实报告该错误。`;

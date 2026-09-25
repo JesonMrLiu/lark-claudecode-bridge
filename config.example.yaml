@@ -15,13 +15,19 @@ apps:
     # env:                    # per-app 环境变量（改后下一条消息热生效；注意：生效目录 settings.json
     #                           的 env 优先级更高，此处适合放 settings.json 里没有的键）
     #   SOME_PLUGIN_KEY: xxx
-    # triggers:               # 触发词映射：命中即把消息改写为 rewrite 再入队（按序首个命中生效）。
+    # triggers:               # 触发词映射：命中即把消息改写为 rewrite（按序首个命中生效）。
     #                          # 通常无须配置：未命中触发词的 /xxx 消息会原文透传给 Claude Code
     #                          自动展开斜杠命令（可触发 skills / 插件命令，如 /superpowers:brainstorming）；
     #                          仅在需要改写参数/附加指令时才配触发词。
     #                          match 以 / 开头 = 首 token 精确匹配（/produce 命中、/produced 不命中），
     #                          否则 = 整条消息包含该关键词即命中；{text}=原文全文，{args}=去掉首 token 的剩余参数。
-    #                          /stop /new /help 等本地命令永远优先，不会被劫持。改动写盘后下一条消息即热生效。
+    #                          rewrite 可指向 bridge 本地命令（/new /ws /reload-plugins 等，飞书菜单
+    #                          场景常用：match=新会话, rewrite=/new）——由 bridge 本地执行，不透传给
+    #                          Claude Code；也可指向技能/插件命令或普通指令（照旧当任务入队）。
+    #                          /stop /new /help 等本地命令原文永远优先，不会被劫持。改动写盘后下一条消息即热生效。
+    #                          ask_detail: true = 两段式触发（配置页触发词「补充」勾选列）：命中先追问
+    #                          补充内容，用户下一条消息（非 / 命令）与原文合并后再改写入队——适合
+    #                          「必须带参数才好执行」的技能；10 分钟无补充自动失效走原流程。
     #   - match: /produce
     #     rewrite: '调用 content-producer 插件的主技能（skills/content-producer/SKILL.md）执行内容生产流程，严格遵循其编排。任务参数：{args}'
     #   - match: 写文章
@@ -31,6 +37,12 @@ apps:
     #                          与自动发现同名时显式优先。插件的 MCP/hooks 随之加载。
     #   - name: content-producer
     #     path: F:/workspace/plugins/content-producer/plugin
+    # profile: GLM             # 机器人级厂商档案（引用 claude.profiles[].name，档案先在「Claude 认证」
+    #                          # 页创建）：配置后该机器人专用该档案的认证与模型，未配置跟随全局。
+    #                          # 认证经独立 settings 文件以 CLI --settings 注入（优先级高于生效目录
+    #                          # settings.json 的 env 块）；改动下一条消息热生效（无须重启）
+    # profile_model: glm-5.3[1m]  # 可选模型覆盖：取该档案候选模型之一（含 [1m] 1M 上下文后缀），
+    #                          # 留空 = 档案默认模型。优先级：通道 /model 命令 > 此处 > 档案默认 > 全局
   # - name: 素材收集           # 再添一个机器人：复制上面的结构即可（会话池独立，配置共享 ~/.claude）
   #   app_id: cli_yyyy
   #   app_secret: yyyy

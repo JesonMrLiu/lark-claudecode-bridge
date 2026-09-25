@@ -49,9 +49,9 @@ lcb start
 配置页随桥接器常驻 `http://127.0.0.1:17317`（也可 `lcb ui` 单独启动，写盘后运行中的桥接器自动拾取可热字段）。共 9 个配置页签：
 
 - **概览** —— 桥接器进程启停 / 重启 / 后台运行、版本检查与一键更新、各机器人应用运行状态。
-- **飞书应用** —— 多机器人管理：App ID / Secret（脱敏回显）、默认工作区、并发上限、人格补充（`append_system_prompt`）、触发词、环境变量。
+- **飞书应用** —— 多机器人管理：App ID / Secret（脱敏回显）、默认工作区、并发上限、人格补充（`append_system_prompt`）、触发词、环境变量、**机器人级厂商档案**（`profile` / `profile_model`：该机器人专用某套档案的认证与模型，未配置跟随全局，改动热生效）。
 - **工作区** —— 工作区白名单（名称 / 路径）与全局默认工作区，改动热生效。
-- **Claude 认证** —— inherit / managed 双模式切换、认证凭证（API Key / Auth Token / Base URL）、模型、厂商档案（多套凭证一键切换）、托管环境变量。
+- **Claude 认证** —— inherit / managed 双模式切换、认证凭证（API Key / Auth Token / Base URL）、模型、厂商档案（多套凭证一键切换；候选模型可标记 `[1m]` 1M 上下文后缀，如 `glm-5.3[1m]`）、托管环境变量。
 - **权限** —— 全部工具免确认开关（`permissions.allow_all_tools`，缺省开）、免确认工具白名单（`permissions.allow_tools`）与危险命令黑名单，保存后热生效。
 - **斜杠命令** —— 把内置命令（`/new` `/status` …）+ 自定义透传命令一键同步为飞书输入框斜杠指令（输入 `/` 弹面板，选中后可继续输入描述再发送）。
 - **插件** —— Claude Code 插件清单（启停 / 卸载，本机 `~/.claude` 与托管目录带来源标记）、从 marketplace 安装、管理市场。
@@ -201,7 +201,7 @@ MCP server 配置（`.mcp.json` / `~/.claude.json` / 插件 `plugin.json` 的 `m
 ## 已知限制
 
 1. **Linux 上 &gt;10 文件不打 zip**：文件打包依赖 bsdtar 的 zip 容器支持（Windows 10+ / macOS 自带），Linux 的 GNU tar 会自动退化为逐个上传文件（功能不丢，只是消息条数多）。
-2. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` / `claude.env` 的同名键会被生效目录 `settings.json` 的 `env` 覆盖（inherit = 本机 `~/.claude`，managed = 托管目录；见「MCP 环境变量」小节）。
+2. **共享 ~/.claude 的副作用**：本机 user 级 hooks 也会在机器人任务里执行（含阻断型 PostToolUse hook）；`apps[].env` / `claude.env` 的同名键会被生效目录 `settings.json` 的 `env` 覆盖（inherit = 本机 `~/.claude`，managed = 托管目录；见「MCP 环境变量」小节）。例外：机器人级厂商档案（`apps[].profile`）的认证三键经独立 settings 文件以 CLI `--settings` 参数注入（命令行层优先级最高，不受此压制）；模型经 `--model` 参数路由。
 3. **多机器人总并发 = 各应用并发之和**：N 个机器人同时满载时会同时跑 Σ(concurrency) 个 Claude Code 子进程，机器吃紧可按 app 调低。
 4. **配置页默认仅本机可访问**（127.0.0.1）：改 `server.host` 放开到局域网意味着页面可读写全部凭证，请仅在可信网络使用。
 

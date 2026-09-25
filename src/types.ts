@@ -1,6 +1,8 @@
 // src/types.ts 全量内容（本任务一次性写齐）
-/** 触发词规则：match 命中后把消息改写为 rewrite 再入队（{text}=原文全文，{args}=去首 token 的剩余参数） */
-export interface TriggerRule { match: string; rewrite: string }
+/** 触发词规则：match 命中后把消息改写为 rewrite 再入队（{text}=原文全文，{args}=去首 token 的剩余参数）；
+ *  askDetail=true（配置 ask_detail）为两段式触发：命中先追问补充内容，用户下一条消息与 rewrite
+ *  合并后再入队（合并语义：补充内容视作原始消息的参数，占位符替换 / 无占位符追加规则不变） */
+export interface TriggerRule { match: string; rewrite: string; askDetail?: boolean }
 /** 显式加载的本地插件（path 指含 .claude-plugin/plugin.json 的插件目录） */
 export interface PluginRef { name: string; path: string }
 export interface FeishuAppConfig {
@@ -28,6 +30,14 @@ export interface FeishuAppConfig {
   /** 机器人角色：primary（缺省，主机器人——全技能/全插件/全工作区，配对码准入）；
    *  deputy（分身——按用途限定能力，艾特即用，供他人使用）。存量配置未配 role 行为不变 */
   role?: 'primary' | 'deputy';
+  /** 机器人级厂商档案（引用 claude.profiles[].name）：配置后该机器人的认证（token/key/base_url）
+   *  与模型改用该档案，未配置/档案不存在时跟随全局。每任务现读解析（热生效，改完下一条消息即生效）；
+   *  认证经惰性生成的 per-bot settings 文件以 CLI --settings 参数注入（命令行层优先级最高，
+   *  不被生效目录 settings.json 的 env 块压制）；模型经 SDK Options.model（--model）路由 */
+  profile?: string;
+  /** 档案级模型覆盖：取值应在该档案 models 候选集内（或即档案默认模型）；未配置 = 用档案默认 model。
+   *  优先级：通道 /model 命令 > profileModel > 档案 model > 全局 */
+  profileModel?: string;
   /** deputy 专用：技能白名单（必填，透传 SDK Options.skills）——未列出的技能对模型不可见
    *  且被 Skill 工具拒绝。注意 SDK 官方语义是「上下文过滤器非沙箱」：技能文件仍在磁盘、
    *  可被 Read/Bash 读到，硬隔离需配合工具级限制（本期按用户决策不做） */
@@ -138,6 +148,9 @@ export interface SessionConfig {
   contextRemindTokens?: number;
   /** 飞书推送规范化（#11）：启用时 SOP 提示词注入 appendSystemPrompt（软约束）+ notify-server 硬兜底。缺省 true */
   notifySop?: boolean;
+  /** 工具可用性说明注入 appendSystemPrompt（软约束）：对抗 Claude Code 2.1.117+ dynamic tool loading
+   *  下模型用 ToolSearch 自查时误判「Read/Write 等核心工具不存在」。缺省 true */
+  toolHint?: boolean;
 }
 export interface IncomingMessage {
   chatId: string; chatType: 'p2p' | 'group'; userId: string; text: string; messageId: string;
@@ -208,6 +221,10 @@ export type ProgressEvent =
 export interface SessionInventory {
   model: string;
   claudeCodeVersion: string;
+  /** 顶层已注册工具清单（init 消息 tools 字段）。dynamic tool loading 下核心工具在顶层、
+   *  其余经 ToolSearch 按需加载——本清单是「Claude 自称某工具不存在」误判的诊断依据。
+   *  可选：旧快照（inventory 落盘/缓存）无此键 */
+  tools?: string[];
   skills: string[];
   slashCommands: string[];
   plugins: Array<{ name: string; version?: string; path: string }>;

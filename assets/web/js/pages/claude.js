@@ -2,6 +2,19 @@
 import { S, $, esc, toast, api, snapDoc, saveDoc, cardDirty, applyDirty, refresh } from '../core.js';
 import { openDrawer, closeDrawer, cancelDrawer, saveBarHtml, dirtyDotHtml, bindSaveBar, confirmDialog } from '../ui.js';
 
+/** 模型名 1M 上下文标记解析（纯函数，可测）：'glm-5.3[1m]' → { name:'glm-5.3', tag:'1M' }；后缀大小写不敏感（后端归一为小写 [1m]） */
+export function splitModelTag(m) {
+  const s = String(m || '');
+  const mm = s.match(/^(.*?)\s*\[1m\]$/i);
+  return mm ? { name: mm[1], tag: '1M' } : { name: s, tag: '' };
+}
+
+/** 勾选 1M 时拼接官方小写后缀 [1m]（Claude Code 1M 上下文模型格式）；输入已带后缀时幂等 */
+export function withModelTag(name, on) {
+  const base = splitModelTag(name).name;
+  return on ? `${base}[1m]` : base;
+}
+
 /** 模型拉取公共逻辑：getBody() 组请求体（凭证仅携带本次输入的明文，空则不带给后端回落磁盘值） */
 async function pullModels(getBody, btn, datalistId) {
   btn.disabled = true;
@@ -32,7 +45,7 @@ function renderClaude(el) {
     <table>
       <tr><td style="width:150px">认证模式</td><td>${mode === 'managed' ? 'bridge 托管（managed）' : '继承本机 ~/.claude（inherit）'}</td></tr>
       <tr><td>BASE_URL</td><td>${cur.baseUrl ? `<code>${esc(cur.baseUrl)}</code>` : '<span class="hint">官方默认（api.anthropic.com）</span>'}</td></tr>
-      <tr><td>模型</td><td>${cur.model ? `<code>${esc(cur.model)}</code>` : '<span class="hint">未设置（CLI 默认）</span>'}</td></tr>
+      <tr><td>模型</td><td>${(() => { const { name, tag } = splitModelTag(cur.model || ''); return cur.model ? `<code>${esc(name)}</code>${tag ? ' <span class="tag ok">1M 上下文</span>' : ''}` : '<span class="hint">未设置（CLI 默认）</span>'; })()}</td></tr>
       <tr><td>Auth Token</td><td>${hint(cur.authToken)}</td></tr>
       <tr><td>API Key</td><td>${hint(cur.apiKey)}</td></tr>
       <tr><td>自定义环境变量</td><td>${cur.envCount ? `${cur.envCount} 个（写入托管 settings.json env 块，MCP 工具可用）` : '<span class="hint">无</span>'}</td></tr>
@@ -160,7 +173,10 @@ function renderClaude(el) {
     };
     const modelChips = (p, active, i) => {
       const list = [...(p.models || []), ...(p.model && !(p.models || []).includes(p.model) ? [p.model] : [])];
-      return list.map((m) => `<button class="btn sm${active && cur.model === m ? ' primary' : ''}" data-op="usemodel" data-i="${i}" data-m="${esc(m)}" title="点击切换为当前模型">${esc(m)}${active && cur.model === m ? ' ✓' : ''}</button>`).join(' ')
+      return list.map((m) => {
+        const { name, tag } = splitModelTag(m);
+        return `<button class="btn sm${active && cur.model === m ? ' primary' : ''}" data-op="usemodel" data-i="${i}" data-m="${esc(m)}" title="点击切换为当前模型">${esc(name)}${tag ? ' <span class="tag ok">1M</span>' : ''}${active && cur.model === m ? ' ✓' : ''}</button>`;
+      }).join(' ')
         || '<span class="hint">—</span>';
     };
     body.innerHTML = c.profiles.map((p, i) => {
@@ -238,12 +254,14 @@ function openProfileDrawer(c, i, el, snap) {
       <input type="text" id="dwPfBase" value="${esc(p.base_url || '')}" placeholder="https://relay.example.com">
       <h4 style="margin:18px 0 4px;font-size:13.5px">候选模型（fable / opus / sonnet / haiku 等，各存一条；列表页点击即切换当前模型）</h4>
       <div class="chips" id="dwPfModels"></div>
-      <div class="row" style="align-items:end;max-width:600px">
+      <div class="row" style="align-items:end;max-width:640px">
         <div style="flex:1"><input type="text" id="dwPfNewModel" list="dwPfModelList" placeholder="输入或下拉选择后点「添加」">
           <datalist id="dwPfModelList"></datalist></div>
+        <label style="display:flex;align-items:center;gap:4px;white-space:nowrap;padding-bottom:6px"><input type="checkbox" id="dwPfModel1M"> 1M 上下文</label>
         <div class="btn-wrap"><button class="btn" id="dwPfAddModel">添加</button></div>
         <div class="btn-wrap"><button class="btn" id="dwPfPull">拉取模型</button></div>
       </div>
+      <div class="hint" style="margin-top:6px">勾选「1M 上下文」添加的模型名带 <code>[1m]</code> 后缀（Claude Code 官方 1M 上下文格式，切换后写入 ANTHROPIC_MODEL）；勾选前请确认厂商支持 1M 上下文。</div>
       <div class="row" style="align-items:end;margin-top:12px;max-width:600px">
         <div style="flex:1"><label>默认模型（点「设为当前」时使用，通常为候选之一）</label>
           <input type="text" id="dwPfModel" list="dwPfModelsList" value="${esc(p.model || '')}" placeholder="留空 = 切换时不指定">
@@ -272,8 +290,10 @@ function openProfileDrawer(c, i, el, snap) {
         if (models.length) p.models = [...models];
         else delete p.models;
         const box = document.getElementById('dwPfModels');
-        box.innerHTML = models.map((m, mi) =>
-          `<span class="chip">${esc(m)}<button type="button" data-rm="${mi}" title="移除">×</button></span>`).join('')
+        box.innerHTML = models.map((m, mi) => {
+          const { name, tag } = splitModelTag(m);
+          return `<span class="chip">${esc(name)}${tag ? '<span class="tag ok" style="margin-left:4px">1M</span>' : ''}<button type="button" data-rm="${mi}" title="移除">×</button></span>`;
+        }).join('')
           || '<span class="hint">尚无候选模型（不影响使用，可随时添加）</span>';
         box.querySelectorAll('button[data-rm]').forEach((b) => b.onclick = () => {
           models.splice(Number(b.dataset.rm), 1);
@@ -284,10 +304,14 @@ function openProfileDrawer(c, i, el, snap) {
       syncModels();
       const addModel = () => {
         const inp = document.getElementById('dwPfNewModel');
+        const cb = document.getElementById('dwPfModel1M');
         const v = inp.value.trim();
         if (!v) return;
-        if (!models.includes(v)) models.push(v);
+        // 勾选 1M：拼官方 [1m] 后缀（输入已带后缀时幂等）；添加后自动取消勾选
+        const full = withModelTag(v, cb.checked);
+        if (!models.includes(full)) models.push(full);
         inp.value = '';
+        cb.checked = false;
         syncModels();
       };
       document.getElementById('dwPfAddModel').onclick = addModel;
