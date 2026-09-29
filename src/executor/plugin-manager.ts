@@ -4,7 +4,7 @@
 // 环境仅白名单透传 + CLAUDE_CONFIG_DIR：插件装到 bridge 解析的配置目录（managed 模式与 ~/.claude 隔离）
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { listAvailablePlugins, listInstalledPlugins } from './plugin-discovery.js';
+import { hasRemoteMarketplaces, listAvailablePlugins, listInstalledPlugins } from './plugin-discovery.js';
 
 /** 平台二进制包候选（与 sdk.mjs 解析序一致：linux 优先 musl 变体；win32 带 .exe） */
 function cliCandidates(): string[] {
@@ -108,6 +108,58 @@ export interface PluginUpdateAllResult extends PluginCliResult {
 
 /** 单插件 update 的超时：比 install 略紧（通常只拉一个小仓库，不含完整 marketplace clone） */
 const UPDATE_TIMEOUT_MS = 3 * 60 * 1000;
+
+/** 市场索引刷新结果（GET /api/plugins?refresh=1 附带；失败降级不阻断列表返回） */
+export interface MarketplaceRefreshResult {
+  refreshed: boolean;
+  reason?: 'no-remote' | 'throttled';
+  warning?: string;
+}
+
+/** 只拉清单远快于 install；卡死也不拖垮页面加载（双目录并行刷新时单目录上限） */
+const MARKETPLACE_REFRESH_TIMEOUT_MS = 45_000;
+/** 节流窗：开页即检测新版本，但 5 分钟内不重复 spawn（失败也记时，防网络故障下每次开页都白等；force 绕过） */
+const MARKETPLACE_REFRESH_THROTTLE_MS = 5 * 60 * 1000;
+const mpRefreshAt = new Map<string, number>();
+const mpRefreshInflight = new Map<string, Promise<MarketplaceRefreshResult>>();
+
+/**
+ * 刷新市场索引（仅 marketplace update 拉最新清单，绝不升级已装插件——与 updateAllPlugins
+ * 语义刻意区分，供插件页「检测远程新版本」使用）。远程市场的清单被 CLI clone 物化在
+ * plugins/marketplaces/ 下，不刷新就永远显示旧版本（本地 directory/file 市场读原路径实时，
+ * 无须刷新）。无远程市场的目录直接跳过省一次 spawn；节流窗内跳过；并发共用同一 in-flight；
+ * 失败/超时/CLI 缺失返回 warning 不抛——调用方仍返回本地清单数据。
+ */
+export async function refreshMarketplaceIndex(
+  claudeConfigDir: string,
+  opts: { force?: boolean } = {},
+): Promise<MarketplaceRefreshResult> {
+  if (!hasRemoteMarketplaces(claudeConfigDir)) return { refreshed: false, reason: 'no-remote' };
+  const running = mpRefreshInflight.get(claudeConfigDir);
+  if (running) return running;
+  if (!opts.force && Date.now() - (mpRefreshAt.get(claudeConfigDir) ?? 0) < MARKETPLACE_REFRESH_THROTTLE_MS) {
+    return { refreshed: false, reason: 'throttled' };
+  }
+  const p = (async (): Promise<MarketplaceRefreshResult> => {
+    try {
+      const r = await runPluginCli(['marketplace', 'update'], {
+        claudeConfigDir,
+        timeoutMs: MARKETPLACE_REFRESH_TIMEOUT_MS,
+      });
+      return r.ok
+        ? { refreshed: true }
+        : { refreshed: false, warning: `市场索引刷新失败：${tail(r.text, 200)}` };
+    } catch (e) {
+      // resolveBundledCliPath 缺失等同步抛错也会落到这里（async 函数内同步抛 = rejected）
+      return { refreshed: false, warning: `市场索引刷新异常：${e instanceof Error ? e.message : String(e)}` };
+    } finally {
+      // 失败也记节流时间戳：网络故障下不会每次开页都重等 45s；手动 force 是即时重试出口
+      mpRefreshAt.set(claudeConfigDir, Date.now());
+    }
+  })().finally(() => mpRefreshInflight.delete(claudeConfigDir));
+  mpRefreshInflight.set(claudeConfigDir, p);
+  return p;
+}
 
 /**
  * 「全部更新」：先刷新市场索引（marketplace update），再逐个更新已装插件

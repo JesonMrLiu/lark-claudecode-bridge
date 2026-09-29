@@ -27,7 +27,7 @@ import { DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMAND_SOURCES } from '../
 import { openBrowser } from '../util/open-browser.js';
 import { ensureRuntimeDirs } from '../util/runtime-dirs.js';
 import { builtinCommands, createSlashApiClient, ensureBuiltins, expectedCommands, syncSlashCommands } from '../feishu/slash-commands.js';
-import { removeMarketplaceIfUnused, resolvePluginMarketplace, runPluginCli, updateAllPlugins } from '../executor/plugin-manager.js';
+import { refreshMarketplaceIndex, removeMarketplaceIfUnused, resolvePluginMarketplace, runPluginCli, updateAllPlugins } from '../executor/plugin-manager.js';
 import { invalidatePluginCache, listAvailablePlugins, listInstalledPlugins, loadEnabledPlugins } from '../executor/plugin-discovery.js';
 import { bridgeStatus, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDetached, stopBridgeByPid } from './lifecycle.js';
 import { getAutostartStatus, setAutostartEnabled } from './autostart.js';
@@ -482,6 +482,19 @@ async function handle(
     const userDir = DEFAULT_CLAUDE_DIR;
     const sameDir = bridgeDir === userDir;
     if (path === '/api/plugins' && req.method === 'GET') {
+      // ?refresh=1：先刷新远程市场索引再读清单（只拉最新版本号，绝不升级已装插件——
+      // 升级仍走单行「更新」/「全部更新」）。插件页开页即带此参；节流与失败降级在
+      // refreshMarketplaceIndex 内部（无远程市场零 spawn；失败仅收集 warning，列表照常返回）
+      const refreshWarnings: string[] = [];
+      if (url.searchParams.get('refresh') === '1') {
+        const force = url.searchParams.get('force') === '1';
+        const dirs = sameDir ? [bridgeDir] : [bridgeDir, userDir];
+        const rs = await Promise.all(dirs.map((d) =>
+          refreshMarketplaceIndex(d, { force }).catch((e) => ({
+            refreshed: false, warning: `市场索引刷新异常：${e instanceof Error ? e.message : String(e)}`,
+          }))));
+        for (const r of rs) if (r.warning) refreshWarnings.push(r.warning);
+      }
       // 市场清单里的最新可装版本，附到已装插件上（前端「0.7.0 → 0.7.1」有新版提示）；
       // 优先按 name@marketplace 精确匹配，市场名对不上时退化按插件名（提示性质，宁多勿漏）
       const from = (dir: string, source: 'bridge' | 'user') => {
@@ -504,6 +517,7 @@ async function handle(
         userDir,
         // inherit 模式两目录相同 → 单份（source=user）；managed 合并两处各自可启停
         plugins: sameDir ? from(bridgeDir, 'user') : [...from(bridgeDir, 'bridge'), ...from(userDir, 'user')],
+        ...(refreshWarnings.length ? { refreshWarning: refreshWarnings.join('；') } : {}),
       });
     }
     if (path === '/api/plugins/available' && req.method === 'GET') {

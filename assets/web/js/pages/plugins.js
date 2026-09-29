@@ -8,10 +8,10 @@ let comboHideBound = false;
 async function renderPlugins(el) {
   el.innerHTML = `
   <div class="card">
-    <h3>Claude Code 插件</h3>
-    <div class="desc">两处目录的已启用插件都会自动加载（managed 托管目录优先）：本机 <code>~/.claude</code>（来源「本机」，与本机 claude CLI 共用）与 bridge 托管目录 <code id="pluginDir">…</code>。装好后下一条消息自动加载。飞书端同样可用 <code>/plugin install xxx@marketplace</code>（仅管理员）。</div>
+    <h3>Claude Code 插件 <button class="btn sm" id="plCheckUpdate" style="margin-left:8px">检查更新</button></h3>
+    <div class="desc">两处目录的已启用插件都会自动加载（managed 托管目录优先）：本机 <code>~/.claude</code>（来源「本机」，与本机 claude CLI 共用）与 bridge 托管目录 <code id="pluginDir">…</code>。装好后下一条消息自动加载。飞书端同样可用 <code>/plugin install xxx@marketplace</code>（仅管理员）。打开页面自动检查远程市场新版本（5 分钟内不重复，只检测不升级，升级点单行「更新」）。</div>
     <table><thead><tr><th>插件</th><th>市场</th><th>来源</th><th>版本</th><th style="width:90px">状态</th><th style="width:250px">操作</th></tr></thead>
-    <tbody id="plBody"><tr><td colspan="6" class="hint">加载中…</td></tr></tbody></table>
+    <tbody id="plBody"><tr><td colspan="6" class="hint">加载中…（首次含远程市场索引检查，可能需数十秒）</td></tr></tbody></table>
   </div>
   <div class="card">
     <h3>安装 / 市场</h3>
@@ -54,15 +54,18 @@ async function renderPlugins(el) {
     'marketplace-add': '添加中…', 'marketplace-remove': '移除中…', enable: '处理中…', disable: '处理中…',
   };
   const opNames = { install: '安装', uninstall: '卸载', update: '更新', 'update-all': '全部更新', 'marketplace-add': '添加市场', 'marketplace-remove': '移除市场', enable: '启用', disable: '停用' };
-  const load = async () => {
+  // force=true（手动「检查更新」）绕过 5 分钟节流立即刷新远程市场索引；开页自动检测传空。
+  // 刷新只拉最新版本号不升级插件本体；失败后端降级返回本地数据并附 refreshWarning
+  const load = async (force) => {
     try {
-      const r = await api('GET', '/api/plugins');
+      const r = await api('GET', `/api/plugins?refresh=1${force ? '&force=1' : ''}`);
+      if (r.refreshWarning) toast(`远程市场索引刷新失败（版本号可能滞后）：${r.refreshWarning}`, true);
       installed = r.plugins || [];
       $('#pluginDir').textContent = r.configDir;
       const body = $('#plBody');
       if (!installed.length) {
         body.innerHTML = '<tr><td colspan="6" class="hint">尚未安装任何插件</td></tr>';
-        return;
+        return true;
       }
       body.innerHTML = installed.map((p) => `
         <tr>
@@ -100,9 +103,11 @@ async function renderPlugins(el) {
         if (op === 'enable' || op === 'disable') act(op, arg, dir, b);
         else runOpDialog(op, arg, dir, b);
       });
+      return true;
     } catch (e) {
       installed = [];
       $('#plBody').innerHTML = `<tr><td colspan="6" class="hint">加载失败：${esc(e.message)}</td></tr>`;
+      return false;
     }
   };
   /** 轻量操作（enable/disable 亚秒级）：按钮瞬时 loading + toast，不弹框 */
@@ -279,6 +284,23 @@ async function renderPlugins(el) {
     runOpDialog('install', selectedInstall, $('#plDir').value, $('#plDoInstall'));
   };
   $('#plDir').onchange = loadAvailable; // 安装目标目录切换 → 可装清单随之变化
+  // 手动「检查更新」：force 绕过节流立即刷新远程市场索引，汇总提示有新版的插件数
+  //（只检测新版本号，升级仍由用户逐个点「更新」/「全部更新」）
+  $('#plCheckUpdate').onclick = async () => {
+    const btn = $('#plCheckUpdate');
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '检查中…';
+    try {
+      const ok = await load(true);
+      if (!ok) return; // 加载失败已在表格内提示，不再误报「全部最新」
+      const n = installed.filter((p) => p.latestVersion).length;
+      toast(n ? `${n} 个插件有新版本（见列表「→ 版本」标注，逐个点「更新」升级）` : '已检查：所有插件均为最新版本');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  };
   $('#plDoMarketAdd').onclick = () => {
     const v = $('#plMarket').value.trim();
     if (!v) return toast('请填写 marketplace git 地址或本机路径', true);

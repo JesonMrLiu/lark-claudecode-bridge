@@ -304,6 +304,7 @@ tr.empty-row td { text-align: center; padding: 22px 10px; color: var(--muted); }
 .tag {
   display: inline-flex; align-items: center; gap: 5px;
   padding: 2px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 500;
+  white-space: nowrap; /* 状态标签（如「未随本页启动」）不折行 */
 }
 .tag::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: 0 0 auto; }
 .tag.ok { background: var(--ok-bg); color: var(--ok-tx); }
@@ -458,8 +459,8 @@ body.drawer-resizing { cursor: ew-resize; user-select: none; }
 .msel:focus-within { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-ring); }
 .msel-chips { margin: 4px 0; }
 .msel-chips:empty { display: none; }
-.msel-input { border: 0; background: none; box-shadow: none; width: 100%; padding: 6px 2px; font-size: 13.5px; }
-.msel-input:focus { border: 0; box-shadow: none; } /* 覆盖全局 input:focus（焦点态由 .msel:focus-within 呈现） */
+.msel .msel-input { border: 0; background: none; box-shadow: none; width: 100%; padding: 6px 2px; font-size: 13.5px; }
+.msel .msel-input:focus { border: 0; box-shadow: none; } /* 覆盖全局 input:focus（焦点态由 .msel:focus-within 呈现）；带 .msel 前缀提特异性，防被 input[type=text] (0,1,1) 压制 */
 .combo-item.active { background: var(--primary-weak); } /* 键盘高亮（:hover 已有） */
 .msel-check { float: right; color: var(--primary); font-weight: 650; }
 .chip.ghost { border-style: dashed; color: var(--muted); }

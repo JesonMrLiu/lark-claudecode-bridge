@@ -141,6 +141,22 @@ export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真
   transcript?: TranscriptRecorder;
 }
 
+// ENABLE_TOOL_SEARCH 显式开启会加剧核心工具 defer 进 ToolSearch（开场工具清单更不完整），
+// 第三方模型（GLM 等）更易误判「没有 Bash/Skill」而拒绝执行。启动预检 warn-once（每 app 一次；
+// 检测合并后的任务 env，覆盖 claude.env / app.env / 系统环境变量三个来源）
+const toolSearchWarned = new Set<string>();
+function warnIfToolSearchEnabled(appName: string, env: Record<string, string | undefined>): void {
+  if (toolSearchWarned.has(appName)) return;
+  const v = env.ENABLE_TOOL_SEARCH;
+  if (v !== undefined && String(v).toLowerCase() === 'true') {
+    toolSearchWarned.add(appName);
+    console.warn(
+      `[app:${appName}] 任务环境变量 ENABLE_TOOL_SEARCH=true：核心工具（Bash/Read/Skill 等）会被延迟注册，`
+      + '模型可能声称没有工具而拒绝执行；如无必要请在 claude.env / 应用环境变量 / 系统环境变量中移除该键',
+    );
+  }
+}
+
 export function createBridge(
   config: BridgeConfig,
   app: FeishuAppConfig, // 本 bridge 绑定的飞书应用：并发/默认工作区/Claude Code 环境/人格均 per-app
@@ -161,10 +177,12 @@ export function createBridge(
   const claudeDir = resolveClaudeDir(config);
   // 启动预检：认证来源全落空（env 无 token、配置目录无登录态）时提前 warn，
   // 免得用户配好机器人才发现每条消息都报 Not logged in（真判定仍在 CLI 侧）
-  warnIfNoClaudeAuth(app.name, buildTaskEnv(config, app, claudeDir), claudeDir, {
+  const precheckEnv = buildTaskEnv(config, app, claudeDir);
+  warnIfNoClaudeAuth(app.name, precheckEnv, claudeDir, {
     managed: config.claude?.mode === 'managed',
     serverUrl: serverUrl(config),
   });
+  warnIfToolSearchEnabled(app.name, precheckEnv);
   // 会话清单缓存（SDK init 消息）：按工作区键存——project 级 .mcp.json/skills 随工作区不同，
   // 任一通道跑过一次该工作区即可供 /skills /plugins /mcp /model 渲染。进程内存，重启后清空
   const inventories = new Map<string, SessionInventory>();

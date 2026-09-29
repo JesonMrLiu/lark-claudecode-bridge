@@ -144,11 +144,13 @@ async function runUpdateFlow() {
 export function larkCliStatHtml(r) {
   if (!r) return '<span class="hint">未检查</span>';
   if (!r.installed) return '<span class="tag off">未安装</span>';
-  // authorized 之外一律呈现为「未授权」（含探测不出的 unknown）：UI 不留没有出口的状态，
-  // 两种情况都能点授权按钮。detail 悬浮可见（unknown 现已带诊断线索），便于自查。
+  // authorized 之外一律呈现为可点授权按钮的警示态（含探测不出的 unknown）：UI 不留没有出口的状态。
+  // expired 单列（曾授权但 refresh token 失效）：与「从未授权」区分，detail 悬浮带原因与过期日期。
   const authTag = r.auth?.state === 'authorized'
     ? '<span class="tag ok">已授权</span>'
-    : `<span class="tag warn"${r.auth?.detail ? ` title="${esc(r.auth.detail)}"` : ''}>未授权</span>`;
+    : r.auth?.state === 'expired'
+      ? `<span class="tag warn"${r.auth?.detail ? ` title="${esc(r.auth.detail)}"` : ''}>已过期</span>`
+      : `<span class="tag warn"${r.auth?.detail ? ` title="${esc(r.auth.detail)}"` : ''}>未授权</span>`;
   // skill 字段为旧后端所无（undefined 时不显示），与 auth 解耦展示
   const skillTag = r.skill
     ? (r.skill.installed ? '<span class="tag ok">SKILL</span>' : '<span class="tag warn">SKILL 未装</span>')
@@ -166,7 +168,7 @@ export function larkCliStatHtml(r) {
  * 探测不出（unknown）**不**算未配置：误判会把已配好应用的用户反复推去重配，按「扫码授权」处理。
  */
 export function larkCliPrimaryLabel(r) {
-  if (r?.auth?.state === 'authorized') return '重新授权';
+  if (r?.auth?.state === 'authorized' || r?.auth?.state === 'expired') return '重新授权';
   return larkNotConfigured(r) ? '配置应用' : '扫码授权';
 }
 
@@ -497,14 +499,6 @@ export const page = {
           <tr><td>状态</td><td id="larkCliStat"><span class="hint">检测中…</span></td></tr>
         </table>
       </div>
-    </div>
-    <div class="card">
-      <h3>机器人应用</h3>
-      <table><thead><tr><th>名称</th><th>App ID</th><th>状态</th></tr></thead><tbody>
-      ${(st.apps || []).map((a) => `<tr><td>${esc(a.name)}</td><td><code>${esc(a.appId)}</code></td><td>${
-        a.started === true ? '<span class="tag ok">运行中</span>' : a.started === false ? '<span class="tag err">启动失败</span>' : '<span class="tag off">未随本页启动</span>'
-      }</td></tr>`).join('') || '<tr><td colspan="3" class="hint">无</td></tr>'}
-      </tbody></table>
     </div>
     <div class="card">
       <h3>常用命令</h3>

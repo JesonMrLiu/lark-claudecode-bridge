@@ -28,11 +28,13 @@ send_file 严限：仅用户明确要求文件本体、或二进制类无法卡�
 
 /**
  * 工具可用性说明（session.toolHint，缺省注入）：对抗 Claude Code 2.1.117+ dynamic tool loading
- * 下的模型自查误判——核心工具保留在顶层直接可用，其余 defer 进 ToolSearch 注册表按需加载，
- * 而 ToolSearch 索引不到顶层工具；第三方模型（GLM 等）用 ToolSearch 验证"我有哪些工具"时
- * 搜不到 Read/Bash 便声称工具缺失（anthropics/claude-code#52004 同源现象）。
+ * 下的模型自查误判——工具按会话/首轮上下文动态注册，开场系统提示列出的工具清单可能只有少数几个
+ * （实测出现过仅 ToolSearch/WebSearch/WebFetch 三个），Bash/Read/Skill 等被按需 defer；
+ * 第三方模型（GLM 等）据开场清单或 ToolSearch 检索断言"没有 Bash/Read/Skill 工具"并拒绝执行
+ * （如查考勤依赖 Bash 跑 lark-cli 被拒）。覆盖两个误判维度：开场清单未列出 ≠ 不可用；
+ * ToolSearch 检索不到 ≠ 不存在（anthropics/claude-code#52004 同源现象）。
  */
 export const TOOL_HINT_PROMPT = `【工具可用性说明】
-- Read / Write / Edit / Bash / Glob / Grep 等核心内置工具在本会话始终直接可用，直接调用即可，无需检索确认。
-- 部分低频工具经 ToolSearch 按需加载——在工具注册表（ToolSearch）里搜不到某个核心工具 ≠ 该工具不存在（索引只覆盖按需加载的部分）。
-- 被问及"你有哪些工具 / 某工具是否存在"时按上述事实回答，不要因检索无结果而声称核心工具缺失；仅当调用实际返回错误时才如实报告该错误。`;
+- Bash / Read / Write / Edit / Glob / Grep / Skill 等核心工具在本会话始终直接可用。系统提示开场的工具清单并不完整（运行环境按需加载注册），某工具「未被列出」或「ToolSearch 搜不到」都 ≠ 它不存在——直接调用即可，无需检索确认。
+- 需要执行命令、读写文件、查数据等任务时直接调用对应工具完成，绝不要以「我没有某工具 / 工具未提供」为由拒绝执行或只给口头做法。
+- 仅当工具调用实际返回错误时，才如实报告该错误。`;

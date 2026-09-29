@@ -358,7 +358,7 @@ export async function checkLarkCliAtStartup(deps: Partial<StartupCheckDeps> = {}
 
 // ============ 授权状态探测 ============
 
-export type LarkCliAuthState = 'authorized' | 'unauthorized' | 'unknown';
+export type LarkCliAuthState = 'authorized' | 'unauthorized' | 'unknown' | 'expired';
 
 export interface LarkCliAuthStatus {
   state: LarkCliAuthState;
@@ -435,7 +435,20 @@ function parseIdentities(v: unknown): LarkCliAuthStatus | undefined {
   }
   const u = user as Record<string, unknown>;
   if (str(u.status) === 'ready') return { state: 'authorized', identity: pickIdentity(u) };
-  return { state: 'unauthorized', detail: str(u.status) ?? str(u.message) ?? '用户身份未就绪' };
+  // 实测（2026-09）：refresh token 失效后 status="missing"、tokenStatus="expired"、
+  // message 含 "refresh token expired"——用户曾授权过，与「从未授权」必须区分展示
+  const msg = str(u.message);
+  if (str(u.tokenStatus) === 'expired' || (msg && /expired/i.test(msg))) {
+    const when = str(u.refreshExpiresAt)?.slice(0, 10); // "2026-09-24T22:41:56+08:00" → 日期段
+    return {
+      state: 'expired',
+      detail: when
+        ? `用户授权已于 ${when} 过期（refresh token 失效），请重新扫码授权`
+        : '用户授权已过期（refresh token 失效），请重新扫码授权',
+    };
+  }
+  // 其余非 ready：message 比 status 枚举（missing 等）有信息量，优先展示
+  return { state: 'unauthorized', detail: msg ?? str(u.status) ?? '用户身份未就绪' };
 }
 
 /**
@@ -900,7 +913,9 @@ async function runLarkCliDeviceFinish(s: DeviceSession, deps: LarkCliDeviceDeps)
     }
     // gen 失配 = 已被新一轮取代 → 丢弃结果，绝不污染新会话
     if (deviceSession?.gen !== s.gen) return;
-    const authAfter = raw.code === 0 ? await deps.checkAuth().catch(() => undefined) : undefined;
+    // 无论退出码都复核：auth login --device-code 成功后也可能以退出码 3 结束（auth 子命令的惯例），
+    // 跳过复核会把实际成功的授权误报成失败——正向补救判据（decideDeviceFinishOutcome）依赖 authAfter
+    const authAfter = await deps.checkAuth().catch(() => undefined);
     const out = decideDeviceFinishOutcome({
       exitCode: raw.code, stdout: raw.stdout, stderr: raw.stderr,
       wasAuthorized: s.wasAuthorized, authAfter,

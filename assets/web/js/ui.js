@@ -426,3 +426,109 @@ export function multiSelectField({ mount, options = [], value = [], placeholder 
     destroy() { mselLive.delete(inst); root.remove(); },
   };
 }
+
+/**
+ * 可搜索单选字段（应用抽屉「档案模型」等，Select2 单选形态）：收起态当前值直接显示在
+ * 输入框内；聚焦即进入过滤态（清空输入露出 placeholder、面板全量展开，选中项以 ✓ 标记
+ * ——单选不做"已选值额外加 chip"，避免与面板 ✓ 重复展示）。清除手势 = 聚焦后空输入退格。
+ * 值只能来自候选 options；初始 value 不在候选中的遗留值以虚线 ghost chip 展示（chip 是
+ * 遗留值唯一展示处）、可点 × 清除。事件边界与 multiSelectField 同款：
+ * mousedown+preventDefault 防失焦竞态、ESC 面板开时仅关面板（stopPropagation 防误关抽屉）、
+ * Enter/方向键在过滤结果内导航（Enter 选中即收起——单选无连续选取场景）。
+ *
+ * @returns {{root: Element, setValue(v: string): void, setOptions(list: Array, emptyText?: string): void, destroy(): void}}
+ */
+export function singleSelectField({ mount, options = [], value = '', placeholder = '', emptyText = '暂无可选项', onChange = () => {} }) {
+  ensureMselDocListener();
+  const root = document.createElement('div');
+  root.className = 'msel';
+  root.innerHTML = `
+    <div class="chips msel-chips"></div>
+    <input type="text" class="msel-input" placeholder="${esc(placeholder)}" autocomplete="off">
+    <div class="combo-panel msel-panel" hidden></div>`;
+  mount.appendChild(root);
+  const chipsBox = root.querySelector('.msel-chips');
+  const input = root.querySelector('.msel-input');
+  const panel = root.querySelector('.msel-panel');
+  let opts = options.slice();
+  let emptyTextCur = emptyText;
+  let selected = String(value || '');
+  let highlight = 0;
+  let inputAsFilter = false; // false = input 显示的是选中值（展示态）；true = 用户输入的过滤词
+
+  // 展示态渲染：非 ghost 已选值不渲染 chip（面板 ✓ 是唯一选中标记），值回显进输入框；
+  // ghost 遗留值（不在候选）以虚线 chip 展示——那是它唯一展示处。过滤中不动输入框。
+  const renderDisplay = () => {
+    const ghost = !!selected && !opts.some((o) => o.value === selected);
+    if (ghost) {
+      chipsBox.innerHTML = `<span class="chip ghost" title="已不在候选列表，可点击 × 清除">${esc(selected)}<button type="button" aria-label="清除">×</button></span>`;
+      chipsBox.querySelector('button').onclick = () => { selected = ''; emit(); };
+    } else chipsBox.innerHTML = '';
+    if (!inputAsFilter) input.value = ghost ? '' : (selected ? (opts.find((o) => o.value === selected)?.label || selected) : '');
+  };
+  const paintPanel = () => {
+    if (!opts.length) { panel.innerHTML = `<div class="combo-empty">${esc(emptyTextCur)}</div>`; return; }
+    const { list, truncated } = filterMselOptions(opts, input.value);
+    if (!list.length) { panel.innerHTML = '<div class="combo-empty">无匹配项</div>'; return; }
+    panel.innerHTML = list.map((o, i) => `
+      <div class="combo-item${i === highlight ? ' active' : ''}" data-val="${esc(o.value)}">
+        <b>${esc(o.label || o.value)}</b>${o.tag ? ` <span class="tag off"${o.tagTitle ? ` title="${esc(o.tagTitle)}"` : ''}>${esc(o.tag)}</span>` : ''}${o.value === selected ? '<span class="msel-check">✓</span>' : ''}
+        ${o.desc ? `<div class="hint">${esc(o.desc)}</div>` : ''}
+      </div>`).join('')
+      + (truncated ? '<div class="combo-empty">仅显示前 50 项，继续输入缩小范围</div>' : '');
+    panel.querySelectorAll('.combo-item').forEach((el) => {
+      el.addEventListener('mousedown', (e) => { e.preventDefault(); pick(el.dataset.val); });
+    });
+  };
+  const showPanel = () => { if (panel.hidden) panel.hidden = false; paintPanel(); };
+  // 统一收口：ESC / pick / 外点三路关面板都在此恢复展示态（回显选中值、丢掉未确认的过滤词）
+  const hidePanel = () => { panel.hidden = true; inputAsFilter = false; renderDisplay(); };
+  const pick = (v) => { selected = v; hidePanel(); emit(); };
+  const emit = () => { renderDisplay(); if (!panel.hidden) paintPanel(); onChange(selected); };
+
+  input.addEventListener('focus', () => {
+    inputAsFilter = false;
+    input.value = ''; // 程序化清空不触发 input 事件，placeholder 露出作搜索提示
+    highlight = 0;    // 过滤列表将由收窄变全量，残留索引会让 Enter 选错项
+    showPanel();
+  });
+  // pick/ESC 收起后焦点仍留在 input 上，再点击不触发 focus——补一条重开路径（与 focus 幂等同款）
+  input.addEventListener('click', () => {
+    if (panel.hidden) { inputAsFilter = false; input.value = ''; highlight = 0; showPanel(); }
+  });
+  input.addEventListener('input', () => { inputAsFilter = true; highlight = 0; showPanel(); });
+  input.addEventListener('keydown', (e) => {
+    // 面板开时 ESC 只关面板：阻止冒泡到 document 的抽屉关闭监听（面板已关则放行，符合直觉）
+    if (e.key === 'Escape' && !panel.hidden) { e.stopPropagation(); hidePanel(); return; }
+    // 空输入框退格 = 清除已选（回空 = 跟随默认），与多选「删最后一个 chip」同直觉
+    if (e.key === 'Backspace' && !input.value && selected) { e.preventDefault(); selected = ''; emit(); return; }
+    if (!opts.length) return;
+    const { list } = filterMselOptions(opts, input.value);
+    if (!list.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      highlight = panel.hidden ? 0 : (highlight + (e.key === 'ArrowDown' ? 1 : -1) + list.length) % list.length;
+      showPanel();
+      panel.querySelector('.combo-item.active')?.scrollIntoView({ block: 'nearest' });
+    } else if (e.key === 'Enter' && !panel.hidden) {
+      e.preventDefault();
+      pick(list[highlight]?.value ?? list[0].value); // 选中即收起：单选无连续选取
+    }
+  });
+
+  const inst = { root, hidePanel };
+  mselLive.add(inst);
+  renderDisplay();
+  return {
+    root,
+    // 静默设值：不触发 onChange（切档案联动清空等程序化操作用，用户交互才走 onChange）
+    setValue(v) { selected = String(v || ''); renderDisplay(); },
+    setOptions(list, nextEmptyText) {
+      opts = list.slice();
+      if (nextEmptyText !== undefined) emptyTextCur = nextEmptyText;
+      renderDisplay(); // ghost 态随候选变化
+      if (!panel.hidden) paintPanel();
+    },
+    destroy() { mselLive.delete(inst); root.remove(); },
+  };
+}

@@ -212,6 +212,29 @@ export function listAvailablePlugins(claudeConfigDir: string): MarketplaceCatalo
   return out;
 }
 
+/**
+ * 该目录是否注册了会物化副本的远程市场（github/git/url）：决定 marketplace update 是否值得跑。
+ * 判定：
+ * 1. known_marketplaces.json 任一条目 source 非 directory/file → true（未知 source 类型按远程处理，宁刷勿漏）；
+ * 2. 兜底：plugins/marketplaces 下存在子目录（远程市场 clone 的痕迹，登记表缺失/旧版 CLI 场景）→ true。
+ * 本地 directory/file 市场读原路径实时生效无须刷新——这正是「本地插件升级立即可见、远程仍显旧版本」的根源。
+ */
+export function hasRemoteMarketplaces(claudeConfigDir: string): boolean {
+  const known = readJson<KnownMarketplacesDoc>(join(claudeConfigDir, 'plugins', 'known_marketplaces.json'));
+  if (known.ok) {
+    for (const info of Object.values(known.doc)) {
+      const sourceType = info?.source?.source;
+      if (sourceType !== 'directory' && sourceType !== 'file') return true;
+    }
+  }
+  try {
+    return readdirSync(join(claudeConfigDir, 'plugins', 'marketplaces'), { withFileTypes: true })
+      .some((e) => e.isDirectory());
+  } catch {
+    return false; // 市场根目录不存在 = 未添加过任何远程市场
+  }
+}
+
 function parseInstalled(dir: string, installedPath: string, settingsPath: string): DiscoveredPlugin[] {
   const installed = readJson<InstalledPluginsDoc>(installedPath);
   if (!installed.ok) {

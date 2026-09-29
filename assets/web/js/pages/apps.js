@@ -1,6 +1,6 @@
 // ============ 应用（列表 + 抽屉编辑；输入实时写回 S.doc.apps，抽屉「保存」一次落盘） ============
 import { S, $, esc, toast, api, snapDoc, saveDoc } from '../core.js';
-import { openDrawer, closeDrawer, cancelDrawer, confirmDialog, multiSelectField } from '../ui.js';
+import { openDrawer, closeDrawer, cancelDrawer, confirmDialog, multiSelectField, singleSelectField } from '../ui.js';
 
 // ---- 分身白名单多选候选（/api/skills + /api/plugins；60s TTL + in-flight 去重 + stale-if-error） ----
 /** 纯函数（可测）：技能清单 → 多选候选。插件来源 value 用 `plugin:skill` 限定格式
@@ -38,6 +38,20 @@ export function toPluginOptions(plugins) {
   return out;
 }
 
+/** 纯函数（可测）：档案 → 模型单选候选（models ∪ 默认 model 去重，默认模型带 tag 便于辨认）。
+ *  空档案（未配置任何模型）返回空数组，由组件展示 emptyText */
+export function toProfileModelOptions(prof) {
+  if (!prof) return [];
+  const seen = new Set();
+  const models = [];
+  for (const m of [...(prof.models || []), ...(prof.model ? [prof.model] : [])]) {
+    if (seen.has(m)) continue;
+    seen.add(m);
+    models.push(m);
+  }
+  return models.map((m) => ({ value: m, tag: m === prof.model ? '默认' : '' }));
+}
+
 const CAND = { at: 0, skills: null, plugins: null, skillsError: '', pluginsError: '', inflight: null };
 const CAND_TTL = 60_000;
 /** 拉候选（失败时保留旧缓存继续用；全新失败返回 error 字段，组件空候选但已选值不受影响） */
@@ -63,15 +77,15 @@ function renderApps(el) {
   el.innerHTML = `
   <div class="card">
     <h3>飞书应用（机器人）</h3>
-    <div class="desc">每个应用一条独立长连接与会话池。点击行或「编辑」在抽屉中配置；App Secret 已脱敏，留空 = 保持不变。凭证 / 名称 / 域名 / 默认工作区 / 并发 / 人格 / 角色改动需重启 lcb start；触发词、显式插件与环境变量改动下一条消息热生效。</div>
+    <div class="desc">每个应用一条独立长连接与会话池。点击行或「编辑」在抽屉中配置；App Secret 已脱敏，留空 = 保持不变。凭证 / 名称 / 域名 / 默认工作区 / 并发 / 人格 / 角色改动需重启 lcb start；触发词与环境变量改动下一条消息热生效。</div>
     <div class="list-toolbar">
       <button class="btn primary" id="addApp">+ 新增应用</button>
     </div>
     <table>
-      <thead><tr><th>名称</th><th>App ID</th><th style="width:80px">域名</th><th>默认工作区</th><th style="width:110px">状态</th><th style="width:64px"></th></tr></thead>
+      <thead><tr><th>名称</th><th>App ID</th><th style="width:130px">域名</th><th>默认工作区</th><th style="width:130px">状态</th><th style="width:64px"></th></tr></thead>
       <tbody id="appsBody"></tbody>
     </table>
-    <div class="footer-note">⚠️ 应用段改动需重启 lcb start 后生效（触发词 / 显式插件除外，下一条消息自动生效）。</div>
+    <div class="footer-note">⚠️ 应用段改动需重启 lcb start 后生效（触发词与环境变量除外，下一条消息自动生效）。</div>
   </div>`;
   const statusTag = (app) => {
     const st = S.status?.apps?.find((s) => s.name === (app.name || app.app_id))?.started;
@@ -79,15 +93,22 @@ function renderApps(el) {
       : st === false ? '<span class="tag err">启动失败</span>'
       : '<span class="tag off">未随本页启动</span>';
   };
-  $('#appsBody').innerHTML = apps.map((app, i) => `
+  // 该应用实际启用的模型：profile_model 覆盖优先，其次档案默认 model（与后端 resolveAppProfileModel 展示口径一致）
+  const profiles = (S.doc.claude && S.doc.claude.profiles) || [];
+  const profileModelOf = (app) =>
+    app.profile_model || (profiles.find((p) => p.name === app.profile)?.model || '');
+  $('#appsBody').innerHTML = apps.map((app, i) => {
+    const model = profileModelOf(app);
+    return `
     <tr data-i="${i}" style="cursor:pointer">
-      <td><b>${esc(app.name || app.app_id || '（未命名）')}</b>${app.role === 'deputy' ? ' <span class="tag off">分身</span>' : ''}${app.profile ? ` <span class="tag warn">${esc(app.profile)}</span>` : ''}</td>
+      <td><b>${esc(app.name || app.app_id || '（未命名）')}</b>${app.role === 'deputy' ? ' <span class="tag off">分身</span>' : ''}${app.profile ? ` <span class="tag warn">${esc(model ? `${app.profile} · ${model}` : app.profile)}</span>` : ''}</td>
       <td><code>${esc(app.app_id || '')}</code></td>
-      <td>${esc(app.domain === 'lark' ? 'lark' : 'feishu')}</td>
+      <td>${esc(app.domain === 'lark' ? 'lark（国际）' : 'feishu（国内）')}</td>
       <td>${esc(app.default_workspace || '（全局默认）')}</td>
       <td>${statusTag(app)}</td>
       <td><button class="btn sm">编辑</button></td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   $('#appsBody').querySelectorAll('tr').forEach((tr) =>
     tr.onclick = () => openAppDrawer(apps, Number(tr.dataset.i), el));
   $('#addApp').onclick = () => {
@@ -141,7 +162,7 @@ function openAppDrawer(apps, idx, el, snap) {
         <option value="primary" ${app.role !== 'deputy' ? 'selected' : ''}>主机器人（全权限，配对码准入）</option>
         <option value="deputy" ${app.role === 'deputy' ? 'selected' : ''}>分身机器人（限定技能 / 插件 / 工作区，艾特即用）</option>
       </select>
-      <h4 style="margin:18px 0 2px;font-size:13.5px">厂商档案（该机器人专用的模型厂商；改动下一条消息热生效）</h4>
+      <h4 style="margin:18px 0 2px;font-size:13.5px">模型配置（该机器人专用的模型厂商与模型；改动下一条消息热生效）</h4>
       <div class="hint" style="margin-bottom:6px">未配置 = 跟随全局（「Claude 认证」页当前生效配置）。档案须先在「Claude 认证」页创建；认证经独立 settings 文件注入（优先级高于全局），模型经 --model 参数注入。</div>
       <div class="row" style="align-items:end">
         <div><label>档案</label>
@@ -150,8 +171,7 @@ function openAppDrawer(apps, idx, el, snap) {
             ${profiles.map((p) => `<option value="${esc(p.name)}" ${app.profile === p.name ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}
           </select></div>
         <div id="profileModelBox" style="flex:1;${app.profile ? '' : 'display:none'}"><label>模型（从该档案候选中选择；留空 = 档案默认模型）</label>
-          <input type="text" data-f="profile_model" list="profileModelList" value="${esc(app.profile_model || '')}" placeholder="留空 = 档案默认模型">
-          <datalist id="profileModelList"></datalist></div>
+          <div id="profileModelMount"></div></div>
       </div>
       <div id="deputyFields" style="${app.role === 'deputy' ? '' : 'display:none'}">
         <div class="hint" style="margin:8px 0 2px">分身必填「允许的技能」与「允许的工作区」；未列入白名单的技能 / 插件不加载，任务锁定在第一个允许的工作区；管理命令在分身里一律不可用。改动需重启生效。</div>
@@ -168,12 +188,6 @@ function openAppDrawer(apps, idx, el, snap) {
       <div class="hint" style="margin-bottom:6px">match：以 <code>/</code> 开头 或 关键词 = 消息首词精确匹配;</br>rewrite：可用 <code>{text}</code>=原文全文、<code>{args}</code>=首词后的参数；</br>补充追问：命中先追问补充内容，你的下一条消息与原文合并后再改写入队（斜杠 / 等命令消息除外）。</br>PS. 可指向 bridge 本地命令（如 match=新会话、rewrite=/new，飞书菜单场景常用——bridge 本地执行，不透传给 Claude Code）；本地命令原文（/stop 等）不被劫持；按序首个命中生效。</div>
       <table><thead><tr><th style="width:38%">match</th><th>rewrite</th><th style="width:76px" title="开启后命中先追问补充内容，下一条消息与原文合并再执行（两段式触发）">追问补充</th><th style="width:44px"></th></tr></thead><tbody data-list="triggers"></tbody></table>
       <button class="btn sm" data-add="triggers" style="margin-top:6px">+ 添加规则</button>
-      <!-- 飞书应用级插件 -->
-      <h4 style="margin:18px 0 2px;font-size:13.5px">显式插件（本地插件源码目录；同名优先于 ~/.claude 自动发现；热生效）</h4>
-      <div class="hint" style="margin-bottom:6px">须为包含 <code>.claude-plugin/plugin.json</code> 的目录；一般用户无须配置，多用于开发期直指源码。</div>
-      <table><thead><tr><th style="width:30%">name</th><th>path</th><th style="width:44px"></th></tr></thead><tbody data-list="plugins"></tbody></table>
-      <button class="btn sm" data-add="plugins" style="margin-top:6px">+ 添加插件</button>
-      
       <h4 style="margin:18px 0 2px;font-size:13.5px">环境变量（注入该机器人 Claude 子进程，覆盖本机同名值；改动需重启生效）</h4>
       <div class="hint" style="margin-bottom:6px">~/.claude/settings.json 已配置的键会被 CLI 自身应用且优先，无须在此重复。</div>
       <table><thead><tr><th style="width:38%">KEY</th><th>VALUE</th><th style="width:44px"></th></tr></thead><tbody data-list="env"></tbody></table>
@@ -209,18 +223,30 @@ function openAppDrawer(apps, idx, el, snap) {
         else delete app.role;
         deputyFields.style.display = roleSel.value === 'deputy' ? '' : 'none';
       });
-      // ---- 厂商档案：切换 select 联动「模型覆盖」框显隐 + datalist（所选档案的候选模型 + 默认模型） ----
-      // 通用 [data-f] 绑定负责赋值/删键，此处只管联动展示；模型值是否在候选集内由后端运行期 warn
+      // ---- 厂商档案：模型 = 可搜索单选 combo（候选 = 所选档案的模型候选 ∪ 默认模型）----
+      // 保存从 app 对象取值：combo onChange 实时写回（与分身白名单 multiSelectField 同构），
+      // 不走 [data-f] 通用绑定（combo 非原生 input）。初始 mount 只填候选不清值（打开抽屉
+      // 不能丢已存配置）；切换档案时清空模型覆盖（留空 = 跟随新档案默认模型，旧档案的
+      // profile_model 残留会串档案——后端对非候选值 warn 回退，前端直接不残留）
       const profileSel = body.querySelector('[data-f="profile"]');
       const profileModelBox = body.querySelector('#profileModelBox');
-      const fillProfileModels = () => {
-        const prof = profileByName(profileSel.value);
-        const list = prof ? [...(prof.models || []), ...(prof.model && !(prof.models || []).includes(prof.model) ? [prof.model] : [])] : [];
-        body.querySelector('#profileModelList').innerHTML = list.map((m) => `<option value="${esc(m)}"></option>`).join('');
+      const modelCombo = singleSelectField({
+        mount: body.querySelector('#profileModelMount'),
+        value: app.profile_model || '', // 遗留值（含已不在候选的）ghost 展示可清除
+        placeholder: '输入关键词搜索选择；留空 = 档案默认模型',
+        emptyText: '该档案未配置候选模型（到「Claude 认证」页为档案添加模型）',
+        onChange: (v) => { if (v) app.profile_model = v; else delete app.profile_model; },
+      });
+      const applyProfileModels = () => {
+        modelCombo.setOptions(toProfileModelOptions(profileByName(profileSel.value)));
         profileModelBox.style.display = profileSel.value ? '' : 'none';
       };
-      profileSel.addEventListener('change', fillProfileModels);
-      fillProfileModels();
+      applyProfileModels(); // 初次填充：不动 value、不动 app.profile_model
+      profileSel.addEventListener('change', () => {
+        applyProfileModels();
+        modelCombo.setValue(''); // 静默清空 → 显式删键（切「（跟随全局）」同样命中：隐藏 + 清空）
+        delete app.profile_model;
+      });
       // ---- 分身白名单（可搜索多选）：onChange 实时写回 app——空数组删键，语义与旧 textarea 一致 ----
       const mselInst = {};
       for (const f of ['allowed_skills', 'allowed_workspaces', 'allowed_plugins']) {
@@ -248,10 +274,9 @@ function openAppDrawer(apps, idx, el, snap) {
           c.pluginsError ? `候选加载失败：${c.pluginsError}（已选项不受影响）` : (c.plugins?.length ? undefined : '暂无已安装插件'),
         );
       });
-      // ---- 触发词 / 显式插件：数组行编辑，实时写回 ----
+      // ---- 触发词：数组行编辑，实时写回 ----（显式插件区块已移除，统一走「插件」页全局配置；存量 apps[].plugins 数据继续生效）
       const LIST_DEFS = {
         triggers: { key: 'triggers', cols: [['match', '/produce 或 关键词'], ['rewrite', '请执行内容生产流程：{args}']], check: ['ask_detail', '补充'] },
-        plugins: { key: 'plugins', cols: [['name', 'my-plugin'], ['path', 'F:/dev/my-plugin']] },
       };
       const renderPairList = (name) => {
         const def = LIST_DEFS[name];
@@ -338,7 +363,7 @@ function openAppDrawer(apps, idx, el, snap) {
           const badWs = (app.allowed_workspaces || []).filter((w) => !wsNames.includes(w));
           if (badWs.length) return toast(`「允许的工作区」含未定义的工作区：${badWs.join('、')}（请先在工作区列表中添加）`, true);
         }
-        // 清理半填的空行：triggers/plugins 行两列全空剔除；env 以 key 非空为准（syncEnv 已过滤）。数组空则整键删除
+        // 清理半填的空行：triggers 行两列全空剔除；env 以 key 非空为准（syncEnv 已过滤）。数组空则整键删除
         for (const name of Object.keys(LIST_DEFS)) {
           const def = LIST_DEFS[name];
           const list = app[def.key];
