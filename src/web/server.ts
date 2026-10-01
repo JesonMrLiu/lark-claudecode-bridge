@@ -188,6 +188,38 @@ function readRawDoc(configPath: string): Record<string, unknown> | null {
   }
 }
 
+/** 远程/无桌面场景隧道指引触发条件（导出供单测）：
+ * 回环监听 + SSH 会话，或 Linux 无图形会话——云厂商网页终端（腾讯云 OrcaTerminal 等）
+ * 不设 SSH_*，后者是云服务器上最常见的操作方式 */
+export function shouldShowTunnelHint(host: string): boolean {
+  const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  if (!isLoopback) return false;
+  if (process.env.SSH_CONNECTION || process.env.SSH_CLIENT) return true;
+  return process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+}
+
+/** EADDRINUSE 报错文案：探测占用者身份（是否旧 lcb 配置页进程）+ 按平台给排查命令。
+ * 裸 Node 错误（listen EADDRINUSE :::17317）对首装用户完全不可操作 */
+async function friendlyAddrInUse(host: string, port: number): Promise<string> {
+  const disp = host === '::1' ? '[::1]' : host;
+  let occupier = '';
+  try {
+    const res = await fetch(`http://${disp}:${port}/api/status`, { signal: AbortSignal.timeout(2000) });
+    if (res.ok) {
+      const st = await res.json().catch(() => null) as { version?: string } | null;
+      if (st && typeof st.version === 'string') {
+        occupier = `（占用者疑似旧 lcb 配置页进程 v${st.version}——npm 更新后旧进程未退出，需手动结束）`;
+      }
+    }
+  } catch { /* 探测失败/非 lcb 服务：走通用文案 */ }
+  const probe = process.platform === 'win32'
+    ? `netstat -ano | findstr :${port} 查 PID、taskkill /F /PID <pid> 停止`
+    : process.platform === 'darwin'
+      ? `lsof -i :${port} 查 PID、kill <pid> 停止`
+      : `ss -ltnp | grep :${port} 查 PID、kill <pid> 停止`;
+  return `配置页端口 ${port} 已被占用${occupier}。排查：${probe}；或修改 config.yaml 的 server.port 换端口`;
+}
+
 export async function startWebServer(opts: WebServerOptions = {}): Promise<WebServerHandle | null> {
   ensureRuntimeDirs(); // 独立入口兜底：即使不经 lcb CLI（测试/嵌入式调用），首装写盘也有目录
   const serverCfg = opts.server ?? (defaultServerDoc() as unknown as ServerConfig);
@@ -203,13 +235,27 @@ export async function startWebServer(opts: WebServerOptions = {}): Promise<WebSe
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, host, () => resolve());
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, host, () => resolve());
+    });
+  } catch (e) {
+    // EADDRINUSE 友好化：探测占用者并给平台排查命令，替代裸 Node 错误栈
+    if ((e as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+      throw new Error(await friendlyAddrInUse(host, port));
+    }
+    throw e;
+  }
   port = (server.address() as { port: number }).port;
   const url = `http://${host === '::1' ? '[::1]' : host}:${port}`;
   console.log(`🧭 配置页已就绪：${url}${opts.embedded ? '' : '（lcb ui 独立模式，桥接器未启动）'}`);
+  if (shouldShowTunnelHint(host)) {
+    console.log('🌐 检测到远程/无桌面环境：配置页仅监听本机回环地址，可在本地机器另开终端执行');
+    console.log(`   ssh -L ${port}:127.0.0.1:${port} <用户名>@<此服务器>`);
+    console.log(`   建立隧道后在本地浏览器打开 ${url}`);
+    console.log('⚠️ 配置页为前台进程：关闭终端或断开连接会停止它（配置完成前请保持本终端运行）');
+  }
   if (opts.autoOpen) openBrowser(url);
   return {
     url,

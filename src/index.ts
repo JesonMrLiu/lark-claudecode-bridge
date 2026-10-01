@@ -1438,10 +1438,8 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if ((e as NodeJS.ErrnoException).code === 'EADDRINUSE') {
-        // 兜底 pid 登记不到的占用者（如旧版本进程不写 pid 文件、或他程序占端口）
-        const port = config.server?.port ?? 17317;
-        console.warn(`[配置页] 端口 ${port} 已被占用（可能是未登记 pid 的旧 lcb 进程）。` +
-          `排查：netstat -ano | findstr :${port} 查 PID、taskkill /F /PID <pid> 停止（macOS: lsof -i :${port}）；或修改 config.yaml 的 server.port`);
+        // server.ts 已把 EADDRINUSE 转成友好文案（含占用者探测与平台排查命令），此处只补语境
+        console.warn(`[配置页] ${msg}（桥接器继续运行，配置页暂不可用）`);
       } else {
         console.warn(`[配置页] 启动失败（桥接器继续运行）：${msg}；可通过 config.yaml 的 server.port 换端口`);
       }
