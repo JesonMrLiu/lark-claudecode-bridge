@@ -9,9 +9,10 @@ async function renderPlugins(el) {
   el.innerHTML = `
   <div class="card">
     <h3>Claude Code 插件 <button class="btn sm" id="plCheckUpdate" style="margin-left:8px">检查更新</button></h3>
-    <div class="desc">两处目录的已启用插件都会自动加载（managed 托管目录优先）：本机 <code>~/.claude</code>（来源「本机」，与本机 claude CLI 共用）与 bridge 托管目录 <code id="pluginDir">…</code>。装好后下一条消息自动加载。飞书端同样可用 <code>/plugin install xxx@marketplace</code>（仅管理员）。打开页面自动检查远程市场新版本（5 分钟内不重复，只检测不升级，升级点单行「更新」）。</div>
+    <div class="desc">两处目录的已启用插件都会自动加载（managed 托管目录优先）：本机 <code>~/.claude</code>（来源「本机」，与本机 claude CLI 共用）与 bridge 托管目录 <code id="pluginDir">…</code>。装好后下一条消息自动加载。飞书端同样可用 <code>/plugin install xxx@marketplace</code>（仅管理员）。打开页面在后台自动检查远程市场新版本（不阻塞列表，5 分钟内不重复；只检测不升级，升级点单行「更新」）。</div>
+    <div class="hint" id="plSyncNote" hidden style="margin:6px 0"></div>
     <table><thead><tr><th>插件</th><th>市场</th><th>来源</th><th>版本</th><th style="width:90px">状态</th><th style="width:250px">操作</th></tr></thead>
-    <tbody id="plBody"><tr><td colspan="6" class="hint">加载中…（首次含远程市场索引检查，可能需数十秒）</td></tr></tbody></table>
+    <tbody id="plBody"><tr><td colspan="6" class="hint">加载中…</td></tr></tbody></table>
   </div>
   <div class="card">
     <h3>安装 / 市场</h3>
@@ -54,62 +55,94 @@ async function renderPlugins(el) {
     'marketplace-add': '添加中…', 'marketplace-remove': '移除中…', enable: '处理中…', disable: '处理中…',
   };
   const opNames = { install: '安装', uninstall: '卸载', update: '更新', 'update-all': '全部更新', 'marketplace-add': '添加市场', 'marketplace-remove': '移除市场', enable: '启用', disable: '停用' };
-  // force=true（手动「检查更新」）绕过 5 分钟节流立即刷新远程市场索引；开页自动检测传空。
-  // 刷新只拉最新版本号不升级插件本体；失败后端降级返回本地数据并附 refreshWarning
-  const load = async (force) => {
+  /** 远程刷新信息条：后台检查远程市场索引的状态提示（非阻断、非报错样式；空串隐藏） */
+  const setSyncNote = (text) => {
+    const note = $('#plSyncNote');
+    if (!note) return;
+    note.textContent = text || '';
+    note.hidden = !text;
+  };
+  /** 渲染已装插件表（本地秒出与后台刷新完成两条路径共用；入参 /api/plugins 响应） */
+  const renderList = (r) => {
+    installed = r.plugins || [];
+    $('#pluginDir').textContent = r.configDir;
+    const body = $('#plBody');
+    if (!body) return; // 页面已切走（后台刷新回调晚于切页）
+    if (!installed.length) {
+      body.innerHTML = '<tr><td colspan="6" class="hint">尚未安装任何插件</td></tr>';
+      return;
+    }
+    body.innerHTML = installed.map((p) => `
+      <tr>
+        <td><b>${esc(p.name)}</b></td>
+        <td>${esc(p.marketplace || '-')}</td>
+        <td>${p.source === 'bridge' ? '<span class="tag warn">bridge 托管</span>' : '<span class="tag off">本机 ~/.claude</span>'}</td>
+        <td class="hint">${esc(p.version || '-')}${p.latestVersion ? ` <span class="tag warn">→ ${esc(p.latestVersion)}</span>` : ''}</td>
+        <td>${p.enabled ? '<span class="tag ok">已启用</span>' : '<span class="tag off">未启用</span>'}</td>
+        <td>
+          <button class="btn sm" data-op="update" data-arg="${esc(p.key)}" data-dir="${p.source}">更新</button>
+          <button class="btn sm" data-op="${p.enabled ? 'disable' : 'enable'}" data-arg="${esc(p.key)}" data-dir="${p.source}">${p.enabled ? '停用' : '启用'}</button>
+          <button class="btn sm danger" data-op="uninstall" data-arg="${esc(p.key)}" data-dir="${p.source}">卸载</button>
+        </td>
+      </tr>`).join('');
+    body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = async () => {
+      const { op, arg, dir } = b.dataset;
+      // 影响性操作先二次确认（启用/安装/市场添加为新增类，无需确认）
+      if (op === 'disable' && !(await confirmDialog({
+        title: '停用插件',
+        message: `确定停用插件 <code>${esc(arg)}</code> 吗？停用后下一条消息不再加载该插件，可随时再启用。`,
+        confirmText: '停用',
+      }))) return;
+      if (op === 'update' && !(await confirmDialog({
+        title: '更新插件',
+        message: `确定更新插件 <code>${esc(arg)}</code> 吗？更新后下一条消息按新版本加载。`,
+        confirmText: '更新',
+      }))) return;
+      if (op === 'uninstall' && !(await confirmDialog({
+        title: '卸载插件',
+        message: `确定卸载插件 <code>${esc(arg)}</code> 吗？卸载后需重新安装才能恢复，进行中的会话不受影响。`,
+        danger: true,
+        confirmText: '卸载',
+      }))) return;
+      // 慢操作走进度弹框；亚秒级启停走轻量 act（弹框一闪而过反而干扰）
+      if (op === 'enable' || op === 'disable') act(op, arg, dir, b);
+      else runOpDialog(op, arg, dir, b);
+    });
+  };
+  // 列表本地秒出：不带 refresh（纯本地文件读取，无远程市场索引等待）
+  const loadLocal = async () => {
     try {
-      const r = await api('GET', `/api/plugins?refresh=1${force ? '&force=1' : ''}`);
-      if (r.refreshWarning) toast(`远程市场索引刷新失败（版本号可能滞后）：${r.refreshWarning}`, true);
-      installed = r.plugins || [];
-      $('#pluginDir').textContent = r.configDir;
-      const body = $('#plBody');
-      if (!installed.length) {
-        body.innerHTML = '<tr><td colspan="6" class="hint">尚未安装任何插件</td></tr>';
-        return true;
-      }
-      body.innerHTML = installed.map((p) => `
-        <tr>
-          <td><b>${esc(p.name)}</b></td>
-          <td>${esc(p.marketplace || '-')}</td>
-          <td>${p.source === 'bridge' ? '<span class="tag warn">bridge 托管</span>' : '<span class="tag off">本机 ~/.claude</span>'}</td>
-          <td class="hint">${esc(p.version || '-')}${p.latestVersion ? ` <span class="tag warn">→ ${esc(p.latestVersion)}</span>` : ''}</td>
-          <td>${p.enabled ? '<span class="tag ok">已启用</span>' : '<span class="tag off">未启用</span>'}</td>
-          <td>
-            <button class="btn sm" data-op="update" data-arg="${esc(p.key)}" data-dir="${p.source}">更新</button>
-            <button class="btn sm" data-op="${p.enabled ? 'disable' : 'enable'}" data-arg="${esc(p.key)}" data-dir="${p.source}">${p.enabled ? '停用' : '启用'}</button>
-            <button class="btn sm danger" data-op="uninstall" data-arg="${esc(p.key)}" data-dir="${p.source}">卸载</button>
-          </td>
-        </tr>`).join('');
-      body.querySelectorAll('button[data-op]').forEach((b) => b.onclick = async () => {
-        const { op, arg, dir } = b.dataset;
-        // 影响性操作先二次确认（启用/安装/市场添加为新增类，无需确认）
-        if (op === 'disable' && !(await confirmDialog({
-          title: '停用插件',
-          message: `确定停用插件 <code>${esc(arg)}</code> 吗？停用后下一条消息不再加载该插件，可随时再启用。`,
-          confirmText: '停用',
-        }))) return;
-        if (op === 'update' && !(await confirmDialog({
-          title: '更新插件',
-          message: `确定更新插件 <code>${esc(arg)}</code> 吗？更新后下一条消息按新版本加载。`,
-          confirmText: '更新',
-        }))) return;
-        if (op === 'uninstall' && !(await confirmDialog({
-          title: '卸载插件',
-          message: `确定卸载插件 <code>${esc(arg)}</code> 吗？卸载后需重新安装才能恢复，进行中的会话不受影响。`,
-          danger: true,
-          confirmText: '卸载',
-        }))) return;
-        // 慢操作走进度弹框；亚秒级启停走轻量 act（弹框一闪而过反而干扰）
-        if (op === 'enable' || op === 'disable') act(op, arg, dir, b);
-        else runOpDialog(op, arg, dir, b);
-      });
+      renderList(await api('GET', '/api/plugins'));
       return true;
     } catch (e) {
       installed = [];
-      $('#plBody').innerHTML = `<tr><td colspan="6" class="hint">加载失败：${esc(e.message)}</td></tr>`;
+      const body = $('#plBody');
+      if (body) body.innerHTML = `<tr><td colspan="6" class="hint">加载失败：${esc(e.message)}</td></tr>`;
       return false;
     }
   };
+  // 后台刷新远程市场索引（force=true 绕过 5 分钟节流，手动「检查更新」用）：不阻塞列表，
+  // 完成后仅更新版本号列（只拉最新版本号不升级插件本体）；失败降级为信息条温和提示
+  // （后端本就返回本地数据 + refreshWarning），不再弹红色 toast。切页后放弃渲染
+  const refreshRemote = async (force) => {
+    setSyncNote('🔄 后台检查远程市场新版本中…（不影响浏览）');
+    try {
+      const r = await api('GET', `/api/plugins?refresh=1${force ? '&force=1' : ''}`);
+      if (!$('#plBody')) return !r.refreshWarning;
+      renderList(r);
+      if (r.refreshWarning) {
+        setSyncNote('远程市场索引刷新失败，列表为本地缓存数据（网络或市场源异常，不影响本地使用）');
+      } else {
+        const n = installed.filter((p) => p.latestVersion).length;
+        setSyncNote(n ? `${n} 个插件有新版本（见列表「→ 版本」标注，逐个点「更新」升级）` : '');
+      }
+      return !r.refreshWarning;
+    } catch (e) {
+      if ($('#plBody')) setSyncNote(`远程市场索引刷新失败，列表为本地缓存数据（${e.message}）`);
+      return false;
+    }
+  };
+
   /** 轻量操作（enable/disable 亚秒级）：按钮瞬时 loading + toast，不弹框 */
   const act = async (op, arg, dir, btn) => {
     const pageBtns = el.querySelectorAll('button');
@@ -119,7 +152,7 @@ async function renderPlugins(el) {
     try {
       const r = await api('POST', '/api/plugins/action', { op, arg, ...(dir ? { dir } : {}) });
       report(r.ok ? `✅ ${op} 完成` : `❌ ${op} 失败`, r.text);
-      await load();
+      await loadLocal();
       toast(r.ok ? `${opNames[op] || op}完成，下一条消息生效` : `${opNames[op] || op}失败：${r.text.slice(0, 120)}`, !r.ok);
     } catch (e) {
       report(`❌ ${op} 失败`, e.message);
@@ -182,7 +215,7 @@ async function renderPlugins(el) {
     pageBtns.forEach((b) => { b.disabled = true; });
     if (btn) btn.textContent = busyText[op] || '处理中…';
     report(`执行中：${op} ${arg}${dir ? `（${dirLabel}）` : ''}`, '…（安装/更新可能需要拉取仓库，请稍候）');
-    const close = async () => { mask.remove(); await Promise.all([load(), loadAvailable()]); };
+    const close = async () => { mask.remove(); await Promise.all([loadLocal(), loadAvailable()]); };
     try {
       let allOk = true;
       const lines = [];
@@ -292,8 +325,8 @@ async function renderPlugins(el) {
     btn.disabled = true;
     btn.textContent = '检查中…';
     try {
-      const ok = await load(true);
-      if (!ok) return; // 加载失败已在表格内提示，不再误报「全部最新」
+      const ok = await refreshRemote(true);
+      if (!ok) return; // 刷新失败已在信息条提示，不再误报「全部最新」
       const n = installed.filter((p) => p.latestVersion).length;
       toast(n ? `${n} 个插件有新版本（见列表「→ 版本」标注，逐个点「更新」升级）` : '已检查：所有插件均为最新版本');
     } finally {
@@ -319,7 +352,9 @@ async function renderPlugins(el) {
     }))) return;
     runOpDialog('update-all', '', $('#plMarketDir').value, $('#plDoMarketUpdate'));
   };
-  await Promise.all([load(), loadAvailable()]);
+  // 列表本地秒出；远程市场索引后台检查不阻塞（切页后回调自动放弃渲染）
+  await Promise.all([loadLocal(), loadAvailable()]);
+  void refreshRemote(false);
 }
 
 export const page = {

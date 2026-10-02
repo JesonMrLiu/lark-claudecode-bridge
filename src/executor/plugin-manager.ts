@@ -53,8 +53,8 @@ function tail(text: string, max = 800): string {
 
 /**
  * 执行 `claude plugin <args…> -y`（-y：非 TTY 环境跳过交互确认）。
- * env 白名单透传：CLI 需要 PATH（git）、Windows 需要 SystemRoot（spawn 系统调用），
- * 其余变量一律不带——杜绝外部 ANTHROPIC_* 凭证把认证带偏到非预期端点。
+ * env 白名单透传：CLI 需要 PATH（git）、Windows 需要 SystemRoot（spawn 系统调用）、
+ * 代理变量（git 走代理拉市场），其余变量一律不带——杜绝外部 ANTHROPIC_* 凭证把认证带偏到非预期端点。
  */
 export function runPluginCli(
   args: string[],
@@ -62,7 +62,13 @@ export function runPluginCli(
 ): Promise<PluginCliResult> {
   const cli = resolveBundledCliPath();
   const passThrough: Record<string, string | undefined> = {};
-  for (const key of ['PATH', 'SystemRoot', 'windir', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TMP', 'TEMP', 'LANG']) {
+  // 代理变量一并透传（大小写两态：Windows env 不分大小写，Linux/macOS 分）：git 拉远程市场
+  // 索引需走代理，不带则网络不佳时 marketplace update 挂满超时被杀（刷新永远失败）
+  for (const key of [
+    'PATH', 'SystemRoot', 'windir', 'HOME', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TMP', 'TEMP', 'LANG',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+    'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
+  ]) {
     if (process.env[key] !== undefined) passThrough[key] = process.env[key];
   }
   // -y（非 TTY 跳过确认）：install/uninstall 均支持（uninstall 实测接受，缺省时非 TTY 下

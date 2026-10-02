@@ -105,13 +105,19 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
     await new Promise<never>(() => {}); // 永不自然结束：由消费端收到最终 result 后 break 收尾
   }
   let resultErrorText = '';
+  // 启动耗时分解（先诊断承诺）：spawn→init≈CLI 冷启动（配置/插件/MCP 拉起 + resume 回放），
+  // init→首输出≈模型首响。t0 取 query 创建时刻（子进程 spawn 随之发生）
+  const t0 = Date.now();
   const q: Query = query({
     prompt: inputStream(),
     options: {
       cwd: opts.cwd,
       settingSources: ['user', 'project'],
       permissionMode: opts.permissionMode ?? 'default',
-      includePartialMessages: false,
+      // 流式增量事件（stream_event）：仅消费首个 text delta 提前点亮「正在执行」（首个完整块
+      // 生成前 otherwise 状态行停留在启动阶段，视觉上拉长「启动中」）；不渲染不落盘，
+      // 完整块仍走 assistant 分支（渲染/落盘口径不变）
+      includePartialMessages: true,
       // 转发子代理 text 块（默认只转发 tool_use/tool_result 心跳）——配合 parent_tool_use_id
       // 区分主/子代理输出，飞书进度卡能看到子代理在做什么
       forwardSubagentText: true,
@@ -160,6 +166,11 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
   // 主 turn 终态已到但仍在等后台任务（true 期间静默超时看门狗生效）
   let waitingBg = false;
   let lastEventAt = Date.now();
+  // 启动耗时锚点（见 t0 注释）：initAt=system/init 到达；firstOutAt=首个输出信号
+  // （首个流式 text delta 或首个完整 assistant 块，先到先记）
+  let initAt = 0;
+  let firstOutAt = 0;
+  let sawFirstDelta = false;
   // init 消息提取的会话清单（每 query 一次）；数组字段全部 ?? [] 兜底——SDK 升级字段改名时清单为空但不崩
   let inventory: Omit<SessionInventory, 'workspace' | 'loadedAt'> | undefined;
   const toolNames = new Map<string, string>(); // tool_use_id → 工具名（tool_result 块本身不带 name）
@@ -189,6 +200,7 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
       switch (message.type) {
         case 'system': {
           if (message.subtype === 'init') {
+            initAt = Date.now();
             // init 即携带 session_id：全新会话在首轮 turn 结束前被 /stop 中止时不会有 result 消息，
             // 不在此捕获则 sessionId 恒为空串 → catch 挂不上 err.sessionId → 归档 no-op，
             // 会话指针停留 null，用户随后「继续」会开全新会话丢失上下文（resume 场景两值等价）
@@ -258,7 +270,20 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
           }
           break;
         }
+        case 'stream_event': {
+          // 流式增量（includePartialMessages）：仅用首个 text delta 提前点亮「正在执行」——
+          // 完整块生成前状态行 otherwise 停留在启动阶段。按 Anthropic Messages stream 事件
+          // 结构窄化访问，字段缺失/其他事件类型静默忽略
+          const ev = (message as { event?: { type?: string; delta?: { type?: string } } }).event;
+          if (!sawFirstDelta && ev?.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
+            sawFirstDelta = true;
+            if (!firstOutAt) firstOutAt = Date.now();
+            await cb.onProgress({ kind: 'first-delta' });
+          }
+          break;
+        }
         case 'assistant': {
+          if (!firstOutAt) firstOutAt = Date.now();
           // turns 只计主循环轮次：子代理消息（parent_tool_use_id 非空）混入会把单任务轮数
           // 放大数倍（旧超长提醒误报的帮凶），兜底口径应以主循环为准
           if (!message.parent_tool_use_id) turns++;
@@ -337,6 +362,10 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
   return finalize();
 
   function finalize(): TaskOutcome {
+    // 启动耗时分解（先诊断承诺）：spawn→init 是 CLI 冷启动（配置/插件/MCP server 拉起 +
+    // resume 回放，越用越慢的主要嫌疑），init→首输出是模型首响——数据在手再决定下一步优化
+    const sec = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+    console.log(`[executor] 启动耗时：spawn→init ${initAt ? sec(initAt - t0) : '?'}，init→首输出 ${initAt && firstOutAt ? sec(firstOutAt - initAt) : '?'}，总 ${sec(Date.now() - t0)}${opts.resumeSessionId ? '（resume 续接）' : '（新会话）'}`);
     if (resultErrorText) {
       // 携带 sessionId 抛出：wiring 侧据此把出错任务的会话也归档进 /resume 历史
       //（错误任务的会话上下文同样有价值；早期不归档导致历史列表难积累）

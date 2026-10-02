@@ -888,6 +888,9 @@ planAsk: async (req) => {
         onQuery: (handle) => { activeQueries.set(key, { wsName, handle }); },
       }, {
         onInit: (inv) => {
+          // CLI 进程已起、会话已建：状态从「已接收，启动中」切「会话已建立」（冷启动大头在
+          // init 之前，先让用户看到进程已建立而非黑盒等待）
+          progress.markSessionReady();
           // inventory 键带 appId 前缀：分身机器人技能/插件集与主机器人不同，两个 app 共用
           // 工作区时 /skills /plugins /mcp 清单不能互相污染
           inventories.set(`${app.appId}:${wsName}`, { ...inv, workspace: wsName, loadedAt: new Date().toISOString() });
@@ -903,6 +906,9 @@ planAsk: async (req) => {
           if (e.kind === 'status') {
             // CLI 状态心跳（等待模型响应/上下文压缩）：刷新进度卡状态行，避免静默期黑盒感
             progress.setStatus(e.content);
+          } else if (e.kind === 'first-delta') {
+            // 首个流式增量（模型开始吐字）：提前点亮「正在执行」，不等首个完整块
+            progress.markStarted();
           } else if (e.kind === 'text') {
             progress.markStarted();
             progress.appendText(e.content);

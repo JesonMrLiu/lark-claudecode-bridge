@@ -206,10 +206,12 @@ export type PermissionDecision = 'allow' | 'deny' | 'allow-session';
 /**
  * 执行器 → 进度卡的流事件：
  * - text/tool-start/tool-result/status：主循环输出与状态（tool-result 失败时带首行原因 note）
+ * - first-delta：首个流式 text 增量（模型开始吐字）——提前把启动阶段文案切为「正在执行」
  * - agent-start/agent-settle：子代理与后台任务生命周期（进度卡子代理清单的数据源）
  */
 export type ProgressEvent =
   | { kind: 'text' | 'tool-start' | 'status'; content: string }
+  | { kind: 'first-delta' }
   | { kind: 'tool-result'; content: string; ok: boolean; note?: string }
   | { kind: 'agent-start'; agent: { id: string; description: string; type: string } }
   | { kind: 'agent-settle'; id: string; status: 'done' | 'failed' | 'stopped'; summary?: string };

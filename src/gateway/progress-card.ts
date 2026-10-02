@@ -18,6 +18,9 @@ export interface CardSender {
 
 /** 进度卡初始文案：markStarted 据此识别「尚未进入执行阶段」——首个执行事件到达时切为执行中 */
 const INITIAL_STATUS = '🚀 已接收，启动中…';
+/** init 到达后的启动阶段文案（CLI 进程已起、会话已建，仍在加载上下文/工具）：markSessionReady
+ *  切入此态，markStarted 同样允许从此态接管——冷启动大头发生在 init 之前，先让用户看到进程已建立 */
+const BOOT_STATUS = '🔌 会话已建立，加载上下文与工具中…';
 /** 单次卡片更新请求超时：飞书 SDK 的 axios 无超时（timeout=0），请求被网络黑洞时
  *  flush 串行链会无限期挂起（生产实测单次挂 7.4 分钟）——挂起期间计时/交互区全停，
  *  与任务卡死无从区分。到点按失败处理（seq 不推进）下轮重试；若超时请求实际已在
@@ -126,13 +129,23 @@ export class ProgressCard {
   }
 
   /**
-   * 首个执行事件（流式文本/工具调用）到达：初始「已接收，启动中…」切为「正在执行…」。
-   * 幂等且仅在状态行仍是初始文案时改写——CLI status 心跳（🌐 等待模型响应等）若先到
-   * 则不覆盖；解决长任务期间状态行一直停留在"启动中"与实际执行进度不符的问题
+   * 首个执行事件（流式增量/工具调用）到达：启动阶段文案（已接收/会话已建立）切为「正在执行…」。
+   * 幂等且仅在状态行仍处于启动阶段（INITIAL/BOOT）时改写——CLI status 心跳（🌐 等待模型响应等）
+   * 若先到则不覆盖；解决长任务期间状态行一直停留在"启动中"与实际执行进度不符的问题
    */
   markStarted(): void {
-    if (this.done || this.state.status !== INITIAL_STATUS) return;
+    if (this.done || (this.state.status !== INITIAL_STATUS && this.state.status !== BOOT_STATUS)) return;
     this.setStatus('🔄 正在执行…');
+  }
+
+  /**
+   * system/init 到达（CLI 进程已起、会话已建立）：「已接收，启动中…」切为「会话已建立」，
+   * 冷启动期间（加载配置/插件/MCP server、resume 回放，常见数十秒）不再黑盒。幂等且仅在
+   * 初始文案时生效——CLI status 心跳若先到则不倒退
+   */
+  markSessionReady(): void {
+    if (this.done || this.state.status !== INITIAL_STATUS) return;
+    this.setStatus(BOOT_STATUS);
   }
 
   setStatus(status: string): void {

@@ -98,7 +98,7 @@ export function buildNotifyTools(sender: NotifySender): SdkMcpToolDefinition<any
         return fail(`图片发送失败：${basename(p)}（${errText(e)}）`);
       }
     }),
-    tool('send_file', '把本地文件作为附件实时发送给用户（如 article.md / images-prompt.md），可附一条说明文字。', {
+    tool('send_file', '仅当用户明确要求发送某个文件本体时使用（如用户说「把 xxx.md 文件发给我」）。给用户看的内容（文案/报告/帖子/代码/长文等）一律用 send_text 或写进最终回复——两者都会自动拆成多张卡片消息。禁止把要给用户看的内容先写成文件再用本工具发送。', {
       path: z.string().describe('本地文件的绝对路径'),
       note: z.string().optional().describe('随文件发送的说明文字（飞书文件消息本身不带说明）'),
     }, async (args: { path: string; note?: string }) => {
