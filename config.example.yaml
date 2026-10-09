@@ -46,17 +46,22 @@ apps:
   # - name: 素材收集           # 再添一个机器人：复制上面的结构即可（会话池独立，配置共享 ~/.claude）
   #   app_id: cli_yyyy
   #   app_secret: yyyy
-  # - name: SQL 审核分身       # 分身机器人（role: deputy）：按用途限定能力、艾特即用（无需配对），
-  #   app_id: cli_zzzz         # 供他人使用。能力 = 技能白名单 + 插件白名单 + 工作区锁定；
-  #   app_secret: zzzz         # 工具权限跟全局 permissions 走。管理命令（/ws use、/model-profile、
-  #   role: deputy             # /plugin 变更类、/reload-plugins）在分身里一律拒绝（含 admin 本人）。
-  #   allowed_skills:          # 必填：技能白名单——未列出的技能对模型不可见且被 Skill 工具拒绝。
-  #     - sql-review           # 注意：SDK 官方语义为「上下文过滤器非沙箱」，技能文件仍可被
-  #     - sql-optimize         # Read/Bash 读到；硬隔离需工具级限制（当前版本不做，已知悉边界）
-  #   allowed_workspaces:      # 必填：工作区锁定——分身任务恒运行在第一个允许的工作区（本示例
-  #     - demo                 #   须替换为 workspaces 列表内的真实工作区）
-  #   allowed_plugins:         # 可选：插件白名单（按 name 过滤自动发现，未列出的不加载）；
-  #     - db-tools             #   未配置 = 不加载任何自动发现插件（显式 plugins 始终保留）
+  # - name: SQL 审核分身       # 分身机器人（role: deputy）：艾特即用（无需配对），供他人使用。
+  #   app_id: cli_zzzz         # 权限轴（白单）：下列白名单全部可选——未配置 = 全给；配置了才按名单收窄。
+  #   app_secret: zzzz         # 安保红线轴（恒定生效、不占配置）：R1 红区读黑名单 / R2 工作区外只写禁 /
+  #   role: deputy             # R3 出站脱敏 / Bash 三态，见下方 security 段与 bash_mode。
+  #                            # 管理命令（/ws use、/model-profile、/plugin 变更类）在分身里一律拒绝。
+  #   bash_mode: confirm       # Bash 可用性：off=不提供 Bash（R1/R2 成为完备硬约束的推荐形态）；
+  #                            # confirm=危险命令/红区特征拦截或弹卡（缺省）；trusted=放行不打扰
+  #                            # （红区探测仍生效；要真正安全需 OS 层沙箱，见方案 §7）。
+  #   allowed_skills:          # 可选：技能白名单——未列出的技能对模型不可见且被 Skill 工具拒绝；
+  #     - sql-review           #   未配置 = 全部技能。SDK 语义为「上下文过滤器非沙箱」：技能文件仍可被
+  #     - sql-optimize         #   Read/Bash 读到，硬隔离由红区读黑名单（security.redzone.read）承担
+  #   allowed_workspaces:      # 可选：工作区白名单——配置后任务锁定在第一个允许的工作区（本示例
+  #     - demo                 #   须替换为 workspaces 列表内的真实工作区），写操作仅限这些工作区；
+  #                            #   未配置 = 全部已配置工作区（工作区外一律只读，R2 恒定）
+  #   allowed_plugins:         # 可选：插件白名单（按 name 过滤自动发现）；未配置 = 全部加载
+  #     - db-tools             #   （显式 plugins 始终保留）
 workspaces:                    # 工作区白名单：名字 + 路径（所有机器人共享列表，当前使用哪个 per-app 隔离）
   - name: demo
     path: F:\workspace\demo
@@ -90,6 +95,26 @@ concurrency: 3                 # 全局并发上限（未单独配置的 app 沿
 #                             # allow_all_tools 开启时本表是唯一的安全网，删条目前请三思
 #   - 'rm\s+-rf'
 #   - 'sudo\s'
+# security:                   # 安保段（红线轴；整块可选，全部恒定生效、不占分身配置）。改后热生效
+#   redzone:                  # R1 读黑名单（对 deputy 硬拦截；主机器人不消费，出站脱敏兜底）。
+#                             # 支持 ~/ 展开、** 跨层级、* 段内通配；配置即整体替换内置默认
+#     read:
+#       - '~/.lark-claudecode-bridge/**'   # bridge 自身配置（app_secret）/ transcripts
+#       - '~/.lark-cli/**'                 # lark-cli 用户授权 token
+#       - '~/.claude/**'                   # CLI 登录态 / OAuth
+#       - '~/.ssh/**'
+#       - '~/.aws/**'
+#       - '~/.gnupg/**'
+#       - '~/AppData/Local/Google/**'      # 浏览器资料（Cookies / Login Data）
+#       - '**/credentials*'
+#       - '**/.env'
+#       - '**/*.pem'
+#       - '**/*.key'
+#       - '**/*.enc'
+#   redact_patterns:          # R3 出站脱敏自定义正则（追加在内置规则后；内置已覆盖 sk-/Bearer/
+#     - '内部工号\d{6,}'       # JWT/PEM/password= 键值对/≥32位 hex 等；命中统一替换为 ******）
+#   canary_patterns:          # 金丝雀：出站文本命中 = 防线被穿透，脱敏之外触发告警到当前聊天
+#     - 'sk-canary-'
 # server:                     # Web 配置页（随 lcb start 常驻，浏览器打开 http://127.0.0.1:17317 随时改配置；
 #                              # 也可 lcb ui 单独启动。整块可选，缺省 enabled/127.0.0.1/17317）
 #   enabled: true             # false = 不启动配置页

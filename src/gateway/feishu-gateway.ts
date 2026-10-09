@@ -5,6 +5,16 @@ import type { CardDecision, FeishuAppConfig, GatewayHandlers, IncomingMessage, R
 import { CONFIG_DIR } from '../config.js';
 import { buildImageCard, buildTextCard } from './card-builder.js';
 import { isImageFile } from '../util/file-types.js';
+import type { Redactor } from '../security/redact.js';
+import { CANARY_ALERT_TEXT, type SecurityEvent } from '../security/audit.js';
+
+/**
+ * 文件外发黑名单（R3 出口红线的一部分）：凭证/密钥类文件不问来源一律不进飞书消息——
+ * 正常协作永远不会把 .pem/.key/credentials/.env 发到聊天里，命中即拦截 + 审计。
+ * 二进制与图片内容无法正则脱敏，这里是文件通道唯一的硬拦截点（OS 沙箱落地前的已知边界）。
+ */
+const DENIED_FILE_NAME_RE = /(^|[/\\])(credentials[^/\\]*|\.env(\.|$)|id_rsa[^/\\]*$)/i;
+const DENIED_FILE_EXT = new Set(['.pem', '.key', '.enc', '.p12', '.pfx', '.keystore']);
 
 /**
  * 消息卡通道不支持的 cardkit 专属属性：im.message.create / im.message.patch 的卡片 JSON
@@ -295,6 +305,13 @@ export class FeishuGateway {
    *  对象，getter 每次发卡现读 → 热生效）。sendText/sendImage 的文本卡与图片卡都消费它，
    *  进度卡/长回复卡由 wiring 直接传参（同一 config 源）。缺省 default 与旧行为一致 */
   private cardWidth: () => 'default' | 'fill';
+  /** R3 出站脱敏器（wiring 注入，按 config.security 现取 getter 形态 → 热生效）；缺省不脱敏（测试/旧 mock） */
+  private redactor?: () => Redactor;
+  /** 安全事件回调（脱敏/金丝雀/文件拦截 → 审计落盘） */
+  private onSecurityEvent?: (ev: SecurityEvent) => void;
+  // 金丝雀告警节流：同一聊天 5 分钟最多告警一次（持续穿透时不刷屏，审计全量可查）
+  private canaryAlertAt = new Map<string, number>();
+  private static readonly CANARY_ALERT_INTERVAL_MS = 5 * 60_000;
   // 入站消息去重：飞书 WS 长连接 at-least-once 投递，重连窗口内同一消息可能重投——
   // 不去重会导致整个任务跑两遍（两张进度卡 + 两条结果）。Map 迭代序即插入序，容量超限删最旧。
   private seenMessageIds = new Map<string, number>();
@@ -312,6 +329,10 @@ export class FeishuGateway {
       inboxDir?: string;
       /** 卡片宽度 getter（config.card.width），缺省恒 default */
       cardWidth?: () => 'default' | 'fill';
+      /** R3 出站脱敏器 getter（每张卡现取 → config.security 热生效），缺省不脱敏 */
+      redactor?: () => Redactor;
+      /** 安全事件回调（审计落盘），缺省仅日志 */
+      onSecurityEvent?: (ev: SecurityEvent) => void;
     } = {},
   ) {
     this.cfg = cfg;
@@ -324,8 +345,41 @@ export class FeishuGateway {
     this.strictGroupMention = deps.strictGroupMention ?? false;
     this.inboxDir = deps.inboxDir ?? join(CONFIG_DIR, 'inbox');
     this.cardWidth = deps.cardWidth ?? (() => 'default');
+    this.redactor = deps.redactor;
+    this.onSecurityEvent = deps.onSecurityEvent;
     const domain = cfg.domain === 'lark' ? this.sdk.Domain.Lark : this.sdk.Domain.Feishu;
     this.client = new this.sdk.Client({ appId: cfg.appId, appSecret: cfg.appSecret, domain });
+  }
+
+  /** 出站卡片深度脱敏（R3 单点）：审计事件在此统一上报；金丝雀走 chatId 可得的告警通道 */
+  private sanitizeCard<T>(chatId: string, card: T): T {
+    const r = this.sanitizeValue(card);
+    if (r.canary) this.alertCanary(chatId);
+    return r.value;
+  }
+
+  /** 无 chatId 出口的脱敏（cardkit 实体全量替换）：事件照常审计，告警退化为日志 */
+  private sanitizeValue<T>(card: T): { value: T; canary: boolean } {
+    const redactor = this.redactor?.();
+    if (!redactor) return { value: card, canary: false };
+    const r = redactor.deep(card);
+    if (r.hits.length) this.onSecurityEvent?.({ kind: 'redact', ruleIds: [...new Set(r.hits)], source: 'card' });
+    if (r.canary) {
+      this.onSecurityEvent?.({ kind: 'canary', source: 'card' });
+      this.log.error('[security] 🚨 金丝雀命中：敏感标记出现在对外卡片中，已脱敏并告警（无 chatId，仅审计+日志）');
+    }
+    return { value: r.value, canary: r.canary };
+  }
+
+  /** 金丝雀命中：审计 + 控制台 + 向当前聊天发固定告警模板（节流；告警文本无敏感内容，无递归风险） */
+  private alertCanary(chatId: string): void {
+    this.onSecurityEvent?.({ kind: 'canary', source: 'card' });
+    this.log.error('[security] 🚨 金丝雀命中：敏感标记出现在对外卡片中，已脱敏并告警');
+    const now = Date.now();
+    const last = this.canaryAlertAt.get(chatId) ?? 0;
+    if (now - last < FeishuGateway.CANARY_ALERT_INTERVAL_MS) return;
+    this.canaryAlertAt.set(chatId, now);
+    void this.sendText(chatId, CANARY_ALERT_TEXT).catch(() => { /* 告警发送失败仅留日志 */ });
   }
 
   /**
@@ -541,11 +595,13 @@ export class FeishuGateway {
     }
   }
 
-  /** 发送卡片消息，返回 message_id（消息卡通道：入口剥离 cardkit 专属属性，见 strip 函数注释） */
+  /** 发送卡片消息，返回 message_id（消息卡通道：入口剥离 cardkit 专属属性，见 strip 函数注释）。
+   *  R3：先经出站深度脱敏——文本卡/进度卡/结果卡/diff 卡/notify 卡全部走此口 */
   async sendCard(chatId: string, card: unknown): Promise<string> {
+    const safe = this.sanitizeCard(chatId, card);
     const res = await this.client.im.message.create({
       params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(stripMessageChannelUnsupportedProps(card)) },
+      data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(stripMessageChannelUnsupportedProps(safe)) },
     });
     if (!res.data?.message_id) throw new Error(`发送卡片失败: ${JSON.stringify(res)}`);
     return res.data.message_id;
@@ -556,9 +612,12 @@ export class FeishuGateway {
     return this.sendCard(chatId, buildTextCard(markdown, this.cardWidth()));
   }
 
-  /** 更新已发送卡片（流式进度刷新；消息卡通道：入口剥离 cardkit 专属属性） */
+  /** 更新已发送卡片（流式进度刷新；消息卡通道：入口剥离 cardkit 专属属性）。
+   *  R3：流式正文同样出站，先深度脱敏（chatId 不可得 → 告警通道退化为仅审计+日志，
+   *  流式块的金丝雀告警由 wiring 在 finalText/流文本层覆盖） */
   async updateCard(messageId: string, card: unknown): Promise<void> {
-    await this.client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(stripMessageChannelUnsupportedProps(card)) } });
+    const safe = this.sanitizeValue(card);
+    await this.client.im.message.patch({ path: { message_id: messageId }, data: { content: JSON.stringify(stripMessageChannelUnsupportedProps(safe.value)) } });
   }
 
   /**
@@ -568,9 +627,10 @@ export class FeishuGateway {
    * 调用方（ProgressCard.start）捕获失败后自动降级普通卡片 + 整卡 PATCH。
    */
   async sendCardEntity(chatId: string, card: unknown): Promise<{ messageId: string; cardId: string }> {
+    const safe = this.sanitizeCard(chatId, card);
     const create = await this.client.request({
       method: 'POST', url: '/open-apis/cardkit/v1/cards',
-      data: { type: 'card_json', data: JSON.stringify(card) },
+      data: { type: 'card_json', data: JSON.stringify(safe) },
     });
     const cardId = (create.data as { card_id?: string } | undefined)?.card_id;
     if (create.code !== 0 || !cardId) throw new Error(`创建卡片实体失败: ${JSON.stringify(create)}`);
@@ -597,9 +657,10 @@ export class FeishuGateway {
    *  发创建式字段会被飞书直接 400（card is required），所有结构变化（confirm/plan/
    *  question 区、终态）都渲染不上屏，且结构签名不变回来前连计时局部更新也一并停摆 */
   async replaceCardEntity(cardId: string, sequence: number, card: unknown): Promise<void> {
+    const safe = this.sanitizeValue(card);
     const res = await this.client.request({
       method: 'PUT', url: `/open-apis/cardkit/v1/cards/${cardId}`,
-      data: { card: { type: 'card_json', data: JSON.stringify(card) }, sequence },
+      data: { card: { type: 'card_json', data: JSON.stringify(safe.value) }, sequence },
     });
     if (res.code !== 0) throw new Error(`卡片全量更新失败: ${JSON.stringify(res)}`);
   }
@@ -643,6 +704,15 @@ export class FeishuGateway {
    * 不校验会静默 resolve，用户收不到文件且无任何报错。
    */
   async uploadAndSendFile(chatId: string, filePath: string): Promise<void> {
+    // R3 文件出口红线：凭证/密钥类文件名一律不进飞书（模型 send_file、用户点名取文件、
+    // 计划文件发送全部经此口）。命中即抛错 + 审计——调用方（notify 工具/取文件通道）会把
+    // 错误消息回给模型或用户，文件本体不出进程
+    const name = basename(filePath);
+    if (DENIED_FILE_NAME_RE.test(name) || DENIED_FILE_EXT.has(name.slice(name.lastIndexOf('.')).toLowerCase())) {
+      this.onSecurityEvent?.({ kind: 'file-deny', path: filePath });
+      this.log.error(`[security] 已拦截凭证类文件外发：${name}`);
+      throw new Error('⛔ 没有权限发送该文件（安全红线）');
+    }
     if (isImageFile(filePath)) {
       const up = await this.client.im.image.create({
         data: { image_type: 'message', image: createReadStream(filePath) },

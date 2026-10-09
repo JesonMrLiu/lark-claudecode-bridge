@@ -38,15 +38,20 @@ export interface FeishuAppConfig {
   /** 档案级模型覆盖：取值应在该档案 models 候选集内（或即档案默认模型）；未配置 = 用档案默认 model。
    *  优先级：通道 /model 命令 > profileModel > 档案 model > 全局 */
   profileModel?: string;
-  /** deputy 专用：技能白名单（必填，透传 SDK Options.skills）——未列出的技能对模型不可见
-   *  且被 Skill 工具拒绝。注意 SDK 官方语义是「上下文过滤器非沙箱」：技能文件仍在磁盘、
-   *  可被 Read/Bash 读到，硬隔离需配合工具级限制（本期按用户决策不做） */
+  /** deputy 专用：技能白名单（可选，透传 SDK Options.skills）——配置后未列出的技能对模型不可见
+   *  且被 Skill 工具拒绝；未配置 = 全部技能（权限轴「未配置 = 全给」，安保由红线轴承担）。
+   *  注意 SDK 官方语义是「上下文过滤器非沙箱」：技能文件仍在磁盘、可被 Read/Bash 读到，
+   *  硬隔离由 R1 红区读黑名单与 Bash 三态承担 */
   allowedSkills?: string[];
   /** deputy 专用：插件白名单（可选）——自动发现的插件按 name 过滤，未列出的剔除；
-   *  显式 app.plugins 始终保留（开发期直指源码目录的场景） */
+   *  未配置 = 自动发现插件全部加载（显式 app.plugins 始终保留） */
   allowedPlugins?: string[];
-  /** deputy 专用：工作区锁定（必填）——任务强制运行在首个允许的工作区，/ws 切换被拒 */
+  /** deputy 专用：工作区白名单（可选）——配置后任务锁定在首个允许的工作区、/ws 切换被拒、
+   *  写操作（R2 红线）仅限这些工作区路径；未配置 = 全部已配置工作区（写红线仍在：工作区外一律只读） */
   allowedWorkspaces?: string[];
+  /** deputy 专用：Bash 可用性三态（缺省 confirm）。off=不提供 Bash（R1/R2 成为完备硬约束的推荐形态）；
+   *  confirm=危险命令/红区特征拦截或弹卡；trusted=放行（红区探测仍恒定生效；真正安全需 OS 沙箱，见方案 §7） */
+  bashMode?: 'off' | 'confirm' | 'trusted';
 }
 /** 工作区：name + path。旧版 type（code-dev/generic）已废弃（#6）——计划模式改为
  *  通道级 /plan 命令切换，diff 收尾改为 git 仓库自动判定；旧配置携带 type 仅 warn 忽略 */
@@ -62,6 +67,19 @@ export interface PermissionsConfig {
 }
 /** Web 配置页服务器（lcb start / lcb ui 内嵌，node:http 零依赖）：enabled/host/port 均为启动时读取，改动需重启 */
 export interface ServerConfig { enabled?: boolean; host?: string; port?: number }
+
+/**
+ * 安保段（整体可选；方案 v3 红线轴）。红区/脱敏/金丝雀三层：
+ * - redzone.read：R1 读黑名单（glob 模式，~ 展开、** 跨层级、* 段内通配）。对 deputy 恒定硬拦截，
+ *   不占分身配置、不可被绕过；主机器人不启用手（主人读本机文件属合法自用），由出站脱敏兜底
+ * - redact_patterns：R3 出站脱敏的自定义正则（追加在内置规则之后；全部机器人出站链路恒开）
+ * - canary_patterns：金丝雀标记，出站文本命中 = 防线被穿透，除脱敏外触发主人告警
+ */
+export interface SecurityConfig {
+  redzone?: { read?: string[] };
+  redactPatterns?: string[];
+  canaryPatterns?: string[];
+}
 export type ClaudeAuthMode = 'inherit' | 'managed';
 /**
  * 多厂商认证档案（Web 配置页「Claude 认证」管理，0.13 起）。档案仅是配置库：
@@ -120,6 +138,8 @@ export interface BridgeConfig {
   transcripts?: { retentionDays?: number };
   /** 权限白名单；缺省用 permission-gate 的内置默认（读工具 + Bash + 危险命令表） */
   permissions?: PermissionsConfig;
+  /** 安保段（红线轴）：R1 红区 / R3 脱敏与金丝雀；缺省用内置默认红区（见 security/paths 内置源） */
+  security?: SecurityConfig;
   /** Web 配置页服务器；缺省 enabled=true / 127.0.0.1:17317（随 lcb start 常驻） */
   server?: ServerConfig;
   /** Claude 认证模式；缺省 inherit（共享 ~/.claude） */

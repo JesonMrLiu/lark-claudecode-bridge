@@ -196,7 +196,20 @@ MCP server 配置（`.mcp.json` / `~/.claude.json` / 插件 `plugin.json` 的 `m
 本机 Claude Code 是共用资源：白名单用户可通过确认卡片让它在你电脑执行任意命令。
 请只批准信任的人；工作区白名单、用户白名单、写操作确认三道闸不要关闭。
 
-**隐私提醒**：对话全文（含代码、文件路径）明文落盘于 `~/.lark-claudecode-bridge/transcripts/`；`config.yaml` 中的 `app_secret` 与 `apps[].env` 值同样为明文。请自行控制该目录与文件的访问权限，并按需配置 `transcripts.retention_days` 保留期。
+**隐私提醒**：对话全文（含代码、文件路径）明文落盘于 `~/.lark-claudecode-bridge/transcripts/`（机器人输出的敏感形字符串已脱敏后落盘）；`config.yaml` 中的 `app_secret` 与 `apps[].env` 值同样为明文。请自行控制该目录与文件的访问权限，并按需配置 `transcripts.retention_days` 保留期。
+
+### 安保红线（分身机器人 deputy）
+
+权限模型为「双轴」：**权限轴**（`allowed_skills` / `allowed_plugins` / `allowed_workspaces`，全部可选，未配置 = 全给）管「能办哪些事」；**红线轴**（不占配置、恒定生效）管「任何分身、任何调用者都绝对不发生的事」：
+
+- **R1 读红线**：`security.redzone.read` 黑名单内的路径（bridge 自身配置与 transcripts、lark-cli token、`~/.ssh`、`credentials*`、`.env`、`*.pem` 等，内置默认见 `config.example.yaml`），分身一律拒绝访问，统一回复「没有权限」且不解释保护对象
+- **R2 写红线**：分身写/改/删仅限已分配工作区（未配置工作区白名单 = 全部已配置工作区），工作区外一律只读
+- **R3 出站脱敏**：全部机器人（含主机器人）发往飞书的每张卡片、流式正文、最终回复必经出站脱敏网关——`sk-` key、Bearer、JWT、PEM 块、`password=` 键值对、≥32 位 hex 等统一替换为 `******`；凭证类文件（`.pem/.key/.enc/credentials`）一律不允许发送到聊天。命中事件全量落盘 `~/.lark-claudecode-bridge/security/audit-<appId>.jsonl`
+- **R4 私人面拒绝**：分身设计上不承载主人私人数据面（邮件/私聊/通讯录），私人面工具对分身不存在（「不可被说服的能力缺失」）；主人私事请走主机器人
+- **Bash 三态**：`bash_mode: off`（不提供 Bash，R1/R2 成为完备硬约束的推荐形态）/ `confirm`（缺省，危险命令与红区特征弹卡或拒绝）/ `trusted`（放行；红区探测仍生效，真正安全需 OS 层沙箱）
+- **金丝雀**：在敏感位置预埋假密钥（如 `sk-canary-xxx`），任何金丝雀出现在对外消息中即触发脱敏 + 实时告警——这是验证防线存活的手段，建议部署后立即埋设
+
+已知边界：Bash 命令串的红区探测是 best-effort（命令替换/编码可绕过），进程内控制对 CLI 漏洞与恶意插件无能为力；要对抗这些需 OS 层沙箱（独立账号 + NTFS ACL），见方案文档「批次 3」。
 
 ## 已知限制
 

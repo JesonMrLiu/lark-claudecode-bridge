@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { parse, type YAMLParseError } from 'yaml';
 import type {
   BridgeConfig, CardConfig, ClaudeAuthMode, ClaudeConfig, ClaudeProfile, FeishuAppConfig, PermissionsConfig, PluginRef,
-  ServerConfig, SessionConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace,
+  SecurityConfig, ServerConfig, SessionConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace,
 } from './types.js';
 
 /** LCB_CONFIG_DIR 环境变量可覆盖配置根目录（多租户分进程场景用；正常用户无须设置） */
@@ -75,6 +75,7 @@ interface RawApp {
   role?: string;
   profile?: string;
   profile_model?: string;
+  bash_mode?: unknown;
   allowed_skills?: unknown;
   allowed_plugins?: unknown;
   allowed_workspaces?: unknown;
@@ -184,6 +185,55 @@ function normalizePermissions(doc: Record<string, unknown>): PermissionsConfig |
     ...(allowTools !== undefined ? { allowTools: allowTools as string[] } : {}),
     ...(dangerous !== undefined ? { dangerousCommands } : {}),
   };
+}
+
+/**
+ * 安保段归一化（整体可选；方案 v3 红线轴）：redzone.read 为 glob 模式串数组（运行期编译，
+ * 空数组 = 关闭 R1——显式关闭是主人的权利，但分身误配为空会失去红区保护，warn 提示）；
+ * redact_patterns 为自定义脱敏正则源串（此处预编译校验，非法条目 warn 跳过——运行期再失败
+ * 会静默漏规则，配置期提示一次）；canary_patterns 为金丝雀标记串。
+ */
+function normalizeSecurity(doc: Record<string, unknown>): SecurityConfig | undefined {
+  const raw = doc.security;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object') throw new Error('security 必须为对象（含 redzone / redact_patterns / canary_patterns），请检查 config.yaml');
+  const s = raw as { redzone?: unknown; redact_patterns?: unknown; canary_patterns?: unknown };
+  const out: SecurityConfig = {};
+  if (s.redzone !== undefined && s.redzone !== null) {
+    if (typeof s.redzone !== 'object') throw new Error('security.redzone 必须为对象（含 read 数组），请检查 config.yaml');
+    const read = (s.redzone as { read?: unknown }).read;
+    if (read !== undefined && read !== null) {
+      if (!Array.isArray(read) || read.some((x) => typeof x !== 'string' || !x.trim())) {
+        throw new Error('security.redzone.read 必须为非空字符串数组（glob 模式，支持 ~ / ** / *），请检查 config.yaml');
+      }
+      const list = (read as string[]).map((x) => x.trim()).filter(Boolean);
+      out.redzone = { read: list };
+      if (list.length === 0) console.warn('[配置] security.redzone.read 为空数组：R1 读红线已关闭（分身将可读取全盘），请确认是否预期');
+    }
+  }
+  const redact = s.redact_patterns;
+  if (redact !== undefined && redact !== null) {
+    if (!Array.isArray(redact)) throw new Error('security.redact_patterns 必须为正则字符串数组，请检查 config.yaml');
+    const compiled: string[] = [];
+    (redact as unknown[]).forEach((x, i) => {
+      if (typeof x !== 'string' || !x.trim()) throw new Error(`security.redact_patterns[${i}] 必须为非空正则字符串，请检查 config.yaml`);
+      try {
+        new RegExp(x); // 预编译校验（运行期 compileCustomRules 会再兜一层）
+        compiled.push(x);
+      } catch (e) {
+        console.warn(`[配置] security.redact_patterns[${i}] 不是合法正则（"${x.slice(0, 40)}"），已忽略：${(e as Error).message}`);
+      }
+    });
+    if (compiled.length) out.redactPatterns = compiled;
+  }
+  const canary = s.canary_patterns;
+  if (canary !== undefined && canary !== null) {
+    if (!Array.isArray(canary) || canary.some((x) => typeof x !== 'string' || !x.trim())) {
+      throw new Error('security.canary_patterns 必须为非空字符串数组，请检查 config.yaml');
+    }
+    out.canaryPatterns = (canary as string[]).map((x) => x.trim()).filter(Boolean);
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** Web 配置页服务器段（整体可选）：host 缺省 127.0.0.1、port 硬校验（非法值会让 server 起不来） */
@@ -419,9 +469,9 @@ function normalizeApps(doc: Record<string, unknown>, workspaceNames: string[]): 
       );
     }
     // 角色模型：primary（缺省）主机器人——全技能/全插件/全工作区，配对码准入；
-    // deputy 分身——按用途限定能力（技能/插件白名单 + 工作区锁定），艾特即用供他人使用。
-    // deputy 必须显式配置 allowed_skills 与 allowed_workspaces：分身不限能力 = 把主权限
-    // 开放给所有艾特者（本机数据/认证泄露面），配置错误在启动时硬抛而非静默全开
+    // deputy 分身——艾特即用供他人使用。权限轴语义（方案 v3）：白单未配置 = 全给
+    // （技能全开/插件全开/工作区=全部已配置工作区），安保由红线轴（security 红区 +
+    // R2 工作区外写拦截 + Bash 三态 + 出站脱敏）恒定承担，不依赖白单收窄
     let role: 'primary' | 'deputy' = 'primary';
     if (raw.role !== undefined && raw.role !== null) {
       if (raw.role !== 'primary' && raw.role !== 'deputy') {
@@ -429,25 +479,32 @@ function normalizeApps(doc: Record<string, unknown>, workspaceNames: string[]): 
       }
       role = raw.role;
     }
+    // Bash 三态：仅 deputy 消费（主机器人 Bash 永远可用，行为由全局 permissions 管）
+    let bashMode: 'off' | 'confirm' | 'trusted' | undefined;
+    if (raw.bash_mode !== undefined && raw.bash_mode !== null) {
+      if (raw.bash_mode !== 'off' && raw.bash_mode !== 'confirm' && raw.bash_mode !== 'trusted') {
+        throw new Error(`${where} 的 bash_mode 必须为 off / confirm / trusted（当前值：${String(raw.bash_mode)}），请检查 config.yaml`);
+      }
+      if (role !== 'deputy') {
+        console.warn(`[配置] ${where} 非 deputy 角色，bash_mode 不生效（主机器人 Bash 由全局 permissions 约束），已忽略`);
+      } else {
+        bashMode = raw.bash_mode;
+      }
+    }
     let allowedSkills: string[] | undefined;
     let allowedPlugins: string[] | undefined;
     let allowedWorkspaces: string[] | undefined;
     if (role === 'deputy') {
+      // 白单全部可选：未配置 = 全给（权限轴）。配置了才按白名单收窄；工作区名单仍校验拼写
       allowedSkills = normalizeStringArray(raw.allowed_skills, `${where} 的 allowed_skills`);
-      allowedWorkspaces = normalizeStringArray(raw.allowed_workspaces, `${where} 的 allowed_workspaces`);
       allowedPlugins = normalizeStringArray(raw.allowed_plugins, `${where} 的 allowed_plugins`);
-      if (!allowedSkills?.length) {
-        throw new Error(`${where} 为 deputy（分身）角色，必须配置 allowed_skills（技能白名单，非空数组）——分身须显式限定能干什么，如 [sql-review]`);
-      }
-      if (!allowedWorkspaces?.length) {
-        throw new Error(`${where} 为 deputy（分身）角色，必须配置 allowed_workspaces（工作区锁定，非空数组）——分身任务将锁定在第一个允许的工作区运行`);
-      }
-      const unknownWs = allowedWorkspaces.filter((w) => !workspaceNames.includes(w));
+      allowedWorkspaces = normalizeStringArray(raw.allowed_workspaces, `${where} 的 allowed_workspaces`);
+      const unknownWs = (allowedWorkspaces ?? []).filter((w) => !workspaceNames.includes(w));
       if (unknownWs.length) {
         throw new Error(`${where} 的 allowed_workspaces 含未在 workspaces 列表中定义的工作区：${unknownWs.join('、')}`);
       }
-    } else if (raw.allowed_skills !== undefined || raw.allowed_plugins !== undefined || raw.allowed_workspaces !== undefined) {
-      console.warn(`[配置] ${where} 非 deputy 角色，allowed_skills / allowed_plugins / allowed_workspaces 不生效（仅分身角色支持能力限定），已忽略`);
+    } else if (raw.allowed_skills !== undefined || raw.allowed_plugins !== undefined || raw.allowed_workspaces !== undefined || bashMode !== undefined) {
+      console.warn(`[配置] ${where} 非 deputy 角色，allowed_skills / allowed_plugins / allowed_workspaces / bash_mode 不生效（仅分身角色支持能力限定），已忽略`);
     }
     return {
       name,
@@ -465,6 +522,7 @@ function normalizeApps(doc: Record<string, unknown>, workspaceNames: string[]): 
       profile: typeof raw.profile === 'string' && raw.profile.trim() ? raw.profile.trim() : undefined,
       profileModel: typeof raw.profile_model === 'string' && raw.profile_model.trim() ? raw.profile_model.trim() : undefined,
       role,
+      bashMode,
       allowedSkills,
       allowedPlugins,
       allowedWorkspaces,
@@ -528,6 +586,7 @@ export function parseConfigText(raw: string, pathForError: string = CONFIG_PATH)
     transcripts: Number.isFinite(retentionDays) && retentionDays > 0 ? { retentionDays } : undefined,
     // 权限白名单：未配置的字段由消费侧（permission-gate）回退内置默认
     ...section(normalizePermissions(doc), 'permissions'),
+    ...section(normalizeSecurity(doc), 'security'),
     ...section(server, 'server'),
     ...section(claude, 'claude'),
     ...section(slashCommands, 'slashCommands'),
@@ -551,6 +610,7 @@ export function sameApps(a: FeishuAppConfig[], b: FeishuAppConfig[]): boolean {
       && x.concurrency === y.concurrency
       && x.appendSystemPrompt === y.appendSystemPrompt
       && x.role === y.role
+      && x.bashMode === y.bashMode
       && JSON.stringify(x.allowedSkills) === JSON.stringify(y.allowedSkills)
       && JSON.stringify(x.allowedPlugins) === JSON.stringify(y.allowedPlugins)
       && JSON.stringify(x.allowedWorkspaces) === JSON.stringify(y.allowedWorkspaces);

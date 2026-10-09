@@ -44,6 +44,9 @@ import { isLocalCommandRewrite, matchTrigger, rewriteByTrigger } from './session
 import { Semaphore, channelKey } from './session/channel.js';
 import { TranscriptWriter, sweepTranscripts, type TranscriptRecorder } from './transcript/transcript-writer.js';
 import { nowBeijingISO } from './util/beijing-time.js';
+import { getRedactor } from './security/redact.js';
+import { DEFAULT_REDZONE_READ_SOURCES } from './security/paths.js';
+import { CANARY_ALERT_TEXT, SecurityAudit, type SecurityAuditWriter, type SecurityEvent } from './security/audit.js';
 
 // 版本号收敛到 version.ts 单一来源（bin/lcb.ts 与 smoke 测试均引用）
 export { VERSION } from './version.js';
@@ -139,6 +142,8 @@ export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真
   executor: typeof runTask;
   /** 对话落盘记录器（可选依赖：缺失即不落盘，写失败自身消化不抛出） */
   transcript?: TranscriptRecorder;
+  /** 安全面审计（可选依赖：deny/脱敏/金丝雀事件落盘；缺失时仅控制台日志） */
+  audit?: SecurityAuditWriter;
 }
 
 // ENABLE_TOOL_SEARCH 显式开启会加剧核心工具 defer 进 ToolSearch（开场工具清单更不完整），
@@ -418,10 +423,11 @@ export function createBridge(
     // currentWorkspace 语义：store 中已设置的工作区优先，否则 app 默认，最后全局默认——
     // 保证 /new、/status 回复与实际一致。用 || 而非 ??：archiveSession 为新通道建档时
     // workspaceName 存 ''（归档时不知工作区），空串必须回退默认，否则 inventory 键错位。
-    // 分身角色恒锁首个允许的工作区（config 已校验非空）：命令上下文、inventory 键与任务
-    // wsName 同源锁定，通道 state 旧存的 workspaceName 一律不采信
-    const currentWorkspace = app.role === 'deputy'
-      ? app.allowedWorkspaces![0]
+    // 分身角色配置了工作区白名单时恒锁首个允许的工作区：命令上下文、inventory 键与任务
+    // wsName 同源锁定，通道 state 旧存的 workspaceName 一律不采信；未配置白名单 =
+    // 权限轴「全给」，与主机器人同规则（state 优先 → app 默认 → 全局默认）
+    const currentWorkspace = app.role === 'deputy' && app.allowedWorkspaces?.length
+      ? app.allowedWorkspaces[0]
       : (st?.workspaceName || app.defaultWorkspace || config.defaults.workspace);
     // 2.4 触发词两段式补充（ask_detail）：上一条消息命中「需补充」规则且正在等待时，本条
     // 非 / 消息（同一用户）视作补充内容——与原始消息拼接后对该规则重新改写：补充内容即
@@ -629,6 +635,27 @@ export function createBridge(
     // 白名单/黑名单经 getter 传入：gate 虽按通道永久复用，decide 时才经 getter 现读
     // config.permissions——热重载原地 mutate 同一 config 对象后，已有通道的下一个工具
     // 调用即生效（不再需要新通道/重启；0.17.0 静态快照导致改配置后旧通道不生效）
+    // 分身安全闸（R1/R2/Bash 三态）：仅 deputy 注入，主机器人行为零变化
+    const securityGuard = app.role === 'deputy'
+      ? {
+        cwd: workspacePath(wsName),
+        redzone: () => config.security?.redzone?.read ?? DEFAULT_REDZONE_READ_SOURCES,
+        // 未配置工作区白名单 = 权限轴全给：写根 = 全部已配置工作区（R2 红线仍在：工作区外只读）
+        writeRoots: () => (app.allowedWorkspaces?.length ? app.allowedWorkspaces : config.workspaces.map((w) => w.name))
+          .map((n) => workspacePath(n)),
+        bashMode: () => app.bashMode ?? 'confirm',
+      }
+      : undefined;
+    // 安全事件分流：审计落盘（always）+ 金丝雀向当前聊天告警（固定模板，节流在 gateway 侧）
+    const onSecurityEvent = (ev: SecurityEvent): void => {
+      deps.audit?.write(app.appId, ev);
+      if (ev.kind !== 'canary') {
+        console.warn(tag, '[安全拦截]', JSON.stringify(ev));
+        return;
+      }
+      console.error(tag, '[安全告警] 🚨 金丝雀命中（防线疑似被穿透），已脱敏并告警');
+      void deps.gateway.sendTextTo(msg.chatId, CANARY_ALERT_TEXT).catch(() => { /* 告警失败仅留日志 */ });
+    };
     let gate = gates.get(key);
     if (!gate) {
       gate = new PermissionGate({
@@ -636,6 +663,8 @@ export function createBridge(
         // ?? 而非 ||：显式 false（用户主动关闭全部免确认）不能被回落到缺省的 true
         allowAllTools: () => config.permissions?.allowAllTools ?? DEFAULT_ALLOW_ALL_TOOLS,
         dangerousCommands: () => config.permissions?.dangerousCommands ?? DEFAULT_DANGEROUS_COMMANDS,
+        ...(securityGuard ? { security: securityGuard } : {}),
+        onSecurityEvent,
         ask: async (req) => {
           // 工具确认嵌入当前任务的进度卡（按钮在计时行上方、正文收敛）——不再单独发确认卡：
           // 独立确认卡与进度卡正文内容大量重复，且追加在进度卡下方会把进度卡顶出会话底部。
@@ -869,21 +898,23 @@ planAsk: async (req) => {
         // managed 模式合并发现两处目录（自管 + 本机 ~/.claude）：按绝对 installPath 传 SDK，
         // 用户本机已装插件无须重装；resolvePluginPaths 按 name 去重，当前生效目录优先。
         // 分身角色按 allowed_plugins 白名单过滤（显式 app.plugins 始终保留——写在分身配置里
-        // 的就是要给的）；未配 allowed_plugins 时自动发现全剔除（分身不声明 = 不加载）
+        // 的就是要给的）；未配 allowed_plugins = 权限轴「全给」，自动发现插件全部加载
         ...(() => {
           const discovered = claudeDir === DEFAULT_CLAUDE_DIR
             ? discoverPlugins(claudeDir)
             : [...discoverPlugins(claudeDir), ...discoverPlugins(DEFAULT_CLAUDE_DIR)];
           let merged = resolvePluginPaths(app.plugins, discovered);
-          if (app.role === 'deputy') {
+          if (app.role === 'deputy' && app.allowedPlugins !== undefined) {
             merged = merged.filter((p) =>
-              app.plugins?.some((e) => e.name === p.name) || app.allowedPlugins?.includes(p.name));
+              app.plugins?.some((e) => e.name === p.name) || app.allowedPlugins!.includes(p.name));
           }
           return merged.length ? { plugins: merged.map((p) => ({ path: p.path })) } : {};
         })(),
         // 分身技能白名单：透传 SDK Options.skills（官方上下文过滤器——未列出技能对模型不可见
         // 且被 Skill 工具拒绝；非沙箱：技能文件仍在磁盘可被 Read/Bash 读到，用户已知悉此边界）
         ...(app.role === 'deputy' && app.allowedSkills?.length ? { allowedSkills: app.allowedSkills } : {}),
+        // 分身计划批准不升级 acceptEdits：该模式会绕过 canUseTool，宿主安全闸（R1/R2）随之失效
+        ...(app.role === 'deputy' ? { planApproveEscalates: false } : {}),
         canUseTool: (toolName, input, ctx) => gate.decide(toolName, input, wsName, ctx),
         onQuery: (handle) => { activeQueries.set(key, { wsName, handle }); },
       }, {
@@ -911,19 +942,28 @@ planAsk: async (req) => {
             progress.markStarted();
           } else if (e.kind === 'text') {
             progress.markStarted();
-            progress.appendText(e.content);
+            // R3：流式正文块脱敏后再渲染/落盘（进度卡展示 + transcript 双消费点；
+            // gateway 深度脱敏仍在其后兜底，双保险覆盖 transcript 这一本地落盘面）
+            const streamRedaction = getRedactor(config.security).text(e.content);
+            if (streamRedaction.hits.length) {
+              deps.audit?.write(app.appId, { kind: 'redact', ruleIds: [...new Set(streamRedaction.hits)], source: 'stream' });
+            }
+            if (streamRedaction.canary) onSecurityEvent({ kind: 'canary', source: 'stream' });
+            progress.appendText(streamRedaction.text);
             // 落盘 · assistant：流式文本块全文（每块一行，天然增量）
             deps.transcript?.assistant({
               v: 1, ts: now(), kind: 'assistant', app: app.appId,
-              chatId: msg.chatId, userId: msg.userId, text: e.content,
+              chatId: msg.chatId, userId: msg.userId, text: streamRedaction.text,
             });
           } else if (e.kind === 'tool-start') {
             const [n, ...rest] = e.content.split(': ');
             progress.markStarted();
-            progress.toolStart(n, rest.join(': '));
+            // 摘要（命令串/路径）同样过脱敏再落盘——命令回显可能带出先前输出中的秘密
+            const summaryRedaction = getRedactor(config.security).text(rest.join(': '));
+            progress.toolStart(n, summaryRedaction.text);
             deps.transcript?.tool({
               v: 1, ts: now(), kind: 'tool', app: app.appId,
-              chatId: msg.chatId, userId: msg.userId, phase: 'start', tool: n, summary: rest.join(': '), ok: true,
+              chatId: msg.chatId, userId: msg.userId, phase: 'start', tool: n, summary: summaryRedaction.text, ok: true,
             });
           } else if (e.kind === 'tool-result') {
             progress.toolResult(e.content, e.ok ?? true, e.note);
@@ -950,8 +990,15 @@ planAsk: async (req) => {
         });
         return;
       }
-      // finalText 提前算好：finish 携带字数，终态进度卡据此显示「完整回复已单独发送」提示行
-      const finalText = outcome.finalText?.trim() ?? '';
+      // finalText 提前算好：finish 携带字数，终态进度卡据此显示「完整回复已单独发送」提示行。
+      // R3：先脱敏再落盘/发送——transcript 写入（下方 result 事件）与结果卡都消费脱敏后文本，
+      // bridge 自己的落盘不再残留明文（方案 v3 §八.4：脱敏点在 transcript 之前，非发送点）
+      const finalRedaction = getRedactor(config.security).text(outcome.finalText?.trim() ?? '');
+      if (finalRedaction.hits.length) {
+        deps.audit?.write(app.appId, { kind: 'redact', ruleIds: [...new Set(finalRedaction.hits)], source: 'final' });
+      }
+      if (finalRedaction.canary) onSecurityEvent({ kind: 'canary', source: 'final' });
+      const finalText = finalRedaction.text;
       await progress.finish('✅ 完成', finalText.length || undefined);
       archive(outcome.sessionId);
       deps.transcript?.result({
@@ -1312,8 +1359,10 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     config.workspaces = fresh.workspaces;
     config.defaults = fresh.defaults;
     // 权限白名单/黑名单热应用：通道级 gate 复用，但经 getter 在 decide 时现读 config.permissions，
-    // 此处原地替换后已有通道的下一个工具调用即用新名单
+    // 此处原地替换后已有通道的下一个工具调用即用新名单。安保段（红区/脱敏/金丝雀）同款 getter
+    // 现读 → 热生效；脱敏器按配置键 memo，键变化自动重编译
     config.permissions = fresh.permissions;
+    config.security = fresh.security;
     config.claude = fresh.claude;
     config.server = fresh.server;
     config.slashCommands = fresh.slashCommands;
@@ -1343,6 +1392,8 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
         // 机器人级厂商档案热生效：executeTask 每任务经 app-profile.ts 现读解析
         config.apps[i].profile = fa.profile;
         config.apps[i].profileModel = fa.profileModel;
+        // 分身 Bash 三态热生效：gate 在 decide 时经 getter 现读 app.bashMode
+        config.apps[i].bashMode = fa.bashMode;
       });
     }
     return null;
@@ -1379,6 +1430,8 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     }
   }
   // 每 app 一对 gateway+bridge：长连接/会话池/并发闸/Claude Code 环境/落盘目录全部 per-app 隔离
+  // 安全面审计：单实例按 appId 分文件落盘（CONFIG_DIR/security/audit-<appId>.jsonl）
+  const securityAudit = new SecurityAudit(join(CONFIG_DIR, 'security'));
   const runners = config.apps.map((app) => {
     const tag = `[app:${app.name}]`;
     const gateway = new FeishuGateway(app, {
@@ -1387,6 +1440,12 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
       strictGroupMention: config.apps.length > 1,
       // 卡片宽度热生效：getter 现读 config.card（reloader 原地 mutate 同一对象）
       cardWidth: () => config.card?.width ?? 'default',
+      // R3 出站脱敏（恒开，全部机器人）：getter 现读 config.security → 热重载即生效
+      redactor: () => getRedactor(config.security),
+      onSecurityEvent: (ev) => {
+        securityAudit.write(app.appId, ev);
+        if (ev.kind !== 'redact') console.warn(tag, '[安全事件]', ev.kind);
+      },
     });
     const deps: BridgeDeps = {
       gateway: {
@@ -1407,6 +1466,7 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
       store: SessionStore.load(join(CONFIG_DIR, `sessions.${app.appId}.json`)),
       executor: runTask,
       transcript: new TranscriptWriter(join(CONFIG_DIR, 'transcripts', app.appId)),
+      audit: securityAudit,
     };
     return { app, gateway, bridge: createBridge(config, app, deps, { reloadConfig }) };
   });

@@ -24,7 +24,9 @@ export interface RunTaskOptions {
   signal?: AbortSignal;
   /** per-app 环境变量：至少含 CLAUDE_CONFIG_DIR（~/.claude，全部机器人共享）；可追加 settings.json 里没有的键 */
   env?: Record<string, string | undefined>;
-  /** per-app 人格补充，直通 SDK appendSystemPrompt */
+  /** per-app 人格补充：经 extraArgs['append-system-prompt'] 以 CLI 命令行参数注入。
+   *  不走 SDK options.appendSystemPrompt——实测（方案 §1.2 A/B）该字段被 CLI 2.1.x 静默丢弃
+   *  （SDK 经 initialize 控制通道下发，CLI 不消费），命令行参数是唯一生效通道 */
   appendSystemPrompt?: string;
   /** 通道级模型覆盖（/model 命令设置），直通 Options.model；未设 = 跟随 ~/.claude/settings.json 的 model */
   model?: string;
@@ -52,6 +54,11 @@ export interface RunTaskOptions {
   /** 技能白名单（分身机器人）：非空时透传 SDK Options.skills——未列出的技能对模型不可见
    *  且被 Skill 工具拒绝（官方语义为「上下文过滤器非沙箱」）；缺省不传 = CLI 默认全量技能 */
   allowedSkills?: string[];
+  /** 计划批准后是否升级 CLI 权限模式到 acceptEdits（缺省 true，主机器人既有行为）。
+   *  分身必须传 false：acceptEdits 下 CLI 自动批准写操作、canUseTool 不再被调用，
+   *  宿主侧 R1 红区/R2 写边界随之失效——分身的写操作必须每笔过安全闸（gate 侧有
+   *  allow-session 记忆兜住确认摩擦，安全性不因批准计划而降级） */
+  planApproveEscalates?: boolean;
   /** query 创建后回调：暴露 mcpServerStatus 窄句柄（wiring 存入 activeQueries，/mcp 命令实时拉取用）。
    *  句柄仅在该 query 存活期间有效，任务结束后调用会 reject——调用方须自行 catch */
   onQuery?(handle: { mcpServerStatus(): Promise<McpServerStatus[]> }): void;
@@ -134,8 +141,11 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
           ) => {
             const decision = await opts.canUseTool!(toolName, input, { suggestions: ctx?.suggestions });
             // 计划批准即授权写操作：对齐 Claude Code CLI「plan 批准 → accept edits on」语义，
-            // 后续 Write/Edit 不再逐次弹确认卡（SDK Query.setPermissionMode，官方 permissions 文档姿势）
-            if (decision.behavior === 'allow' && toolName === 'ExitPlanMode') {
+            // 后续 Write/Edit 不再逐次弹确认卡（SDK Query.setPermissionMode，官方 permissions 文档姿势）。
+            // 分身（planApproveEscalates=false）不升级：acceptEdits 会绕过 canUseTool，
+            // 宿主安全闸（R1 红区/R2 写边界）随之失效——安全优先于确认摩擦
+            if (decision.behavior === 'allow' && toolName === 'ExitPlanMode'
+              && opts.planApproveEscalates !== false) {
               await q.setPermissionMode('acceptEdits').catch((e) => {
                 console.warn('[executor] setPermissionMode(acceptEdits) 失败（继续按批准前模式执行）:', e instanceof Error ? e.message : e);
               });
@@ -146,11 +156,19 @@ export async function runTask(prompt: string, opts: RunTaskOptions, cb: Executor
         : {}),
       ...(opts.signal ? { abortController: bridgeSignal(opts.signal) } : {}),
       ...(opts.env ? { env: opts.env } : {}),
-      ...(opts.appendSystemPrompt ? { appendSystemPrompt: opts.appendSystemPrompt } : {}),
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
       ...(opts.plugins ? { plugins: opts.plugins.map((p) => ({ type: 'local' as const, path: p.path })) } : {}),
-      ...(opts.extraArgs && Object.keys(opts.extraArgs).length ? { extraArgs: opts.extraArgs } : {}),
+      // extraArgs 合并口：调用方传入（--settings 档案认证）+ 人格补充（--append-system-prompt，
+      // CLI 2.1.x 只认命令行参数，SDK 同名 option 被静默丢弃——见 RunTaskOptions.appendSystemPrompt 注释）
+      ...((opts.extraArgs && Object.keys(opts.extraArgs).length) || opts.appendSystemPrompt
+        ? {
+          extraArgs: {
+            ...(opts.extraArgs ?? {}),
+            ...(opts.appendSystemPrompt ? { 'append-system-prompt': opts.appendSystemPrompt } : {}),
+          },
+        }
+        : {}),
     },
   });
   let finalText = '';

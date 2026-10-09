@@ -7,6 +7,13 @@ import { randomUUID } from 'node:crypto';
 import type { ConfirmationRequest, PermissionDecision } from '../types.js';
 import { NOTIFY_TOOL_PREFIX } from './notify-server.js';
 import { generateFileDiff } from '../util/diff.js';
+import {
+  extractToolPaths, matchRedzone, isUnderAnyRoot, bashHitsRedzone, cachedPathMatchers, WRITE_TOOLS,
+} from '../security/paths.js';
+import {
+  DENY_BASH_MESSAGE, DENY_REDLINE_MESSAGE, DENY_WRITE_MESSAGE,
+  type SecurityEvent,
+} from '../security/audit.js';
 
 /**
  * 内置默认免确认工具白名单（config.yaml permissions.allow_tools 缺省值；配置即整体替换）。
@@ -83,6 +90,28 @@ const TIMED_OUT_SYM = Symbol('question-timed-out');
 /** 生成确认 diff 的写工具集合（NotebookEdit 传入 generateFileDiff 后返回空，保持统一入口） */
 const DIFF_TOOLS: ReadonlySet<string> = new Set(['Write', 'Edit', 'NotebookEdit']);
 
+/** 分身 Bash 可用性三态（config apps[].bash_mode）：off=无 Bash；confirm=危险命令/红区特征弹卡或拒；
+ *  trusted=放行（R1 红区探测仍恒定生效——红线不随信任档位放宽）。trusted 档要真正安全需 OS 层沙箱 */
+export type DeputyBashMode = 'off' | 'confirm' | 'trusted';
+
+/**
+ * 分身安全闸配置（role: deputy 时由 wiring 注入；主机器人不注入 → 行为零变化）。
+ * 全部 getter 形态：decide 时现读，config.security 热重载即生效。
+ */
+export interface GateSecurity {
+  /** 相对路径的解析基准（= 当前任务工作区绝对路径） */
+  cwd: string;
+  /** R1 红区读黑名单（glob 模式源串，运行期编译缓存） */
+  redzone: () => readonly string[];
+  /** R2 写白名单根（已分配工作区绝对路径；未分配 = 全部已配置工作区） */
+  writeRoots: () => readonly string[];
+  /** Bash 三态 */
+  bashMode: () => DeputyBashMode;
+}
+
+/** 安全闸内部判定结果：命中即 deny + 产出审计事件 */
+interface GuardHit { event: SecurityEvent; message: string }
+
 /** 解析并校验 AskUserQuestion 的 input.questions；非法结构返回空数组（由调用方 deny） */
 export function parseQuestions(input: Record<string, unknown>): QuestionItem[] {
   const raw = input.questions;
@@ -135,6 +164,11 @@ export class PermissionGate {
       allowAllTools?: boolean | (() => boolean);
       /** Bash 危险命令正则（静态值或 getter）；缺省 DEFAULT_DANGEROUS_COMMANDS */
       dangerousCommands?: readonly RegExp[] | (() => readonly RegExp[]);
+      /** 分身安全闸（R1 红区读黑名单 / R2 工作区写边界 / Bash 三态）：deputy 角色注入，
+       *  主机器人不注入。判定先于 allowAllTools/allowTools 直通——红线是免确认模式也压不住的底线 */
+      security?: GateSecurity;
+      /** 安全事件回调（deny / 命中即触发）：wiring 侧接审计落盘与金丝雀告警 */
+      onSecurityEvent?: (ev: SecurityEvent) => void;
     },
   ) {
     this.allowTools = typeof opts.allowTools === 'function' ? opts.allowTools
@@ -153,6 +187,44 @@ export class PermissionGate {
   private isDangerousCommand(input: Record<string, unknown>): boolean {
     const cmd = typeof input.command === 'string' ? input.command : '';
     return cmd ? this.dangerousCommands().some((re) => re.test(cmd)) : false;
+  }
+
+  /**
+   * 分身安全闸判定（顺序即红线优先级）：
+   * 1) R1 读红线：文件工具路径命中红区 → deny（Read/Write/Edit/Grep/Glob/LS 的路径参数；
+   *    Bash 命令串红区字面前缀探测为 best-effort，文档化边界）
+   * 2) R2 写红线：写工具目标不在任何已分配工作区内 → deny
+   * 3) Bash 三态：off 一律 deny；confirm/trusted 下红区探测仍生效（R1 恒定，不随档位放宽）
+   */
+  private checkSecurity(toolName: string, input: Record<string, unknown>): GuardHit | null {
+    const sec = this.opts.security!;
+    const matchers = cachedPathMatchers(sec.redzone());
+    // R1：结构化路径工具的红区命中
+    for (const p of extractToolPaths(toolName, input)) {
+      const ruleId = matchRedzone(p, matchers, sec.cwd);
+      if (ruleId) return { event: { kind: 'path-deny', tool: toolName, path: p, ruleId }, message: DENY_REDLINE_MESSAGE };
+    }
+    // R2：写工具的工作区边界
+    if (WRITE_TOOLS.has(toolName)) {
+      const roots = sec.writeRoots();
+      for (const p of extractToolPaths(toolName, input)) {
+        if (!isUnderAnyRoot(p, roots, sec.cwd)) {
+          return { event: { kind: 'write-deny', tool: toolName, path: p }, message: DENY_WRITE_MESSAGE };
+        }
+      }
+    }
+    // Bash 三态 + 命令串红区探测（R1 恒定生效）
+    if (toolName === 'Bash') {
+      const cmd = typeof input.command === 'string' ? input.command : '';
+      if (sec.bashMode() === 'off') {
+        return { event: { kind: 'bash-deny', command: cmd.slice(0, 200), ruleId: 'mode:off' }, message: DENY_BASH_MESSAGE };
+      }
+      const ruleId = bashHitsRedzone(cmd, matchers);
+      if (ruleId) {
+        return { event: { kind: 'bash-deny', command: cmd.slice(0, 200), ruleId }, message: DENY_REDLINE_MESSAGE };
+      }
+    }
+    return null;
   }
 
   async decide(
@@ -199,6 +271,15 @@ export class PermissionGate {
     // 下一个工具调用即生效）；Bash 命中危险命令正则时落到确认卡——安全优先于两者，
     // 开关与白名单都不是绕过黑名单的后门
     const dangerous = toolName === 'Bash' && this.isDangerousCommand(input);
+    // 安全闸（分身）：R1 红区读 / R2 工作区外写 / Bash 三态与红区命令探测。
+    // 位置在 allowAllTools/allowTools/会话记忆之前——开关与白名单都不是红线的后门
+    if (this.opts.security) {
+      const hit = this.checkSecurity(toolName, input);
+      if (hit) {
+        this.opts.onSecurityEvent?.(hit.event);
+        return { behavior: 'deny', message: hit.message };
+      }
+    }
     if (!dangerous && (this.allowAllTools() || this.allowTools().has(toolName))) {
       return { behavior: 'allow' };
     }

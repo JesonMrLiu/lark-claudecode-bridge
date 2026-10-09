@@ -46,7 +46,7 @@ import {
 } from '../lark-cli-manager.js';
 
 /** PUT /api/config 参与整段替换的顶级键；body 未携带的键保持磁盘原文（含注释） */
-const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'server', 'claude', 'slash_commands', 'transcripts', 'session', 'card', 'autostart'] as const;
+const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'security', 'server', 'claude', 'slash_commands', 'transcripts', 'session', 'card', 'autostart'] as const;
 
 export interface WebServerOptions {
   /** server 段配置；缺省用默认（firstRun 无配置文件场景） */
