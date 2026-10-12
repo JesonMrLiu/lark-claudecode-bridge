@@ -128,6 +128,28 @@ export function createNotifyServer(sender: NotifySender): McpSdkServerConfigWith
   });
 }
 
+/** 通道级 sender 槽（生命周期方案 A2）：常驻进程复用 spawn 时的 notify server 实例，
+ *  而发送目标（chatId 绑定 + sentPaths 去重集）是每任务状态——delegate 固定挂在 server
+ *  上，实际 sender 经 setSender 每任务换绑。同通道 FIFO 串行保证换绑发生在上一轮全部
+ *  发送完成之后，无竞态窗口 */
+export interface NotifySenderSlot {
+  setSender(sender: NotifySender): void;
+  /** 恒定 delegate：createNotifyServer(delegate) 注入 MCP，调用时路由到当前 sender */
+  readonly delegate: NotifySender;
+}
+
+export function createNotifySenderSlot(): NotifySenderSlot {
+  let current: NotifySender | undefined;
+  return {
+    setSender: (sender) => { current = sender; },
+    delegate: {
+      sendText: (md) => current!.sendText(md),
+      sendImage: (path, caption) => current!.sendImage(path, caption),
+      sendFile: (path, note) => current!.sendFile(path, note),
+    },
+  };
+}
+
 /**
  * 由 gateway 发送能力 + chatId 组装 NotifySender（executeTask 每任务构造）。
  * sendImageWithCaption 可选：缺省（旧 gateway / 测试 mock）时图片降级为

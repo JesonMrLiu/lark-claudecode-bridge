@@ -15,12 +15,19 @@ export const CONFIG_PATH = join(CONFIG_DIR, 'config.yaml');
 export const DEFAULT_CONTEXT_REMIND_TOKENS = 150000;
 
 /** 会话行为段（整体可选）：context_remind_tokens 硬校验（非法值会让提醒永久误报/永不触发）；
- *  notify_sop 类型校验（非法值会让 SOP 注入/硬兜底配对错位） */
+ *  notify_sop 类型校验（非法值会让 SOP 注入/硬兜底配对错位）。
+ *  生命周期方案新增键：resident_process / resident_idle_minutes / resident_max_processes
+ *  （A2 常驻进程池）与 group_idle_reset_hours / group_max_turns / group_roll_notify
+ *  （A3 群聊自动滚动），全部硬校验——非法值会让回收/滚动永久误触发或永不触发 */
 function normalizeSession(doc: Record<string, unknown>): SessionConfig | undefined {
   const raw = doc.session;
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== 'object') throw new Error('session 必须为对象（含 context_remind_tokens / notify_sop），请检查 config.yaml');
-  const s = raw as { context_remind_tokens?: unknown; notify_sop?: unknown; tool_hint?: unknown };
+  const s = raw as {
+    context_remind_tokens?: unknown; notify_sop?: unknown; tool_hint?: unknown;
+    resident_process?: unknown; resident_idle_minutes?: unknown; resident_max_processes?: unknown;
+    group_idle_reset_hours?: unknown; group_max_turns?: unknown; group_roll_notify?: unknown;
+  };
   const out: SessionConfig = {};
   if (s.context_remind_tokens !== undefined && s.context_remind_tokens !== null) {
     const n = Number(s.context_remind_tokens);
@@ -42,6 +49,53 @@ function normalizeSession(doc: Record<string, unknown>): SessionConfig | undefin
       throw new Error(`session.tool_hint 必须为 boolean（true = 启用，false = 关闭；当前值：${String(s.tool_hint)}），请检查 config.yaml`);
     }
     out.toolHint = s.tool_hint;
+  }
+  // resident_process：缺省=true（同通道常驻复用 CLI 子进程），false = 每消息冷启（旧行为）
+  if (s.resident_process !== undefined && s.resident_process !== null) {
+    if (typeof s.resident_process !== 'boolean') {
+      throw new Error(`session.resident_process 必须为 boolean（true = 启用，false = 关闭；当前值：${String(s.resident_process)}），请检查 config.yaml`);
+    }
+    out.residentProcess = s.resident_process;
+  }
+  // resident_idle_minutes：空闲回收阈值（分钟），0 = 不自动回收；缺省 60（消费侧 ?? 兜底）
+  if (s.resident_idle_minutes !== undefined && s.resident_idle_minutes !== null) {
+    const n = Number(s.resident_idle_minutes);
+    if (!Number.isInteger(n) || n < 0 || n > 10_080) {
+      throw new Error(`session.resident_idle_minutes 必须为 0-10080 的整数（0 = 不自动回收；当前值：${String(s.resident_idle_minutes)}），请检查 config.yaml`);
+    }
+    if (n === 0) console.warn('[配置] session.resident_idle_minutes = 0：常驻进程将不被空闲回收（仅受 resident_max_processes 上限约束），注意内存占用');
+    out.residentIdleMinutes = n;
+  }
+  // resident_max_processes：池上限（按 app 统计），缺省 = 该 app 并发数（消费侧兜底）
+  if (s.resident_max_processes !== undefined && s.resident_max_processes !== null) {
+    const n = Number(s.resident_max_processes);
+    if (!Number.isInteger(n) || n < 1 || n > 100) {
+      throw new Error(`session.resident_max_processes 必须为 1-100 的整数（当前值：${String(s.resident_max_processes)}），请检查 config.yaml`);
+    }
+    out.residentMaxProcesses = n;
+  }
+  // group_idle_reset_hours：群聊空闲滚动阈值（小时），0 = 关闭；缺省 4（消费侧 ?? 兜底）
+  if (s.group_idle_reset_hours !== undefined && s.group_idle_reset_hours !== null) {
+    const n = Number(s.group_idle_reset_hours);
+    if (!Number.isFinite(n) || n < 0 || n > 720) {
+      throw new Error(`session.group_idle_reset_hours 必须为 0-720 的数字（0 = 关闭空闲滚动；当前值：${String(s.group_idle_reset_hours)}），请检查 config.yaml`);
+    }
+    out.groupIdleResetHours = n;
+  }
+  // group_max_turns：群聊轮次滚动阈值（任务数），0 = 关闭；缺省 30（消费侧 ?? 兜底）
+  if (s.group_max_turns !== undefined && s.group_max_turns !== null) {
+    const n = Number(s.group_max_turns);
+    if (!Number.isInteger(n) || n < 0 || n > 1000) {
+      throw new Error(`session.group_max_turns 必须为 0-1000 的整数（0 = 关闭轮次滚动；当前值：${String(s.group_max_turns)}），请检查 config.yaml`);
+    }
+    out.groupMaxTurns = n;
+  }
+  // group_roll_notify：滚动后首条回复尾部轻注记，缺省 true
+  if (s.group_roll_notify !== undefined && s.group_roll_notify !== null) {
+    if (typeof s.group_roll_notify !== 'boolean') {
+      throw new Error(`session.group_roll_notify 必须为 boolean（true = 带轻注记，false = 关闭；当前值：${String(s.group_roll_notify)}），请检查 config.yaml`);
+    }
+    out.groupRollNotify = s.group_roll_notify;
   }
   return out;
 }

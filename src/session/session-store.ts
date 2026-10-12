@@ -28,6 +28,12 @@ export interface ChannelState {
   /** 通道级计划模式（/plan 命令切换，跨重启持久；/new 不清除——它是通道偏好而非会话状态）。
    *  true = 任务以 plan mode 启动（模型先出计划 → 飞书卡片批准后执行）；缺省 = 直接执行 */
   planMode?: boolean;
+  /** 最近一次任务完成时间（ISO）：群聊空闲滚动（session.groupIdleResetHours）的判定基准。
+   *  每个任务收尾经 markActivity 刷新；缺省 = 无记录（不触发空闲滚动，首轮轮次滚动仍可生效） */
+  lastActiveAt?: string;
+  /** 当前会话累计任务轮次（每任务收尾 +1，切换续接指针时清零）：群聊轮次滚动
+   *  （session.groupMaxTurns）的判定基准。口径按飞书消息任务数计（非 CLI 主循环轮次） */
+  turnCount?: number;
 }
 
 /**
@@ -86,11 +92,28 @@ export class SessionStore {
    * /new 传 null（下个任务新开会话，历史保留）；/resume <n> 传选中 sessionId。
    * null 显式落盘（JSON 保留 "currentSessionId": null）——读取端以「字段缺失 vs null」
    * 区分存量数据与用户主动 /new，不能 delete（会退化为 undefined，见 ChannelState 注释）。
+   * 切换指针 = 切换会话（三个调用方 /new、/resume <n>、/ws use 与群聊自动滚动同语义），
+   * 轮次计数随之清零——turnCount 度量的是「当前会话跑了多少任务」，换了会话从头计。
    * channel 不存在时以 defaultWorkspace 初始化后设置。
    */
   setCurrentSession(key: string, sessionId: string | null, defaultWorkspace = ''): void {
     const st = this.data[key] ?? { workspaceName: defaultWorkspace, sessions: [] };
     st.currentSessionId = sessionId;
+    st.turnCount = 0;
+    this.data[key] = st;
+    this.save();
+  }
+
+  /**
+   * 任务收尾记一次通道活跃（生命周期方案 A3 滚动计数据源）：
+   * lastActiveAt = 当前时间（群聊空闲滚动基准），turnCount +1（群聊轮次滚动基准）。
+   * 成功/出错/被停止的任务都算一轮——只要上下文被消耗就在向滚动阈值累积。
+   * 不动指针与会话历史（归档由 archiveSession 负责，两者先后执行互不干扰）。
+   */
+  markActivity(key: string): void {
+    const st = this.data[key] ?? { workspaceName: '', sessions: [] };
+    st.lastActiveAt = new Date().toISOString();
+    st.turnCount = (st.turnCount ?? 0) + 1;
     this.data[key] = st;
     this.save();
   }

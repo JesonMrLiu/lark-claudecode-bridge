@@ -171,6 +171,26 @@ export interface SessionConfig {
   /** 工具可用性说明注入 appendSystemPrompt（软约束）：对抗 Claude Code 2.1.117+ dynamic tool loading
    *  下模型用 ToolSearch 自查时误判「Read/Write 等核心工具不存在」。缺省 true */
   toolHint?: boolean;
+  /** 常驻进程池（生命周期方案 A2）：同通道消息亲和复用同一 CLI 子进程，冷启动税从
+   *  「每消息一次」摊薄为「每会话一次」。配置指纹（人设/模型/plan/env/MCP/插件/档案
+   *  settings/cwd）任一变化即回收重建，保住「每任务现读热生效」语义。false = 每消息冷启
+   *  （旧行为）。缺省 true */
+  residentProcess?: boolean;
+  /** 常驻进程空闲回收阈值（分钟）：通道空闲超阈值杀进程释放内存（每进程数百 MB），只影响
+   *  下次响应速度、不影响会话（指针与 transcript 均落盘，追问时冷启 + resume 无缝续上）。
+   *  0 = 不自动回收（仅受 resident_max_processes 上限约束）；缺省 60 */
+  residentIdleMinutes?: number;
+  /** 常驻进程池上限（按 app 统计）：超出按 LRU 回收最久未用的空闲进程（忙进程不动）。
+   *  缺省 = 该 app 的并发数（concurrency） */
+  residentMaxProcesses?: number;
+  /** 群聊会话空闲滚动阈值（小时）（生命周期方案 A3）：话题切换天然伴随时间间隔，空闲超阈值
+   *  自动开新话题（业务无感）。0 = 关闭空闲滚动；缺省 4。私聊不受影响（手动 /new 最优） */
+  groupIdleResetHours?: number;
+  /** 群聊会话轮次滚动阈值（任务数）：兜底单话题超长，满阈值主动滚动（赶在 auto-compact 之前，
+   *  token 线性可控）。0 = 关闭轮次滚动；缺省 30 */
+  groupMaxTurns?: number;
+  /** 群聊滚动后首条回复尾部的轻注记开关（「🍃 已开启新话题」仅一条）；缺省 true */
+  groupRollNotify?: boolean;
 }
 export interface IncomingMessage {
   chatId: string; chatType: 'p2p' | 'group'; userId: string; text: string; messageId: string;

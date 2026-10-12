@@ -165,6 +165,25 @@ function flattenPost(rawContent: string): { text: string; imageKeys: string[]; f
  * 本函数以展平结构为主，同时兼容 {event: {...}} 包裹形态（原始事件体直投）。
  * 结构不合法一律返回 null，绝不抛异常。
  */
+/**
+ * 入站事件的创建时刻（ms）。探测链覆盖四种载荷形态：展平顶层 create_time（EventDispatcher
+ * 解包后 header/event 字段在顶层）、包裹形态 event.create_time、消息资源自带的
+ * message.create_time（毫秒字符串，receive 事件恒存在）与 event.message.create_time。
+ * 秒/毫秒自适应；全部缺失/非法返回 NaN（调用方按「未知年龄」放行——守卫宁可漏杀不可误杀）。
+ */
+export function eventCreateMs(event: unknown): number {
+  if (!event || typeof event !== 'object') return NaN;
+  const raw = event as {
+    create_time?: unknown;
+    event?: { create_time?: unknown; message?: { create_time?: unknown } };
+    message?: { create_time?: unknown };
+  };
+  const v = raw.create_time ?? raw.event?.create_time ?? raw.message?.create_time ?? raw.event?.message?.create_time;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return NaN;
+  return n > 1e12 ? n : n * 1000;
+}
+
 export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: { strictGroupMention?: boolean } = {}): IncomingMessage | RejectedMessage | null {
   try {
     if (event === null || typeof event !== 'object') return null;
@@ -316,6 +335,12 @@ export class FeishuGateway {
   // 不去重会导致整个任务跑两遍（两张进度卡 + 两条结果）。Map 迭代序即插入序，容量超限删最旧。
   private seenMessageIds = new Map<string, number>();
   private static readonly SEEN_MAX = 1000;
+  /** 过期消息守卫阈值：飞书长连接为至少一次投递，未确认事件会被延迟补投（实例接管/
+   *  重连场景实测 5 分钟后补投）——补投的"僵尸消息"若携带命令/触发词，会在此刻执行，
+   *  用户体感「机器人自己动了」。超过阈值（消息创建时间距今）一律忽略。正常路径消息
+   *  到达与处理延迟 <1s（分发不受任务队列阻塞），3 分钟余量充足；lcb 停机期间的消息
+   *  重启后补投同样被挡（用户通常已重发，日志留痕可查） */
+  private static readonly STALE_MAX_MS = 3 * 60_000;
 
   constructor(
     cfg: FeishuAppConfig,
@@ -524,6 +549,16 @@ export class FeishuGateway {
     this.ws = ws;
     const dispatcher = new this.sdk.EventDispatcher({}).register({
       'im.message.receive_v1': async (data: never) => {
+        // 过期消息守卫（须在 markSeen 之前：过期消息不进已见集合，重复补投同样被挡）
+        const created = eventCreateMs(data);
+        const ageMs = Date.now() - created;
+        if (Number.isFinite(created) && ageMs > FeishuGateway.STALE_MAX_MS) {
+          const mid = (data as { message?: { message_id?: string } })?.message?.message_id
+            ?? (data as { event?: { message?: { message_id?: string } } })?.event?.message?.message_id
+            ?? '(unknown)';
+          this.log.warn(`[过期消息] 忽略延迟补投的入站消息（创建于 ${Math.round(ageMs / 60000)} 分钟前，阈值 ${Math.round(FeishuGateway.STALE_MAX_MS / 60000)} 分钟）：${mid}`);
+          return;
+        }
         const parsed = parseIncomingMessage(data, botOpenId, { strictGroupMention: this.strictGroupMention });
         if (parsed && 'rejected' in parsed) {
           // 不支持的消息类型（p2p）：明确反馈而非静默蒸发；提示发送失败不影响主流程

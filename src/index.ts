@@ -23,7 +23,7 @@ import {
   type QuestionCardRequest, type QuestionCardAnswers,
 } from './gateway/card-builder.js';
 import { chunkText } from './util/chunk-text.js';
-import { runTask } from './executor/claude-executor.js';
+import { runTask, killResidentSession, killAllResidentSessions } from './executor/claude-executor.js';
 import { buildFileDiffCards } from './gateway/diff-card.js';
 import { collectFileDiff } from './util/workspace-diff.js';
 import type { McpServerStatus } from '@anthropic-ai/claude-agent-sdk';
@@ -32,7 +32,7 @@ import {
   type PlanAskResult, type AskQuestionResult,
 } from './executor/permission-gate.js';
 import { discoverPlugins, resolvePluginPaths } from './executor/plugin-discovery.js';
-import { createGatewaySender, createNotifyServer, NOTIFY_SERVER_NAME } from './executor/notify-server.js';
+import { createGatewaySender, createNotifyServer, createNotifySenderSlot, NOTIFY_SERVER_NAME, type NotifySenderSlot } from './executor/notify-server.js';
 import { BRIDGE_MCP_JSON, readMcpServersFromJsonFile } from './web/skills-mcp-api.js';
 import { FEISHU_NOTIFY_SOP_PROMPT, TOOL_HINT_PROMPT } from './notify-sop.js';
 import { ensureProfileSettingsFile, resolveAppProfile, resolveAppProfileModel } from './app-profile.js';
@@ -245,6 +245,10 @@ export function createBridge(
   // 当前存活 query 的 MCP 状态拉取句柄（executor onQuery 注入、任务 finally 删除）：
   // /mcp 命令在任务运行中经此实时拉取；句柄随 query 结束失效，调用侧须 catch
   const activeQueries = new Map<string, { wsName: string; handle: { mcpServerStatus(): Promise<McpServerStatus[]> } }>();
+  // 通道级 notify sender 槽（生命周期方案 A2）：常驻进程复用 spawn 时的 lcb-notify server
+  // 实例，发送目标（chatId 绑定 + sentPaths）经槽每任务换绑——同通道 FIFO 串行保证换绑
+  // 总在上一轮发送完成后发生
+  const notifySlots = new Map<string, NotifySenderSlot>();
   // 触发词两段式（ask_detail）等待补充的挂起项：channelKey → 命中规则与原始消息。
   // 命中「需补充」规则时先追问不入队；同用户下一条非 / 消息视作补充内容，与 rewrite 合并后入队。
   // 超时（SUPPLEMENT_WAIT_MS）自动失效走原流程；任意本地命令（cmd.handled）即取消等待——
@@ -538,10 +542,13 @@ export function createBridge(
         await deps.gateway.sendTextTo(msg.chatId, cmd.reply);
       }
       // 指针变更代际 bump：/new、/resume <n>、/ws use 都改写了 currentSessionId——
-      // 运行中/收尾窗口内任务的迟到归档据 pointerGen 放弃回写指针（archive 闭包比对）
+      // 运行中/收尾窗口内任务的迟到归档据 pointerGen 放弃回写指针（archive 闭包比对）。
+      // 同时作废该通道的常驻进程：换了续接目标，旧进程的会话上下文不再适用（忙进程不动，
+      // 运行中任务的中止由 /new 的 abort 负责，abort 会连带杀进程）
       if (cmd.pointerTouched) {
         const rt = runtimes.get(key);
         if (rt) rt.pointerGen = (rt.pointerGen ?? 0) + 1;
+        killResidentSession(`${app.appId}:${key}`);
       }
       // /new 开启新会话：
       // 1) 清空旧代际排队消息（epoch 自增，旧任务入 executeTask 即 no-op）
@@ -789,7 +796,14 @@ planAsk: async (req) => {
     const toolHintEnabled = config.session?.toolHint !== false;
     const sentPaths = new Set<string>();
     const sink = async (): Promise<void> => { await activeProgress.get(key)?.sinkToBottom(); };
-    const notifySender = createGatewaySender({
+    // 槽式换绑（A2）：本任务的 sender（chatId 硬绑定 + sentPaths 去重集）挂进通道级槽——
+    // 常驻进程复用 spawn 时的 lcb-notify server 实例，经 delegate 路由到槽内当前 sender
+    let notifySlot = notifySlots.get(key);
+    if (!notifySlot) {
+      notifySlot = createNotifySenderSlot();
+      notifySlots.set(key, notifySlot);
+    }
+    notifySlot.setSender(createGatewaySender({
       chatId: msg.chatId,
       sentPaths,
       sendText: async (c, md) => {
@@ -808,7 +822,7 @@ planAsk: async (req) => {
         await deps.gateway.uploadAndSendFile(c, p);
         await sink();
       },
-    });
+    }));
     activeProgress.set(key, progress);
     // 指针代际快照：任务运行期间 /new、/resume <n>、/ws use 都会 bump pointerGen，本任务
     // 收尾归档据此放弃回写指针（只入历史不覆盖用户选择）。定义在 try 外：catch 路径同样调用
@@ -822,11 +836,41 @@ planAsk: async (req) => {
     try {
       await progress.start();
       const state = deps.store.getChannelState(key);
+      // A3 群聊会话自动滚动（双阈值，先到先滚，业务无感）：空闲超阈值（话题切换天然伴随
+      // 时间间隔）或轮次满阈值（兜底单话题超长）→ 指针置 null——即 /new 的现成一行语义，
+      // 本条消息就是新话题的首条。私聊不滚（手动 /new 管理最优）。滚动同样 bump epoch
+      // 对齐 /new 语义：旧代际排队消息按「新建会话」丢弃（指针写保护已有 pointerGen 兜底）。
+      // 有排队消息被丢弃时显式告知（静默吞用户消息不可接受）；滚动本身不发独立提示，
+      // 仅在本条回复尾部带一次轻注记（见下方成功路径，可配置关闭）
+      let rolled = false;
+      if (msg.chatType === 'group') {
+        const idleHours = config.session?.groupIdleResetHours ?? 4;
+        const maxTurns = config.session?.groupMaxTurns ?? 30;
+        const lastActiveMs = state?.lastActiveAt ? Date.parse(state.lastActiveAt) : NaN;
+        const idleHit = idleHours > 0 && Number.isFinite(lastActiveMs) && Date.now() - lastActiveMs > idleHours * 3_600_000;
+        const turnsHit = maxTurns > 0 && (state?.turnCount ?? 0) >= maxTurns;
+        if (idleHit || turnsHit) {
+          deps.store.setCurrentSession(key, null, state?.workspaceName || wsName); // turnCount 随之清零
+          const rtRoll = runtimes.get(key);
+          const dropped = rtRoll?.queuedCount ?? 0;
+          if (rtRoll) {
+            rtRoll.epoch = (rtRoll.epoch ?? 0) + 1; // 本条已过代际检查，继续执行；后续旧代际排队消息入口 no-op
+            rtRoll.queuedCount = 0;
+          }
+          rolled = true;
+          console.log(tag, `[滚动] ${idleHit ? `空闲超 ${idleHours}h` : `轮次满 ${maxTurns}`}，群聊自动开启新话题：${key}`);
+          if (dropped > 0) {
+            await deps.gateway.sendTextTo(msg.chatId, `🗑️ 已开启新话题，${dropped} 条排队消息按旧话题取消（/resume 可找回此前讨论）`)
+              .catch(() => { /* 提示失败不阻断任务 */ });
+          }
+        }
+      }
 
       // 续接指针三态：undefined=旧版存量数据 → 回退 sessions[0]（旧语义 sessions[0] 即当前）；
       // null=/new 或 /ws use 已清指针 → 新开会话；字符串 → resume 该会话。
-      // 不能用 ??：null 会被 ?? 当成空值回退 sessions[0]，/new 的意图就被吞掉了
-      const pointer = state?.currentSessionId;
+      // 不能用 ??：null 会被 ?? 当成空值回退 sessions[0]，/new 的意图就被吞掉了。
+      // 滚动刚把指针置 null：本条直接开新会话（rolled 分支不用再读盘）
+      const pointer = rolled ? null : state?.currentSessionId;
       const resumeId = pointer === undefined ? state?.sessions?.[0]?.sessionId : pointer || undefined;
       const now = () => nowBeijingISO();
       // 落盘 · user：任务起点（prompt 全文 + resume 链上一轮 sessionId）
@@ -890,9 +934,19 @@ planAsk: async (req) => {
         // 机器人档案认证 settings 文件（--settings）：仅含认证键，命令行层压制生效目录 env
         ...(profileSettingsPath ? { extraArgs: { settings: profileSettingsPath } } : {}),
         // 进程内通知工具（send_text/send_image/send_file）：中间产物实时推给当前聊天。
-        // server 实例按任务构造，chatId 在 sender 闭包内硬绑定——模型无法选择接收者。
+        // server 实例按任务构造（挂通道槽 delegate，见上方槽式换绑），chatId 在 sender
+        // 闭包内硬绑定——模型无法选择接收者。
         // 配置页 MCP（#12）一并注入：bridge 自管 servers.json 每任务现读（热生效），notify 后展开保名
-        mcpServers: { ...loadBridgeMcpServers(), [NOTIFY_SERVER_NAME]: createNotifyServer(notifySender) },
+        mcpServers: { ...loadBridgeMcpServers(), [NOTIFY_SERVER_NAME]: createNotifyServer(notifySlot.delegate) },
+        // A2 常驻进程池：同通道亲和复用 CLI 子进程（冷启动税摊薄为每会话一次）。
+        // 指纹 = 本任务现读的全部 spawn 输入（人设/模型/plan/env/MCP/插件/档案 settings/
+        // cwd/续接指针），任一变化 → executor 回收重建，保「每任务现读热生效」语义；
+        // 空闲回收与池上限策略同样每任务现读（热改配置下一条消息生效）
+        affinityKey: `${app.appId}:${key}`,
+        resident: config.session?.residentProcess !== false,
+        residentIdleMs: (config.session?.residentIdleMinutes ?? 60) * 60_000,
+        residentMax: config.session?.residentMaxProcesses ?? (app.concurrency ?? config.concurrency),
+        residentScope: app.appId,
         // 插件：config.yaml 显式配置（开发期指源码目录）+ Claude 配置目录已启用的 marketplace
         // 插件自动发现，同名显式优先；SDK 对无效路径静默跳过，实际加载以 init 清单（/plugins 命令）为准。
         // managed 模式合并发现两处目录（自管 + 本机 ~/.claude）：按绝对 installPath 传 SDK，
@@ -999,6 +1053,15 @@ planAsk: async (req) => {
       }
       if (finalRedaction.canary) onSecurityEvent({ kind: 'canary', source: 'final' });
       const finalText = finalRedaction.text;
+      // A3 滚动轻注记：新话题首条回复尾部带一次（仅此一条，可配置关闭）——不发独立提示
+      // 消息（群聊里机器人自言自语就是噪音），失忆困惑由注记 + /resume 兜底；记忆层上线后
+      // 此注记可弱化/去除。注记只进回传文本，不进 transcript（传输层装饰，非模型产出）
+      const rollNote = rolled && config.session?.groupRollNotify !== false
+        ? '🍃 已开启新话题（此前讨论 /resume 可找回）'
+        : '';
+      const replyText = finalText
+        ? (rollNote ? `${finalText}\n\n---\n${rollNote}` : finalText)
+        : rollNote;
       await progress.finish('✅ 完成', finalText.length || undefined);
       archive(outcome.sessionId);
       deps.transcript?.result({
@@ -1025,8 +1088,8 @@ planAsk: async (req) => {
       // 消息限流）——不论长短都不再进进度卡正文（主卡只留提示行），彻底消除「折叠看不到全文」
       // 与「卡片/消息两边重复」（旧三段式 ≤400 终态自载的边界问题）。尾卡纯展示，想继续对话/
       // 提意见直接回复消息即可
-      if (finalText) {
-        const chunks = chunkText(finalText);
+      if (replyText) {
+        const chunks = chunkText(replyText);
         const total = chunks.length;
         const resultReq: ResultCardRequest = {
           charCount: finalText.length, workspaceName: wsName,
@@ -1117,6 +1180,9 @@ planAsk: async (req) => {
       activeQueries.delete(key);
       rt.abort = undefined;
       rt.busy = false;
+      // A3 滚动计数：任务收尾即一轮活跃（成功/出错/停止都消耗了上下文，均向阈值累积）；
+      // 指针与历史归档已在上文完成，markActivity 只记时间戳与轮次
+      deps.store.markActivity(key);
       release();
     }
   }
@@ -1254,9 +1320,11 @@ planAsk: async (req) => {
           return { toast: { type: 'info', content: '该工作区已是当前工作区' } };
         }
         applyWorkspaceSwitch(deps.store, wsc.channelKey, target);
-        // 等价 cmd.pointerTouched：切换清了续接指针，运行中/收尾窗口内任务的迟到归档不得回写
+        // 等价 cmd.pointerTouched：切换清了续接指针，运行中/收尾窗口内任务的迟到归档不得回写；
+        // 常驻进程同步作废（cwd 已随工作区变化，旧进程上下文不再适用）
         const wsRt = runtimes.get(wsc.channelKey);
         if (wsRt) wsRt.pointerGen = (wsRt.pointerGen ?? 0) + 1;
+        killResidentSession(`${app.appId}:${wsc.channelKey}`);
         // 同通道其余工作区卡置 stale：旧卡显示的当前项已过时，继续可点会诱导误切回旧工作区
         for (const [id, e] of wsPending) {
           if (e.channelKey === wsc.channelKey && id !== action.value.requestId) e.stale = true;
@@ -1487,6 +1555,8 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     console.log(`\n收到 ${sig}，正在关闭 ${runners.length} 条长连接…`);
     webHandle?.close();
     for (const r of runners) r.gateway.close();
+    // 常驻 CLI 子进程一并回收（优雅退出，不赖 stdio 断连兜底）
+    killAllResidentSessions();
     clearPidFile();
     process.exit(0);
   };
