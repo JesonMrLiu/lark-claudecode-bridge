@@ -18,7 +18,7 @@ export interface PathMatcher { id: string; re: RegExp }
  * 出站脱敏兜底）。误报取向：宁可多拦（双星加 .key 一类的密钥扩展名），分身工作区如需此类文件由主人显式调整清单。
  */
 export const DEFAULT_REDZONE_READ_SOURCES: readonly string[] = [
-  '~/.lark-claudecode-bridge/**',   // bridge config.yaml（app_secret）/ transcripts / plans
+  '~/.lark-claudecode-bridge/**',   // bridge config.yaml（app_secret）/ transcripts / plans；inbox 子目录被 R1 豁免（入站附件，见 GateSecurity.inboxRoot）
   '~/.lark-cli/**',                 // lark-cli 用户授权 token（R4 私人面互锁项）
   '~/.claude/**',                   // CLI 登录态 / OAuth / 本机 settings
   '~/.codex/**',
@@ -170,17 +170,44 @@ export const WRITE_TOOLS: ReadonlySet<string> = new Set(['Write', 'Edit', 'Noteb
  * - 把命令文本中的 `~/` 引用展开后，检查是否包含任一红区模式的「字面前缀」（模式首个通配符之前
  *   的字面部分，如 `~/.ssh/**` → `<home>/.ssh/`）；
  * - 纯通配开头（如双星开头再接 credentials）无稳定字面前缀，跳过——此类交给出站脱敏兜底。
+ * inboxRoot（入站附件豁免根）传入时：命中字面前缀后须命令串中该前缀的每一处出现都指向 inbox
+ * 根内才豁免该模式，任一处不指向仍命中——fail-closed，不扩大既有绕过面。
  * 命中返回模式串，未命中返回 null。
  */
-export function bashHitsRedzone(command: string, matchers: readonly PathMatcher[]): string | null {
+export function bashHitsRedzone(
+  command: string,
+  matchers: readonly PathMatcher[],
+  inboxRoot?: string,
+): string | null {
   if (!command) return null;
   const expanded = command.replace(/(^|[\s"'=;(])~([/\\])/g, (_m, pre: string, sep: string) => `${pre}${homedir()}${sep}`);
   const norm = normalizeForCompare(expanded);
+  const inboxNorm = inboxRoot ? normalizeForCompare(inboxRoot) : '';
   for (const m of matchers) {
     const literal = literalPrefix(m.id);
-    if (literal && norm.includes(literal)) return m.id;
+    if (!literal || !norm.includes(literal)) continue;
+    if (inboxNorm && allOccurrencesUnderInbox(norm, literal, inboxNorm)) continue; // 全部指向 inbox → 豁免该模式
+    return m.id;
   }
   return null;
+}
+
+/** Bash token 断字字符集（豁免的 fail-closed 边界）：inbox 根之后紧跟这些字符视为引用结束；
+ *  其余字符（含 : = * ? $ 等 shell 合法文件名成分）一律视为路径成分 → 不豁免回退 deny */
+const BASH_TOKEN_BREAK = new Set([' ', '\t', '\n', '\r', '"', "'", '`', ';', '&', '|', '<', '>', '(', ')', ',']);
+
+/** literal 在 norm 中的每一处出现是否都指向 inbox 根内（含根本身）：
+ *  - 出现处须完整匹配 inboxNorm 前缀（~/.ssh/inbox 一类「第一段恰好叫 inbox」的无关模式引用不会误豁免）；
+ *  - inboxNorm 之后须为 /（子路径）、串尾（根本身）或断字符；inbox2 / inbox:x 等视为不同路径 → false。
+ *  已知边界（与文件头 best-effort 口径一致）：`inbox/../config.yaml` 回溯、命令替换编码不在字面探测
+ *  能力内（R1 结构化路径侧因 normalizeForCompare 走 resolve 折叠 .. 无此问题），根治靠 OS 层沙箱 */
+function allOccurrencesUnderInbox(norm: string, literal: string, inboxNorm: string): boolean {
+  for (let i = norm.indexOf(literal); i !== -1; i = norm.indexOf(literal, i + literal.length)) {
+    if (!norm.startsWith(inboxNorm, i)) return false;
+    const c = norm[i + inboxNorm.length];
+    if (c !== undefined && c !== '/' && !BASH_TOKEN_BREAK.has(c)) return false;
+  }
+  return true;
 }
 
 /** 模式串首个通配符前的字面前缀（归一化；无有效字面前缀返回 ''） */

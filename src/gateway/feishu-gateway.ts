@@ -2,7 +2,7 @@ import * as realSdk from '@larksuiteoapi/node-sdk';
 import { createReadStream, mkdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type { CardDecision, FeishuAppConfig, GatewayHandlers, IncomingMessage, RejectedMessage } from '../types.js';
-import { CONFIG_DIR } from '../config.js';
+import { INBOX_DIR } from '../config.js';
 import { buildImageCard, buildTextCard } from './card-builder.js';
 import { isImageFile } from '../util/file-types.js';
 import type { Redactor } from '../security/redact.js';
@@ -368,7 +368,7 @@ export class FeishuGateway {
       error: (...a: unknown[]) => console.error(tag, ...a),
     };
     this.strictGroupMention = deps.strictGroupMention ?? false;
-    this.inboxDir = deps.inboxDir ?? join(CONFIG_DIR, 'inbox');
+    this.inboxDir = deps.inboxDir ?? INBOX_DIR;
     this.cardWidth = deps.cardWidth ?? (() => 'default');
     this.redactor = deps.redactor;
     this.onSecurityEvent = deps.onSecurityEvent;

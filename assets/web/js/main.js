@@ -14,8 +14,9 @@ import { page as pSlash } from './pages/slash.js';
 import { page as pPlugins } from './pages/plugins.js';
 import { page as pSkills } from './pages/skills.js';
 import { page as pMcp } from './pages/mcp.js';
+import { page as pMemory } from './pages/memory.js';
 
-const PAGES = [pOverview, pApps, pWorkspaces, pClaude, pPermissions, pSlash, pPlugins, pSkills, pMcp];
+const PAGES = [pOverview, pApps, pWorkspaces, pClaude, pPermissions, pSlash, pPlugins, pSkills, pMcp, pMemory];
 const pageById = new Map(PAGES.map((p) => [p.id, p]));
 const DEFAULT_TAB = 'overview';
 

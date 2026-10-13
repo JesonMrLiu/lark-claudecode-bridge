@@ -61,6 +61,27 @@ export function applySecrets(newDoc: Record<string, unknown>, oldDoc: Record<str
     }
     doc.claude = newClaude;
   }
+  // memory 段（§6.8 记忆增强）：memory.api_key（root key）与 memory.model.api_key（模型 key）
+  // 未修改时回填磁盘现值——与 claude 段同款语义，页面「打开直接保存」不丢已配 Key
+  if (doc.memory && typeof doc.memory === 'object' && !Array.isArray(doc.memory)) {
+    const newMemory = { ...(doc.memory as Record<string, unknown>) };
+    const oldMemory = oldDoc.memory && typeof oldDoc.memory === 'object' && !Array.isArray(oldDoc.memory)
+      ? (oldDoc.memory as Record<string, unknown>)
+      : {};
+    if (isUnchangedSecret(newMemory.api_key)) newMemory.api_key = oldMemory.api_key;
+    if (newMemory.model && typeof newMemory.model === 'object' && !Array.isArray(newMemory.model)) {
+      const oldModel = oldMemory.model && typeof oldMemory.model === 'object' && !Array.isArray(oldMemory.model)
+        ? (oldMemory.model as Record<string, unknown>)
+        : {};
+      newMemory.model = {
+        ...(newMemory.model as Record<string, unknown>),
+        ...(isUnchangedSecret((newMemory.model as Record<string, unknown>).api_key)
+          ? { api_key: oldModel.api_key }
+          : {}),
+      };
+    }
+    doc.memory = newMemory;
+  }
   return doc;
 }
 
@@ -86,6 +107,16 @@ export function docForClient(doc: Record<string, unknown>): Record<string, unkno
       }));
     }
     out.claude = c;
+  }
+  // memory 段脱敏（§6.8）：root key / 模型 key 只回显尾 4 位提示
+  if (out.memory && typeof out.memory === 'object' && !Array.isArray(out.memory)) {
+    const m = { ...(out.memory as Record<string, unknown>) };
+    m.api_key = maskSecret(typeof m.api_key === 'string' ? m.api_key : undefined);
+    if (m.model && typeof m.model === 'object' && !Array.isArray(m.model)) {
+      const mm = m.model as Record<string, unknown>;
+      m.model = { ...mm, api_key: maskSecret(typeof mm.api_key === 'string' ? mm.api_key : undefined) };
+    }
+    out.memory = m;
   }
   return out;
 }

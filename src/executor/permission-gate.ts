@@ -101,6 +101,11 @@ export type DeputyBashMode = 'off' | 'confirm' | 'trusted';
 export interface GateSecurity {
   /** 相对路径的解析基准（= 当前任务工作区绝对路径） */
   cwd: string;
+  /** R1 豁免根：入站附件目录绝对路径（gateway 下载的用户图片/文件落盘处）。inbox 可读是产品功能
+   *  正确性而非安全策略——独立于 redzone 清单恒定生效（清单「配置即整体替换」不影响它，用户显式
+   *  配 inbox 模式也拦不住，属预期）；仅豁免读语义（R1 与 Bash 探测），R2 写边界不豁免。
+   *  进程级常量（派生自 CONFIG_DIR），同 cwd 取静态值 */
+  inboxRoot: string;
   /** R1 红区读黑名单（glob 模式源串，运行期编译缓存） */
   redzone: () => readonly string[];
   /** R2 写白名单根（已分配工作区绝对路径；未分配 = 全部已配置工作区） */
@@ -192,15 +197,18 @@ export class PermissionGate {
   /**
    * 分身安全闸判定（顺序即红线优先级）：
    * 1) R1 读红线：文件工具路径命中红区 → deny（Read/Write/Edit/Grep/Glob/LS 的路径参数；
-   *    Bash 命令串红区字面前缀探测为 best-effort，文档化边界）
+   *    Bash 命令串红区字面前缀探测为 best-effort，文档化边界）。inboxRoot 之下一律豁免
+   *    （用户入站附件，见 GateSecurity.inboxRoot；normalizeForCompare 走 resolve 折叠 ..，
+   *    inbox/../config.yaml 一类回溯在此侧不可绕）
    * 2) R2 写红线：写工具目标不在任何已分配工作区内 → deny
    * 3) Bash 三态：off 一律 deny；confirm/trusted 下红区探测仍生效（R1 恒定，不随档位放宽）
    */
   private checkSecurity(toolName: string, input: Record<string, unknown>): GuardHit | null {
     const sec = this.opts.security!;
     const matchers = cachedPathMatchers(sec.redzone());
-    // R1：结构化路径工具的红区命中
+    // R1：结构化路径工具的红区命中（inboxRoot 之下豁免）
     for (const p of extractToolPaths(toolName, input)) {
+      if (isUnderAnyRoot(p, [sec.inboxRoot], sec.cwd)) continue;
       const ruleId = matchRedzone(p, matchers, sec.cwd);
       if (ruleId) return { event: { kind: 'path-deny', tool: toolName, path: p, ruleId }, message: DENY_REDLINE_MESSAGE };
     }
@@ -219,7 +227,7 @@ export class PermissionGate {
       if (sec.bashMode() === 'off') {
         return { event: { kind: 'bash-deny', command: cmd.slice(0, 200), ruleId: 'mode:off' }, message: DENY_BASH_MESSAGE };
       }
-      const ruleId = bashHitsRedzone(cmd, matchers);
+      const ruleId = bashHitsRedzone(cmd, matchers, sec.inboxRoot);
       if (ruleId) {
         return { event: { kind: 'bash-deny', command: cmd.slice(0, 200), ruleId }, message: DENY_REDLINE_MESSAGE };
       }

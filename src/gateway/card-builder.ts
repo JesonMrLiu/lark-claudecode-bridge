@@ -14,18 +14,17 @@ export interface ProgressState {
   confirm?: ConfirmationRequest;
   /** 子代理/后台任务清单（启动加入、落定标记保留到任务结束） */
   agents: SubagentTask[];
-  /** 内嵌计划确认（独立提问卡 #3+#6：方案不再单独发卡，正文收敛为一行 + 内嵌表单按钮 + 「查看完整方案」按钮，原文落盘并通过 send_file 发送） */
+  /** 内嵌计划确认（#3+#6：计划正文与结论同款两段式多卡直发，此处仅一行就绪提示 + 内嵌审批表单） */
   plan?: EmbeddedPlanState;
   /** 内嵌提问确认（AskUserQuestion：选项按钮 + 提交按钮全部在主卡上，qa-pick PATCH 选中态） */
   question?: EmbeddedQuestionState;
 }
 
-/** 内嵌计划状态：planFilePath 用于「查看完整方案」回调发送原文 md；plan 原文仅在卡片内露出预览片段（防爆卡片） */
+/** 内嵌计划状态：plan 正文以消息卡片直发（index 侧 sendPlanContentCards），此状态只承载审批表单所需元信息 */
 export interface EmbeddedPlanState {
   requestId: string;
   plan: string;
   workspaceName: string;
-  planFilePath: string;
 }
 /** 内嵌提问状态：answers 跟随选项点击 PATCH 更新（multiSelect 时为 string[]） */
 export interface EmbeddedQuestionState {
@@ -58,6 +57,11 @@ function md(content: string): unknown {
 /** 纯文本卡：宽度跟随调用方传入（gateway 层注入 config.card.width，缺省 default） */
 export function buildTextCard(markdown: string, widthMode: 'default' | 'fill' = 'default'): unknown {
   return card([md(markdown)], widthMode);
+}
+/** 进度卡沉底后旧卡的迁移提示：撤回失败（权限/网络）时兜底打终态标记，
+ *  避免旧卡冻结在中间态被误读成任务中断（1.3.7 真机事故）。宽度同 buildTextCard */
+export function buildSinkNoticeCard(title: string, widthMode: 'default' | 'fill' = 'default'): unknown {
+  return card([md(`⏩ **${title}** 进度卡已沉底\n\n任务仍在正常执行，请以下方最新进度卡为准。`)], widthMode);
 }
 /** 图片卡片：caption（可选）显示在图片上方——逐张发图时带编号说明用；宽度同 buildTextCard */
 export function buildImageCard(caption: string | undefined, imgKey: string, widthMode: 'default' | 'fill' = 'default'): unknown {
@@ -156,17 +160,11 @@ export function buildProgressCard(state: ProgressState, widthMode: 'default' | '
       })),
     });
   }
-  // 内嵌计划确认区（#3+#6）：方案正文不进卡片（产品决策：主卡不铺长内容），仅一行就绪提示 +
-  // 「查看完整方案」按钮（send_file 发送落盘的原 md）+ 表单（批准/放弃/按意见修改 + 意见输入框）。
-  // 用户动线：点按钮看方案文件 → 回卡片选操作
+  // 内嵌计划确认区（#3+#6）：计划正文与完整回复同款两段式多卡直发（index 侧 sendPlanContentCards），
+  // 主卡不铺长内容也不留「查看文件」特例按钮，仅一行就绪提示 + 表单（批准/放弃/按意见修改 + 意见输入框）。
+  // 用户动线：看下方消息卡片读方案 → 回本卡选操作
   if (state.plan) {
-    elements.push(md(`**📋 执行计划已就绪**（共 ${state.plan.plan.length} 字）· 工作区 \`${state.plan.workspaceName}\`\n\n请先点击下方「📂 查看完整方案」阅读原文，再选择操作`));
-    elements.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: '📂 查看完整方案' },
-      type: 'default',
-      behaviors: [{ type: 'callback', value: { requestId: state.plan.requestId, decision: 'plan-view-file' } }],
-    });
+    elements.push(md(`**📋 执行计划已就绪**（共 ${state.plan.plan.length} 字）· 工作区 \`${state.plan.workspaceName}\`\n\n计划正文已作为下方消息卡片直接发送，阅读后回到本卡选择操作`));
     elements.push({
       tag: 'form',
       name: 'plan_form',
@@ -359,6 +357,26 @@ export function buildResultTailCard(
   widthMode: 'default' | 'fill' = 'default',
 ): unknown {
   return card([md(`${resultChunkHeader(req, pos.index, pos.total)}\n\n${chunkContent}`)], widthMode);
+}
+
+// ---------- 计划多卡（plan 正文与结论同款两段式直发，无特例按钮） ----------
+
+/** 计划块头部标号行：与 resultChunkHeader 同构（非尾卡文本消息与尾卡共用同一标题样式） */
+export function planChunkHeader(req: PlanCardRequest, index: number, total: number): string {
+  return `**📋 执行计划**（${total > 1 ? `${index}/${total} · ` : ''}共 ${req.plan.length.toLocaleString()} 字）· 工作区 \`${req.workspaceName}\``;
+}
+
+/**
+ * 计划尾卡：计划正文多卡的最后一张——末块正文（头部标号行 + 正文，纯展示无交互组件；
+ * 审批按钮在主进度卡的内嵌 plan 区）。仍走消息卡通道以支持 config.card.width 与头部加粗渲染。
+ */
+export function buildPlanTailCard(
+  req: PlanCardRequest,
+  chunkContent: string,
+  pos: { index: number; total: number },
+  widthMode: 'default' | 'fill' = 'default',
+): unknown {
+  return card([md(`${planChunkHeader(req, pos.index, pos.total)}\n\n${chunkContent}`)], widthMode);
 }
 
 // ---------- 工作区切换卡（裸 /ws）：左按钮右路径一行一工作区，点击即切换，切换后整卡终态 ----------

@@ -32,6 +32,8 @@ import { invalidatePluginCache, listAvailablePlugins, listInstalledPlugins, load
 import { bridgeStatus, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDetached, stopBridgeByPid } from './lifecycle.js';
 import { getAutostartStatus, setAutostartEnabled } from './autostart.js';
 import { checkUpdate, hasNewerVersion, installMode, runUpdate } from './update.js';
+import { memoryStatus, testMemoryConnection } from './memory-api.js';
+import { MANAGED_OV_CONF, getInstallState, runInstall, runStartPipeline, stopManagedServer } from '../memory-installer.js';
 import {
   checkLarkCliAuth,
   checkLarkCliLatest,
@@ -45,8 +47,9 @@ import {
   type LarkCliOp,
 } from '../lark-cli-manager.js';
 
-/** PUT /api/config 参与整段替换的顶级键；body 未携带的键保持磁盘原文（含注释） */
-const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'security', 'server', 'claude', 'slash_commands', 'transcripts', 'session', 'card', 'autostart'] as const;
+/** PUT /api/config 参与整段替换的顶级键；body 未携带的键保持磁盘原文（含注释）。
+ *  memory（记忆增强 §6.8）：模型表单/开关经标准 config 管道提交，自动获得注释保留与写前校验 */
+const PUT_SECTIONS = ['apps', 'workspaces', 'defaults', 'concurrency', 'permissions', 'security', 'server', 'claude', 'slash_commands', 'transcripts', 'session', 'card', 'autostart', 'memory'] as const;
 
 export interface WebServerOptions {
   /** server 段配置；缺省用默认（firstRun 无配置文件场景） */
@@ -392,6 +395,65 @@ async function handle(
     writeAtomic(ctx.configPath, text);
     syncManagedClaude(after);
     return json(res, 200, { ok: true, restartRequired });
+  }
+  // ---- 记忆增强（生命周期方案 §6.8）：状态聚合 + 模型连接测试；配置读写走标准 /api/config ----
+  if (path === '/api/memory/status' && req.method === 'GET') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先提交 bootstrap 向导' });
+    try {
+      return json(res, 200, await memoryStatus(loadConfig(ctx.configPath)));
+    } catch (e) {
+      return json(res, 500, { error: `配置读取失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+  if (path === '/api/memory/test-connection' && req.method === 'POST') {
+    // 表单现值直测（不落盘）：把 Key/端点/模型名错误挡在开启之前（§6.8 双绿门禁）
+    const body = await readJsonBody(req);
+    // Key 输入框脱敏不回显：表单 Key 留空时回退配置已保存值（firstRun/配置损坏按无保存值直测）
+    let savedKey: string | undefined;
+    if (!firstRun) {
+      try { savedKey = loadConfig(ctx.configPath).memory?.model?.apiKey; } catch { /* 按无保存值直测 */ }
+    }
+    try {
+      return json(res, 200, await testMemoryConnection(body as Parameters<typeof testMemoryConnection>[0], savedKey));
+    } catch (e) {
+      return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  // ---- B3 一键安装（§6.7 嵌入式流水线）：后台执行 + 进度轮询；失败步骤可整链重跑（幂等跳过） ----
+  if (path === '/api/memory/install' && req.method === 'POST') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先提交 bootstrap 向导' });
+    try {
+      const config = loadConfig(ctx.configPath);
+      // 首装前置校验（同步 400，不让用户撞「生成服务配置」步骤失败才发现缺模型）：
+      // 受管 conf 不存在 = 首装，必须有三件套；conf 已存在 = 重跑/修复，沿用现值放行
+      const m = config.memory?.model;
+      if (!existsSync(MANAGED_OV_CONF) && (!m || !m.apiBase || !m.vlmModel || !m.embeddingModel)) {
+        return json(res, 400, { error: '首装需要记忆模型三件套（API 端点 / 提炼模型 / 向量模型）——请先在「模型配置」卡填写并保存，再执行安装' });
+      }
+      // 模型三件套取自 memory 段（页面通常已保存过表单）；缺省也允许（沿用现有受管 conf 重跑场景）
+      void runInstall({
+        configPath: ctx.configPath,
+        model: config.memory?.model,
+        pin: config.memory?.version,
+      });
+      return json(res, 200, { ok: true, started: true, note: '流水线后台执行中，轮询 /api/memory/install/status 查看进度' });
+    } catch (e) {
+      return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  if (path === '/api/memory/install/status' && req.method === 'GET') {
+    return json(res, 200, getInstallState());
+  }
+  if (path === '/api/memory/stop' && req.method === 'POST') {
+    stopManagedServer();
+    return json(res, 200, { ok: true });
+  }
+  // 启动服务 = LCB 接管式启动流水线（检查 → 拉起探活 → 接入插件）：后台执行 + 同款进度轮询，
+  // 结束即完整接管态（无须再点「检查修复」补插件）；与安装流水线共用状态机（kind='start'）
+  if (path === '/api/memory/start' && req.method === 'POST') {
+    if (getInstallState().running) return json(res, 409, { error: '流水线执行中，请等待当前流程完成' });
+    void runStartPipeline({ configPath: ctx.configPath });
+    return json(res, 200, { ok: true, started: true, note: '启动流水线后台执行中，轮询 /api/memory/install/status 查看进度' });
   }
   // ---- 模型列表拉取（厂商无关；凭证用磁盘现值或本次表单输入，响应只含模型 id，绝不回传凭证） ----
   if (path === '/api/models/fetch' && req.method === 'POST') {

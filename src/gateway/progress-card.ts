@@ -1,4 +1,4 @@
-import { buildProgressCard, buildPartialUpdateActions, buildQaButtonActions, type ProgressState } from './card-builder.js';
+import { buildProgressCard, buildSinkNoticeCard, buildPartialUpdateActions, buildQaButtonActions, type ProgressState } from './card-builder.js';
 import type { ConfirmationRequest } from '../types.js';
 
 export interface CardSender {
@@ -24,8 +24,12 @@ const BOOT_STATUS = '🔌 会话已建立，加载上下文与工具中…';
 /** 单次卡片更新请求超时：飞书 SDK 的 axios 无超时（timeout=0），请求被网络黑洞时
  *  flush 串行链会无限期挂起（生产实测单次挂 7.4 分钟）——挂起期间计时/交互区全停，
  *  与任务卡死无从区分。到点按失败处理（seq 不推进）下轮重试；若超时请求实际已在
- *  服务端落地，下轮会收 300317 经跳号分支自愈 */
+ *  服务端落地，下轮会收 300317 经跳号自愈分支对齐（MAX_SEQ_SKIP 内零成本恢复，无需弃卡重建） */
 const UPDATE_TIMEOUT_MS = 30_000;
+/** 300317 sequence 错位的单次跳号探测上限：服务端 seq 超前时本地乐观 +1 逐级逼近。
+ *  真机观测假阴性（300308 Server Internal Error 但请求实际已落地）均为单次超前 1，
+ *  上限 3 足够覆盖；跳满仍未对齐说明错位成因未知，弃卡沉底重建兜底 */
+const MAX_SEQ_SKIP = 3;
 
 /** 给单次更新请求加超时闸：到点 reject 由 flush catch 统一按失败重试 */
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -47,6 +51,8 @@ export class ProgressCard {
   private seq = 0;
   /** 同一实体连续更新失败计数（任何错误码）：达到阈值放弃该实体沉底式重建，防未知错误死循环刷日志 */
   private consecutiveFailures = 0;
+  /** 300317 跳号自愈计数：服务端 seq 超前时本地乐观 +1 逼近，成功推进即清零；单次错位跳满 MAX_SEQ_SKIP 仍失败则弃卡重建 */
+  private seqSkipRetries = 0;
   /** 上次全量渲染的结构签名：交互区（confirm/plan/question）增删、终态需要全量重渲染。
    *  0.20.0 起 qa 选中态不进签名（见 structureKey）——改走 partial 按钮级局部更新 */
   private lastStructure = '';
@@ -168,8 +174,8 @@ export class ProgressCard {
   }
 
   /**
-   * 挂起/清除内嵌计划确认（#3+#6）：plan 内容过长仅露 600 字预览，完整原文落盘到 planFilePath，
-   * 「查看完整方案」按钮 callback 触发 send_file 而非嵌入卡片。决策后 clearPlan() 收回区域
+   * 挂起/清除内嵌计划确认（#3+#6）：plan 正文由 wiring 侧两段式多卡直发（sendPlanContentCards），
+   * 本卡仅渲染就绪提示 + 审批表单。决策后 clearPlan() 收回区域
    */
   setPlan(req: import('./card-builder.js').EmbeddedPlanState | undefined): void {
     if (this.done) return;
@@ -290,7 +296,17 @@ export class ProgressCard {
     const oldCardId = this.cardId;
     this.messageId = undefined; // 期间 flush 自动跳过，避免 PATCH 打到已删除的旧卡
     this.cardId = undefined;
-    if (this.sender.deleteCard) await this.sender.deleteCard(old).catch(() => {});
+    if (this.sender.deleteCard) {
+      await this.sender.deleteCard(old).catch((e) => {
+        // 撤回失败不再静默：1.3.7 真机事故里旧卡冻结在中间态无结束文案，被误读成任务中断。
+        // 每次沉底都出现此日志 ≈ 应用缺 im:message:delete 撤回权限（去开发者后台开通并发布）
+        console.warn('[进度卡] 旧卡撤回失败(若每次沉底都出现,多为应用缺 im:message:delete 撤回权限,请在飞书开发者后台开通并发布新版本):',
+          e instanceof Error ? e.message : e, feishuErrorBody(e) ?? '');
+        // 撤不掉就整卡 PATCH 打迁移标记（消息级 PATCH 无 cardkit sequence 依赖，同 done 分支做法），
+        // 旧卡不再停在中间态；PATCH 也失败则静默（尽力而为，不阻断沉底主流程）
+        void this.sender.updateCard(old, buildSinkNoticeCard(this.state.title)).catch(() => {});
+      });
+    }
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const fresh = buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default');
@@ -382,14 +398,19 @@ export class ProgressCard {
           }
           this.seq = expectedSeq; // 仅成功后提交推进
           this.consecutiveFailures = 0; // 成功即清零连续失败计数
+          this.seqSkipRetries = 0; // 对齐成功即清零跳号计数（下次错位重新计数）
         } catch (e) {
           // 本轮携带 qa 按钮更新但发送失败：恢复脏标记，下轮重试补发选中态（先清后发的恢复路径）
           if (withQaButtons) this.qaButtonsDirty = true;
           // cardkit sequence OCC 失败恢复：
-          // - 300317(本地 seq 与服务端错位,典型成因:超时请求实际已在服务端落地)或连续失败达到
-          //   阈值:sequence 无法对齐服务端真实值(飞书不提供读取口;实测跳 Date.now() 兜底被
-          //   9499 拒绝——sequence 只接受从 1 递增的小整数),继续同 seq 重试只会
-          //   永久失败死循环。放弃当前实体恢复：
+          // - 300317(本地 seq 落后于服务端,典型成因:上轮请求假阴性——300308/超时但实际已在
+          //   服务端落地):本地 seq 乐观 +1 逐级对齐(上限 MAX_SEQ_SKIP),对齐即零成本自愈、
+          //   卡片不重建。1.3.7 真机事故:300308 假阴性 → 同 seq 重试必撞 300317 → 弃卡
+          //   沉底重建,撤卡又失败留下一张无结束文案的冻结卡。飞书不提供读取服务端 seq 的口;
+          //   实测跳 Date.now() 兜底被 9499 拒绝——sequence 只接受从 1 递增的小整数,
+          //   故只能小步 +1 逼近,不能大数跳变。
+          // - 300317 跳满上限(错位过深/成因未知)或非 300317 连续失败达到阈值:sequence 无法
+          //   对齐,继续重试只会永久死循环。放弃当前实体恢复：
           //   非 done:沉底式重建(循环外 deferSink 执行点 → sinkToBottom:删旧卡→新实体,seq 从 1 干净开始);
           //   done(sinkToBottom 不处理终态):降级整卡 PATCH(同一 messageId,无需 sequence;
           //     终态无交互输入,重置客户端输入无副作用),尽力而为失败静默
@@ -398,24 +419,31 @@ export class ProgressCard {
           // 错误码可能在 axios 的 response.data 里（HTTP 400 时 message 只有 status code），一并带出供定位
           const code = extractFeishuErrorCode(e);
           const detail = feishuErrorBody(e);
-          const giveUp = code === '300317' || ++this.consecutiveFailures >= 5;
-          if (giveUp) {
-            this.consecutiveFailures = 0;
-            console.warn(`[进度卡] 更新持续失败,放弃当前卡片实体${code === '300317' ? '(300317 sequence 错位)' : '(连续 5 次)'},沉底式重建:`,
-              e instanceof Error ? e.message : e, detail ?? '');
-            if (this.done) {
-              // 终态兜底：整卡 PATCH 不依赖 sequence；失败静默（终态尽力而为，不再重试）
-              try {
-                await withTimeout(this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
-                this.lastStructure = this.structureKey();
-              } catch { /* 尽力而为 */ }
-            } else {
-              this.deferSink = true; // 循环外执行点 → sinkToBottom（自带挂起输入延迟逻辑）
-              break; // 错位 seq 继续重试无意义，退出本轮循环（定时器每秒仍会触发新 flush，无丢失）
-            }
+          if (code === '300317' && this.seqSkipRetries < MAX_SEQ_SKIP) {
+            this.seqSkipRetries += 1;
+            this.seq += 1; // 乐观对齐：服务端 seq 已超前，本地 +1 逼近（成功推进处清零计数）
+            this.dirty = true; // 立即再跑一轮用 seq+1 重试，不进 giveUp
+            console.warn(`[进度卡] 300317 sequence 错位,本地 seq 乐观跳至 ${this.seq + 1} 跳号自愈重试(${this.seqSkipRetries}/${MAX_SEQ_SKIP})`);
           } else {
-            console.warn('[进度卡] 更新失败(seq 未推进,下次用相同 expectedSeq 重试):',
-              e instanceof Error ? e.message : e, detail ?? '');
+            const giveUp = code === '300317' || ++this.consecutiveFailures >= 5;
+            if (giveUp) {
+              this.consecutiveFailures = 0;
+              console.warn(`[进度卡] 更新持续失败,放弃当前卡片实体${code === '300317' ? `(300317 sequence 错位,跳号 ${MAX_SEQ_SKIP} 次未对齐)` : '(连续 5 次)'},沉底式重建:`,
+                e instanceof Error ? e.message : e, detail ?? '');
+              if (this.done) {
+                // 终态兜底：整卡 PATCH 不依赖 sequence；失败静默（终态尽力而为，不再重试）
+                try {
+                  await withTimeout(this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
+                  this.lastStructure = this.structureKey();
+                } catch { /* 尽力而为 */ }
+              } else {
+                this.deferSink = true; // 循环外执行点 → sinkToBottom（自带挂起输入延迟逻辑）
+                break; // 错位 seq 继续重试无意义，退出本轮循环（定时器每秒仍会触发新 flush，无丢失）
+              }
+            } else {
+              console.warn('[进度卡] 更新失败(seq 未推进,下次用相同 expectedSeq 重试):',
+                e instanceof Error ? e.message : e, detail ?? '');
+            }
           }
         }
         if (!this.dirty) break; // 落地期间无新请求，收工

@@ -123,6 +123,39 @@ export interface ClaudeConfig {
   /** 多厂商档案库（不直接生效；Web 页「设为当前」拷贝到顶层） */
   profiles?: ClaudeProfile[];
 }
+/** 记忆模型配置（memory.model 子段）：OpenAI 协议端点（embedding/vlm），与厂商档案（Anthropic 协议）
+ *  分属两个协议域，不做隐式推导——零耦合是生命周期方案 §6.8 的定稿原则。B2 配置页消费（渲染 ov.conf），
+ *  B1 仅解析透传 */
+export interface MemoryModelConfig {
+  /** 服务商预设（填表助手语义：预设只预填 endpoint/模型名，值仍可见可改） */
+  provider?: 'glm' | 'volcengine' | 'openai-compatible' | 'ollama';
+  apiBase?: string;
+  /** 配置页输入；GET 脱敏回显（对齐 app_secret 惯例），不参与日志 */
+  apiKey?: string;
+  /** 提炼模型（会话归档时用），独立于对话模型可指定更强档位 */
+  vlmModel?: string;
+  embeddingModel?: string;
+}
+/** 长期记忆段（整体可选；生命周期方案 §6）：缺省/enabled=false = 零开销——不下发 env、不注入插件、
+ *  不产生告警，LCB 行为与无此段完全一致（总验收「可插拔」条款）。热生效：env 下发与插件装配均每任务
+ *  现读，改盘后下一条消息即生效（常驻进程经配置指纹回收重建） */
+export interface MemoryConfig {
+  /** 总开关；缺省 false。开启后：所有 bot 下发 OPENVIKING_* ns env + 记忆插件自动注入（含 deputy，§6.9） */
+  enabled: boolean;
+  /** embedded（B3 落地：LCB 受管本地服务）/ remote（B1 起可用：外部已跑的 server） */
+  mode: 'embedded' | 'remote';
+  /** 服务与插件 pin 版本（B3 安装器消费；B1 仅记录回显） */
+  version?: string;
+  /** remote 模式的 server 地址；embedded 由 LCB 分配后回写。缺省 http://127.0.0.1:1933 */
+  endpoint?: string;
+  /** OPENVIKING_ACCOUNT（全局账号轴）；缺省 "lcb" */
+  account?: string;
+  /** OPENVIKING_API_KEY：root key 只进 LCB 侧（配置盘 + 子进程 env），永不出现在浏览器/日志。
+   *  dev 模式服务可为空；Admin API user key 自动签发落地前先承接手填值（B1-4 演进） */
+  apiKey?: string;
+  /** 记忆模型（B2 消费；与厂商档案零耦合） */
+  model?: MemoryModelConfig;
+}
 /** 飞书斜杠命令注册定义（同步到开放平台 app_slash_commands；command 不含 / 前缀） */
 export interface SlashCommandDef { command: string; description: string; icon?: string }
 /** 斜杠命令同步配置：extra 为用户自定义透传命令（内置命令集见 commands.SLASH_COMMAND_META，始终参与同步） */
@@ -146,6 +179,8 @@ export interface BridgeConfig {
   claude?: ClaudeConfig;
   /** 飞书斜杠命令同步；缺省仅内置命令集 */
   slashCommands?: SlashCommandsConfig;
+  /** 长期记忆段（生命周期方案 §6，v2.3）：缺省关 = 零开销；热生效（每任务现读） */
+  memory?: MemoryConfig;
   /** 会话行为微调；缺省 contextRemindTokens 用 config.ts 的内置默认 */
   session?: SessionConfig;
   /** 卡片展示；缺省 width=default（飞书默认宽度） */
@@ -207,7 +242,7 @@ export interface RejectedMessage {
   rejected: { kind: 'unsupported-type'; chatId: string; chatType: 'p2p' | 'group'; messageType: string };
 }
 /** 卡片回调决策：allow/deny/allow-session 为写工具确认卡；plan-* 为计划确认卡（feedback = 按意见修改时的用户输入）；
- *  plan-view-file = 计划「查看完整方案」按钮触发，原文 md 直接 send_file 而非塞入卡片正文；
+ *  plan-view-file = legacy「查看完整方案」按钮（存量卡片残留），计划正文已改为卡片直发，回调等价重发内容卡片；
  *  qa-* 为提问卡；ws-switch 为工作区切换卡 */
 export type CardDecision = 'allow' | 'deny' | 'allow-session'
   | 'plan-approve' | 'plan-revise' | 'plan-reject' | 'plan-view-file'

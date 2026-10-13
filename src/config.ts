@@ -3,13 +3,17 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse, type YAMLParseError } from 'yaml';
 import type {
-  BridgeConfig, CardConfig, ClaudeAuthMode, ClaudeConfig, ClaudeProfile, FeishuAppConfig, PermissionsConfig, PluginRef,
-  SecurityConfig, ServerConfig, SessionConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace,
+  BridgeConfig, CardConfig, ClaudeAuthMode, ClaudeConfig, ClaudeProfile, FeishuAppConfig, MemoryConfig, MemoryModelConfig,
+  PermissionsConfig, PluginRef, SecurityConfig, ServerConfig, SessionConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace,
 } from './types.js';
 
 /** LCB_CONFIG_DIR 环境变量可覆盖配置根目录（多租户分进程场景用；正常用户无须设置） */
 export const CONFIG_DIR = join(process.env.LCB_CONFIG_DIR ?? homedir(), '.lark-claudecode-bridge');
 export const CONFIG_PATH = join(CONFIG_DIR, 'config.yaml');
+
+/** 入站附件目录（用户发给 bot 的图片/文件下载落盘处）：gateway 下载（feishu-gateway.ts）与
+ *  分身安全闸 R1 读豁免（index.ts securityGuard）共用单源；固定为 CONFIG_DIR 一级子目录 inbox */
+export const INBOX_DIR = join(CONFIG_DIR, 'inbox');
 
 /** 会话上下文超长提醒默认阈值（tokens）：约 200k 窗口的 75%，估算口径见 SessionConfig 注释 */
 export const DEFAULT_CONTEXT_REMIND_TOKENS = 150000;
@@ -332,6 +336,81 @@ function normalizeAutostart(doc: Record<string, unknown>): { enabled?: boolean }
   return { ...(typeof a.enabled === 'boolean' ? { enabled: a.enabled } : {}) };
 }
 
+/**
+ * 长期记忆段（整体可选；生命周期方案 §6.6）：enabled 缺省 false（零开销）；mode 缺省 remote——
+ * embedded 由 B3 安装器接管（受管服务/自动分配端口），此前显式 remote 或缺省都指向外部已跑的
+ * server。段内字段全部硬校验：enabled/mode 类型错会让「开关记忆」语义错位，endpoint 非法 URL
+ * 会让探活/env 透传指向错误目标。缺省 enabled=false 时其余字段仍解析保存（用户先填表单后开启，
+ * B2 配置页 [测试连接] 双绿门禁的前置形态）。
+ */
+function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | undefined {
+  const raw = doc.memory;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object') throw new Error('memory 必须为对象（含 enabled / mode / endpoint），请检查 config.yaml');
+  const m = raw as {
+    enabled?: unknown; mode?: unknown; version?: unknown; endpoint?: unknown;
+    account?: unknown; api_key?: unknown; model?: unknown;
+  };
+  let enabled = false;
+  if (m.enabled !== undefined && m.enabled !== null) {
+    if (typeof m.enabled !== 'boolean') {
+      throw new Error(`memory.enabled 必须为 boolean（true = 开启记忆；当前值：${String(m.enabled)}），请检查 config.yaml`);
+    }
+    enabled = m.enabled;
+  }
+  let mode: MemoryConfig['mode'] = 'remote';
+  if (m.mode !== undefined && m.mode !== null) {
+    if (m.mode !== 'embedded' && m.mode !== 'remote') {
+      throw new Error(`memory.mode 必须为 embedded / remote（当前值：${String(m.mode)}），请检查 config.yaml`);
+    }
+    mode = m.mode;
+  }
+  const str = (v: unknown, key: string): string | undefined => {
+    if (v === undefined || v === null) return undefined;
+    if (typeof v !== 'string') throw new Error(`memory.${key} 必须为字符串，请检查 config.yaml`);
+    const t = v.trim();
+    return t ? t : undefined;
+  };
+  const version = str(m.version, 'version');
+  const endpoint = str(m.endpoint, 'endpoint');
+  if (endpoint && !/^https?:\/\//.test(endpoint)) {
+    throw new Error(`memory.endpoint 必须为 http(s):// 开头的 URL（当前值：${endpoint}），请检查 config.yaml`);
+  }
+  const account = str(m.account, 'account');
+  const apiKey = str(m.api_key, 'api_key');
+  // model 子段：B2 配置页消费（渲染 ov.conf），此处仅形状校验 + 透传——与厂商档案零耦合，不读 claude 段
+  let model: MemoryModelConfig | undefined;
+  if (m.model !== undefined && m.model !== null) {
+    if (typeof m.model !== 'object') throw new Error('memory.model 必须为对象（含 provider / api_base / api_key / vlm_model / embedding_model），请检查 config.yaml');
+    const mm = m.model as Record<string, unknown>;
+    let provider: MemoryModelConfig['provider'];
+    const rawProvider = str(mm.provider, 'model.provider');
+    if (rawProvider) {
+      if (rawProvider !== 'glm' && rawProvider !== 'volcengine' && rawProvider !== 'openai-compatible' && rawProvider !== 'ollama') {
+        throw new Error(`memory.model.provider 必须为 glm / volcengine / openai-compatible / ollama（当前值：${rawProvider}），请检查 config.yaml`);
+      }
+      provider = rawProvider;
+    }
+    model = {
+      ...(provider ? { provider } : {}),
+      ...(str(mm.api_base, 'model.api_base') ? { apiBase: str(mm.api_base, 'model.api_base')! } : {}),
+      ...(str(mm.api_key, 'model.api_key') ? { apiKey: str(mm.api_key, 'model.api_key')! } : {}),
+      ...(str(mm.vlm_model, 'model.vlm_model') ? { vlmModel: str(mm.vlm_model, 'model.vlm_model')! } : {}),
+      ...(str(mm.embedding_model, 'model.embedding_model') ? { embeddingModel: str(mm.embedding_model, 'model.embedding_model')! } : {}),
+    };
+    if (Object.keys(model).length === 0) model = undefined;
+  }
+  return {
+    enabled,
+    mode,
+    ...(version ? { version } : {}),
+    ...(endpoint ? { endpoint } : {}),
+    ...(account ? { account } : {}),
+    ...(apiKey ? { apiKey } : {}),
+    ...(model ? { model } : {}),
+  };
+}
+
 /** Claude 认证段（整体可选）：mode 缺省 inherit；managed 下两凭证并存硬抛（会被 API 拒绝且意图不明） */
 function normalizeClaude(doc: Record<string, unknown>): ClaudeConfig | undefined {
   const raw = doc.claude;
@@ -647,6 +726,7 @@ export function parseConfigText(raw: string, pathForError: string = CONFIG_PATH)
     ...section(session, 'session'),
     ...section(normalizeCard(doc), 'card'),
     ...section(normalizeAutostart(doc), 'autostart'),
+    ...section(normalizeMemory(doc), 'memory'),
   };
 }
 

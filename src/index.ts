@@ -6,7 +6,7 @@ import type {
   BridgeConfig, CardActionEvent, CardActionResponse, CardDecision, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
   IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory, TriggerRule,
 } from './types.js';
-import { CONFIG_DIR, CONFIG_PATH, DEFAULT_CONTEXT_REMIND_TOKENS, loadConfig, sameApps } from './config.js';
+import { CONFIG_DIR, CONFIG_PATH, DEFAULT_CONTEXT_REMIND_TOKENS, INBOX_DIR, loadConfig, sameApps } from './config.js';
 import { DEFAULT_CLAUDE_DIR, initManagedClaudeDir, resolveClaudeDir } from './claude-config.js';
 import { buildTaskEnv } from './task-env.js';
 import { warnIfNoClaudeAuth } from './auth-precheck.js';
@@ -18,7 +18,7 @@ import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { ProgressCard, feishuErrorBody } from './gateway/progress-card.js';
 import {
   DECISION_TEXT,
-  buildResultTailCard, buildWorkspaceSwitchedCard, resultChunkHeader,
+  buildPlanTailCard, buildResultTailCard, buildWorkspaceSwitchedCard, planChunkHeader, resultChunkHeader,
   type PlanCardRequest, type ResultCardRequest,
   type QuestionCardRequest, type QuestionCardAnswers,
 } from './gateway/card-builder.js';
@@ -36,6 +36,10 @@ import { createGatewaySender, createNotifyServer, createNotifySenderSlot, NOTIFY
 import { BRIDGE_MCP_JSON, readMcpServersFromJsonFile } from './web/skills-mcp-api.js';
 import { FEISHU_NOTIFY_SOP_PROMPT, TOOL_HINT_PROMPT } from './notify-sop.js';
 import { ensureProfileSettingsFile, resolveAppProfile, resolveAppProfileModel } from './app-profile.js';
+import {
+  MEMORY_PLUGIN_NAME, createMemoryProvider, ensureMemoryUserKeys, memoryEnvFor, type MemoryProvider,
+} from './memory.js';
+import { stopManagedServer } from './memory-installer.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
@@ -80,7 +84,7 @@ const PLAN_DECISION_TEXT: Record<Extract<CardDecision, `plan-${string}`>, string
   'plan-approve': '✅ 计划已批准，开始执行（后续写操作免确认）',
   'plan-revise': '📝 修改意见已提交',
   'plan-reject': '❌ 计划已放弃',
-  // plan-view-file 不消费挂起项，仅 toast「正在发送方案文件…」——文案不在此出现，留口供编译期完整性
+  // plan-view-file 不消费挂起项，仅 toast「正在重新发送计划内容卡片…」——文案不在此出现，留口供编译期完整性
   'plan-view-file': '',
 };
 
@@ -144,6 +148,9 @@ export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真
   transcript?: TranscriptRecorder;
   /** 安全面审计（可选依赖：deny/脱敏/金丝雀事件落盘；缺失时仅控制台日志） */
   audit?: SecurityAuditWriter;
+  /** 长期记忆（可选依赖，§6.6 B1）：探活/ns 映射/user key 缓存。与消息路径正交——env 下发与
+   *  插件注入由 config.memory 每任务现读驱动，缺失此依赖不影响记忆生效，仅无健康状态可查 */
+  memory?: MemoryProvider;
 }
 
 // ENABLE_TOOL_SEARCH 显式开启会加剧核心工具 defer 进 ToolSearch（开场工具清单更不完整），
@@ -214,8 +221,23 @@ export function createBridge(
     ownerId: string;
     channelKey: string;
     chatId: string;
-    planFilePath: string;
   }>();
+  // 计划正文两段式多卡直发（与下方「结果回传两段式」完全同构）：~3000 字/块，非尾卡走文本
+  // 消息、尾卡走卡片，连发间隔 300ms 防飞书限流。planAsk 与 plan-view-file 回调（存量卡片
+  // 残留按钮，重发即「再看一遍」）共用
+  async function sendPlanContentCards(chatId: string, req: PlanCardRequest): Promise<void> {
+    const chunks = chunkText(req.plan);
+    const total = chunks.length;
+    for (let i = 0; i < total; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 300));
+      if (i === total - 1) {
+        await deps.gateway.sendCardTo(chatId,
+          buildPlanTailCard(req, chunks[i], { index: total, total }, config.card?.width ?? 'default'));
+      } else {
+        await deps.gateway.sendTextTo(chatId, `${planChunkHeader(req, i + 1, total)}\n\n${chunks[i]}`);
+      }
+    }
+  }
   // 提问挂起项：requestId → 等待中的问题答案（qa-pick 逐项收集，qa-submit 一次性 resolve）。
   // 嵌入主卡片后无 cardId，改带 channelKey 定位活跃进度卡
   const qaPending = new Map<string, {
@@ -646,6 +668,9 @@ export function createBridge(
     const securityGuard = app.role === 'deputy'
       ? {
         cwd: workspacePath(wsName),
+        // 入站附件豁免根：与 gateway 下载目录共用单源常量（config.ts INBOX_DIR）——用户发给 bot 的
+        // 图片/文件必须可读可处理，属产品功能正确性；R1/Bash 探测豁免，R2 写边界不豁免
+        inboxRoot: INBOX_DIR,
         redzone: () => config.security?.redzone?.read ?? DEFAULT_REDZONE_READ_SOURCES,
         // 未配置工作区白名单 = 权限轴全给：写根 = 全部已配置工作区（R2 红线仍在：工作区外只读）
         writeRoots: () => (app.allowedWorkspaces?.length ? app.allowedWorkspaces : config.workspaces.map((w) => w.name))
@@ -706,23 +731,27 @@ export function createBridge(
             });
           });
         },
-        // plan 确认（#3+#6）：不再单独发计划卡片组。计划正文先落盘到 ~/.lark-claudecode-bridge/claude/plans/
-// （slug + 时间戳，方便后续 review 与 SOP 要求的 plan 本地归档），然后嵌入当前任务的进度卡：
-// 卡片正文仅露 600 字预览 + 「查看完整方案」按钮（callback send_file 发送原 md 文件，不塞卡片正文
-// ——飞书单卡 30KB 上限与可读性都不允许长方案铺在卡片里）；批准/放弃/按意见修改三按钮与意见输入框
-// 仍在主卡片的内嵌 form 内。超时由本闭包自管：到点 clearPlan + resolve reject
-planAsk: async (req) => {
+        // plan 确认（#3+#6）：计划正文与完整回复同款两段式多卡直发（sendPlanContentCards），
+        // 不搞「点按钮收文件」特例；原文另落盘 claude/plans/ 归档（slug + 时间戳，方便 review
+        // 与 SOP 要求的本地归档，不再有回调消费）。批准/放弃/按意见修改三按钮与意见输入框仍在
+        // 主卡片的内嵌 form 内。超时由本闭包自管：到点 clearPlan + resolve reject
+        planAsk: async (req) => {
           const planReq: PlanCardRequest = { requestId: randomUUID(), plan: req.plan, workspaceName: req.workspaceName };
-          // 落盘计划原文：路径走 ensureRuntimeDirs 已建的 claude/plans 目录，文件名加时间戳避免并发冲突
+          // 落盘归档：文件名加时间戳避免并发冲突；失败仅影响归档，不影响直发与审批
           const planFilePath = writeRuntimeMarkdown(
             join('claude', 'plans'),
             req.workspaceName || 'plan',
             `# 执行计划 · ${req.workspaceName} · ${new Date().toLocaleString('zh-CN', { hour12: false })}\n\n${req.plan}\n`,
-            `${tag}[计划落盘失败]（不影响流程，仅「查看完整方案」可能不可用）：`,
+            `${tag}[计划归档落盘失败]（不影响流程）：`,
           );
+          if (planFilePath) console.log(tag, `[计划归档] ${planFilePath}`);
           const progress = activeProgress.get(key);
           if (!progress) return { action: 'reject' }; // 进度卡不在 = 任务已结束/被 abort，按放弃处理
-          progress.setPlan({ requestId: planReq.requestId, plan: req.plan, workspaceName: req.workspaceName, planFilePath });
+          progress.setPlan({ requestId: planReq.requestId, plan: req.plan, workspaceName: req.workspaceName });
+          // 正文直发放挂起开始前：raceFallback 兜底 WS 偶发挂起（此刻超时定时器尚未 arm，裸 await
+          // 挂起即永不超时——同 ask 发卡约束）；raceFallback 永不 reject，失败/超时仅内部落日志，
+          // 审批表单照常可用
+          await raceFallback(sendPlanContentCards(msg.chatId, planReq), CARD_SEND_TIMEOUT_MS, undefined);
           // 不再 sinkToBottom：plan 区嵌入主进度卡，flush 自然 PATCH，删旧卡重发只会让用户看到计划区跳一下
           return new Promise<PlanAskResult>((resolve) => {
             const gc = setTimeout(() => {
@@ -741,7 +770,6 @@ planAsk: async (req) => {
               ownerId: msg.userId,
               channelKey: key,
               chatId: msg.chatId,
-              planFilePath,
             });
           });
         },
@@ -880,6 +908,15 @@ planAsk: async (req) => {
       });
       // 任务级 env 现读构造（热生效）：apps[].env / claude.env 改动后下一条消息即用新值
       const taskEnv = buildTaskEnv(config, app, claudeDir);
+      // 长期记忆 ns env（§6.4/§6.6）：memory.enabled 时每条消息拼装下发——OPENVIKING_USER 按
+      // 消息级 userId 隔离（群聊同事话语不混入主人记忆；deputy 的 appId 天然不同即分身永不读
+      // 主人记忆）。?? 保留既有值：apps[].env 手配 OPENVIKING_* = 专家覆盖口。关段 = 零注入，
+      // 行为与无此段完全一致（可插拔验收）；常驻进程经配置指纹回收（env 变 → 指纹变 → 重建）
+      if (config.memory?.enabled) {
+        for (const [k, v] of Object.entries(memoryEnvFor(config.memory, app.appId, msg.userId, deps.memory?.userKeys()))) {
+          taskEnv[k] ??= v;
+        }
+      }
       // 打点只列键名不列值（env 常含凭证，防日志泄漏）；值含 ${ 提示误配——env 值不做变量
       // 展开，${VAR} 会原样传给 CLI（变量展开只在 MCP 配置一侧，展开源正是这里注入的环境）
       const envKeys = [...new Set([...Object.keys(app.env ?? {}), ...Object.keys(config.claude?.env ?? {})])];
@@ -952,7 +989,10 @@ planAsk: async (req) => {
         // managed 模式合并发现两处目录（自管 + 本机 ~/.claude）：按绝对 installPath 传 SDK，
         // 用户本机已装插件无须重装；resolvePluginPaths 按 name 去重，当前生效目录优先。
         // 分身角色按 allowed_plugins 白名单过滤（显式 app.plugins 始终保留——写在分身配置里
-        // 的就是要给的）；未配 allowed_plugins = 权限轴「全给」，自动发现插件全部加载
+        // 的就是要给的）；未配 allowed_plugins = 权限轴「全给」，自动发现插件全部加载。
+        // 记忆插件自动注入（§6.9）：memory.enabled 时 openviking-memory 以宿主基础设施身份
+        // 加入加载集，不受 deputy 白名单过滤——记忆是宿主给每个 bot 的恒定能力（同 notify
+        // server），不是主人分配给分身的业务插件。B0 实测教训：不注入则白名单分身静默金鱼记忆。
         ...(() => {
           const discovered = claudeDir === DEFAULT_CLAUDE_DIR
             ? discoverPlugins(claudeDir)
@@ -961,6 +1001,32 @@ planAsk: async (req) => {
           if (app.role === 'deputy' && app.allowedPlugins !== undefined) {
             merged = merged.filter((p) =>
               app.plugins?.some((e) => e.name === p.name) || app.allowedPlugins!.includes(p.name));
+          }
+          // 装配校验告警 ①（§6.9 L2）：deputy 白名单零命中——配了白名单但与发现集零交集，
+          // 「以为在收权，实际连一个插件都没给」几乎必为配置错误（B0 实测：二号 bot 配
+          // [library] 而该插件未启用 → 实际加载 0 插件，全程零提示）。在记忆注入前判定，
+          // 避免注入的记忆插件掩盖零命中事实
+          if (app.role === 'deputy' && app.allowedPlugins?.length && merged.length === 0) {
+            console.warn(
+              tag,
+              `[memory] 分身 "${app.name}" 配置了 allowed_plugins（${app.allowedPlugins.join('、')}）`
+              + ' 但与已发现插件零命中：自动发现插件实际加载 0 个。请检查插件名拼写，或确认插件已安装且在 '
+              + 'settings.json enabledPlugins 中启用（/plugins 可查实际加载清单；方案 §6.9）',
+            );
+          }
+          // 记忆插件注入（§6.9 L1）：幂等合流——已显式配置或已过白名单时同名去重不重复加载；
+          // 未发现（未安装/未启用）则注入无从谈起，落告警 ② 提示安装，不静默
+          if (config.memory?.enabled && !merged.some((p) => p.name === MEMORY_PLUGIN_NAME)) {
+            const found = discovered.find((p) => p.name === MEMORY_PLUGIN_NAME);
+            if (found) merged.push({ name: found.name, path: found.path, source: 'discovered' });
+            else {
+              console.warn(
+                tag,
+                `[memory] memory.enabled=true 但插件 ${MEMORY_PLUGIN_NAME} 未被发现（未安装或 enabledPlugins 未启用）：`
+                + '记忆召回/沉淀 hooks 不会生效。安装：claude plugin install openviking-memory@openviking'
+                + '（或经配置页插件安装；详见 docs 方案 §6.9）',
+              );
+            }
           }
           return merged.length ? { plugins: merged.map((p) => ({ path: p.path })) } : {};
         })(),
@@ -1203,12 +1269,12 @@ planAsk: async (req) => {
           return { toast: { type: 'info', content: '仅任务发起人可操作计划' } };
         }
         const decision = action.value.decision;
-        // 「查看完整方案」（#6）：callback 触发 send_file 直接发原 md 文件，不消耗挂起项
+        // plan-view-file（存量卡片残留按钮）：计划正文已改为卡片直发（planAsk），此处等价重发
+        // 一遍内容卡片组——不消耗挂起项，可反复点击
         if (decision === 'plan-view-file') {
-          // 文件在 planAsk 时已落盘；这里直接 send_file（feishuGateway 走 file_type:stream，md 等任意后缀可发）
-          void deps.gateway.uploadAndSendFile(plan.chatId, plan.planFilePath)
-            .catch((e) => console.error('[查看方案发送失败]', action.value.requestId, e));
-          return { toast: { type: 'info', content: '正在发送方案文件…' } };
+          void sendPlanContentCards(plan.chatId, plan.req)
+            .catch((e) => console.error('[计划内容重发失败]', action.value.requestId, e));
+          return { toast: { type: 'info', content: '正在重新发送计划内容卡片…' } };
         }
         if (decision !== 'plan-approve' && decision !== 'plan-revise' && decision !== 'plan-reject') {
           return { toast: { type: 'info', content: '该计划确认已被处理或已过期' } };
@@ -1394,7 +1460,11 @@ planAsk: async (req) => {
  * 读失败（文件被写坏的中间态等）沿用旧值不崩，并返回用户可读的错误消息（成功返回 null）——
  * 调用方（processMessage）据此在聊天里显式提示「本次沿用旧配置」，不再静默。
  */
-export function createConfigReloader(config: BridgeConfig, configPath: string): () => string | null {
+export function createConfigReloader(
+  config: BridgeConfig,
+  configPath: string,
+  opts: { onMemoryChanged?: (memory: BridgeConfig['memory']) => void } = {},
+): () => string | null {
   return () => {
     let fresh: BridgeConfig;
     try {
@@ -1439,6 +1509,12 @@ export function createConfigReloader(config: BridgeConfig, configPath: string): 
     // 卡片宽度热应用：gateway 的 cardWidth getter 与各处发卡传参都现读 config.card，
     // 原地替换后下一条消息的所有卡片即用新宽度（0.x 遗漏导致改宽度须重启的修复）
     config.card = fresh.card;
+    // 长期记忆段热应用（§6.6）：OPENVIKING_* env 下发与记忆插件注入均每任务现读 config.memory，
+    // 原地替换后下一条消息即生效；常驻进程经配置指纹回收（env/plugins 变化 → 指纹变 → 重建）。
+    // 段变化时通知调用方（startBridge 据此后台重签 user key——account/root key 改动会使旧 key 失配）
+    const memoryChanged = JSON.stringify(fresh.memory ?? null) !== JSON.stringify(config.memory ?? null);
+    config.memory = fresh.memory;
+    if (memoryChanged) opts.onMemoryChanged?.(fresh.memory);
     // managed 模式 claude.env 热生效：inherit 由每任务 buildTaskEnv 并入子进程 env 即可；
     // managed 走托管 settings.json 通道（CLI 侧 settings.json env 优先于进程 env），
     // 此处即时重写盘保证两通道同值——不写盘则手改 env 会被盘上旧值覆盖而静默失效
@@ -1484,8 +1560,35 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     const removed = sweepTranscripts(join(CONFIG_DIR, 'transcripts'), config.transcripts.retentionDays);
     if (removed > 0) console.log(`[transcripts] 已清理 ${removed} 个过期落盘文件`);
   }
+  // 长期记忆（§6.6 B1）：启动时 Admin API 签发 per-bot user key——api_key 模式才实际签发，
+  // dev 模式服务端禁用 Admin API（身份经 OPENVIKING_USER → X-OpenViking-User header 隔离，
+  // 跳过即正解）；memory 段热重载变化时后台重签（account/root key 改动会使旧 key 失配）。
+  // key 只进内存缓存与子进程 env，永不落日志/配置页
+  const memoryUserKeys = new Map<string, string>();
+  const refreshMemoryKeys = async (): Promise<void> => {
+    if (!config.memory?.enabled) {
+      memoryUserKeys.clear();
+      return;
+    }
+    const outcomes = await ensureMemoryUserKeys(config.memory, config.apps.map((a) => a.appId));
+    memoryUserKeys.clear();
+    for (const o of outcomes.values()) {
+      if (o.userKey) {
+        memoryUserKeys.set(o.appId, o.userKey);
+        console.log(`[memory] bot ${o.appId}：user key 已签发（api_key 模式）`);
+      } else if (o.error) console.warn(`[memory] bot ${o.appId}：user key ${o.error}`);
+      else console.log(`[memory] bot ${o.appId}：${o.skipped}`);
+    }
+  };
+  if (config.memory?.enabled) await refreshMemoryKeys();
+  const memoryProvider = createMemoryProvider(config, memoryUserKeys);
   // reloader 共享：所有 bridge 持有同一 config 对象引用，mutate 一处全员可见
-  const reloadConfig = createConfigReloader(config, configPath);
+  const reloadConfig = createConfigReloader(config, configPath, {
+    onMemoryChanged: (memory) => {
+      if (memory?.enabled) void refreshMemoryKeys();
+      else memoryUserKeys.clear();
+    },
+  });
   // 旧版（≤0.3.x）缺省独立目录的一次性迁移提示：目录还在则其中历史会话不再可 /resume
   //（本版起所有机器人统一 ~/.claude，会话无法跨数据目录 resume）。不做自动迁移（双目录合并无安全做法）
   for (const app of config.apps) {
@@ -1535,6 +1638,7 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
       executor: runTask,
       transcript: new TranscriptWriter(join(CONFIG_DIR, 'transcripts', app.appId)),
       audit: securityAudit,
+      memory: memoryProvider,
     };
     return { app, gateway, bridge: createBridge(config, app, deps, { reloadConfig }) };
   });
@@ -1557,6 +1661,8 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     for (const r of runners) r.gateway.close();
     // 常驻 CLI 子进程一并回收（优雅退出，不赖 stdio 断连兜底）
     killAllResidentSessions();
+    // B3 受管 OpenViking 服务一并关停（embedded 模式随 LCB 生命周期；独立手动服务不受影响）
+    stopManagedServer();
     clearPidFile();
     process.exit(0);
   };
