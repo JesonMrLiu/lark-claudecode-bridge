@@ -1,16 +1,18 @@
-// ============ 记忆增强（OpenViking 长期记忆，生命周期方案 §6.7/§6.8/§6.9） ============
-// 双视图页面（互斥渲染，消除「未安装却看一堆服务状态行」的错位）：
-// - 未安装向导（!serverFound && !healthy && 非远程模式）：引导横幅（⚡ 一键安装 + 五步流水线
-//   水平 stepper，模型未保存时安装置灰）+ 模型配置（安装前置）+ 外部服务入口 + 折叠手动指引。
-// - 已安装：总开关卡（OFF 时下方整体置灰仅查看）+ 服务状态卡（deriveState 八态精确状态横幅
-//   + 关键信息网格；启停 / 检查修复 / 刷新按钮就在卡标题右侧——状态与操作同屏）+ 模型配置卡。
+// ============ 记忆增强（OpenViking 长期记忆，生命周期方案 §6.7/§6.8/§6.9 + 最终方案 v1.1） ============
+// 页内双 Tab（最终方案 §六：「服务与配置」|「用户与密钥」，形态同配置页分栏；侧边栏不加一级导航）：
+// - Tab1 服务与配置：双视图（未安装向导 / 已安装管理）——总开关 + 服务状态（五步流水线 stepper
+//   + 启停/检查修复/刷新）+ 模型配置（P2 双端点：vlm 块与 embedding 块各自独立端点/Key）。
+//   P1 保存即生效：模型变更保存后弹「立即生效」确认 → /api/memory/apply 重渲染 ov.conf + 重启服务。
+// - Tab2 用户与密钥：一键初始化 / 用户列表（web / 机器人） / 打开记忆空间（密钥进剪贴板 + 自动
+//   新标签开 1933，Ctrl+V 一次连接） / 复制·重置·删除（重置删除均二次确认，删除先备份）。
+//   api_key 模式但 web 用户未建时 Tab 亮红点「待初始化鉴权」（前置化浏览器 401 重定向类问题）。
 // 配置读写走标准 doc 管道（saveDoc → PUT /api/config，secret 自动回填）；测试连接走
 // /api/memory/test-connection（表单现值，不落盘）；安装/启停走 /api/memory/install|start|stop。
-// 安装回写会改 config.yaml——完成后走 refresh()（重拉 S.doc 再渲染），避免陈旧 doc 覆盖回写。
 import { S, $, esc, api, toast, saveDoc, hooks, refresh } from '../core.js';
 import { confirmDialog } from '../ui.js';
 
-/** 服务商预设（§6.8 填表助手：只预填已知值，全部可见可改） */
+/** 服务商预设（§6.8 填表助手：只预填已知值，全部可见可改）。预设只填主块（vlm）；
+ *  向量块留空沿用主块——跨厂商组合时单独填向量端点/Key（P2 双端点拆分语义） */
 const PRESETS = {
   glm: { label: '智谱 GLM', api_base: 'https://open.bigmodel.cn/api/paas/v4', vlm_model: 'glm-4.7', embedding_model: 'embedding-3', key_hint: 'open.bigmodel.cn 的 API Key' },
   volcengine: { label: '火山方舟', api_base: 'https://ark.cn-beijing.volces.com/api/v3', vlm_model: '', embedding_model: '', key_hint: '方舟 API Key；模型名填推理接入点 EP ID' },
@@ -22,7 +24,7 @@ const DOC_URL = 'https://github.com/volcengine/OpenViking';
 
 /** 探活失败分类 → 下一步行动建议（后端 reason 驱动；not-running 由状态机接管，不在此列） */
 const REASON_HINT = {
-  auth: '鉴权失败——服务为 api_key 模式时，检查 ov.conf 的 root key 与本页保存的 API Key 是否一致（一键安装会自动对齐）',
+  auth: '鉴权失败——api_key 模式下网页/机器人各需一把用户密钥。点「用户与密钥」Tab 一键初始化，或检查 ov.conf 的 root key 与本页保存的 API Key 是否一致',
   timeout: '服务无响应——进程可能卡死，可「一键检查 / 修复」重拉',
   unreachable: '端点不可达——检查服务端点地址与网络（远程模式常见），或服务是否监听该地址',
   'http-error': '服务返回异常状态码——可「一键检查 / 修复」重拉，或查看服务日志定位',
@@ -78,11 +80,38 @@ const infoCell = (icon, label, valueHtml, span = 1) =>
     <div style="font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;line-height:1.5">${valueHtml}</div>
   </div>`;
 
-/** 页头说明行（卡片外，两视图共用）：一句话定位 + 文档外链 */
+/** 页头说明行（卡片外，双 Tab 共用）：一句话定位 + 文档外链 */
 const pageIntro = `<div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:0 0 14px">
   <span class="hint" style="font-size:12.5px">OpenViking 长期记忆：每条消息自动召回相关历史、会话归档自动提炼，按 <code>{appId}-{userId}</code> 命名空间隔离（机器人之间互不可见）。</span>
   <!--<a href="${DOC_URL}" target="_blank" rel="noreferrer" style="font-size:12.5px;flex:0 0 auto;margin-left:auto">查看文档 ↗</a>-->
 </div>`;
+
+// ============ 页内双 Tab（最终方案 §六：「服务与配置」|「用户与密钥」） ============
+
+/** 当前 Tab（模块级：rerender 保持）；用户快照（红点判定 + Tab2 渲染数据） */
+let activeTab = 'service';
+let usersSnapshot = null;
+
+/** 切 Tab（重渲染整个记忆页——S.doc/状态已在内存，切换零请求） */
+function switchTab(tab) {
+  activeTab = tab;
+  hooks.rerender();
+}
+
+/** Tab 条：与「权限」页同款标准 .tabs 组件（下划线高亮，main.css 统一样式）；待初始化时 Tab2 亮红点 */
+function tabBarHtml(authInitNeeded) {
+  const dot = ' <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--danger);vertical-align:2px" title="待初始化鉴权：服务为 api_key 模式但网页端用户未创建"></span>';
+  return `<div class="tabs">
+    <button data-memtab="service" class="${activeTab === 'service' ? 'active' : ''}">服务与配置</button>
+    <button data-memtab="users" class="${activeTab === 'users' ? 'active' : ''}">用户与密钥${authInitNeeded ? dot : ''}</button>
+  </div>`;
+}
+
+function bindTabBar() {
+  document.querySelectorAll('[data-memtab]').forEach((b) => {
+    b.onclick = () => switchTab(b.dataset.memtab);
+  });
+}
 
 // ============ 服务状态八态（「一概而论异常」→ 精确状态；探活 reason 全量映射） ============
 
@@ -136,34 +165,54 @@ function clientConfBadge(p) {
   return label ? ` <span class="hint" title="插件侧启用判定：env 优先，客户端配置兜底（${esc(p.clientConfPath || '')}）">${esc(label)}</span>` : '';
 }
 
-// ============ 模型表单（双视图共用：渲染 + 绑定） ============
+// ============ 模型表单（双视图共用：渲染 + 绑定；P2 双端点拆分） ============
 
 function modelFormHtml(model, endpoint) {
   const secretVal = (v) => (v && typeof v === 'object' && v.secretSet) ? v.secretHint : '';
+  // 向量块独立凭证展示：own=显式配置（输入框脱敏提示「留空不修改」）；未配置=沿用主块（提示现沿用值）
+  const embOwn = !!model.embeddingKeyOwn;
+  const embKeyHint = secretVal(model.embeddingApiKey);
+  const embKeyPlaceholder = embOwn
+    ? `已保存 ${embKeyHint || '••••'}，留空不修改`
+    : embKeyHint ? `当前沿用主 Key ${embKeyHint}，填写后独立` : '留空沿用主 Key（可单独指定）';
+  const embBasePlaceholder = model.embeddingApiBaseResolved || '留空沿用主端点';
+  // 左右两栏面板（提炼主模型 | 向量模型）：用「权限」页同款 row-2col 响应式栅格，窄屏自动上下叠放
+  const panel = (title, hint, inner) => `
+    <div style="border:1px solid var(--border);border-radius:10px;padding:14px 16px 4px;background:var(--field);min-width:0">
+      <div style="font-size:13px;font-weight:700;margin-bottom:12px">${title}
+        <span class="hint" style="font-weight:400;margin-left:6px">${hint}</span></div>
+      ${inner}
+    </div>`;
+  const fld = (label, inner, hint) => `
+    <div style="margin-bottom:12px"><label>${label}</label>${inner}
+      ${hint ? `<div class="hint" style="margin-top:3px">${hint}</div>` : ''}</div>`;
   return `
-  <div class="grid2">
-    <div><label>服务商预设（填表助手，值可改）</label>
-      <select id="memProvider">
+  <div class="row-2col" style="gap:16px;align-items:stretch">
+    ${panel('提炼主模型配置', 'vlm · 会话归档时提炼记忆', `
+      ${fld('服务商预设（填表助手，值可改）', `<select id="memProvider">
         <option value="">— 选择预设 —</option>
         ${Object.entries(PRESETS).map(([k, p]) => `<option value="${k}" ${model.provider === k ? 'selected' : ''}>${p.label}</option>`).join('')}
-      </select>
-      <div class="hint" style="margin-top:3px">选择后只预填空字段，已填值不覆盖</div></div>
-    <div><label>API 端点（api_base）</label><input type="text" id="memApiBase" value="${esc(model.apiBase || '')}" placeholder="https://…/v1">
-      <div class="hint" style="margin-top:3px">OpenAI 协议端点，与机器人对话用的厂商档案相互独立</div></div>
-    <div><label>API Key ${secretVal(model.apiKey) ? `<span class="hint">已保存 ${esc(secretVal(model.apiKey))}，测试连接将使用已保存 Key；更换请输入新值</span>` : ''}</label>
-      <input type="password" id="memApiKey" value="" placeholder="${esc(PRESETS[model.provider]?.key_hint || 'sk-…（本地端点可留空）')}"></div>
-    <div><label>提炼模型（vlm，会话归档时用）</label><input type="text" id="memVlm" value="${esc(model.vlmModel || '')}" placeholder="glm-4.7">
-      <div class="hint" style="margin-top:3px">归档会话时提炼记忆的对话模型，可选更强档位</div></div>
-    <div><label>向量模型（embedding）</label><input type="text" id="memEmb" value="${esc(model.embeddingModel || '')}" placeholder="embedding-3">
-      <div class="hint" style="margin-top:3px">文本向量化模型，测试连接会真调一次验证</div></div>
-    <div><label>服务端点（OpenViking server）</label><input type="text" id="memEndpoint" value="${esc(endpoint || DEFAULT_ENDPOINT)}" placeholder="${DEFAULT_ENDPOINT}">
+      </select>`, '选择后只预填空字段，已填值不覆盖（同时预填右侧向量模型名）')}
+      ${fld('API 端点（api_base）', `<input type="text" id="memApiBase" value="${esc(model.apiBase || '')}" placeholder="https://…/v1">`, 'OpenAI 协议端点，与机器人对话用的厂商档案相互独立')}
+      ${fld(`API Key ${secretVal(model.apiKey) ? `<span class="hint">已保存 ${esc(secretVal(model.apiKey))}，留空不修改</span>` : ''}`, `<input type="password" id="memApiKey" value="" placeholder="${esc(PRESETS[model.provider]?.key_hint || 'sk-…（本地端点可留空）')}">`)}
+      ${fld('提炼模型（vlm）', `<input type="text" id="memVlm" value="${esc(model.vlmModel || '')}" placeholder="glm-4.7">`, '归档会话时提炼记忆的对话模型，可选更强档位')}
+    `)}
+    ${panel('向量模型配置', 'embedding · 向量化入库与召回', `
+      ${fld('向量模型（embedding）', `<input type="text" id="memEmb" value="${esc(model.embeddingModel || '')}" placeholder="embedding-3">`, '测试连接会真调一次验证')}
+      ${fld('向量端点（独立）', `<input type="text" id="memEmbBase" value="${esc(model.embeddingApiBase || '')}" placeholder="${esc(embBasePlaceholder)}">`, '跨厂商组合时单独指定（如主模型=glm + 向量=OpenAI 系）；留空沿用主端点')}
+      ${fld('向量 Key（独立）', `<input type="password" id="memEmbKey" value="" placeholder="${esc(embKeyPlaceholder)}">`, '与主 Key 相同时留空即可；两块凭证互不影响（留空 = 不修改）')}
+    `)}
+  </div>
+  <div class="row" style="margin-top:12px;align-items:end">
+    <div style="flex:1;min-width:260px"><label>服务端点（OpenViking server）</label><input type="text" id="memEndpoint" value="${esc(endpoint || DEFAULT_ENDPOINT)}" placeholder="${DEFAULT_ENDPOINT}">
       <div class="hint" style="margin-top:3px">一般无须修改：一键安装自动回写；远程模式填外部服务地址</div></div>
   </div>`;
 }
 
-/** 绑定模型表单交互（预设联动 / 测试连接双绿 / 保存）。isWizard 只影响保存后的提示文案 */
-function bindModelForm(isWizard) {
-  // 预设联动：只预填空字段（已手填的值不覆盖）
+/** 绑定模型表单交互（预设联动 / 测试连接双绿 / 保存 + P1 立即生效）。isWizard 只影响保存后的
+ *  提示文案；canApply（已安装视图）= 保存后检测到模型变更时提供「立即生效」 */
+function bindModelForm(isWizard, canApply) {
+  // 预设联动：只预填主块空字段（已手填的值不覆盖；向量块留空沿用——跨厂商组合才手填）
   $('#memProvider').onchange = (e) => {
     const p = PRESETS[e.target.value];
     if (!p) return;
@@ -172,7 +221,7 @@ function bindModelForm(isWizard) {
     if (!$('#memEmb').value.trim()) $('#memEmb').value = p.embedding_model;
     $('#memApiKey').placeholder = p.key_hint || 'sk-…';
   };
-  // 测试连接：表单现值直测（不落盘）——把 Key/端点/模型名错误挡在开启之前
+  // 测试连接：表单现值直测（不落盘）——向量块留空回退主块现值，与渲染 ov.conf 同口径
   $('#memTest').onclick = async () => {
     const btn = $('#memTest');
     btn.disabled = true;
@@ -184,6 +233,8 @@ function bindModelForm(isWizard) {
         api_key: $('#memApiKey').value.trim(),
         vlm_model: $('#memVlm').value.trim(),
         embedding_model: $('#memEmb').value.trim(),
+        embedding_api_base: $('#memEmbBase').value.trim(),
+        embedding_api_key: $('#memEmbKey').value.trim(),
       });
       const line = (name, c) => `${c.ok ? '✅' : '❌'} ${name}：${c.detail}`;
       $('#memTestResult').innerHTML = r.ok
@@ -196,24 +247,42 @@ function bindModelForm(isWizard) {
     }
     btn.disabled = false;
   };
-  // 保存模型配置：写入 S.doc.memory（secret 空值保持脱敏对象 → 后端 applySecrets 回填现值）
+  // 保存模型配置：写入 S.doc.memory（secret 空值保持脱敏对象 → 后端 applySecrets 按块独立回填）。
+  // P1 保存即生效：已安装视图检测到模型实际变更 → 弹「立即生效」确认 → apply 流水线
+  //（重渲染 ov.conf + 强制重启受管服务）——消灭「保存后还需手动检查修复」两步坑
   $('#memSaveModel').onclick = async () => {
     if (!S.doc.memory || typeof S.doc.memory !== 'object') S.doc.memory = {};
     const mem = S.doc.memory;
-    mem.endpoint = $('#memEndpoint').value.trim() || DEFAULT_ENDPOINT;
-    const keep = (mem.model && typeof mem.model === 'object') ? mem.model : {};
+    const prev = (mem.model && typeof mem.model === 'object') ? mem.model : {};
+    // 变更检测须在改 S.doc 前取原值（api_key 输入非空视为换 Key）
+    const newApiBase = $('#memApiBase').value.trim();
+    const newVlm = $('#memVlm').value.trim();
+    const newEmb = $('#memEmb').value.trim();
+    const newEmbBase = $('#memEmbBase').value.trim();
+    const rawKey = $('#memApiKey').value.trim();
+    const rawEmbKey = $('#memEmbKey').value.trim();
     const pv = $('#memProvider').value;
+    const modelChanged = newApiBase !== (prev.api_base || '')
+      || newVlm !== (prev.vlm_model || '')
+      || newEmb !== (prev.embedding_model || '')
+      || newEmbBase !== (prev.embedding_api_base || '')
+      || (pv || '') !== (prev.provider || '')
+      || !!rawKey || !!rawEmbKey;
+    mem.endpoint = $('#memEndpoint').value.trim() || DEFAULT_ENDPOINT;
     const next = {
-      ...keep,
+      ...prev,
       ...(pv ? { provider: pv } : {}),
-      api_base: $('#memApiBase').value.trim(),
-      vlm_model: $('#memVlm').value.trim(),
-      embedding_model: $('#memEmb').value.trim(),
+      api_base: newApiBase,
+      vlm_model: newVlm,
+      embedding_model: newEmb,
     };
     if (!pv) delete next.provider;
+    // 向量端点（非凭证）：留空 = 清除 → 沿用主端点（与输入框提示一致）
+    if (!newEmbBase) delete next.embedding_api_base;
+    else next.embedding_api_base = newEmbBase;
     mem.model = next;
-    const rawKey = $('#memApiKey').value.trim();
-    if (rawKey) mem.model.api_key = rawKey; // 空值保留脱敏对象 → applySecrets 回填
+    if (rawKey) mem.model.api_key = rawKey; // Key 空值保留脱敏对象 → applySecrets 回填主 Key（留空=不修改）
+    if (rawEmbKey) mem.model.embedding_api_key = rawEmbKey; // 向量 Key 按块独立，同款回填
     if (!await saveDoc()) return;
     if (isWizard) {
       // 保存即解锁「⚡ 一键安装」：重渲染让 modelSaved 重新计算（不让用户对着灰按钮困惑到刷新）
@@ -221,14 +290,29 @@ function bindModelForm(isWizard) {
       hooks.rerender();
       return;
     }
+    if (modelChanged && canApply) {
+      const ok = await confirmDialog({
+        title: '使新配置立即生效',
+        message: '模型配置已保存。<br><br>记忆服务需<b>重新渲染配置并重启</b>才能应用新模型（运行中的进程不会热加载）。<br>立即生效？',
+        confirmText: '立即生效',
+      });
+      if (ok) {
+        await startPipeline('/api/memory/apply', '正在应用新模型配置（重渲染 → 重启服务 → 校验插件），本页实时显示进度')();
+        return;
+      }
+      toast('已保存。稍后点「检查修复」或再次保存时选择「立即生效」即可应用');
+      return;
+    }
     toast('记忆模型配置已保存（未开启记忆时仅保存，打开开关后生效）');
   };
 }
 
-// ============ 安装流水线（双视图共用：水平 stepper + 轮询 + 进页恢复） ============
+// ============ 安装流水线（双 Tab1 共用：水平 stepper + 轮询 + 进页恢复） ============
 
 /** 模块级轮询句柄：rerender 不产生重复 interval（旧闭包继续刷新 DOM，gate 以最新渲染为准） */
 let installTimer = null;
+/** 已安装视图的门禁（受管 conf 缺失且模型未保存时禁「检查修复」）；向导视图 = 模型未保存禁安装 */
+let installGateFn = () => false;
 
 function installStepsHtml(steps) {
   const chip = (s, i) => {
@@ -250,49 +334,58 @@ function installStepsHtml(steps) {
   return `<div style="display:flex;gap:6px;align-items:stretch;margin-top:12px">${steps.map(chip).join('<span class="hint" style="align-self:center;flex:0 0 auto">→</span>')}</div>`;
 }
 
+/** 安装状态渲染（P0：慢启动时「拉起/拉起受管服务」步骤保持 running 并实时显示「已等 N 秒」，
+ *  不出现红叉——后端转后台续等，就绪自动续跑后续步骤） */
+function renderInstallState(ist) {
+  const box = $('#memInstallSteps');
+  if (box) box.innerHTML = installStepsHtml(ist.steps);
+  const failed = ist.steps.find((s) => s.status === 'failed');
+  const hintEl = $('#memInstallHint');
+  const kindTxt = ist.kind === 'start' ? '启动流水线' : ist.steps.some((s) => s.detail && s.detail.includes('重渲染')) ? '应用流水线' : '安装流水线';
+  if (hintEl) hintEl.innerHTML = ist.running ? `${kindTxt}执行中…`
+    : failed ? `<span style="color:var(--warn-tx)">「${esc(failed.title)}」失败：${esc(failed.detail || '')}——修正后可重跑（已就绪步骤自动跳过）</span>`
+    : ist.finishedAt ? (ist.kind === 'start'
+      ? '<span class="tag ok">启动完成</span> 服务已就绪、记忆插件已接入——LCB 接管的完整记忆链路即刻生效'
+      : '<span class="tag ok">全部就绪</span> 配置已回写（endpoint / mode=embedded），机器人记忆即刻生效')
+    : '';
+  const btn = $('#memInstall');
+  if (btn) btn.disabled = !!ist.running || installGateFn();
+  ['memStart', 'memStop', 'memRefresh'].forEach((id) => { const b = $('#' + id); if (b) b.disabled = !!ist.running; });
+}
+
+const pollInstall = async () => {
+  try {
+    const ist = await api('GET', '/api/memory/install/status');
+    renderInstallState(ist);
+    if (!ist.running) {
+      if (installTimer) { clearInterval(installTimer); installTimer = null; }
+      // 回写改了 config.yaml：refresh 重拉 S.doc 再整页渲染（防止陈旧 doc 在下次保存时覆盖回写）
+      refresh().catch(() => hooks.rerender());
+      return;
+    }
+  } catch { /* 轮询失败静默重试 */ }
+};
+
+/** 发起流水线（安装 / 启动 / P1 立即生效共用）：POST + toast + 轮询 */
+function startPipeline(path, runningMsg) {
+  return async () => {
+    try {
+      await api('POST', path, {});
+      toast(runningMsg);
+      if (!installTimer) installTimer = setInterval(pollInstall, 2000);
+      pollInstall();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
 /**
  * 绑定安装按钮 + 轮询 + 进页恢复。gate() = 额外禁用条件（向导：模型未保存时禁装——
  * 首装生成 ov.conf 需要模型三件套；已安装视图的「检查/修复」不受此限）。
  */
 function bindInstallActions(gate) {
-  const renderInstall = (ist) => {
-    const box = $('#memInstallSteps');
-    if (box) box.innerHTML = installStepsHtml(ist.steps);
-    const failed = ist.steps.find((s) => s.status === 'failed');
-    const hintEl = $('#memInstallHint');
-    const kindTxt = ist.kind === 'start' ? '启动流水线' : '安装流水线';
-    if (hintEl) hintEl.innerHTML = ist.running ? `${kindTxt}执行中…`
-      : failed ? `<span style="color:var(--warn-tx)">「${esc(failed.title)}」失败：${esc(failed.detail || '')}——修正后可重跑（已就绪步骤自动跳过）</span>`
-      : ist.finishedAt ? (ist.kind === 'start'
-        ? '<span class="tag ok">启动完成</span> 服务已就绪、记忆插件已接入——LCB 接管的完整记忆链路即刻生效'
-        : '<span class="tag ok">全部就绪</span> 配置已回写（endpoint / mode=embedded），机器人记忆即刻生效')
-      : '';
-    const btn = $('#memInstall');
-    if (btn) btn.disabled = !!ist.running || gate();
-    ['memStart', 'memStop', 'memRefresh'].forEach((id) => { const b = $('#' + id); if (b) b.disabled = !!ist.running; });
-  };
-  const poll = async () => {
-    try {
-      const ist = await api('GET', '/api/memory/install/status');
-      renderInstall(ist);
-      if (!ist.running) {
-        if (installTimer) { clearInterval(installTimer); installTimer = null; }
-        // 回写改了 config.yaml：refresh 重拉 S.doc 再整页渲染（防止陈旧 doc 在下次保存时覆盖回写）
-        refresh().catch(() => hooks.rerender());
-        return;
-      }
-    } catch { /* 轮询失败静默重试 */ }
-  };
-  const startPipeline = (path, runningMsg) => async () => {
-    try {
-      await api('POST', path, {});
-      toast(runningMsg);
-      if (!installTimer) installTimer = setInterval(poll, 2000);
-      poll();
-    } catch (e) { toast(e.message, true); }
-  };
-  const btn = $('#memInstall');
-  if (btn) btn.onclick = startPipeline('/api/memory/install', '安装流水线已启动（后台执行，本页实时显示进度）');
+  installGateFn = gate;
+  const installBtn = $('#memInstall');
+  if (installBtn) installBtn.onclick = startPipeline('/api/memory/install', '安装流水线已启动（后台执行，本页实时显示进度）');
   // 启动服务：LCB 接管式启动流水线（检查 → 拉起探活 → 接入插件），同款 stepper 实时进度——
   // 结束即完整接管态，无须再点「检查修复」补插件
   const startBtn = $('#memStart');
@@ -300,8 +393,8 @@ function bindInstallActions(gate) {
   // 进页恢复（切页回来 / 安装刚结束）：在跑则继续轮询，刚结束则展示结果
   api('GET', '/api/memory/install/status').then((ist) => {
     if (ist.running || ist.finishedAt) {
-      renderInstall(ist);
-      if (ist.running && !installTimer) installTimer = setInterval(poll, 2000);
+      renderInstallState(ist);
+      if (ist.running && !installTimer) installTimer = setInterval(pollInstall, 2000);
     }
   }).catch(() => {});
 }
@@ -317,6 +410,9 @@ export async function renderMemory(el) {
     el.innerHTML = `<div class="card"><h3>记忆增强</h3><div class="hint">状态读取失败：${esc(e.message)}</div></div>`;
     return;
   }
+  // 用户快照（Tab2 数据 + 红点判定）；失败按 null（Tab2 内可重试），不阻塞 Tab1
+  try { usersSnapshot = await api('GET', '/api/memory/users'); } catch { usersSnapshot = null; }
+
   const m = st.memory ?? { enabled: false, mode: 'remote', endpoint: DEFAULT_ENDPOINT };
   const model = m.model ?? {};
   const inst = st.install ?? {};
@@ -325,21 +421,21 @@ export async function renderMemory(el) {
   // 远程模式（endpoint 指向非本机）：不引导本地安装，进已安装视图管理外部服务
   const remoteConfigured = m.mode === 'remote' && !!m.endpoint && !isLocalHost(m.endpoint);
   const showWizard = !svcInstalled && !svcOk && !remoteConfigured;
-  const state = deriveState(st, svcInstalled);
-  const meta = STATE_META[state] ?? STATE_META.error;
-  // 首装模型三件套就绪判定（安装流水线生成 ov.conf 的前置）
-  const modelSaved = !!(model.apiBase && model.vlmModel && model.embeddingModel);
+  const authInitNeeded = !!usersSnapshot?.authInitNeeded;
 
-  if (showWizard) return renderWizard(el, { m, model, modelSaved });
-  return renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured });
+  el.innerHTML = `${pageIntro}${tabBarHtml(authInitNeeded)}<div id="memTabBody"></div>`;
+  bindTabBar();
+  const body = $('#memTabBody');
+  if (activeTab === 'users') return renderUsersTab(body, { st, m });
+  if (showWizard) return renderWizard(body, { m, model, modelSaved: !!(model.apiBase && model.vlmModel && model.embeddingModel) });
+  return renderInstalled(body, { st, m, model, inst, state: deriveState(st, svcInstalled), meta: STATE_META[deriveState(st, svcInstalled)] ?? STATE_META.error, remoteConfigured, authInitNeeded });
 }
 
-// ============ 未安装向导 ============
+// ============ Tab1 · 未安装向导 ============
 
 function renderWizard(el, { m, model, modelSaved }) {
   const epVal = (m.endpoint && m.endpoint !== DEFAULT_ENDPOINT) ? m.endpoint : '';
   el.innerHTML = `
-  ${pageIntro}
   <div class="card">
     <div style="display:flex;align-items:center;gap:10px">
       <h3 style="margin:0">开始使用记忆增强</h3>
@@ -348,7 +444,7 @@ function renderWizard(el, { m, model, modelSaved }) {
     </div>
     <div style="background:var(--primary-weak);border-radius:10px;padding:14px 16px">
       <b>未安装 OpenViking 服务</b>
-      <div class="hint" style="margin-top:4px;line-height:1.7">点右上「⚡ 一键安装」自动完成安装与配置（检测/安装 uv 运行时 → 安装 OpenViking 服务 → 生成配置 → 拉起服务 → 接入记忆插件）。全程无须终端；已就绪部件自动跳过，可重复执行。</div>
+      <div class="hint" style="margin-top:4px;line-height:1.7">点右上「⚡ 一键安装」自动完成安装与配置（检测/安装 uv 运行时 → 安装 OpenViking 服务 → 生成配置 → 拉起服务 → 接入记忆插件）。全程无须终端；已就绪部件自动跳过，可重复执行。安装完成后到「用户与密钥」Tab 一键初始化网页/机器人密钥。</div>
       ${modelSaved ? '' : `<div class="hint" style="margin-top:8px;color:var(--warn-tx)">⚠ 请先在下方「模型配置」填表并保存——安装需要用模型三件套（API 端点 / 提炼模型 / 向量模型）生成服务配置。</div>`}
     </div>
     <div id="memInstallSteps">${installStepsHtml(IDLE_STEPS)}</div>
@@ -362,7 +458,7 @@ function renderWizard(el, { m, model, modelSaved }) {
       <button class="btn sm" id="memTest">测试连接</button>
       <button class="btn sm primary" id="memSaveModel">保存配置</button>
     </div>
-    <div class="desc" style="margin-top:6px">记忆的<b>提炼（vlm）与向量化（embedding）</b>走 OpenAI 协议端点，与机器人对话用的厂商档案相互独立。建议先 [测试连接] 双绿，再保存并一键安装。</div>
+    <div class="desc" style="margin-top:6px">记忆的<b>提炼（vlm）与向量化（embedding）</b>走 OpenAI 协议端点，两块可各自独立端点与 Key（跨厂商组合），默认向量块沿用主块。建议先 [测试连接] 双绿，再保存并一键安装。</div>
     ${modelFormHtml(model, m.endpoint)}
     <div id="memTestResult" class="hint" style="margin-top:8px"></div>
     <pre class="report" id="memTestReport" style="display:none;margin-top:6px"></pre>
@@ -388,16 +484,16 @@ function renderWizard(el, { m, model, modelSaved }) {
     claude marketplace add openviking
     claude plugin install openviking-memory@openviking
 
-③ 回到本页：保存模型配置 → 一键安装（或直接开启）</pre>
+③ 回到本页：保存模型配置 → 一键安装 → 「用户与密钥」一键初始化</pre>
       <div class="hint" style="margin-top:8px;line-height:1.9">常见问题：
-· 启动失败 / 服务异常 → 点「一键检查 / 修复」重跑流水线（已就绪步骤自动跳过，不覆盖现有数据）
-· 鉴权失败 → ov.conf 的 root_api_key 与本页保存的 API Key 需一致（一键安装会自动对齐）
-· 支持哪些模型 → 任意 OpenAI 协议端点（智谱 / 方舟 / 中转 / Ollama 本地）
+· 启动失败 / 服务异常 → 点「一键检查 / 修复」重跑流水线（已就绪步骤自动跳过，不覆盖现有数据）；首装冷启动可能超过 1 分钟，流水线会转为后台等待并实时显示秒数，无需反复重试
+· 鉴权失败 → 到「用户与密钥」Tab 一键初始化（api_key 模式下网页/机器人各需一把用户密钥）
+· 支持哪些模型 → 任意 OpenAI 协议端点（智谱 / 方舟 / 中转 / Ollama 本地）；提炼与向量可分别指定
 · 修改端口 → 模型配置里的「服务端点」；一键安装会自动避开占用端口</div>
     </details>
   </div>`;
 
-  bindModelForm(true);
+  bindModelForm(true, false);
   bindInstallActions(() => !modelSaved);
 
   // 外部服务入口：保存远程 endpoint → remoteConfigured → 切到已安装（外部）视图
@@ -410,9 +506,9 @@ function renderWizard(el, { m, model, modelSaved }) {
   };
 }
 
-// ============ 已安装视图 ============
+// ============ Tab1 · 已安装视图 ============
 
-function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured }) {
+function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured, authInitNeeded }) {
   const ver = st.health?.version;
   const endpoint = m.endpoint || DEFAULT_ENDPOINT;
   const authNote = st.authNote;
@@ -422,8 +518,11 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
   const statusSub = state === 'running' ? 'OpenViking 服务运行正常，记忆召回与归档已就绪'
     : state === 'stopped' ? '服务已安装，进程未运行——点右上「▶ 启动服务」一键拉起（自动检查配置 → 拉起探活 → 接入插件）'
       : '';
+  // 鉴权失败态优先引导「用户与密钥」Tab（api_key 模式下 401 的正确解法是初始化用户密钥，而非改模型配置）
   const statusDetail = state === 'running' || state === 'stopped' ? ''
     : `${esc(st.health?.detail || '探活失败')}${REASON_HINT[st.health?.reason] ? `<br>➜ ${REASON_HINT[st.health.reason]}` : ''}`;
+  const goUsersBtn = (state === 'auth' || authInitNeeded)
+    ? '<button class="btn sm" id="memGoUsers" style="margin-top:8px">去 用户与密钥 →</button>' : '';
 
   // 信息网格：只渲染「有值」的列（隐藏字段不占列位）；运行方式用 mode 推导（embedded=LCB 受管安装）
   // 网格固定 3 列（一行 3 项；auto-fit 会在宽屏挤成 6 列）；地址列不跨列，长 URL 列内省略号截断防撑破；插件列值整体 nowrap 防拆行
@@ -443,7 +542,7 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
   // 卡标题右按钮组：主行动随状态切换（启动/停止），刷新与检查修复常驻
   // 检查/修复门禁与向导一键安装同口径：受管 conf 缺失（= 重跑会走首装生成 ov.conf）且模型
   // 三件套未保存时禁用——把「缺模型」挡在点击之前，而不是让用户在「生成服务配置」步骤撞失败
-  const needModelFirst = !inst.confFound && !modelSaved;
+  const needModelFirst = !inst.confFound && !modelSavedCheck(model);
   const repairBtn = `<button class="btn sm" id="memInstall" title="${needModelFirst
     ? '受管服务配置缺失，生成配置需要模型三件套——请先在下方「模型配置」卡填写并保存'
     : '重跑安装流水线（已就绪部件自动跳过）'}">检查修复</button>`;
@@ -455,7 +554,6 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
       : `${repairBtn} ${refreshBtn}`;
 
   el.innerHTML = `
-  ${pageIntro}
   <div class="card">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       <label class="switch"><input type="checkbox" id="memEnabled" ${m.enabled ? 'checked' : ''}><span class="track"></span></label>
@@ -479,8 +577,10 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
         ${statusSub ? `<span class="hint">— ${statusSub}</span>` : ''}
       </div>
       ${statusDetail ? `<div class="hint" style="margin-top:9px;line-height:1.8">${statusDetail}</div>` : ''}
+      ${goUsersBtn}
       <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-flow:dense;gap:16px 22px;margin-top:16px">${cells.join('')}</div>
     </div>
+    ${authInitNeeded ? `<div class="hint" style="margin-top:10px;padding:9px 14px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px">🔑 待初始化鉴权：服务为 api_key 模式但网页端用户尚未创建——浏览器打开记忆空间会 401。到「用户与密钥」Tab 点「一键初始化」即可。</div>` : ''}
     <div id="memInstallSteps"></div>
     <div id="memInstallHint" class="hint" style="margin-top:8px"></div>
   </div>
@@ -491,7 +591,7 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
       <button class="btn sm" id="memTest">测试连接</button>
       <button class="btn sm primary" id="memSaveModel">保存配置</button>
     </div>
-    <div class="desc" style="margin-top:6px">记忆的<b>提炼（vlm）与向量化（embedding）</b>走 OpenAI 协议端点，与机器人对话用的厂商档案相互独立（改档案不影响记忆）。建议变更后先 [测试连接] 双绿再保存。</div>
+    <div class="desc" style="margin-top:6px">记忆的<b>提炼（vlm）与向量化（embedding）</b>走 OpenAI 协议端点，两块可各自独立端点与 Key（跨厂商组合），默认向量块沿用主块。变更后先 [测试连接] 双绿再保存；保存后可「立即生效」。</div>
     ${modelFormHtml(model, m.endpoint)}
     <div id="memTestResult" class="hint" style="margin-top:8px"></div>
     <pre class="report" id="memTestReport" style="display:none;margin-top:6px"></pre>
@@ -507,6 +607,7 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
         blockers.push(`OpenViking 服务不可达：${esc(st.health?.detail || '未知原因')}${state === 'stopped' ? '——开启后可在「服务状态」卡点「▶ 启动服务」拉起' : ''}`);
       }
       if (!st.plugin?.found) blockers.push('记忆插件未安装——开启后可在「服务状态」卡点「一键检查 / 修复」补装');
+      if (authInitNeeded) blockers.push('网页端用户未创建（待初始化鉴权）——开启后到「用户与密钥」Tab 一键初始化');
       const warnTxt = blockers.length
         ? `开启前请注意：<br>· ${blockers.join('<br>· ')}<br><br>仍可开启（保存配置，日志会在每条消息给出指引），确认继续？`
         : '开启后每个机器人的每条消息将自动：注入记忆召回（hooks）+ 按命名空间隔离读写。确认开启？';
@@ -539,7 +640,9 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
     catch { toast('复制失败（浏览器未授权剪贴板）', true); }
   };
 
-  // 启动服务已统一走 bindInstallActions 的启动流水线（检查 → 拉起探活 → 接入插件，stepper 实时进度）
+  // 去「用户与密钥」Tab（入口联动：Tab1 只留跳转，不承载密钥操作——权限隔离）
+  const goUsers = $('#memGoUsers');
+  if (goUsers) goUsers.onclick = () => switchTab('users');
 
   // 停止受管服务（危险确认；外部自管服务不显示此按钮）
   const stopBtn = $('#memStop');
@@ -548,9 +651,225 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
     try { await api('POST', '/api/memory/stop', {}); toast('已停止'); hooks.rerender(); } catch (e) { toast(e.message, true); }
   };
 
-  bindModelForm(false);
+  bindModelForm(false, true);
   // 已安装视图：检查/修复门禁——受管 conf 已存在时放行（沿用现值重跑）；缺失时与向导同口径要模型三件套
   bindInstallActions(() => needModelFirst);
+}
+
+/** 模型三件套就绪判定（status 数据源：apiBase/vlmModel/embeddingModel） */
+const modelSavedCheck = (model) => !!(model && model.apiBase && model.vlmModel && model.embeddingModel);
+
+// ============ Tab2 · 用户与密钥（最终方案 §六） ============
+
+/** 体量人性化 */
+const fmtSize = (b) => (b === undefined || b === null) ? '—'
+  : b < 1024 ? `${b} B`
+    : b < 1048576 ? `${(b / 1024).toFixed(0)} KB`
+      : `${(b / 1048576).toFixed(1)} MB`;
+
+/** 最近活跃人性化（目录最大 mtime） */
+const fmtActive = (iso) => {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return '—';
+  const diff = Date.now() - t;
+  if (diff < 86400000) return '今天';
+  const days = Math.floor(diff / 86400000);
+  if (days < 30) return `${days} 天前`;
+  return new Date(t).toLocaleDateString();
+};
+
+/** 用户行（网页管理 / 机器人 / 其他；升级 bot×人 后机器人组可展开聊天者维度） */
+function userRowHtml(u) {
+  const displayName = u.appName || (u.kind === 'web' ? '网页管理' : u.userId);
+  const keyState = u.keyAvailable
+    ? `密钥 <span title="脱敏显示，完整密钥经「复制 key / 打开记忆空间」按需放行">${esc(u.keyHint || '••••')}</span>`
+    : '<span style="color:var(--warn-tx)">密钥未在库</span>';
+  const meta = [fmtSize(u.sizeBytes), u.lastActive ? `活跃于 ${fmtActive(u.lastActive)}` : '暂无记忆数据'].filter(Boolean).join(' · ');
+  return `<div style="display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">
+    <span style="width:8px;height:8px;border-radius:50%;background:var(--ok-tx);flex:0 0 auto"></span>
+    <div style="min-width:180px;flex:1">
+      <div style="font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap">${esc(displayName)}
+        <span class="hint"><code style="font-size:11px">${esc(u.userId)}</code></span>
+        <span class="hint">${keyState}</span>
+      </div>
+      <div class="hint" style="margin-top:3px">${meta}</div>
+    </div>
+    <button class="btn sm primary" data-open="${esc(u.userId)}" title="密钥进剪贴板 + 自动打开记忆空间（文件系统页），粘贴一次即可连接">打开记忆空间</button>
+    <button class="btn sm" data-copy="${esc(u.userId)}" title="复制密钥（脱敏显示，此操作会留痕）">⧉ 复制key</button>
+    <button class="btn sm" data-reset="${esc(u.userId)}" title="重签密钥：旧密钥立即失效，所有使用方需同步更新">重置</button>
+    <button class="btn sm danger" data-del="${esc(u.userId)}" title="删除用户与记忆（先自动备份本地数据）">删除</button>
+  </div>`;
+}
+
+/** Tab2 主渲染：一键初始化 + 用户列表（网页管理 / 机器人分组）+ 粒度向导 */
+function renderUsersTab(el, { st, m }) {
+  const u = usersSnapshot;
+  const healthy = !!st.health?.healthy;
+  const apiKeyMode = st.health?.authMode === 'api_key';
+  const gran = (S.doc.memory && typeof S.doc.memory === 'object' && S.doc.memory.granularity) || 'bot';
+
+  let bodyHtml;
+  if (!u) {
+    bodyHtml = `<div class="card"><div class="hint">用户列表加载失败（服务未运行或请求异常）。</div>
+      <button class="btn sm" id="memUsersRetry" style="margin-top:10px">重试</button></div>`;
+  } else if (!healthy) {
+    bodyHtml = `<div class="card">
+      <div style="background:var(--warn-bg);border-radius:10px;padding:14px 16px">
+        <b>服务未运行</b>
+        <div class="hint" style="margin-top:4px;line-height:1.7">${esc(u.error || st.health?.detail || 'OpenViking 服务不可达')}——请先到「服务与配置」Tab 拉起服务，再回到本页管理用户与密钥。</div>
+      </div></div>`;
+  } else if (!apiKeyMode) {
+    bodyHtml = `<div class="card">
+      <div style="background:var(--off-bg);border-radius:10px;padding:14px 16px">
+        <b>当前为 ${esc(u.authMode || 'dev')} 模式：无须用户密钥</b>
+        <div class="hint" style="margin-top:4px;line-height:1.7">本机回环免鉴权，机器人身份经命名空间（<code>{appId}-{userId}</code>）隔离——浏览器打开记忆空间可直接访问。部署走向多人共享 / 出现敏感内容隔离需求时，配置 root_api_key 切换到 api_key 模式后，回本页一键初始化网页与机器人密钥。</div>
+      </div>
+      ${granularityCardHtml(gran)}</div>`;
+  } else {
+    const webUsers = u.users.filter((x) => x.kind === 'web');
+    const botUsers = u.users.filter((x) => x.kind === 'bot');
+    const otherUsers = u.users.filter((x) => x.kind === 'other');
+    const group = (title, rows, hint) => rows.length === 0 ? '' : `
+      <div style="margin-top:14px">
+        <div style="font-size:12.5px;font-weight:700;color:var(--muted);letter-spacing:.4px">${esc(title)} <span class="hint" style="font-weight:400">${hint || ''}</span></div>
+        <div>${rows.map(userRowHtml).join('')}</div>
+      </div>`;
+    bodyHtml = `<div class="card">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <h3 style="margin:0">用户与密钥</h3>
+        <span class="hint">${esc(String(u.users.length))} 个用户 · 合计 ${fmtSize(u.totalBytes)} 记忆数据</span>
+        <span style="flex:1"></span>
+        ${u.authInitNeeded ? '<button class="btn sm primary" id="memUsersInit">⚡ 一键初始化</button>' : '<button class="btn sm" id="memUsersInit">⚡ 一键初始化</button>'}
+        <button class="btn sm" id="memUsersRefresh">↻ 刷新</button>
+      </div>
+      <div class="desc" style="margin-top:6px">api_key 模式：网页与每个机器人各持一把独立密钥（密钥落盘已加密、页面只脱敏显示，查看行为留痕审计）。「打开记忆空间」= 密钥进剪贴板 + 自动新标签打开，粘贴一次即可连接。</div>
+      ${u.authInitNeeded ? `<div class="hint" style="margin-top:10px;padding:9px 14px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px">🔑 待初始化鉴权：网页端用户（web）尚未创建——浏览器打开记忆空间会 401。点右上「⚡ 一键初始化」自动创建网页 + 各机器人用户并签发密钥。</div>` : ''}
+      ${u.users.length === 0 && !u.authInitNeeded ? '<div class="hint" style="margin-top:12px">暂无用户——点「⚡ 一键初始化」创建。</div>' : ''}
+      ${group('网页管理', webUsers, '浏览器打开记忆空间用')}
+      ${group('机器人', botUsers, '每个 bot 一把独立密钥（升级 bot×人 后此处可展开聊天者维度）')}
+      ${group('其他', otherUsers, '')}
+      ${granularityCardHtml(gran)}
+    </div>`;
+  }
+  el.innerHTML = bodyHtml;
+  bindUsersTabActions(el, { m });
+}
+
+/** 粒度向导卡（方案 §六：默认 bot 级；「升级到 bot×人」开关 = 增量升级意向，不动既有 key 与记忆） */
+const granularityCardHtml = (gran) => `
+  <div class="card" style="margin-top:14px">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <b style="font-size:13.5px">记忆粒度</b>
+      <span class="hint">${gran === 'bot-user' ? '已选择：bot × 人（每位聊天者独立空间）' : '当前：每 bot 一把密钥（默认，单机自用零损失）'}</span>
+      <span style="flex:1"></span>
+      <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
+        <span class="hint">升级到 bot×人</span>
+        <label class="switch"><input type="checkbox" id="memGran" ${gran === 'bot-user' ? 'checked' : ''}><span class="track"></span></label>
+      </label>
+    </div>
+    <div class="hint" style="margin-top:8px;line-height:1.8">升级属<b>增量演进</b>：既有密钥与记忆不受影响、会话不中断，仅为新聊天者追加独立签发。建议触发条件（任一出现即升级）：同一 bot 服务 2 人以上且内容敏感 / 出现「记忆是谁写的」追溯需求 / 部署走向团队共享。</div>
+  </div>`;
+
+function bindUsersTabActions(el, { m }) {
+  const endpoint = (m.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, '');
+
+  const reload = async () => {
+    try { usersSnapshot = await api('GET', '/api/memory/users'); } catch { usersSnapshot = null; }
+    hooks.rerender();
+  };
+
+  const retry = $('#memUsersRetry');
+  if (retry) retry.onclick = reload;
+
+  const refreshBtn = $('#memUsersRefresh');
+  if (refreshBtn) refreshBtn.onclick = reload;
+
+  const initBtn = $('#memUsersInit');
+  if (initBtn) initBtn.onclick = async () => {
+    initBtn.disabled = true;
+    initBtn.textContent = '初始化中…';
+    try {
+      const r = await api('POST', '/api/memory/users/init', {});
+      if (r.ok) toast(r.detail || '初始化完成');
+      else toast((r.errors && r.errors[0]) || r.detail || '初始化失败', true);
+    } catch (e) { toast(e.message, true); }
+    await reload();
+  };
+
+  // 打开记忆空间（最终方案 §三 决策 5）：密钥进剪贴板 → 自动新标签开 Web Studio 文件系统页
+  //（深链 /studio/filesystem 直落记忆目录树，避开默认的 VikingBot 标签——那是 OpenViking
+  //  自带的 Agent 对话功能，需 --with-bot 启动，与记忆浏览无关）。未连接的浏览器会被
+  //  Studio 引导到连接设置页，粘贴一次即可。
+  const openSpace = async (uid) => {
+    try {
+      const r = await api('POST', '/api/memory/users/reveal', { user_id: uid });
+      if (!r.ok || !r.key) return toast(r.error || '密钥获取失败', true);
+      try { await navigator.clipboard.writeText(r.key); } catch { return toast('密钥已放行但剪贴板不可用——请在浏览器地址栏手动粘贴', true); }
+      window.open(`${endpoint}/studio/filesystem`, '_blank', 'noopener');
+      toast('密钥已复制到剪贴板——在打开的页面粘贴一次（Ctrl+V）即可连接');
+    } catch (e) { toast(e.message, true); }
+  };
+
+  const copyKey = async (uid) => {
+    try {
+      const r = await api('POST', '/api/memory/users/reveal', { user_id: uid });
+      if (!r.ok || !r.key) return toast(r.error || '密钥获取失败', true);
+      await navigator.clipboard.writeText(r.key);
+      toast(`已复制 ${uid} 的密钥（查看行为已留痕）`);
+    } catch (e) { toast(e.message, true); }
+  };
+
+  const resetKey = async (uid) => {
+    if (!(await confirmDialog({
+      title: '重置密钥', danger: true,
+      message: `确定重置 <b>${esc(uid)}</b> 的密钥？<br><br>旧密钥将<b>立即失效</b>——所有使用此密钥的一方（浏览器连接、已打开的记忆空间、机器人会话）需同步更新并重启会话。`,
+      confirmText: '重置',
+    }))) return;
+    try {
+      const r = await api('POST', '/api/memory/users/reset', { user_id: uid });
+      if (!r.ok || !r.key) return toast(r.error || '重置失败', true);
+      try { await navigator.clipboard.writeText(r.key); toast('新密钥已生成并复制到剪贴板（旧密钥已失效）'); }
+      catch { toast('新密钥已生成（旧密钥已失效；剪贴板不可用，可稍后复制）'); }
+    } catch (e) { toast(e.message, true); }
+  };
+
+  const delUser = async (uid) => {
+    if (!(await confirmDialog({
+      title: '删除用户', danger: true,
+      message: `确定删除 <b>${esc(uid)}</b>？<br><br>该用户的服务端数据将被异步清理；删除前会自动把本地记忆目录打包备份到 <code>openviking/backups/</code>（备份失败会中止删除）。`,
+      confirmText: '删除',
+    }))) return;
+    try {
+      const r = await api('POST', '/api/memory/users/delete', { user_id: uid });
+      toast(r.ok ? (r.detail || '已删除') : (r.error || r.detail || '删除失败'), !r.ok);
+    } catch (e) { toast(e.message, true); }
+    await reload();
+  };
+
+  el.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-open],[data-copy],[data-reset],[data-del]');
+    if (!t) return;
+    if (t.dataset.open) return void openSpace(t.dataset.open);
+    if (t.dataset.copy) return void copyKey(t.dataset.copy);
+    if (t.dataset.reset) return void resetKey(t.dataset.reset);
+    if (t.dataset.del) return void delUser(t.dataset.del);
+  });
+
+  const granEl = $('#memGran');
+  if (granEl) granEl.onchange = async (e) => {
+    const next = e.target.checked ? 'bot-user' : 'bot';
+    if (!S.doc.memory || typeof S.doc.memory !== 'object') S.doc.memory = {};
+    const old = S.doc.memory.granularity;
+    S.doc.memory.granularity = next;
+    if (await saveDoc()) {
+      toast(next === 'bot-user'
+        ? '已记录升级意向：bot×人（增量生效——既有密钥与记忆不动，新聊天者独立签发）'
+        : '已回到每 bot 一把密钥');
+    } else {
+      S.doc.memory.granularity = old;
+      e.target.checked = !e.target.checked;
+    }
+  };
 }
 
 export const page = {

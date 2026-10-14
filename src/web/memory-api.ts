@@ -80,6 +80,7 @@ export async function memoryStatus(config: BridgeConfig): Promise<Record<string,
         ...(memory.endpoint ? { endpoint: memory.endpoint } : { endpoint: DEFAULT_MEMORY_ENDPOINT }),
         ...(memory.version ? { version: memory.version } : {}),
         ...(memory.account ? { account: memory.account } : {}),
+        ...(memory.granularity ? { granularity: memory.granularity } : {}),
         apiKey: maskSecret(memory.apiKey),
         model: memory.model
           ? {
@@ -88,6 +89,12 @@ export async function memoryStatus(config: BridgeConfig): Promise<Record<string,
             apiKey: maskSecret(memory.model.apiKey),
             ...(memory.model.vlmModel ? { vlmModel: memory.model.vlmModel } : {}),
             ...(memory.model.embeddingModel ? { embeddingModel: memory.model.embeddingModel } : {}),
+            // P2 双端点拆分：向量块独立凭证的展示数据（own = 是否显式配置；未配置 = 沿用主块，
+            // 前端据此显示「沿用主端点/主 Key」而非诱导重复填写；resolved = 渲染 ov.conf 的实际生效值）
+            ...(memory.model.embeddingApiBase ? { embeddingApiBase: memory.model.embeddingApiBase } : {}),
+            embeddingApiBaseResolved: memory.model.embeddingApiBase ?? memory.model.apiBase,
+            embeddingApiKey: maskSecret(memory.model.embeddingApiKey ?? memory.model.apiKey),
+            embeddingKeyOwn: !!memory.model.embeddingApiKey,
           }
           : undefined,
       }
@@ -180,18 +187,25 @@ async function checkVlm(apiBase: string, apiKey: string | undefined, model: stri
 /**
  * POST /api/memory/test-connection：模型表单 [测试连接] 后端（§6.8 双绿门禁）。
  * body 为表单现值（不落盘）——用户可先测通再保存/开启；双绿 = embedding 与 vlm 各真调一次。
+ * P2 双端点拆分：embedding 块可用独立端点/Key（embedding_api_base / embedding_api_key），
+ * 表单留空分别回退主块现值——与渲染 ov.conf 的回退口径完全一致（测什么就是什么）。
  * Ollama 等零 Key 端点：api_key 可空（不带 Authorization 头）。key 只进本次请求，不落日志。
- * savedApiKey：配置中已保存的 Key——输入框脱敏不回显，表单 Key 留空时回退用它测试
+ * saved：配置中已保存的 Key——输入框脱敏不回显，表单 Key 留空时回退已保存值测试
  * （否则已配置过的用户点测试必 401）；表单填了新值则测新值（换 Key 前先验证）。
+ * 向量块回退链：表单向量 Key → 已保存向量 Key → 表单主 Key → 已保存主 Key。
  */
 export async function testMemoryConnection(body: {
   api_base?: unknown; api_key?: unknown; vlm_model?: unknown; embedding_model?: unknown;
-}, savedApiKey?: string): Promise<{ embedding: ConnCheck; vlm: ConnCheck; ok: boolean }> {
+  embedding_api_base?: unknown; embedding_api_key?: unknown;
+}, saved?: { apiKey?: string; embeddingApiKey?: string }): Promise<{ embedding: ConnCheck; vlm: ConnCheck; ok: boolean }> {
   const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
   const apiBase = str(body.api_base);
-  const apiKey = str(body.api_key) || savedApiKey?.trim() || undefined;
+  const apiKey = str(body.api_key) || saved?.apiKey?.trim() || undefined;
   const vlmModel = str(body.vlm_model);
   const embeddingModel = str(body.embedding_model);
+  // 向量块独立值：表单填写优先，留空回退（端点回退主端点；Key 回退主 Key）——与 renderOvConf 同口径
+  const embeddingApiBase = str(body.embedding_api_base) || apiBase;
+  const embeddingApiKey = str(body.embedding_api_key) || saved?.embeddingApiKey?.trim() || apiKey;
   const bad = (detail: string): ConnCheck => ({ ok: false, detail });
   if (!apiBase) {
     const e = bad('api_base 未填写');
@@ -201,8 +215,12 @@ export async function testMemoryConnection(body: {
     const e = bad('api_base 必须以 http(s):// 开头');
     return { embedding: e, vlm: e, ok: false };
   }
+  if (embeddingApiBase && !/^https?:\/\//.test(embeddingApiBase)) {
+    const e = bad('向量端点必须以 http(s):// 开头');
+    return { embedding: e, vlm: { ok: true, detail: '未检测' }, ok: false };
+  }
   const embedding = embeddingModel
-    ? await checkEmbedding(apiBase, apiKey, embeddingModel)
+    ? await checkEmbedding(embeddingApiBase, embeddingApiKey, embeddingModel)
     : bad('embedding 模型未填写');
   const vlm = vlmModel
     ? await checkVlm(apiBase, apiKey, vlmModel)

@@ -281,17 +281,21 @@ export class ProgressCard {
 
   /**
    * 沉底：撤回当前进度卡并在会话底部重发（确认卡/计划卡/提问卡/中途推送都会把进度卡
-   * 顶上去，用户看不出任务是否还在跑）。删除失败（权限/网络）时降级为仅重发——
+   * 顶上去，用户看不出任务是否还在跑）。plan 场景 force 主动沉底：方案正文直发后把
+   * 带审批表单的本卡沉到正文下方，确认动线不用往上滚（form 刚上屏无输入，可旁路挂起延迟）。
+   * 删除失败（权限/网络）时降级为仅重发——
    * 极端情况出现两张进度卡，任务照常。终态后不再沉底。
    * 重发失败（限流/网络）重试一次，仍失败则放弃本卡（messageId 留空，flush 自动跳过）——
    * 绝不向上抛：调用方多为 void 调用，未处理 rejection 会拖垮整个 bridge 进程。
    */
-  async sinkToBottom(): Promise<void> {
+  async sinkToBottom(opts?: { force?: boolean }): Promise<void> {
     if (this.done) { this.deferSink = false; return; }
     if (!this.messageId) return;
     // 挂起输入期间沉底会删卡重发（输入态归零，用户打的意见/自定义答案被清掉）——
-    // 记录请求延迟到挂起解除（flush 落地后检查补执行）
-    if (this.hasInputPending()) { this.deferSink = true; return; }
+    // 记录请求延迟到挂起解除（flush 落地后检查补执行）。force 旁路：调用方确信此刻
+    // form 刚上屏、用户不可能已打字（planAsk 正文直发后立即沉底的场景）
+    if (this.hasInputPending() && !opts?.force) { this.deferSink = true; return; }
+    this.deferSink = false; // 主动沉底时清掉可能暂存的延迟请求，避免挂起解除后再多沉一次
     const old = this.messageId;
     const oldCardId = this.cardId;
     this.messageId = undefined; // 期间 flush 自动跳过，避免 PATCH 打到已删除的旧卡

@@ -78,8 +78,22 @@ export function getInstallState(): InstallState { return installState; }
 
 // ============ 受管服务子进程（崩溃重启 + 随 LCB 关停） ============
 
-interface ManagedProc { proc: ReturnType<typeof spawn>; port: number; restarts: number; stopped: boolean; confPath: string; startedAt: string }
+interface ManagedProc { proc: ReturnType<typeof spawn>; port: number; restarts: number; stopped: boolean; confPath: string; startedAt: string; output: string[] }
 let managed: ManagedProc | undefined;
+
+/** 受管进程最近输出环形缓冲上限（行；P0：失败文案带真实输出而非笼统指引） */
+const MANAGED_OUTPUT_CAP = 40;
+/** stdout/stderr 行入环形缓冲（spawnManaged 的两个 data 回调共用） */
+function pushManagedOutput(line: string): void {
+  if (!managed) return;
+  managed.output.push(line.slice(0, 300));
+  if (managed.output.length > MANAGED_OUTPUT_CAP) managed.output.shift();
+}
+
+/** 受管进程最近输出尾部（失败文案「最近输出：…」的数据源；exported 便于单测验证截断语义） */
+export function managedRecentOutput(maxLines = 12): string {
+  return (managed?.output ?? []).slice(-maxLines).join('\n');
+}
 
 /** 停受管实例（页面 stop / LCB shutdown / 重装前）：幂等，未运行为 no-op */
 export function stopManagedServer(): void {
@@ -250,7 +264,10 @@ function vlmProvider(p: MemoryModelConfig['provider']): string {
   return p === 'glm' ? 'glm' : 'openai';
 }
 
-/** 渲染 ov.conf（纯函数 exported 便于单测）。rootKey 已有则复用（重装不换 key，否则插件侧缓存/用户侧配置全部失效） */
+/** 渲染 ov.conf（纯函数 exported 便于单测）。rootKey 已有则复用（重装不换 key，否则插件侧缓存/用户侧配置全部失效）。
+ *  P2 双端点拆分：embedding.dense 与 vlm 各自独立——向量块显式配置（embeddingApiBase/embeddingApiKey）
+ *  优先，未设置回退主块（apiBase/apiKey），既有单份配置零迁移即可用；跨厂商组合（vlm=glm +
+ *  embedding=openai 系）填向量块两字段即可。 */
 export function renderOvConf(
   model: MemoryModelConfig,
   opts: { workspaceDir: string; port: number; rootApiKey?: string },
@@ -262,8 +279,8 @@ export function renderOvConf(
       dense: {
         provider: 'openai',
         model: model.embeddingModel ?? '',
-        api_key: model.apiKey ?? '',
-        api_base: model.apiBase ?? '',
+        api_key: model.embeddingApiKey ?? model.apiKey ?? '',
+        api_base: model.embeddingApiBase ?? model.apiBase ?? '',
       },
     },
     vlm: {
@@ -410,41 +427,111 @@ export async function findFreePort(startPort = 1933, tries = 20): Promise<number
 }
 
 /** 拉起受管实例并探活等待就绪（安装流水线第 4 步与「启动服务」按钮共用）。
- *  探活轮询给 30s（服务冷启含依赖加载）；启动即崩/超时统一抛带指引的 Error（调用方决定展示）。 */
-async function launchManagedAndWait(bin: string, confPath: string, port: number, external = false): Promise<{ detail: string; port: number }> {
+ *  P0 启动可靠性（记忆系统最终方案 v1.1 §五）：
+ *  - 探活预算 30 → 120 轮（首装冷启动最坏路径：OS 缓存全冷 + Defender 实时扫描 + 重依赖加载，
+ *    常超 30s——旧预算 + 超时即杀是「第一次必败」竞态的根因）；
+ *  - 超时不杀进程：预算耗尽且进程仍活 → 返回 { ready:false, crashed:false }，调用方转后台续等
+ *    （waitSlowStart），UI 显示「启动中（已等 N 秒）」而非红叉，就绪后自动续跑后续步骤；
+ *  - 进程退出（崩溃 3 次放弃 / 被停止）→ { ready:false, crashed:true }，文案带最近真实输出。 */
+const PROBE_BUDGET_ROUNDS = 120;
+/** 慢启动后台续等窗口（预算耗尽且进程存活时；10 分钟仍未见就绪才放弃并停止进程，防僵尸占端口） */
+const SLOW_START_MAX_MS = 600_000;
+
+/** launchManagedAndWait 的结果：ready=就绪；crashed=进程已放弃（崩溃超限/被停）；二者皆否 = 慢启动 */
+export interface LaunchOutcome { ready: boolean; crashed: boolean; detail: string; port: number }
+
+async function launchManagedAndWait(bin: string, confPath: string, port: number, external = false): Promise<LaunchOutcome> {
   spawnManaged(bin, confPath, port);
-  for (let i = 0; i < 30; i++) {
+  for (let i = 1; i <= PROBE_BUDGET_ROUNDS; i++) {
     await new Promise((r) => setTimeout(r, 1000));
     const h = await probeMemoryHealth(`http://127.0.0.1:${port}`, 1500);
     if (h.healthy) {
-      return { detail: `服务已就绪：http://127.0.0.1:${port}${external ? '（外部配置 ~/.openviking/ov.conf，LCB 仅代为拉起、不改写）' : ''}`, port };
+      return {
+        ready: true, crashed: false, port,
+        detail: `服务已就绪：http://127.0.0.1:${port}${external ? '（外部配置 ~/.openviking/ov.conf，LCB 仅代为拉起、不改写）' : ''}${i > 15 ? `（冷启动 ${i} 秒）` : ''}`,
+      };
     }
-    if (!managed) break; // 启动即崩（config 错等）
+    if (!managed) {
+      // 崩溃自动重启 3 次放弃 / 被主动停止：managed 已清。文案带最近输出（stdout+stderr 合流），
+      // 不再误导为「模型配置问题」——真实原因看输出（方案 §五-P0）
+      return { ready: false, crashed: true, port, detail: `服务进程已退出（等待 ${i} 秒）。最近输出：\n${managedRecentOutput() || '（无输出）'}` };
+    }
   }
-  const hint = `服务启动后探活失败（127.0.0.1:${port}）——请检查 ov.conf 的模型配置（api_base/key/模型名）${external ? '，或改用「一键安装」生成 LCB 受管配置' : ''}`;
-  stopManagedServer();
-  throw new Error(hint);
+  if (managed) {
+    // 预算耗尽但进程存活：绝不杀进程（调用方转后台续等）
+    return { ready: false, crashed: false, port, detail: `探活预算（${PROBE_BUDGET_ROUNDS} 秒）内未见就绪，服务进程仍在运行，转后台继续等待` };
+  }
+  return { ready: false, crashed: true, port, detail: `服务进程在等待期间退出。最近输出：\n${managedRecentOutput() || '（无输出）'}` };
 }
 
-async function stepStart(bin: string, confPath: string): Promise<{ skipped: boolean; detail: string; port: number }> {
+/** P0 慢启动后台续等：预算耗尽但进程存活时，后台每 2s 探活；onTick 上报累计已等秒数（UI 实时
+ *  「启动中（已等 N 秒）」）。就绪 → ok；进程放弃（崩溃 3 次/被停止）或窗口耗尽 → !ok——窗口
+ *  耗尽时停止未就绪进程（防僵尸占端口），文案如实说明并附最近输出。 */
+async function waitSlowStart(port: number, onTick: (elapsedSec: number) => void): Promise<{ ok: boolean; detail: string }> {
+  const begin = Date.now();
+  while (Date.now() - begin < SLOW_START_MAX_MS) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const elapsed = PROBE_BUDGET_ROUNDS + Math.round((Date.now() - begin) / 1000);
+    const h = await probeMemoryHealth(`http://127.0.0.1:${port}`, 1500);
+    if (h.healthy) return { ok: true, detail: `服务已就绪（累计等待 ${elapsed} 秒）：http://127.0.0.1:${port}` };
+    if (!managed) return { ok: false, detail: `服务进程已退出（累计等待 ${elapsed} 秒）。最近输出：\n${managedRecentOutput() || '（无输出）'}` };
+    onTick(elapsed);
+  }
+  const detail = `服务启动超时（已等 ${PROBE_BUDGET_ROUNDS + Math.round(SLOW_START_MAX_MS / 1000)} 秒仍未见就绪），已停止该进程。最近输出：\n${managedRecentOutput() || '（无输出）'}`;
+  stopManagedServer();
+  return { ok: false, detail };
+}
+
+/** 流水线统一收尾：err 时把 running 步骤置 failed，无论成败都关闭 running 态（后台续跑路径共用） */
+function finalizeInstallState(steps: InstallStep[], err?: unknown): void {
+  const failed = steps.find((x) => x.status === 'running');
+  if (err && failed) {
+    failed.status = 'failed';
+    failed.detail = err instanceof Error ? err.message : String(err);
+  }
+  installState.running = false;
+  installState.finishedAt = new Date().toISOString();
+}
+
+async function stepStart(bin: string, confPath: string, opts: { forceRestart?: boolean } = {}): Promise<LaunchOutcome & { skipped: boolean }> {
   const port = readConfPort(confPath);
-  // 已有受管实例：探活通即跳过（幂等重跑）
+  // 已有受管实例：探活通即跳过（幂等重跑）；forceRestart（P1 保存即生效）则重启以应用新配置
   if (managed && !managed.stopped) {
     const h = await probeMemoryHealth(`http://127.0.0.1:${managed.port}`, 2000);
-    if (h.healthy) return { skipped: true, detail: `受管实例已在运行（127.0.0.1:${managed.port}）`, port: managed.port };
+    if (h.healthy && !opts.forceRestart) {
+      return { skipped: true, ready: true, crashed: false, detail: `受管实例已在运行（127.0.0.1:${managed.port}）`, port: managed.port };
+    }
     stopManagedServer();
+    await new Promise((r) => setTimeout(r, 1000)); // 端口释放窗口（TIME_WAIT）
   }
   const r = await launchManagedAndWait(bin, confPath, port);
-  return { skipped: false, detail: r.detail, port: r.port };
+  return { ...r, skipped: false };
 }
 
 // ============ 单独启动（「启动服务」按钮 → LCB 接管式启动流水线） ============
+
+/** 启动流水线尾部（③插件接入 + 回写）：正常路径与慢启动后台续跑共用 */
+async function finishStartTail(opts: { configPath: string }, port: number, external: boolean, set: (id: string, status: StepStatus, detail?: string) => void): Promise<void> {
+  set('plugin', 'running');
+  const pl = await stepPlugin({
+    endpoint: `http://127.0.0.1:${port}`,
+    account: await memoryAccount(opts.configPath),
+  });
+  set('plugin', pl.skipped ? 'skipped' : 'done', pl.detail);
+  if (pl.writeback) {
+    // 插件新装/调和才回写：受管场景顺带对齐 endpoint/mode；外部场景不动用户配置（只补插件引用）
+    writeBackConfig(opts.configPath,
+      external ? {} : { endpoint: `http://127.0.0.1:${port}`, mode: 'embedded' },
+      pl.writeback.pluginPath, pl.writeback.opts);
+  }
+}
 
 /**
  * 启动流水线（kind='start'，后台执行 + 与安装同款 stepper 轮询展示）：LCB 已接管 OpenViking，
  * 「启动」就应当是接管的启动——不只拉进程，还要把记忆链路整段拉就绪：
  * ① 检查服务与配置（bin / ov.conf 定位，缺失即 failed + 指引改走「检查修复 / 一键安装」）
- * ② 拉起并探活（受管拉起 + 最长 30s 探活；已在运行则 skipped，幂等重跑）
+ * ② 拉起并探活（受管拉起 + P0 预算 120s；预算耗尽且进程存活 → 转后台续等（UI 显示
+ *    「启动中（已等 N 秒）」），就绪自动续跑 ③；已在运行则 skipped，幂等重跑）
  * ③ 接入记忆插件（CLI 市场渠道真实安装：已登记启用 → skipped；缺失 → marketplace add/install/enable
  *  三步幂等安装，插件页可见可管理；CLI 失败回退 zip 下载自管副本）
  * 完成后无须再点「检查修复」——启动结束即完整接管态。任何一步失败即停（同安装流水线语义）。
@@ -484,34 +571,40 @@ export async function runStartPipeline(opts: { configPath: string }): Promise<In
     }
     if (needLaunch) {
       const r = await launchManagedAndWait(bin, confPath, readConfPort(confPath), external);
+      if (!r.ready) {
+        if (r.crashed) {
+          set('launch', 'failed', r.detail);
+          throw new Error(r.detail);
+        }
+        // P0 慢启动：进程存活 → 不杀不红叉，保持流水线 running 转后台续等，就绪自动续跑 ③
+        set('launch', 'running', `启动中（已等 ${PROBE_BUDGET_ROUNDS} 秒）…`);
+        void (async () => {
+          const slow = await waitSlowStart(r.port, (s) => set('launch', 'running', `启动中（已等 ${s} 秒）…`));
+          if (!slow.ok) {
+            set('launch', 'failed', slow.detail);
+            finalizeInstallState(steps);
+            return;
+          }
+          set('launch', 'done', slow.detail);
+          try {
+            await finishStartTail(opts, r.port, external, set);
+            finalizeInstallState(steps);
+          } catch (e) {
+            finalizeInstallState(steps, e);
+          }
+        })();
+        return installState; // running 保持 true：前端持续轮询看实时秒数
+      }
       port = r.port;
       set('launch', 'done', r.detail);
     }
     // ③ 插件接入（启动完整性的另一半：插件缺失时记忆照样不工作——补齐并回写显式引用；
     //    client 传 endpoint/account：顺带落客户端接入配置 ovcli.conf，外部模式由 ensure 自守卫跳过）
-    set('plugin', 'running');
-    const pl = await stepPlugin({
-      endpoint: `http://127.0.0.1:${port ?? 1933}`,
-      account: await memoryAccount(opts.configPath),
-    });
-    set('plugin', pl.skipped ? 'skipped' : 'done', pl.detail);
-    if (pl.writeback) {
-      // 插件新装/调和才回写：受管场景顺带对齐 endpoint/mode；外部场景不动用户配置（只补插件引用）
-      writeBackConfig(opts.configPath,
-        external ? {} : { endpoint: `http://127.0.0.1:${port ?? 1933}`, mode: 'embedded' },
-        pl.writeback.pluginPath, pl.writeback.opts);
-    }
-    installState.running = false;
-    installState.finishedAt = new Date().toISOString();
+    await finishStartTail(opts, port ?? 1933, external, set);
+    finalizeInstallState(steps);
     return installState;
   } catch (e) {
-    installState.running = false;
-    installState.finishedAt = new Date().toISOString();
-    const failed = steps.find((x) => x.status === 'running');
-    if (failed) {
-      failed.status = 'failed';
-      failed.detail = e instanceof Error ? e.message : String(e);
-    }
+    finalizeInstallState(steps, e);
     return installState;
   }
 }
@@ -521,7 +614,7 @@ function spawnManaged(bin: string, confPath: string, port: number): void {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  managed = { proc, port, restarts: 0, stopped: false, confPath, startedAt: new Date().toISOString() };
+  managed = { proc, port, restarts: 0, stopped: false, confPath, startedAt: new Date().toISOString(), output: [] };
   proc.on('exit', () => {
     if (!managed || managed.proc !== proc) return;
     if (managed.stopped) { managed = undefined; return; }
@@ -539,9 +632,23 @@ function spawnManaged(bin: string, confPath: string, port: number): void {
       managed = undefined;
     }
   });
+  // P0：stdout 原先只 pipe 不消费——缓冲写满会阻塞子进程且信息全丢；现转发控制台并入环形缓冲
+  //（stderr 同款），失败文案「最近输出：…」即来源于此
+  proc.stdout?.on('data', (d: Buffer) => {
+    for (const raw of String(d).split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      pushManagedOutput(line);
+      console.log('[memory-server]', line.slice(0, 300));
+    }
+  });
   proc.stderr?.on('data', (d: Buffer) => {
-    const line = String(d).trim();
-    if (line) console.warn('[memory-server]', line.slice(0, 300));
+    for (const raw of String(d).split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      pushManagedOutput(line);
+      console.warn('[memory-server]', line.slice(0, 300));
+    }
   });
 }
 
@@ -949,11 +1056,36 @@ export interface InstallOptions {
   model?: MemoryModelConfig;
   /** 服务 pin 版本（memory.version ?? DEFAULT_OPENVIKING_PIN） */
   pin?: string;
+  /** P1 保存即生效（「立即生效」按钮）：受管实例探活通过也强制重启——模型配置保存后
+   *  ov.conf 已重渲染，但运行中的旧进程不会热加载，必须重启才能应用新模型 */
+  forceRestart?: boolean;
+}
+
+/** 安装流水线尾部（⑤插件接入 + ⑥回写 config.yaml）：正常路径与慢启动后台续跑共用 */
+async function finishInstallTail(opts: InstallOptions, port: number, firstInstallKey: string | undefined, set: (id: InstallStep['id'], status: StepStatus, detail?: string) => void): Promise<void> {
+  // ⑤ 插件（client 传 endpoint/account：顺带落客户端接入配置 ovcli.conf，§6.7 第 4 步）
+  set('plugin', 'running');
+  const pl = await stepPlugin({
+    endpoint: `http://127.0.0.1:${port}`,
+    account: await memoryAccount(opts.configPath),
+  });
+  set('plugin', pl.skipped ? 'skipped' : 'done', pl.detail);
+  // ⑥ 回写 config.yaml——全链成功才落盘（半成品不污染用户配置）：endpoint / mode=embedded /
+  // 首装生成的 root_api_key 回写 memory.api_key（复用已有 key 不写）+ 插件引用回写（CLI 渠道为
+  // 调和模式、zip 兜底为补齐模式，选项由 stepPlugin 携带）
+  writeBackConfig(opts.configPath, {
+    endpoint: `http://127.0.0.1:${port}`,
+    mode: 'embedded',
+    ...(firstInstallKey ? { apiKey: firstInstallKey } : {}),
+  }, pl.writeback?.pluginPath, pl.writeback?.opts);
 }
 
 /**
  * 一键安装流水线（幂等锁：running 中重复调用直接返回当前状态）。
  * 任何一步失败即停（状态留 failed + detail），页面可整链重跑——已就绪步骤自动 skipped。
+ * P0 慢启动语义：拉起步骤预算耗尽但进程存活时，流水线保持 running、转后台续等（UI 实时显示
+ * 「启动中（已等 N 秒）」），就绪后自动续跑 ⑤⑥ 并收尾——调用方（HTTP 层）此刻即返回，
+ * 前端经 /api/memory/install/status 轮询看到全过程。
  */
 export async function runInstall(opts: InstallOptions): Promise<InstallState> {
   if (installState.running) return installState;
@@ -1011,34 +1143,38 @@ export async function runInstall(opts: InstallOptions): Promise<InstallState> {
     }
     // ④ 拉起
     set('start', 'running');
-    const st = await stepStart(svc.bin, MANAGED_OV_CONF);
+    const st = await stepStart(svc.bin, MANAGED_OV_CONF, { forceRestart: opts.forceRestart });
+    if (!st.ready) {
+      if (st.crashed) {
+        set('start', 'failed', st.detail);
+        throw new Error(st.detail);
+      }
+      // P0 慢启动：进程存活 → 不杀不红叉，保持流水线 running 转后台续等，就绪自动续跑 ⑤⑥
+      set('start', 'running', `启动中（已等 ${PROBE_BUDGET_ROUNDS} 秒）…`);
+      void (async () => {
+        const slow = await waitSlowStart(st.port, (s) => set('start', 'running', `启动中（已等 ${s} 秒）…`));
+        if (!slow.ok) {
+          set('start', 'failed', slow.detail);
+          finalizeInstallState(steps);
+          return;
+        }
+        set('start', 'done', slow.detail);
+        try {
+          await finishInstallTail(opts, st.port, firstInstallKey, set);
+          finalizeInstallState(steps);
+        } catch (e) {
+          finalizeInstallState(steps, e);
+        }
+      })();
+      return installState; // running 保持 true：前端持续轮询看实时秒数
+    }
     set('start', st.skipped ? 'skipped' : 'done', st.detail);
-    // ⑤ 插件（client 传 endpoint/account：顺带落客户端接入配置 ovcli.conf，§6.7 第 4 步）
-    set('plugin', 'running');
-    const pl = await stepPlugin({
-      endpoint: `http://127.0.0.1:${st.port}`,
-      account: await memoryAccount(opts.configPath),
-    });
-    set('plugin', pl.skipped ? 'skipped' : 'done', pl.detail);
-    // ⑥ 回写 config.yaml——全链成功才落盘（半成品不污染用户配置）：endpoint / mode=embedded /
-    // 首装生成的 root_api_key 回写 memory.api_key（复用已有 key 不写）+ 插件引用回写（CLI 渠道为
-    // 调和模式、zip 兜底为补齐模式，选项由 stepPlugin 携带）
-    writeBackConfig(opts.configPath, {
-      endpoint: `http://127.0.0.1:${st.port}`,
-      mode: 'embedded',
-      ...(firstInstallKey ? { apiKey: firstInstallKey } : {}),
-    }, pl.writeback?.pluginPath, pl.writeback?.opts);
-    installState.running = false;
-    installState.finishedAt = new Date().toISOString();
+    // ⑤⑥ 插件接入 + 回写（尾部提取：与慢启动后台续跑共用）
+    await finishInstallTail(opts, st.port, firstInstallKey, set);
+    finalizeInstallState(steps);
     return installState;
   } catch (e) {
-    installState.running = false;
-    installState.finishedAt = new Date().toISOString();
-    const failed = steps.find((x) => x.status === 'running');
-    if (failed) {
-      failed.status = 'failed';
-      failed.detail = e instanceof Error ? e.message : String(e);
-    }
+    finalizeInstallState(steps, e);
     return installState;
   }
 }

@@ -125,16 +125,26 @@ export interface ClaudeConfig {
 }
 /** 记忆模型配置（memory.model 子段）：OpenAI 协议端点（embedding/vlm），与厂商档案（Anthropic 协议）
  *  分属两个协议域，不做隐式推导——零耦合是生命周期方案 §6.8 的定稿原则。B2 配置页消费（渲染 ov.conf），
- *  B1 仅解析透传 */
+ *  B1 仅解析透传。
+ *  双端点拆分（记忆系统最终方案 v1.1 §五-P2）：vlm 块与 embedding 块各自独立 provider/api_base/api_key
+ *  ——服务端 ov.conf 本就双块独立（vlm 块 + embedding 块），此处允许向量块单独指定端点与 Key；
+ *  未设置时沿用主块值（向后兼容既有单份配置，渲染时回退）。两块凭证互不影响：
+ *  「只改主 Key、向量块留空保存」→ 向量 Key 保持原值（表单留空 = 不修改，secret 回填保证）。 */
 export interface MemoryModelConfig {
-  /** 服务商预设（填表助手语义：预设只预填 endpoint/模型名，值仍可见可改） */
+  /** 服务商预设（填表助手语义：预设只预填 endpoint/模型名，值仍可见可改）；vlm 块沿用 */
   provider?: 'glm' | 'volcengine' | 'openai-compatible' | 'ollama';
+  /** vlm 块端点 */
   apiBase?: string;
-  /** 配置页输入；GET 脱敏回显（对齐 app_secret 惯例），不参与日志 */
+  /** vlm 块 Key。配置页输入；GET 脱敏回显（对齐 app_secret 惯例），不参与日志 */
   apiKey?: string;
   /** 提炼模型（会话归档时用），独立于对话模型可指定更强档位 */
   vlmModel?: string;
+  /** 向量模型（embedding 块） */
   embeddingModel?: string;
+  /** embedding 块端点；缺省沿用 apiBase（跨厂商组合时单独指定，如 vlm=glm + embedding=openai 系） */
+  embeddingApiBase?: string;
+  /** embedding 块 Key；缺省沿用 apiKey。配置页输入；GET 脱敏回显，不参与日志 */
+  embeddingApiKey?: string;
 }
 /** 长期记忆段（整体可选；生命周期方案 §6）：缺省/enabled=false = 零开销——不下发 env、不注入插件、
  *  不产生告警，LCB 行为与无此段完全一致（总验收「可插拔」条款）。热生效：env 下发与插件装配均每任务
@@ -155,6 +165,10 @@ export interface MemoryConfig {
   apiKey?: string;
   /** 记忆模型（B2 消费；与厂商档案零耦合） */
   model?: MemoryModelConfig;
+  /** 记忆粒度（最终方案 §三 决策 2/3）：'bot' = 每 bot 一把 key（缺省，单机自用零损失）；
+   *  'bot-user' = 升级 bot×人（触发信号出现后的增量升级——已有 bot key 不作废、不动会话，
+   *  仅追加新聊天者签发逻辑）。仅记录意向与页面展示，鉴权实际形态随 auth_mode 演进 */
+  granularity?: 'bot' | 'bot-user';
 }
 /** 飞书斜杠命令注册定义（同步到开放平台 app_slash_commands；command 不含 / 前缀） */
 export interface SlashCommandDef { command: string; description: string; icon?: string }

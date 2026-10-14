@@ -61,8 +61,10 @@ export function applySecrets(newDoc: Record<string, unknown>, oldDoc: Record<str
     }
     doc.claude = newClaude;
   }
-  // memory 段（§6.8 记忆增强）：memory.api_key（root key）与 memory.model.api_key（模型 key）
-  // 未修改时回填磁盘现值——与 claude 段同款语义，页面「打开直接保存」不丢已配 Key
+  // memory 段（§6.8 记忆增强）：memory.api_key（root key）与 memory.model 的模型 Key
+  // 未修改时回填磁盘现值——与 claude 段同款语义，页面「打开直接保存」不丢已配 Key。
+  // P2 双端点拆分：主 Key（model.api_key / vlm 块）与向量 Key（model.embedding_api_key）
+  // 按块独立回填——「只改主 Key、向量块留空保存」时向量 Key 保持原值，两块互不串扰
   if (doc.memory && typeof doc.memory === 'object' && !Array.isArray(doc.memory)) {
     const newMemory = { ...(doc.memory as Record<string, unknown>) };
     const oldMemory = oldDoc.memory && typeof oldDoc.memory === 'object' && !Array.isArray(oldDoc.memory)
@@ -73,11 +75,11 @@ export function applySecrets(newDoc: Record<string, unknown>, oldDoc: Record<str
       const oldModel = oldMemory.model && typeof oldMemory.model === 'object' && !Array.isArray(oldMemory.model)
         ? (oldMemory.model as Record<string, unknown>)
         : {};
+      const newModel = newMemory.model as Record<string, unknown>;
       newMemory.model = {
-        ...(newMemory.model as Record<string, unknown>),
-        ...(isUnchangedSecret((newMemory.model as Record<string, unknown>).api_key)
-          ? { api_key: oldModel.api_key }
-          : {}),
+        ...newModel,
+        ...(isUnchangedSecret(newModel.api_key) ? { api_key: oldModel.api_key } : {}),
+        ...(isUnchangedSecret(newModel.embedding_api_key) ? { embedding_api_key: oldModel.embedding_api_key } : {}),
       };
     }
     doc.memory = newMemory;
@@ -108,13 +110,18 @@ export function docForClient(doc: Record<string, unknown>): Record<string, unkno
     }
     out.claude = c;
   }
-  // memory 段脱敏（§6.8）：root key / 模型 key 只回显尾 4 位提示
+  // memory 段脱敏（§6.8）：root key / 模型 key 只回显尾 4 位提示。P2 双端点拆分：主 Key 与
+  // 向量 Key（embedding_api_key）按块独立脱敏
   if (out.memory && typeof out.memory === 'object' && !Array.isArray(out.memory)) {
     const m = { ...(out.memory as Record<string, unknown>) };
     m.api_key = maskSecret(typeof m.api_key === 'string' ? m.api_key : undefined);
     if (m.model && typeof m.model === 'object' && !Array.isArray(m.model)) {
       const mm = m.model as Record<string, unknown>;
-      m.model = { ...mm, api_key: maskSecret(typeof mm.api_key === 'string' ? mm.api_key : undefined) };
+      m.model = {
+        ...mm,
+        api_key: maskSecret(typeof mm.api_key === 'string' ? mm.api_key : undefined),
+        embedding_api_key: maskSecret(typeof mm.embedding_api_key === 'string' ? mm.embedding_api_key : undefined),
+      };
     }
     out.memory = m;
   }

@@ -349,7 +349,7 @@ function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | undefined
   if (typeof raw !== 'object') throw new Error('memory 必须为对象（含 enabled / mode / endpoint），请检查 config.yaml');
   const m = raw as {
     enabled?: unknown; mode?: unknown; version?: unknown; endpoint?: unknown;
-    account?: unknown; api_key?: unknown; model?: unknown;
+    account?: unknown; api_key?: unknown; model?: unknown; granularity?: unknown;
   };
   let enabled = false;
   if (m.enabled !== undefined && m.enabled !== null) {
@@ -378,6 +378,14 @@ function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | undefined
   }
   const account = str(m.account, 'account');
   const apiKey = str(m.api_key, 'api_key');
+  // 记忆粒度（最终方案 §三 决策 2）：bot（缺省）/ bot-user（升级意向，增量演进不改既有 key）
+  let granularity: MemoryConfig['granularity'];
+  if (m.granularity !== undefined && m.granularity !== null) {
+    if (m.granularity !== 'bot' && m.granularity !== 'bot-user') {
+      throw new Error(`memory.granularity 必须为 bot / bot-user（当前值：${String(m.granularity)}），请检查 config.yaml`);
+    }
+    granularity = m.granularity;
+  }
   // model 子段：B2 配置页消费（渲染 ov.conf），此处仅形状校验 + 透传——与厂商档案零耦合，不读 claude 段
   let model: MemoryModelConfig | undefined;
   if (m.model !== undefined && m.model !== null) {
@@ -397,6 +405,9 @@ function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | undefined
       ...(str(mm.api_key, 'model.api_key') ? { apiKey: str(mm.api_key, 'model.api_key')! } : {}),
       ...(str(mm.vlm_model, 'model.vlm_model') ? { vlmModel: str(mm.vlm_model, 'model.vlm_model')! } : {}),
       ...(str(mm.embedding_model, 'model.embedding_model') ? { embeddingModel: str(mm.embedding_model, 'model.embedding_model')! } : {}),
+      // 双端点拆分（最终方案 §五-P2）：向量块独立端点/Key，缺省沿用主块（渲染 ov.conf 时回退）
+      ...(str(mm.embedding_api_base, 'model.embedding_api_base') ? { embeddingApiBase: str(mm.embedding_api_base, 'model.embedding_api_base')! } : {}),
+      ...(str(mm.embedding_api_key, 'model.embedding_api_key') ? { embeddingApiKey: str(mm.embedding_api_key, 'model.embedding_api_key')! } : {}),
     };
     if (Object.keys(model).length === 0) model = undefined;
   }
@@ -408,6 +419,7 @@ function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | undefined
     ...(account ? { account } : {}),
     ...(apiKey ? { apiKey } : {}),
     ...(model ? { model } : {}),
+    ...(granularity ? { granularity } : {}),
   };
 }
 

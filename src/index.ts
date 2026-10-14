@@ -329,29 +329,6 @@ export function createBridge(
   }
 
   /**
-   * 用户主动拿文件：消息文本中包含本通道非图片文件清单的 basename（≥4 字符）即视为请求，
-   * 上传匹配文件 + ack，并把已发文件从清单中清除（重复要不再发）。
-   * 返回 true 表示已处理（processMessage 应拦截，不再交给 Claude Code）。
-   */
-  async function tryDeliverRequestedFiles(msg: IncomingMessage, key: string): Promise<boolean> {
-    const files = fileTracker.get(key);
-    if (files.length === 0) return false;
-    // 阈值过滤过短 basename（a.ts / b.js 等），避免消息中随便提到一两个字符就误命中
-    const matched = files.filter((f) => {
-      const bn = basename(f);
-      return bn.length >= 4 && msg.text.includes(bn);
-    });
-    if (matched.length === 0) return false;
-    for (const f of matched) {
-      await deps.gateway.uploadAndSendFile(msg.chatId, f);
-    }
-    const names = matched.map((f) => basename(f)).join('、 ');
-    await deps.gateway.sendTextTo(msg.chatId, `✅ 已发送 ${names}`);
-    fileTracker.clear(key, matched);
-    return true;
-  }
-
-  /**
    * 用户按数字取 diff：任务收尾发过数字编号文件清单后，回复纯数字即视为查看对应文件的
    * 本次改动（unified diff）。范围外提示；diff 短发卡片、长发 .md 文件附件。
    * 仅在本通道存在清单时拦截（否则纯数字放行为普通任务，如「3」也可能是发给模型的内容）。
@@ -392,11 +369,10 @@ export function createBridge(
 
   async function processMessage(msg: IncomingMessage): Promise<void> {
     const key = channelKey(msg.chatId, msg.userId);
-    // 0. 用户主动拿文件/看改动：先按纯数字取 diff（清单序号），再按 basename 点名取本体；
-    // 命中后拦截不再交给 Claude Code——避免模型重复 send_file 同一文件造成轰炸。
-    // 纯数字永不命中 basename 规则（basename ≥4 字符且须被包含），两者无冲突
+    // 0. 用户对收尾文件清单回复纯数字 → 发该文件的本次 diff（清单序号），命中后拦截
+    // 不再交给 Claude Code。消息里提到文件名不再发文件本体（用户反馈：提到 ≠ 要文件，
+    // 子串误判还会拦截提问不送给模型）——明确要文件时由模型侧 send_file 工具按意图判断
     if (await tryDeliverNumberedDiff(msg, key)) return;
-    if (await tryDeliverRequestedFiles(msg, key)) return;
     // 1. 访问控制：白名单外首个使用者自动成为 admin（免配对），其后未知用户发配对码
     // 每条消息先重读 access.json：lcb pair / 运行终端等独立进程批准写盘后，
     // 长存的内存实例不 reload 会查到旧白名单 → 反复发配对码且整盘覆写抹掉新用户（死循环）
@@ -752,7 +728,12 @@ export function createBridge(
           // 挂起即永不超时——同 ask 发卡约束）；raceFallback 永不 reject，失败/超时仅内部落日志，
           // 审批表单照常可用
           await raceFallback(sendPlanContentCards(msg.chatId, planReq), CARD_SEND_TIMEOUT_MS, undefined);
-          // 不再 sinkToBottom：plan 区嵌入主进度卡，flush 自然 PATCH，删旧卡重发只会让用户看到计划区跳一下
+          // 方案正文卡已全部落地：把带审批表单的主进度卡沉底到正文下方——读完方案就近点按钮，
+          // 批准后执行过程也在正文下方刷新，不用往上滚。force 旁路挂起输入延迟（此刻意见框刚
+          // 上屏、用户连方案都未读完，不可能已打字）；void 不 await：沉底内部 API 无超时包裹，
+          // await 挂起会推迟 planPending 注册，期间旧卡按钮点击查不到挂起项失效。沉底自带兜底：
+          // 撤不掉打迁移标记、重发失败不抛错——上方 setPlan 已让旧卡亮出审批表单，失败也照常可用
+          void progress.sinkToBottom({ force: true });
           return new Promise<PlanAskResult>((resolve) => {
             const gc = setTimeout(() => {
               planPending.delete(planReq.requestId);
@@ -1171,7 +1152,8 @@ export function createBridge(
         }
       }
       // 图片自动发（im.image.create 通道），非图片文件不自动回传——
-      // 用户从下面的文件清单里看到改了哪些文件，主动点名 basename 后由 tryDeliverRequestedFiles 处理
+      // 用户从下面的文件清单里看到改了哪些文件，回复数字看该文件 diff；
+      // 明确要文件本体时由模型侧 send_file 工具处理（notify-sop 提示词约束）
       const uploadProducedImages = async (): Promise<void> => {
         const imageFiles = outcome.producedFiles
           .filter((f) => !sentPaths.has(resolve(f)))
@@ -1180,14 +1162,13 @@ export function createBridge(
           await deps.gateway.uploadAndSendFile(msg.chatId, f);
         }
       };
-      // 把非图片文件记入通道（含工作区根，数字取 diff 时用），供后续用户消息按 basename
-      // 点名取本体、或按清单序号取该文件 diff（图片已自动发，不进 tracker）
+      // 把非图片文件记入通道（含工作区根，数字取 diff 时用），供后续用户消息
+      // 按清单序号取该文件 diff（图片已自动发，不进 tracker）
       const wsRoot = workspacePath(wsName);
       const nonImageFiles = outcome.producedFiles.filter((f) => !isImageFile(f));
       fileTracker.record(key, nonImageFiles, { workspace: wsRoot });
       // 收尾文件清单（数字编号 + 相对路径）：用户从这里知道改了哪些文件——回复数字看该文件
-      // 本次改动（diff），点名 basename 取文件本体；计划文件等工作区外路径已被
-      // OutputCollector 按 cwd 过滤，不会混进清单
+      // 本次改动（diff）；计划文件等工作区外路径已被 OutputCollector 按 cwd 过滤，不会混进清单
       if (nonImageFiles.length > 0) {
         const list = nonImageFiles.map((f, i) => {
           const rel = relative(wsRoot, f);

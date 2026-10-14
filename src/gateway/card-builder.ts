@@ -162,9 +162,10 @@ export function buildProgressCard(state: ProgressState, widthMode: 'default' | '
   }
   // 内嵌计划确认区（#3+#6）：计划正文与完整回复同款两段式多卡直发（index 侧 sendPlanContentCards），
   // 主卡不铺长内容也不留「查看文件」特例按钮，仅一行就绪提示 + 表单（批准/放弃/按意见修改 + 意见输入框）。
-  // 用户动线：看下方消息卡片读方案 → 回本卡选操作
+  // 用户动线：读独立发送的方案正文卡 → 在本卡选操作。正文直发后主卡会 force 沉底到正文下方
+  // （index 侧 planAsk）；沉底失败时主卡留在上方——文案不提方向，两种布局都成立
   if (state.plan) {
-    elements.push(md(`**📋 执行计划已就绪**（共 ${state.plan.plan.length} 字）· 工作区 \`${state.plan.workspaceName}\`\n\n计划正文已作为下方消息卡片直接发送，阅读后回到本卡选择操作`));
+    elements.push(md(`**📋 执行计划已就绪**（共 ${state.plan.plan.length} 字）· 工作区 \`${state.plan.workspaceName}\`\n\n计划正文已直接发送为独立消息卡片，阅读后在本卡选择操作`));
     elements.push({
       tag: 'form',
       name: 'plan_form',

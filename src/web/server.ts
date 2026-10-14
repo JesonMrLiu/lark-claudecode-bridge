@@ -33,6 +33,9 @@ import { bridgeStatus, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDeta
 import { getAutostartStatus, setAutostartEnabled } from './autostart.js';
 import { checkUpdate, hasNewerVersion, installMode, runUpdate } from './update.js';
 import { memoryStatus, testMemoryConnection } from './memory-api.js';
+import {
+  deleteMemoryUser, initMemoryUsers, listMemoryUsers, resetUserKey, revealUserKey,
+} from './memory-users-api.js';
 import { MANAGED_OV_CONF, getInstallState, runInstall, runStartPipeline, stopManagedServer } from '../memory-installer.js';
 import {
   checkLarkCliAuth,
@@ -406,15 +409,18 @@ async function handle(
     }
   }
   if (path === '/api/memory/test-connection' && req.method === 'POST') {
-    // 表单现值直测（不落盘）：把 Key/端点/模型名错误挡在开启之前（§6.8 双绿门禁）
+    // 表单现值直测（不落盘）：把 Key/端点/模型名错误挡在开启之前（§6.8 双绿门禁）。
+    // P2 双端点拆分：主 Key 与向量 Key 分别回退各自已保存值（表单留空 = 测已保存值）
     const body = await readJsonBody(req);
-    // Key 输入框脱敏不回显：表单 Key 留空时回退配置已保存值（firstRun/配置损坏按无保存值直测）
-    let savedKey: string | undefined;
+    let saved: { apiKey?: string; embeddingApiKey?: string } | undefined;
     if (!firstRun) {
-      try { savedKey = loadConfig(ctx.configPath).memory?.model?.apiKey; } catch { /* 按无保存值直测 */ }
+      try {
+        const model = loadConfig(ctx.configPath).memory?.model;
+        saved = { apiKey: model?.apiKey, embeddingApiKey: model?.embeddingApiKey };
+      } catch { /* 按无保存值直测 */ }
     }
     try {
-      return json(res, 200, await testMemoryConnection(body as Parameters<typeof testMemoryConnection>[0], savedKey));
+      return json(res, 200, await testMemoryConnection(body as Parameters<typeof testMemoryConnection>[0], saved));
     } catch (e) {
       return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
     }
@@ -454,6 +460,66 @@ async function handle(
     if (getInstallState().running) return json(res, 409, { error: '流水线执行中，请等待当前流程完成' });
     void runStartPipeline({ configPath: ctx.configPath });
     return json(res, 200, { ok: true, started: true, note: '启动流水线后台执行中，轮询 /api/memory/install/status 查看进度' });
+  }
+  // P1 保存即生效（最终方案 §五-P1）：模型配置保存后前端弹「立即生效」确认 → 本端点重渲染
+  // ov.conf + 强制重启受管服务（runInstall forceRestart——运行中的旧进程不会热加载新模型，
+  // 只重渲染不重启的「检查修复」对模型变更无效）。消灭「保存后还需手动检查修复」两步坑
+  if (path === '/api/memory/apply' && req.method === 'POST') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先提交 bootstrap 向导' });
+    if (getInstallState().running) return json(res, 409, { error: '流水线执行中，请等待当前流程完成' });
+    try {
+      const config = loadConfig(ctx.configPath);
+      if (!config.memory?.model) return json(res, 400, { error: '记忆模型未配置——请先在「模型配置」卡填写并保存' });
+      void runInstall({ configPath: ctx.configPath, model: config.memory.model, pin: config.memory.version, forceRestart: true });
+      return json(res, 200, { ok: true, started: true, note: '应用流水线后台执行中（重渲染配置 → 重启服务 → 校验插件），轮询 /api/memory/install/status 查看进度' });
+    } catch (e) {
+      return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  // ---- P3「用户与密钥」Tab（最终方案 §六 Tab2）：用户聚合 / 一键初始化 / 密钥 reveal·重置·删除 ----
+  // 全部走 root key Admin API；密钥明文只在 reveal 响应单次放行（前端进剪贴板）并留痕审计
+  if (path === '/api/memory/users' && req.method === 'GET') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先提交 bootstrap 向导' });
+    try {
+      return json(res, 200, await listMemoryUsers(loadConfig(ctx.configPath)));
+    } catch (e) {
+      return json(res, 500, { error: `用户列表聚合失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+  if (path === '/api/memory/users/init' && req.method === 'POST') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先提交 bootstrap 向导' });
+    try {
+      return json(res, 200, await initMemoryUsers(loadConfig(ctx.configPath)));
+    } catch (e) {
+      return json(res, 500, { error: `一键初始化失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+  if (path === '/api/memory/users/reveal' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const uid = typeof body.user_id === 'string' ? body.user_id : '';
+    try {
+      return json(res, 200, await revealUserKey(loadConfig(ctx.configPath), uid));
+    } catch (e) {
+      return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  if (path === '/api/memory/users/reset' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const uid = typeof body.user_id === 'string' ? body.user_id : '';
+    try {
+      return json(res, 200, await resetUserKey(loadConfig(ctx.configPath), uid));
+    } catch (e) {
+      return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  if (path === '/api/memory/users/delete' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const uid = typeof body.user_id === 'string' ? body.user_id : '';
+    try {
+      return json(res, 200, await deleteMemoryUser(loadConfig(ctx.configPath), uid));
+    } catch (e) {
+      return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+    }
   }
   // ---- 模型列表拉取（厂商无关；凭证用磁盘现值或本次表单输入，响应只含模型 id，绝不回传凭证） ----
   if (path === '/api/models/fetch' && req.method === 'POST') {
