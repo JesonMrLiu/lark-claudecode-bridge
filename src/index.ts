@@ -39,7 +39,7 @@ import { ensureProfileSettingsFile, resolveAppProfile, resolveAppProfileModel } 
 import {
   MEMORY_PLUGIN_NAME, createMemoryProvider, ensureMemoryUserKeys, memoryEnvFor, type MemoryProvider,
 } from './memory.js';
-import { stopManagedServer } from './memory-installer.js';
+import { cleanupClientCliConf, ensureClientCliConf, stopManagedServer } from './memory-installer.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
@@ -1580,13 +1580,26 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
       else console.log(`[memory] bot ${o.appId}：${o.skipped}`);
     }
   };
-  if (config.memory?.enabled) await refreshMemoryKeys();
+  if (config.memory?.enabled) {
+    await refreshMemoryKeys();
+    // 客户端接入配置兜底（§6.7 第 4 步）：外部自管域自动 skipped-external；LCB 骨架已存在
+    // kept 零写。失败只 warn——本机直连 claude 的插件启用受影响，LCB 会话有 env 通道不受影响
+    try {
+      const w = ensureClientCliConf(config.memory);
+      if (w === 'written' || w === 'updated') console.log(`[memory] 客户端配置 ovcli.conf 已${w === 'written' ? '写入' : '刷新'}（${w}）`);
+    } catch (e) { console.warn('[memory] ovcli.conf 写入失败：', e instanceof Error ? e.message : e); }
+  }
   const memoryProvider = createMemoryProvider(config, memoryUserKeys);
   // reloader 共享：所有 bridge 持有同一 config 对象引用，mutate 一处全员可见
   const reloadConfig = createConfigReloader(config, configPath, {
     onMemoryChanged: (memory) => {
-      if (memory?.enabled) void refreshMemoryKeys();
-      else memoryUserKeys.clear();
+      if (memory?.enabled) {
+        void refreshMemoryKeys();
+        try { ensureClientCliConf(memory); } catch { /* 同启动口径，容错不阻断 */ } // 'updated' 自愈端点漂移
+      } else {
+        memoryUserKeys.clear();
+        try { cleanupClientCliConf(); } catch { /* 清理失败不影响停用：只删 LCB 骨架形状，手配/外部文件保留 */ }
+      }
     },
   });
   // 旧版（≤0.3.x）缺省独立目录的一次性迁移提示：目录还在则其中历史会话不再可 /resume

@@ -162,6 +162,25 @@ concurrency: 3                 # 全局并发上限（未单独配置的 app 沿
 #   group_max_turns: 30       # 群聊会话轮次滚动（任务数）：兜底单话题超长，满阈值主动滚动
 #                             # （赶在上下文自动压缩之前，token 线性可控）。0 = 关闭；缺省 30
 #   group_roll_notify: true   # 群聊滚动后的轻注记开关（「🍃 已开启新话题」仅一条）；缺省 true
+# memory:                     # 长期记忆（OpenViking，整块可选）。缺省/关闭 = 零开销；推荐全程用
+#                             # 配置页「记忆增强」tab 一键安装接管（本示例仅备查）。改后热生效：
+#                             # env 下发与插件装配每任务现读；常驻进程经配置指纹自动回收重建
+#   enabled: true             # 总开关。开启后每任务自动下发 OPENVIKING_* env（含
+#                             # OPENVIKING_MEMORY_ENABLED=1 强制启用 + OPENVIKING_URL 对齐受管
+#                             # 端口）并自动注入记忆插件——机器人零手工。注意：shell 里导出过的
+#                             # OPENVIKING_* 会抢占下发值（apps[].env = 专家覆盖口），如遇启用
+#                             # 异常请先清理 shell 中的 OPENVIKING_* 导出
+#   mode: embedded            # embedded = LCB 受管本地服务（一键安装）；remote = 外部已跑的 server
+#   endpoint: http://127.0.0.1:1933
+#   account: lcb              # 账号轴（全局），缺省 lcb；用户轴 = appId-飞书userId 每消息自动拼装
+#   api_key: xxxx             # root key（只进 LCB 侧用于签发 per-bot user key，永不下发子进程/
+#                             # 落盘）。服务为 dev 模式（无 root_api_key）时可空
+#   model:                    # 记忆模型三件套（一键安装渲染服务配置用；先「测试连接」再保存）
+#     provider: glm
+#     api_base: https://open.bigmodel.cn/api/paas/v4
+#     api_key: xxxx
+#     vlm_model: glm-4.7          # 提炼模型（会话归档时用）
+#     embedding_model: embedding-3
 # card:                       # 卡片展示（整块可选）；改后下一条消息热生效
 #   width: fill               # default = 飞书默认宽度（与消息等宽留边）；fill = 撑满聊天窗口。
 #                             # 作用于全部卡片：文本卡/图片卡/进度卡（含确认与问答区）/长回复卡等

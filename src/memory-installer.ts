@@ -17,8 +17,8 @@ import { access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { parseDocument } from 'yaml';
-import type { BridgeConfig, MemoryModelConfig } from './types.js';
-import { probeMemoryHealth, MEMORY_PLUGIN_NAME } from './memory.js';
+import type { BridgeConfig, MemoryConfig, MemoryModelConfig } from './types.js';
+import { probeMemoryHealth, MEMORY_PLUGIN_NAME, memoryEndpoint } from './memory.js';
 
 /** 服务默认 pin 版本（实测环境；memory.version 可覆盖） */
 export const DEFAULT_OPENVIKING_PIN = '0.5.0';
@@ -303,6 +303,91 @@ function readConfPort(confPath: string): number {
   } catch { return 1933; }
 }
 
+// ============ 客户端接入配置（ovcli.conf，§6.7 第 4 步落地） ============
+// 插件 isPluginEnabled() 的第 3 优先级判据 + 连接信息兜底层（env > ovcli.conf > ov.conf，
+// 插件 scripts/shared/credentials.mjs 实测口径）。LCB 只写「无 key 骨架」：key 永远走 env
+// 下发（§6.6），绝不落盘到 ~/.openviking/ 域。全新机器一键安装后即启用插件，用户零手工。
+
+/** 客户端配置文件位置（与 EXTERNAL_OV_CONF 同款 home 解析口径） */
+export const OVCLI_CONF = join(String(process.env.USERPROFILE ?? process.env.HOME ?? ''),
+  '.openviking', 'ovcli.conf');
+
+export type ClientConfWrite = 'written' | 'updated' | 'kept' | 'skipped-external' | 'skipped-foreign';
+
+/** LCB 骨架形状签名：恰好 {url, account, user} 三个 string 键。这是「文件归 LCB 所有」的判定
+ *  依据——插件 setup 向导 / `ov login` 恒写 api_key（含 api_key 的文件永不与本形状同形），
+ *  且形状判定与端点/账号现值解耦：重装 findFreePort 换端口后旧骨架仍被识别为 LCB 所有
+ *  （这是 ensure 能刷新、cleanup 能删中的关键；勿改成内容比对，否则端口漂移后清理永不触发） */
+function isLcbClientConfShape(v: unknown): v is Record<string, string> {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  const keys = Object.keys(o);
+  return keys.length === 3 && ['url', 'account', 'user'].every((k) => typeof o[k] === 'string')
+    && keys.every((k) => ['url', 'account', 'user'].includes(k));
+}
+
+/** 渲染 ovcli.conf（纯函数 exported 便于单测）。刻意不含 api_key / plugin 段；user 取 account
+ *  值：保证直连场景 identity 非空 → 插件判 trusted header 身份（dev 模式服务可用）；留空会被
+ *  判成 api_key 模式而 401 */
+export function renderOvcliConf(memory: Pick<MemoryConfig, 'endpoint' | 'account'>): Record<string, string> {
+  return { url: memoryEndpoint(memory), account: memory.account ?? 'lcb', user: memory.account ?? 'lcb' };
+}
+
+/** 写/刷新客户端配置（幂等可重跑）。决策表：
+ *  ① EXTERNAL_OV_CONF 存在 → 'skipped-external'（~/.openviking 域归用户自管，整体不碰；
+ *     外部 ov.conf 本身就满足插件启用判定，LCB 会话另有 env 通道兜底）
+ *  ② 文件缺失 → mkdir recursive + writeAtomic(渲染值) → 'written'
+ *  ③ 文件存在且为 LCB 骨架：内容与渲染值全等 → 'kept'（幂等零写）；否则重写 → 'updated'
+ *     （端口漂移/账号改名/remote↔embedded 切换后的自愈路径）
+ *  ④ 其余（含 api_key 的用户手配、plugin 段、损坏 JSON）→ 'skipped-foreign'（尊重不动）
+ *  dirOverride 供单测注入临时目录（ov.conf/ovcli.conf 一并重定向，摆脱模块常量的 home 依赖） */
+export function ensureClientCliConf(
+  memory: Pick<MemoryConfig, 'endpoint' | 'account'>,
+  dirOverride?: string,
+): ClientConfWrite {
+  const ovConf = dirOverride ? join(dirOverride, 'ov.conf') : EXTERNAL_OV_CONF;
+  const ovcli = dirOverride ? join(dirOverride, 'ovcli.conf') : OVCLI_CONF;
+  if (existsSync(ovConf)) return 'skipped-external';
+  const next = renderOvcliConf(memory);
+  let cur: unknown;
+  try { cur = JSON.parse(readFileSync(ovcli, 'utf8')); } catch { cur = undefined; }
+  if (cur === undefined && !existsSync(ovcli)) {
+    writeAtomic(ovcli, JSON.stringify(next, null, 2));
+    return 'written';
+  }
+  if (isLcbClientConfShape(cur)) {
+    if (JSON.stringify(cur) === JSON.stringify(next)) return 'kept';
+    writeAtomic(ovcli, JSON.stringify(next, null, 2));
+    return 'updated';
+  }
+  return 'skipped-foreign';
+}
+
+/** 关记忆的对称清理：仅当解析后命中 LCB 骨架形状才删（返回是否删除）。刻意不做内容匹配
+ *  （见 isLcbClientConfShape 注释）；损坏/手配文件一律保留 */
+export function cleanupClientCliConf(dirOverride?: string): boolean {
+  const ovcli = dirOverride ? join(dirOverride, 'ovcli.conf') : OVCLI_CONF;
+  let cur: unknown;
+  try { cur = JSON.parse(readFileSync(ovcli, 'utf8')); } catch { return false; }
+  if (!isLcbClientConfShape(cur)) return false;
+  rmSync(ovcli, { force: true });
+  return true;
+}
+
+/** 客户端配置归属态（状态页展示用） */
+export type ClientConfState = 'lcb-managed' | 'user-managed' | 'external' | 'missing';
+
+/** 状态页分类（exported 便于 memory-api 与单测复用；路径入参可注入摆脱 home 依赖）。
+ *  external 优先：外部 ov.conf 存在即整个 ~/.openviking 域归用户（与 ensure 的守卫口径一致） */
+export function classifyClientConf(paths: { ovcli: string; ovConf: string }): { state: ClientConfState; path: string } {
+  if (existsSync(paths.ovConf)) return { state: 'external', path: paths.ovConf };
+  let cur: unknown;
+  try { cur = JSON.parse(readFileSync(paths.ovcli, 'utf8')); } catch { cur = undefined; }
+  if (isLcbClientConfShape(cur)) return { state: 'lcb-managed', path: paths.ovcli };
+  if (existsSync(paths.ovcli)) return { state: 'user-managed', path: paths.ovcli };
+  return { state: 'missing', path: paths.ovcli };
+}
+
 // ============ 步骤 4：受管拉起 ============
 
 /** 找空闲端口：从 1933 起「net 试探 + HTTP 探活」双重确认（Windows SO_REUSEADDR 允许抢绑，
@@ -402,9 +487,13 @@ export async function runStartPipeline(opts: { configPath: string }): Promise<In
       port = r.port;
       set('launch', 'done', r.detail);
     }
-    // ③ 插件接入（启动完整性的另一半：插件缺失时记忆照样不工作——补齐并回写显式引用）
+    // ③ 插件接入（启动完整性的另一半：插件缺失时记忆照样不工作——补齐并回写显式引用；
+    //    client 传 endpoint/account：顺带落客户端接入配置 ovcli.conf，外部模式由 ensure 自守卫跳过）
     set('plugin', 'running');
-    const pl = await stepPlugin();
+    const pl = await stepPlugin({
+      endpoint: `http://127.0.0.1:${port ?? 1933}`,
+      account: await memoryAccount(opts.configPath),
+    });
     set('plugin', pl.skipped ? 'skipped' : 'done', pl.detail);
     if (pl.writeback) {
       // 插件新装/调和才回写：受管场景顺带对齐 endpoint/mode；外部场景不动用户配置（只补插件引用）
@@ -653,8 +742,19 @@ async function cliInstallViaMarketplace(claudeDir: string, dirs: string[]): Prom
 }
 
 /** 接入记忆插件（安装流水线第 5 步/启动流水线第 3 步共用；exported 便于运维脚本与单测直调）：
- *  ① CLI marketplace 双登记命中 → skipped；② CLI 真实安装（幂等）；③ zip 兜底 + CLI 同构登记 */
-export async function stepPlugin(): Promise<{ skipped: boolean; detail: string; writeback?: PluginWriteback }> {
+ *  ① CLI marketplace 双登记命中 → skipped；② CLI 真实安装（幂等）；③ zip 兜底 + CLI 同构登记。
+ *  client 传入时（endpoint/account）同时落客户端接入配置 ovcli.conf（§6.7 第 4 步：插件启用判定
+ *  的文件兜底层；写入失败只 warn 不阻塞插件接入——LCB 会话另有 env 通道兜底） */
+export async function stepPlugin(client?: { endpoint: string; account?: string }):
+  Promise<{ skipped: boolean; detail: string; writeback?: PluginWriteback; clientConf?: ClientConfWrite }> {
+  // 客户端配置先落（三个 return 分支都要携带：①分支是高频提前 return——「已装但无文件」的
+  // 存量机器最常见形态，放函数体后段会漏掉）
+  let clientConf: ClientConfWrite | undefined;
+  if (client) {
+    try { clientConf = ensureClientCliConf(client); }
+    catch (e) { console.warn('[memory-installer] ovcli.conf 写入失败（不阻塞插件接入）：', e instanceof Error ? e.message : e); }
+  }
+  const detailSuffix = clientConf ? `；客户端配置 ${clientConf}` : '';
   const { loadConfig } = await import('./config.js');
   const { DEFAULT_CLAUDE_DIR, resolveClaudeDir } = await import('./claude-config.js');
   let claudeDir = DEFAULT_CLAUDE_DIR;
@@ -670,7 +770,8 @@ export async function stepPlugin(): Promise<{ skipped: boolean; detail: string; 
       const hit = discoverPlugins(d).find((p) => p.name === MEMORY_PLUGIN_NAME);
       if (hit) return {
         skipped: true,
-        detail: `已安装（CLI marketplace 已启用）：${hit.path}`,
+        detail: `已安装（CLI marketplace 已启用）：${hit.path}${detailSuffix}`,
+        clientConf,
         writeback: {
           pluginPath: hit.path,
           opts: { reconcileOnly: true, artifactRoots: [...dirs.map((x) => join(x, 'plugins', 'cache')), MANAGED_PLUGIN_ROOT] },
@@ -686,7 +787,8 @@ export async function stepPlugin(): Promise<{ skipped: boolean; detail: string; 
   if (cli.installPath) {
     return {
       skipped: false,
-      detail: `${cli.detail}（插件页可见，可启停/更新）`,
+      detail: `${cli.detail}（插件页可见，可启停/更新）${detailSuffix}`,
+      clientConf,
       writeback: {
         pluginPath: cli.installPath,
         opts: { reconcileOnly: true, artifactRoots: [...dirs.map((d) => join(d, 'plugins', 'cache')), MANAGED_PLUGIN_ROOT] },
@@ -731,7 +833,8 @@ export async function stepPlugin(): Promise<{ skipped: boolean; detail: string; 
     invalidatePluginCache(claudeDir);
     return {
       skipped: false,
-      detail: `已安装 v${version}（CLI 同构登记）→ ${dest}（插件页可见，可启停/更新）`,
+      detail: `已安装 v${version}（CLI 同构登记）→ ${dest}（插件页可见，可启停/更新）${detailSuffix}`,
+      clientConf,
       writeback: {
         pluginPath: dest,
         opts: { reconcileOnly: true, artifactRoots: [...dirs.map((d) => join(d, 'plugins', 'cache')), MANAGED_PLUGIN_ROOT] },
@@ -831,6 +934,15 @@ export function writeBackConfig(configPath: string, wb: MemoryWriteback, pluginP
 
 // ============ 主流水线 ============
 
+/** 读 config.yaml 的 memory.account（懒加载；损坏配置降级 undefined → 渲染取缺省 'lcb'）。
+ *  两条流水线原本不读 config.yaml（只有 configPath），stepPlugin 落 ovcli.conf 时需要它 */
+async function memoryAccount(configPath: string): Promise<string | undefined> {
+  try {
+    const { loadConfig } = await import('./config.js');
+    return loadConfig(configPath).memory?.account;
+  } catch { return undefined; }
+}
+
 export interface InstallOptions {
   configPath: string;
   /** memory.model（渲染 ov.conf 的模型三件套）；缺失时若受管 conf 已存在则沿用现有（重跑场景） */
@@ -901,9 +1013,12 @@ export async function runInstall(opts: InstallOptions): Promise<InstallState> {
     set('start', 'running');
     const st = await stepStart(svc.bin, MANAGED_OV_CONF);
     set('start', st.skipped ? 'skipped' : 'done', st.detail);
-    // ⑤ 插件
+    // ⑤ 插件（client 传 endpoint/account：顺带落客户端接入配置 ovcli.conf，§6.7 第 4 步）
     set('plugin', 'running');
-    const pl = await stepPlugin();
+    const pl = await stepPlugin({
+      endpoint: `http://127.0.0.1:${st.port}`,
+      account: await memoryAccount(opts.configPath),
+    });
     set('plugin', pl.skipped ? 'skipped' : 'done', pl.detail);
     // ⑥ 回写 config.yaml——全链成功才落盘（半成品不污染用户配置）：endpoint / mode=embedded /
     // 首装生成的 root_api_key 回写 memory.api_key（复用已有 key 不写）+ 插件引用回写（CLI 渠道为

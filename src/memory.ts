@@ -22,8 +22,9 @@ export const MEMORY_PLUGIN_NAME = 'openviking-memory';
 /** 记忆服务缺省端点（dev 模式回环默认；embedded 模式由 B3 分配后回写 config） */
 export const DEFAULT_MEMORY_ENDPOINT = 'http://127.0.0.1:1933';
 
-/** memory 段的生效端点（remote 显式配置 > 缺省回环） */
-export function memoryEndpoint(memory: MemoryConfig): string {
+/** memory 段的生效端点（remote 显式配置 > 缺省回环）。参数放宽为 Pick——渲染客户端接入配置
+ *  （ovcli.conf 骨架）等场景只有 endpoint/account 子集，只读 endpoint 的纯函数不该要求全段 */
+export function memoryEndpoint(memory: Pick<MemoryConfig, 'endpoint'>): string {
   return memory.endpoint?.trim() || DEFAULT_MEMORY_ENDPOINT;
 }
 
@@ -35,6 +36,14 @@ export function memoryEndpoint(memory: MemoryConfig): string {
  *   deputy 的 appId 天然不同于主 bot——「分身有自己的记忆、永不读主人记忆」的实现点）
  * - OPENVIKING_API_KEY：连接 key。api_key 模式 = 该 bot 的独立 user key（userKeys 缓存，
  *   root key 永不下发子进程）；dev 模式无 key（身份经 header 隔离）
+ * - OPENVIKING_MEMORY_ENABLED：'1' 强制启用通道——插件 isPluginEnabled() 的第 1 优先级判据
+ *   （插件 scripts/config.mjs），使启用不依赖 ~/.openviking/ 下任何文件（全新机器零手工的关键；
+ *   与 ACCOUNT 同级、不依赖 userId）。实测教训：LCB 原先只下发身份三键，插件启用判定根本不看，
+ *   全新机器 ~/.openviking 不存在 → 9 个 hook 全部静默秒退
+ * - OPENVIKING_URL：memoryEndpoint(memory)——embedded = 受管服务实际端口（findFreePort 可能
+ *   分到 1934+，插件缺省连 127.0.0.1:1933 会错连）、remote = 外部端点。它同时是插件
+ *   CREDENTIAL_ENV_VARS 成员：任一凭证 env 存在 → 凭证链 unpinned → env 层恒压过
+ *   ovcli.conf/ov.conf，文件通道（哪怕 user-managed）永远劫持不了 LCB 会话的连接
  * 纯函数 exported 便于单测；userId 为空串时不产出 OPENVIKING_USER（防御非消息触发的任务路径）。
  */
 export function memoryEnvFor(
@@ -44,7 +53,11 @@ export function memoryEnvFor(
   /** 启动时 Admin API 签发的 per-bot user key（api_key 模式）；缺失/未签发则跳过 key 下发 */
   userKeys?: ReadonlyMap<string, string>,
 ): Record<string, string> {
-  const env: Record<string, string> = { OPENVIKING_ACCOUNT: memory.account ?? 'lcb' };
+  const env: Record<string, string> = {
+    OPENVIKING_ACCOUNT: memory.account ?? 'lcb',
+    OPENVIKING_MEMORY_ENABLED: '1',
+    OPENVIKING_URL: memoryEndpoint(memory),
+  };
   if (userId) env.OPENVIKING_USER = `${appId}-${userId}`;
   const key = userKeys?.get(appId);
   if (key) env.OPENVIKING_API_KEY = key;

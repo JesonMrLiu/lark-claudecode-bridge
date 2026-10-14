@@ -118,6 +118,24 @@ const PLUGIN_SOURCE_LABEL = {
   managed: 'LCB 自管副本',
 };
 
+/** 客户端接入状态标注（status.plugin.clientConfState）：插件侧启用判定 env 优先、文件兜底——
+ *  与 LCB 侧「加载渠道」是两回事（加载渠道 ✓ 不代表启用 ✓）。missing 且记忆开启 = env 通道
+ *  启用（LCB 每任务下发 OPENVIKING_MEMORY_ENABLED，无须任何文件） */
+const CLIENT_CONF_LABEL = {
+  'lcb-managed': '客户端配置 LCB 托管',
+  'user-managed': '客户端配置本机自管',
+  external: '外部 ov.conf 接入',
+  missing: 'env 通道启用',
+};
+
+/** 记忆插件 cell 尾部的启用徽标：未启用红字提醒（全绿但 hooks 空转的历史盲区在此现形） */
+function clientConfBadge(p) {
+  if (!p) return '';
+  if (p.clientEnabled === false) return ' <span class="hint" style="color:var(--warn-tx)">未启用（无 env、无配置文件）</span>';
+  const label = p.clientConfState && CLIENT_CONF_LABEL[p.clientConfState];
+  return label ? ` <span class="hint" title="插件侧启用判定：env 优先，客户端配置兜底（${esc(p.clientConfPath || '')}）">${esc(label)}</span>` : '';
+}
+
 // ============ 模型表单（双视图共用：渲染 + 绑定） ============
 
 function modelFormHtml(model, endpoint) {
@@ -417,9 +435,9 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
       : `外部自管 <span class="hint">非 LCB 拉起</span>`),
     ...(inst.managedSince ? [infoCell('clock', '运行时间', esc(fmtSince(inst.managedSince)))] : []),
     ...(st.health?.authMode ? [infoCell('server', '鉴权模式', `${esc(st.health.authMode)}${authNote ? ` <span class="hint" title="${esc(authNote)}">ⓘ</span>` : ''}`)] : []),
-    infoCell('spark', '记忆插件', st.plugin?.found
+    infoCell('spark', '记忆插件', (st.plugin?.found
       ? `<span style="white-space:nowrap;display:inline-flex;align-items:center;gap:6px"><span style="color:var(--ok-tx);font-weight:600">✓</span><code>${esc(st.plugin.name)}</code>${st.plugin.version ? `<span class="hint">v${esc(st.plugin.version)}</span>` : ''}${st.plugin.source && PLUGIN_SOURCE_LABEL[st.plugin.source] ? `<span class="hint" title="实际加载渠道：与机器人任务装配一致">${esc(PLUGIN_SOURCE_LABEL[st.plugin.source])}</span>` : ''}</span>`
-      : '<span style="color:var(--warn-tx);font-weight:600">○ 未安装</span><span class="hint">「检查修复」可补装</span>'),
+      : '<span style="color:var(--warn-tx);font-weight:600">○ 未安装</span><span class="hint">「检查修复」可补装</span>') + clientConfBadge(st.plugin)),
   ];
 
   // 卡标题右按钮组：主行动随状态切换（启动/停止），刷新与检查修复常驻

@@ -7,7 +7,7 @@ import {
   DEFAULT_MEMORY_ENDPOINT, MEMORY_PLUGIN_NAME, memoryEndpoint, probeMemoryHealth,
 } from '../memory.js';
 import {
-  EXTERNAL_OV_CONF, MANAGED_OV_CONF, detectUv, isManagedRunning, locateMemoryPlugin, managedStartedAt, resolveServerBin,
+  EXTERNAL_OV_CONF, MANAGED_OV_CONF, OVCLI_CONF, classifyClientConf, detectUv, isManagedRunning, locateMemoryPlugin, managedStartedAt, resolveServerBin,
 } from '../memory-installer.js';
 import { maskSecret } from './config-api.js';
 
@@ -47,7 +47,17 @@ export async function memoryStatus(config: BridgeConfig): Promise<Record<string,
   // 插件检测与 executeTask 装配同口径（locateMemoryPlugin 三渠道定位；managed 副本未被引用
   // 不计入——运行时不会加载它，报了会与实际装配错位）。历史缺陷：只看 marketplace 自动发现，
   // CLI 卸载清掉登记后，config.yaml 显式引用仍在正常工作的插件被误报「未安装」
-  let plugin: Record<string, unknown> = { found: false, name: MEMORY_PLUGIN_NAME };
+  // 客户端启用状态（插件 isPluginEnabled 口径的近似）：env 通道（memory.enabled → OPENVIKING_
+  // MEMORY_ENABLED 强制启用）+ 文件通道（外部 ov.conf / LCB 骨架 / 用户手配 ovcli.conf）。
+  // 历史盲区：此前只展示 LCB 侧加载渠道，「一键安装完成、状态灯全绿但 hooks 实际静默空转」
+  // 不可见（插件启用判定根本不看 LCB 的身份三键 env）
+  const client = classifyClientConf({ ovcli: OVCLI_CONF, ovConf: EXTERNAL_OV_CONF });
+  const clientEnabled = memory?.enabled === true
+    || client.state === 'external' || client.state === 'lcb-managed' || client.state === 'user-managed';
+  let plugin: Record<string, unknown> = {
+    found: false, name: MEMORY_PLUGIN_NAME,
+    clientEnabled, clientConfState: client.state, clientConfPath: client.path,
+  };
   try {
     const located = await locateMemoryPlugin(config);
     if (located) {
@@ -58,6 +68,7 @@ export async function memoryStatus(config: BridgeConfig): Promise<Record<string,
         path: located.path,
         // 加载渠道（前端据此标注来源）：marketplace=CLI 安装启用；explicit=config.yaml 显式引用
         source: located.where,
+        clientEnabled, clientConfState: client.state, clientConfPath: client.path,
       };
     }
   } catch { /* 插件发现全程容错（plugin-discovery 契约）：失败按未发现展示 */ }
