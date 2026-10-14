@@ -729,6 +729,14 @@ function renderUsersTab(el, { st, m }) {
     const webUsers = u.users.filter((x) => x.kind === 'web');
     const botUsers = u.users.filter((x) => x.kind === 'bot');
     const otherUsers = u.users.filter((x) => x.kind === 'other');
+    // 聊天者归属映射（前端兜底，与后端同口径）：历史复合 ID（{appId}-{ou_xxx}）按前缀归属到
+    // 对应飞书应用——后端未重启（旧构建无映射）时本层照样生效，刷新即见
+    const bots = st.bots || [];
+    otherUsers.forEach((x) => {
+      if (x.appName) return;
+      const hit = bots.find((b) => x.userId.startsWith(`${b.appId}-`));
+      if (hit) x.appName = `${hit.name} · 聊天者`;
+    });
     const group = (title, rows, hint) => rows.length === 0 ? '' : `
       <div style="margin-top:14px">
         <div style="font-size:12.5px;font-weight:700;color:var(--muted);letter-spacing:.4px">${esc(title)} <span class="hint" style="font-weight:400">${hint || ''}</span></div>
@@ -742,12 +750,13 @@ function renderUsersTab(el, { st, m }) {
         ${u.authInitNeeded ? '<button class="btn sm primary" id="memUsersInit">⚡ 一键初始化</button>' : '<button class="btn sm" id="memUsersInit">⚡ 一键初始化</button>'}
         <button class="btn sm" id="memUsersRefresh">↻ 刷新</button>
       </div>
-      <div class="desc" style="margin-top:6px">api_key 模式：网页与每个机器人各持一把独立密钥（密钥落盘已加密、页面只脱敏显示，查看行为留痕审计）。「打开记忆空间」= 密钥进剪贴板 + 自动新标签打开，粘贴一次即可连接。</div>
+      <div class="desc" style="margin-top:6px">api_key 模式：网页与每个机器人各持一把独立密钥（密钥落盘已加密、页面只脱敏显示，查看行为留痕审计）。「打开记忆空间」= 密钥进剪贴板 + 自动新标签打开文件系统页，粘贴一次即可连接。</div>
+      <div class="hint" style="margin-top:6px">ⓘ 1933 网页右上角的身份切换显示的是技术 ID（OpenViking 暂不支持显示名）——哪个 ID 对应哪台机器人，以本页对照为准。</div>
       ${u.authInitNeeded ? `<div class="hint" style="margin-top:10px;padding:9px 14px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px">🔑 待初始化鉴权：网页端用户（web）尚未创建——浏览器打开记忆空间会 401。点右上「⚡ 一键初始化」自动创建网页 + 各机器人用户并签发密钥。</div>` : ''}
       ${u.users.length === 0 && !u.authInitNeeded ? '<div class="hint" style="margin-top:12px">暂无用户——点「⚡ 一键初始化」创建。</div>' : ''}
       ${group('网页管理', webUsers, '浏览器打开记忆空间用')}
       ${group('机器人', botUsers, '每个 bot 一把独立密钥（升级 bot×人 后此处可展开聊天者维度）')}
-      ${group('其他', otherUsers, '')}
+      ${group('聊天者与其他', otherUsers, '历史身份（{appId}-{ou_xxx}）已自动归属到对应机器人')}
       ${granularityCardHtml(gran)}
     </div>`;
   }
