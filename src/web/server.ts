@@ -34,7 +34,7 @@ import { getAutostartStatus, setAutostartEnabled } from './autostart.js';
 import { checkUpdate, hasNewerVersion, installMode, runUpdate } from './update.js';
 import { memoryStatus, testMemoryConnection } from './memory-api.js';
 import {
-  deleteMemoryUser, initMemoryUsers, listMemoryUsers, resetUserKey, revealUserKey,
+  deleteMemoryUser, initMemoryUsers, listMemoryUsers, resetUserKey, revealRootKey, revealUserKey,
 } from './memory-users-api.js';
 import { MANAGED_OV_CONF, getInstallState, runInstall, runStartPipeline, stopManagedServer } from '../memory-installer.js';
 import {
@@ -499,6 +499,14 @@ async function handle(
     const uid = typeof body.user_id === 'string' ? body.user_id : '';
     try {
       return json(res, 200, await revealUserKey(loadConfig(ctx.configPath), uid));
+    } catch (e) {
+      return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  if (path === '/api/memory/users/reveal-root' && req.method === 'POST') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先提交 bootstrap 向导' });
+    try {
+      return json(res, 200, await revealRootKey(loadConfig(ctx.configPath)));
     } catch (e) {
       return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
     }

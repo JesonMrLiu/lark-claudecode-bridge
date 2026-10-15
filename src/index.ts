@@ -37,9 +37,9 @@ import { BRIDGE_MCP_JSON, readMcpServersFromJsonFile } from './web/skills-mcp-ap
 import { FEISHU_NOTIFY_SOP_PROMPT, TOOL_HINT_PROMPT } from './notify-sop.js';
 import { ensureProfileSettingsFile, resolveAppProfile, resolveAppProfileModel } from './app-profile.js';
 import {
-  MEMORY_PLUGIN_NAME, createMemoryProvider, ensureMemoryUserKeys, memoryEnvFor, type MemoryProvider,
+  MEMORY_PLUGIN_NAME, createMemoryProvider, ensureMemoryUserKeys, memoryEndpoint, memoryEnvFor, type MemoryProvider,
 } from './memory.js';
-import { cleanupClientCliConf, ensureClientCliConf, stopManagedServer } from './memory-installer.js';
+import { cleanupClientCliConf, ensureClientCliConf, ensureMemoryServiceRunning, stopManagedServer } from './memory-installer.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
@@ -1526,6 +1526,11 @@ export function createConfigReloader(
 }
 
 export async function startBridge(configPath: string = CONFIG_PATH): Promise<void> {
+  // 启动分步进度（主人可见的启动过程）：[1/4] 长连接 → [2/4] 记忆服务 → [3/4] 记忆身份 → [4/4] 配置页。
+  // 记忆两步全程非阻断——失败只提示 + 给出「去哪手动起」的指引，桥接器本体照常服务
+  const TOTAL_STEPS = 4;
+  let stepNo = 0;
+  const step = (title: string): string => `[${++stepNo}/${TOTAL_STEPS}] ${title}`;
   const config = loadConfig(configPath);
   // 双实例治理：旧实例占着 Web 配置页端口会让本进程配置页静默失联（浏览器仍打到旧进程），启动先接管
   const oldBridge = await stopExistingBridgeAndWait();
@@ -1546,6 +1551,11 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   // 跳过即正解）；memory 段热重载变化时后台重签（account/root key 改动会使旧 key 失配）。
   // key 只进内存缓存与子进程 env，永不落日志/配置页
   const memoryUserKeys = new Map<string, string>();
+  /** 服务不可达时的签发重试预算（15s × 6 ≈ 90s）：旧实现探活失败即跳过且永不重试，导致
+   *  「记忆服务稍后才起 → 整个会话生命周期都没有记忆」。重试只在「服务不可达」时进行，
+   *  且有 flag 防并发叠加（热重载与启动重试可能同时触发） */
+  const MEMORY_KEY_RETRY = { intervalMs: 15_000, rounds: 6 };
+  let memoryKeyRetrying = false;
   const refreshMemoryKeys = async (): Promise<void> => {
     if (!config.memory?.enabled) {
       memoryUserKeys.clear();
@@ -1553,23 +1563,39 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     }
     const outcomes = await ensureMemoryUserKeys(config.memory, config.apps.map((a) => a.appId));
     memoryUserKeys.clear();
+    let unreachable = outcomes.size > 0;
     for (const o of outcomes.values()) {
       if (o.userKey) {
         memoryUserKeys.set(o.appId, o.userKey);
+        unreachable = false;
         console.log(`[memory] bot ${o.appId}：user key 已签发（api_key 模式）`);
-      } else if (o.error) console.warn(`[memory] bot ${o.appId}：user key ${o.error}`);
-      else console.log(`[memory] bot ${o.appId}：${o.skipped}`);
+      } else if (o.error) {
+        unreachable = false;
+        console.warn(`[memory] bot ${o.appId}：user key ${o.error}`);
+      } else {
+        if (o.skipped && !o.skipped.startsWith('服务不可达')) unreachable = false;
+        console.log(`[memory] bot ${o.appId}：${o.skipped}`);
+      }
+    }
+    // 全员因服务不可达被跳过 → 退避重试；服务起来后自动补签，无需重启 LCB
+    if (unreachable && !memoryKeyRetrying) {
+      memoryKeyRetrying = true;
+      void (async () => {
+        for (let i = 1; i <= MEMORY_KEY_RETRY.rounds; i++) {
+          await new Promise((r) => setTimeout(r, MEMORY_KEY_RETRY.intervalMs));
+          await refreshMemoryKeys();
+          if (memoryUserKeys.size > 0 || !config.memory?.enabled) {
+            memoryKeyRetrying = false;
+            if (memoryUserKeys.size > 0) console.log(`[memory] 记忆身份已补签（服务就绪后自动恢复，无需重启）`);
+            return;
+          }
+        }
+        memoryKeyRetrying = false;
+        console.warn(`[memory] 记忆服务在 ${MEMORY_KEY_RETRY.rounds} 次重试后仍不可达，本会话无记忆注入；`
+          + '可在配置页「记忆增强」点「启动服务」后重启 LCB，或等下一条消息触发重试');
+      })();
     }
   };
-  if (config.memory?.enabled) {
-    await refreshMemoryKeys();
-    // 客户端接入配置兜底（§6.7 第 4 步）：外部自管域自动 skipped-external；LCB 骨架已存在
-    // kept 零写。失败只 warn——本机直连 claude 的插件启用受影响，LCB 会话有 env 通道不受影响
-    try {
-      const w = ensureClientCliConf(config.memory);
-      if (w === 'written' || w === 'updated') console.log(`[memory] 客户端配置 ovcli.conf 已${w === 'written' ? '写入' : '刷新'}（${w}）`);
-    } catch (e) { console.warn('[memory] ovcli.conf 写入失败：', e instanceof Error ? e.message : e); }
-  }
   const memoryProvider = createMemoryProvider(config, memoryUserKeys);
   // reloader 共享：所有 bridge 持有同一 config 对象引用，mutate 一处全员可见
   const reloadConfig = createConfigReloader(config, configPath, {
@@ -1639,6 +1665,7 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   // 部分失败不拖垮其它 app：一个凭证写错时其余机器人照常服务。
   // 注意：SDK 对非法 appId 的 start() 是静默 return 不抛错——Promise resolve 不等于连接成功，
   // 逐 app 状态行是运维观测的主要手段
+  console.log(`${step('飞书长连接启动 …')}`);
   const results = await Promise.allSettled(runners.map((r) => r.gateway.start(r.bridge)));
   runners.forEach((r, i) => {
     if (results[i].status === 'fulfilled') console.log(`✅ ${r.app.name}（${r.app.appId}）长连接已启动`);
@@ -1646,6 +1673,38 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   for (const f of results) if (f.status === 'rejected') console.error('❌ 应用启动失败：', f.reason);
   if (results.every((r) => r.status === 'rejected')) throw new Error('所有应用均启动失败，请检查 config.yaml 中的 apps 配置');
   console.log(`🚀 lark-claudecode-bridge 已启动（${results.length - results.filter((r) => r.status === 'rejected').length}/${results.length} 个应用，长连接模式，无需公网 IP）`);
+  // 第二步：记忆增强自举。LCB 先起来（机器人可用性优先），记忆随后尽力而为：
+  // 服务没起就自动拉起（embedded 受管），起不来只提示 + 指引手动开启，绝不阻断启动
+  if (config.memory?.enabled) {
+    console.log(`${step('记忆增强 · 启动 OpenViking 服务 …')}`);
+    let report;
+    try {
+      report = await ensureMemoryServiceRunning({
+        endpoint: memoryEndpoint(config.memory),
+        mode: config.memory.mode,
+      });
+    } catch (e) {
+      // 自举自身抛错（理论上 ensureMemoryServiceRunning 全程收敛为 report，这里是最后一道兜底）
+      report = {
+        ready: false, started: false,
+        detail: `自举异常：${e instanceof Error ? e.message : String(e)}`,
+        hint: '请到配置页「记忆增强」点「检查修复」',
+      };
+    }
+    console.log(`      ${report.ready ? '✅' : '⚠️'} ${report.detail}`);
+    if (!report.ready && report.hint) console.log(`      手动开启指引：${report.hint}`);
+    // 第三步：签发各 bot 记忆身份（服务不可达时内部自动退避重试，服务后就绪即补签）
+    console.log(`${step('记忆增强 · 签发各 bot 记忆身份 …')}`);
+    await refreshMemoryKeys();
+    // 客户端接入配置兜底（§6.7 第 4 步）：外部自管域自动 skipped-external；LCB 骨架已存在
+    // kept 零写。失败只 warn——本机直连 claude 的插件启用受影响，LCB 会话有 env 通道不受影响
+    try {
+      const w = ensureClientCliConf(config.memory);
+      if (w === 'written' || w === 'updated') console.log(`      客户端配置 ovcli.conf 已${w === 'written' ? '写入' : '刷新'}（${w}）`);
+    } catch (e) { console.warn('[memory] ovcli.conf 写入失败：', e instanceof Error ? e.message : e); }
+  } else {
+    console.log(`${step('记忆增强 · 未启用（config.yaml 的 memory.enabled=false），跳过')}`);
+  }
   // 页面托管启停的探活依据：进程存活期间持有 PID 文件（崩溃/被硬杀时由读取方清理陈旧文件）
   writePidFile();
   // 优雅关闭：SIGINT/SIGTERM（或页面 stop/restart 经 selfStop 注入）时逐个关闭全部长连接
@@ -1664,6 +1723,7 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   // 启动失败只 warn 不阻断机器人服务（端口冲突等场景桥接器本体仍可用）
   if (config.server?.enabled !== false) {
     try {
+      console.log(`${step('配置页启动 …')}`);
       webHandle = await startWebServer({
         server: config.server,
         configPath,

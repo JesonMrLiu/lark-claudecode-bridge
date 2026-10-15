@@ -11,7 +11,8 @@
 // - auth_mode=api_key（root_api_key 配置后）：Account/User header 被服务端剥除，身份由
 //   X-API-Key 自带（key = base64url(account).base64url(user).base64url(secret)，不可伪造）；
 //   user key 经 Admin API 签发（POST /api/v1/admin/accounts/{account}/users，X-API-Key 携带
-//   root key，seed 参数可得确定性 key——同 seed 重签同值，LCB 无须持久化存储 key）
+//   root key）。0.5.0 实测：seed 被忽略、key 非确定性、重复创建 409——重签接口为
+//   POST /api/v1/admin/accounts/{account}/users/{uid}/key，详见 ensureMemoryUserKeys 注释
 import { createHash } from 'node:crypto';
 import type { MemoryConfig } from './types.js';
 
@@ -21,6 +22,16 @@ export const MEMORY_PLUGIN_NAME = 'openviking-memory';
 
 /** 记忆服务缺省端点（dev 模式回环默认；embedded 模式由 B3 分配后回写 config） */
 export const DEFAULT_MEMORY_ENDPOINT = 'http://127.0.0.1:1933';
+
+/** 记忆账号缺省名（account 轴）。必须与 OpenViking 服务端自带账号一致：Admin API 对不存在的
+ *  账号一律 404「Account not found」（实弹实测 0.5.0），账号名猜错的表现就是「一键初始化全 404」。
+ *  服务端初始化后固定存在 default 账号，故以此为缺省 */
+export const DEFAULT_MEMORY_ACCOUNT = 'default';
+
+/** memory 段的生效账号（缺省 DEFAULT_MEMORY_ACCOUNT；显式配置优先） */
+export function memoryAccount(memory: Pick<MemoryConfig, 'account'>): string {
+  return memory.account?.trim() || DEFAULT_MEMORY_ACCOUNT;
+}
 
 /** memory 段的生效端点（remote 显式配置 > 缺省回环）。参数放宽为 Pick——渲染客户端接入配置
  *  （ovcli.conf 骨架）等场景只有 endpoint/account 子集，只读 endpoint 的纯函数不该要求全段 */
@@ -54,7 +65,7 @@ export function memoryEnvFor(
   userKeys?: ReadonlyMap<string, string>,
 ): Record<string, string> {
   const env: Record<string, string> = {
-    OPENVIKING_ACCOUNT: memory.account ?? 'lcb',
+    OPENVIKING_ACCOUNT: memoryAccount(memory),
     OPENVIKING_MEMORY_ENABLED: '1',
     OPENVIKING_URL: memoryEndpoint(memory),
   };
@@ -157,7 +168,7 @@ export function createMemoryProvider(config: BridgeConfigLike, userKeys: Readonl
       ? probeMemoryHealth(memoryEndpoint(config.memory))
       : Promise.resolve({ healthy: false, detail: 'memory 段未开启' })),
     namespacesFor: (appId: string) => ({
-      account: config.memory?.account ?? 'lcb',
+      account: config.memory ? memoryAccount(config.memory) : DEFAULT_MEMORY_ACCOUNT,
       userPrefix: `${appId}-`,
     }),
     userKeys: () => userKeys,
@@ -180,9 +191,17 @@ export interface MemoryKeyOutcome {
  * - dev 模式：整体跳过——身份隔离由 OPENVIKING_USER → X-OpenViking-User header 承担，
  *   Admin API 在 dev 模式被服务端禁用（403），跳过是唯一正解而非降级
  * - api_key 模式：X-API-Key 携带 root key（memory.api_key，只在本函数与配置盘间流转），
- *   POST /api/v1/admin/accounts/{account}/users 签发；seed = sha256(appId+rootKey) 确定性
- *   ——同 seed 重签同值，LCB 重启无须持久化 key 存储
+ *   POST /api/v1/admin/accounts/{account}/users 签发
  * - 失败不抛出（逐 bot 记 error）：记忆不可用不应阻断机器人服务，与插件发现的容错基调一致
+ *
+ * OpenViking 0.5.0 实弹实测（探针：创建→重复→重签→列表→删除，全绿）修正了三条旧假设：
+ *  ① key **非确定性**——seed 参数被服务端忽略，同一 user 每次重签都换新 key。因此「同 seed
+ *     重签同值、LCB 无须持久化」不成立，重启必须重新拿到 key（靠下面的三级回退拿，不靠 seed）。
+ *  ② 重复创建返回 **409 ALREADY_EXISTS**，不是「幂等返回同值」。旧实现一旦 409 就记 error 放弃，
+ *     于是「首启建过用户 → 之后每次重启都 409 → 永远拿不到 key → 永远无记忆」——本函数的重签
+ *     与读回两级回退就是为消灭这个死循环（服务重启、root key 轮换、一键初始化重建用户都会踩）。
+ *  ③ 服务端只认**已存在的账号**：账号不存在时 Admin API 一律 404「Account not found」，故签发前
+ *     先确保账号存在（ensureRemoteAccount，缺账号自动创建）。
  */
 export async function ensureMemoryUserKeys(
   memory: MemoryConfig,
@@ -190,6 +209,7 @@ export async function ensureMemoryUserKeys(
   timeoutMs = 5000,
 ): Promise<Map<string, MemoryKeyOutcome>> {
   const out = new Map<string, MemoryKeyOutcome>();
+  const base = memoryEndpoint(memory).replace(/\/+$/, '');
   const health = await probeMemoryHealth(memoryEndpoint(memory), timeoutMs);
   if (!health.healthy) {
     for (const appId of appIds) {
@@ -203,7 +223,7 @@ export async function ensureMemoryUserKeys(
     }
     return out;
   }
-  const account = memory.account ?? 'lcb';
+  const account = memoryAccount(memory);
   const rootKey = memory.apiKey;
   if (!rootKey) {
     for (const appId of appIds) {
@@ -211,29 +231,113 @@ export async function ensureMemoryUserKeys(
     }
     return out;
   }
+  // 账号兜底：账号不存在时后续全部 404（这是「一键初始化全 404」的最常见真因）。先查再建，
+  // 建失败只记 error 不用异常中断——签发逐 bot 继续，文案给出可操作指引
+  const accountReady = await ensureRemoteAccount(base, account, rootKey, timeoutMs);
   for (const appId of appIds) {
-    try {
-      // seed 确定性：sha256(appId + rootKey) 前 32 位。root key 轮换 → seed 变 → 新 key（旧 key
-      // 失效），属预期安全行为；同 root key 下重签幂等
-      const seed = createHash('sha256').update(`${appId}:${rootKey}`).digest('hex').slice(0, 32);
-      const res = await fetch(
-        `${memoryEndpoint(memory).replace(/\/+$/, '')}/api/v1/admin/accounts/${encodeURIComponent(account)}/users`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-API-Key': rootKey },
-          body: JSON.stringify({ user_id: appId, role: 'user', seed }),
-          signal: AbortSignal.timeout(timeoutMs),
-        },
-      );
-      const body = (await res.json().catch(() => ({}))) as { result?: { user_key?: string }; message?: string };
-      if (res.ok && body.result?.user_key) {
-        out.set(appId, { appId, userKey: body.result.user_key });
-      } else {
-        out.set(appId, { appId, error: `签发失败：HTTP ${res.status}${body.message ? `（${body.message}）` : ''}` });
-      }
-    } catch (e) {
-      out.set(appId, { appId, error: `签发异常：${e instanceof Error ? e.message : String(e)}` });
+    if (!accountReady.ok) {
+      out.set(appId, { appId, error: `记忆账号「${account}」不可用：${accountReady.detail}` });
+      continue;
     }
+    const r = await signOneUserKey(base, account, appId, rootKey, timeoutMs);
+    if (r.userKey) out.set(appId, { appId, userKey: r.userKey });
+    else out.set(appId, { appId, error: r.error ?? '签发失败' });
   }
   return out;
+}
+
+/** Admin API 一次调用的最小结果（HTTP 状态 + result + 可读错误文案） */
+interface AdminResult { ok: boolean; status: number; result?: Record<string, unknown>; error?: string }
+
+/** Admin API 调用统一入口（X-API-Key 携 root key；错误文案优先取服务端 error.message——
+ *  OpenViking 的错误体是 {error:{code,message}}，旧实现只读顶层 message，导致 404 变成裸码） */
+async function adminFetch(
+  url: string, rootKey: string, method: string, body?: unknown, timeoutMs = 5000,
+): Promise<AdminResult> {
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': rootKey },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const json = (await res.json().catch(() => ({}))) as {
+      result?: Record<string, unknown>;
+      message?: string;
+      error?: { code?: string; message?: string } | string;
+    };
+    const errObj = typeof json.error === 'object' && json.error ? json.error : undefined;
+    const message = errObj?.message ?? (typeof json.error === 'string' ? json.error : undefined) ?? json.message;
+    const code = errObj?.code ? `${errObj.code}` : undefined;
+    return {
+      ok: res.ok,
+      status: res.status,
+      ...(res.ok && json.result && typeof json.result === 'object' ? { result: json.result } : {}),
+      ...(message ? { error: [code, message].filter(Boolean).join(': ') } : {}),
+    };
+  } catch (e) {
+    return { ok: false, status: 0, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** 账号存在性兜底：GET 列表命中即真；未命中则 POST 创建（OpenViking 0.5.0 提供
+ *  POST /api/v1/admin/accounts）。已存在时 POST 语义未验证，故一律先查后建 */
+export async function ensureRemoteAccount(
+  base: string, account: string, rootKey: string, timeoutMs = 5000,
+): Promise<{ ok: boolean; detail: string }> {
+  const list = await adminFetch(`${base}/api/v1/admin/accounts`, rootKey, 'GET', undefined, timeoutMs);
+  if (list.ok && Array.isArray(list.result?.accounts)) {
+    return { ok: true, detail: '账号已存在' };
+  }
+  // 上游 0.5.0 的账号列表把数组放在 result（result: [{account_id,...}]）；两种形态都认
+  if (list.ok && Array.isArray(list.result)) {
+    const accounts = list.result as Array<{ account_id?: string }>;
+    if (accounts.some((a) => a?.account_id === account)) return { ok: true, detail: '账号已存在' };
+  }
+  if (list.ok && !Array.isArray(list.result)) return { ok: true, detail: '账号列表不可解析，按已存在处理' };
+  const created = await adminFetch(`${base}/api/v1/admin/accounts`, rootKey, 'POST', { account_id: account }, timeoutMs);
+  if (created.ok) return { ok: true, detail: `账号已自动创建（${account}）` };
+  // 并发/已存在等语义差异：创建失败后再查一次，存在即算成功
+  const recheck = await adminFetch(`${base}/api/v1/admin/accounts`, rootKey, 'GET', undefined, timeoutMs);
+  if (recheck.ok) return { ok: true, detail: '账号已存在（自动创建返回异常但复查命中）' };
+  return {
+    ok: false,
+    detail: `自动创建失败（HTTP ${created.status}${created.error ? ` ${created.error}` : ''}）；请核对 config.yaml 的 memory.account 是否与服务端一致`,
+  };
+}
+
+/** 单个 bot 的 user key 签发（三级回退，消灭 409 死循环）：
+ *  ① POST 创建（首启路径）② 409 已存在 → POST /users/{uid}/key 重签（旧 key 立即失效）
+ *  ③ 重签失败 → GET /users 列表回读明文 api_key（api_key 模式列表可回带，实测确认）
+ *  seed 仍随创建请求带上（未来服务端若实现确定性签发即天然幂等），当前版本被忽略也无害 */
+async function signOneUserKey(
+  base: string, account: string, appId: string, rootKey: string, timeoutMs: number,
+): Promise<{ userKey?: string; error?: string }> {
+  const usersBase = `${base}/api/v1/admin/accounts/${encodeURIComponent(account)}/users`;
+  const seed = createHash('sha256').update(`${appId}:${rootKey}`).digest('hex').slice(0, 32);
+  const created = await adminFetch(usersBase, rootKey, 'POST', { user_id: appId, role: 'user', seed }, timeoutMs);
+  if (created.ok) {
+    const key = created.result?.user_key;
+    if (typeof key === 'string' && key) return { userKey: key };
+    return { error: '创建成功但响应未带 user_key（服务端 should_expose_user_key=false？）' };
+  }
+  if (created.status === 409) {
+    const re = await adminFetch(`${usersBase}/${encodeURIComponent(appId)}/key`, rootKey, 'POST', undefined, timeoutMs);
+    if (re.ok) {
+      const key = re.result?.user_key;
+      if (typeof key === 'string' && key) return { userKey: key };
+    }
+    const listed = await adminFetch(usersBase, rootKey, 'GET', undefined, timeoutMs);
+    const users = Array.isArray(listed.result) ? listed.result as Array<{ user_id?: string; api_key?: string }> : [];
+    const hit = users.find((u) => u?.user_id === appId);
+    if (hit && typeof hit.api_key === 'string' && hit.api_key) return { userKey: hit.api_key };
+    return {
+      error: `用户已存在但重签与回读均失败（重签 HTTP ${re.status}${re.error ? ` ${re.error}` : ''}；`
+        + `列表 ${listed.status}${listed.error ? ` ${listed.error}` : ''}）——请到配置页「用户与密钥」重置该用户密钥`,
+    };
+  }
+  if (created.status === 404) {
+    return { error: `HTTP 404（${created.error ?? 'Account or user not found'}）——请核对 config.yaml 的 memory.account 与服务端账号是否一致` };
+  }
+  return { error: `签发失败：HTTP ${created.status}${created.error ? `（${created.error}）` : ''}` };
 }

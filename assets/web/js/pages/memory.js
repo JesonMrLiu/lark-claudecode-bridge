@@ -24,7 +24,7 @@ const DOC_URL = 'https://github.com/volcengine/OpenViking';
 
 /** 探活失败分类 → 下一步行动建议（后端 reason 驱动；not-running 由状态机接管，不在此列） */
 const REASON_HINT = {
-  auth: '鉴权失败——api_key 模式下网页/机器人各需一把用户密钥。点「用户与密钥」Tab 一键初始化，或检查 ov.conf 的 root key 与本页保存的 API Key 是否一致',
+  auth: '鉴权失败——api_key 模式下网页/机器人各需一把用户密钥。点「用户与密钥」Tab 一键初始化，或检查 ov.conf 的 root key 与本页保存的 API Key 是否一致。（若是在 1933 的 Studio 里登录被拒：要填的是 **Root 或账号管理员 API 密钥**，见「用户与密钥」Tab 顶部的「连接 OpenViking Studio」指引卡，一键复制即可）',
   timeout: '服务无响应——进程可能卡死，可「一键检查 / 修复」重拉',
   unreachable: '端点不可达——检查服务端点地址与网络（远程模式常见），或服务是否监听该地址',
   'http-error': '服务返回异常状态码——可「一键检查 / 修复」重拉，或查看服务日志定位',
@@ -533,6 +533,12 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
       ? `LCB 受管${inst.managedRunning ? '' : ' <span class="hint">（未运行）</span>'}`
       : `外部自管 <span class="hint">非 LCB 拉起</span>`),
     ...(inst.managedSince ? [infoCell('clock', '运行时间', esc(fmtSince(inst.managedSince)))] : []),
+    // 随 LCB 启动的自动拉起结果：成功只作留痕，失败把「手动开启指引」摆到状态区
+    // （自举失败不阻断 LCB，用户必须能从页面一眼看到该去哪手动起）
+    ...(inst.autoStart ? [infoCell('clock', '启动自举', inst.autoStart.ready
+      ? `<span style="color:var(--ok-tx);font-weight:600">✓</span> 随 LCB 自动拉起 <span class="hint">${esc(fmtSince(inst.autoStart.at))}</span>`
+      : `<span style="color:var(--warn-tx);font-weight:600">⚠ 未就绪</span> <span class="hint" title="${esc(inst.autoStart.hint || '')}">${esc(inst.autoStart.detail)}</span>`
+        + `${inst.autoStart.hint ? `<div class="hint" style="margin-top:2px">手动开启：${esc(inst.autoStart.hint)}</div>` : ''}`)] : []),
     ...(st.health?.authMode ? [infoCell('server', '鉴权模式', `${esc(st.health.authMode)}${authNote ? ` <span class="hint" title="${esc(authNote)}">ⓘ</span>` : ''}`)] : []),
     infoCell('spark', '记忆插件', (st.plugin?.found
       ? `<span style="white-space:nowrap;display:inline-flex;align-items:center;gap:6px"><span style="color:var(--ok-tx);font-weight:600">✓</span><code>${esc(st.plugin.name)}</code>${st.plugin.version ? `<span class="hint">v${esc(st.plugin.version)}</span>` : ''}${st.plugin.source && PLUGIN_SOURCE_LABEL[st.plugin.source] ? `<span class="hint" title="实际加载渠道：与机器人任务装配一致">${esc(PLUGIN_SOURCE_LABEL[st.plugin.source])}</span>` : ''}</span>`
@@ -693,15 +699,85 @@ function userRowHtml(u) {
         <span class="hint">${keyState}</span>
       </div>
       <div class="hint" style="margin-top:3px">${meta}</div>
+      <div class="hint" style="margin-top:2px">${u.kind === 'web'
+        ? '用途：网页端（Studio 记忆空间 / 文件系统页）用它这把'
+        : u.kind === 'bot'
+          ? `用途：飞书会话由 LCB 自动注入（无须手填）；想在本页看它的记忆，点右侧「打开记忆空间」以 <code>${esc(u.userId)}</code> 身份进入——与其他机器人的记忆完全隔离`
+          : '用途：历史聊天者身份'}</div>
     </div>
-    <button class="btn sm primary" data-open="${esc(u.userId)}" title="密钥进剪贴板 + 自动打开记忆空间（文件系统页），粘贴一次即可连接">打开记忆空间</button>
+    <button class="btn sm primary" data-open="${esc(u.userId)}" title="以「${esc(displayName)}」的身份进入记忆空间：该密钥进剪贴板并自动打开 Studio 文件系统页，粘贴一次即连接。打开的是这一个身份自己的记忆，与其他机器人完全隔离">打开记忆空间</button>
     <button class="btn sm" data-copy="${esc(u.userId)}" title="复制密钥（脱敏显示，此操作会留痕）">⧉ 复制key</button>
     <button class="btn sm" data-reset="${esc(u.userId)}" title="重签密钥：旧密钥立即失效，所有使用方需同步更新">重置</button>
     <button class="btn sm danger" data-del="${esc(u.userId)}" title="删除用户与记忆（先自动备份本地数据）">删除</button>
   </div>`;
 }
 
-/** Tab2 主渲染：一键初始化 + 用户列表（网页管理 / 机器人分组）+ 粒度向导 */
+/**
+ * 「连接 1933 网页控制台」指引卡 —— 回答两个问题：① Studio 那个框填哪把钥匙；② 为什么进去之后
+ * 身份显示 default 且切不了。
+ *
+ * 起因（用户实测卡点）：
+ *  - 登录框要「Root 或账号管理员 API 密钥」，而本页此前没有任何 root key 线索，唯一长得像的
+ *    「模型配置 → API Key」是模型厂商 key，填进去必 401；
+ *  - 用 Root key 进去后身份恒为 default，切不动 → 误以为「LCB 没按机器人隔离」。
+ *
+ * 事实（实弹探针 + Studio 前端文案双向确认）：
+ *  - **Root key 是单段 48 字符**（无 account/user 段），代表 default 账号的管理员；Studio 明说
+ *    「当前服务器模式不支持切换身份」，且「切换身份」不改 Root 管理凭证 → Root 登录态就是 default，
+ *    这是 Studio 的设计，不是 LCB 隔离失效；
+ *  - **用户 key 是三段 base64url(account).user.secret**，每个机器人一把（user 段 = appId）；
+ *    服务端磁盘 `data/viking/default/user/{appId}/` 一机一目录，记忆物理隔离。
+ *  → 所以「看某个机器人的记忆」必须用**那个机器人的用户 key 登录**，不是「在 Root 里切换」。
+ */
+function studioGuideCardHtml(rk, endpoint) {
+  const srcLabel = rk?.source === 'config' ? 'config.yaml 的 memory.api_key'
+    : rk?.source === 'ov-conf' ? '受管 ov.conf 的 server.root_api_key' : '';
+  const state = rk?.configured
+    ? `<span style="color:var(--ok-tx);font-weight:600">✓ 已配置</span> <span class="hint">来源：${esc(srcLabel)}</span>`
+    : '<span style="color:var(--danger);font-weight:600">✗ 未配置</span> <span class="hint">请到「服务与配置」点「检查修复」重新生成</span>';
+  const login = (title, badge, key, body, btn) => `
+    <div style="flex:1;min-width:280px;border:1px solid var(--border);border-radius:10px;padding:12px 14px">
+      <div style="font-size:13px;font-weight:700">${esc(title)} ${esc(badge)}</div>
+      <div class="hint" style="margin-top:6px;line-height:1.8">${body}</div>
+      <div style="margin-top:8px">${btn}</div>
+    </div>`;
+  return `<div class="card" style="margin-top:12px;border-left:3px solid var(--accent)">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <b style="font-size:13.5px">🌐 连接 OpenViking Studio（${esc((endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, ''))}/studio）</b>
+      <span style="flex:1"></span>
+      <button class="btn sm" id="memCopyRoot" title="复制 Root 密钥到剪贴板（查看行为留痕）" ${rk?.configured ? '' : 'disabled style="opacity:.5;cursor:not-allowed"'}>⧉ 复制 Root 密钥</button>
+      <button class="btn sm primary" id="memOpenStudio" title="复制 Root 密钥 → 打开 Studio 新标签 → 在「Root 或账号管理员 API 密钥」框 Ctrl+V 即可进入">打开 Studio 并复制</button>
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:10px">
+      ${login(
+        '登录方式一 · 管理员', 'Root 密钥',
+        'root',
+        `用于<b>管理</b>：列出用户、复制/重置他人密钥、账号设置。<br>
+         用它登录后，Studio 里的身份<b>固定显示为 <code>default</code>，且无法切换</b>——
+         这是 Studio 的设计（管理员凭证不含具体用户身份），<b>不代表机器人记忆没隔离</b>。<br>
+         <span class="hint">密钥即受管 ov.conf 的 <code>server.root_api_key</code>；查看行为会留痕。</span>`,
+        `<button class="btn sm" data-root-copy title="复制 Root 密钥（查看行为留痕）" ${rk?.configured ? '' : 'disabled style="opacity:.5;cursor:not-allowed"'}>⧉ 复制 Root 密钥</button>`,
+      )}
+      ${login(
+        '登录方式二 · 查看某个机器人的记忆', '该机器人的用户密钥',
+        'user',
+        `用于<b>浏览某一个机器人（或网页用户）自己的记忆空间</b>。<br>
+         在下方用户列表点那一行的「打开记忆空间」，密钥自动进剪贴板并跳转，粘贴即以<b>该机器人身份</b>进入。<br>
+         <span class="hint">每个机器人一把独立密钥、一机一目录，数据物理隔离，互不可见。</span>`,
+        '<span class="hint">↓ 在下方「机器人」分组里点对应那一行的「打开记忆空间」</span>',
+      )}
+    </div>
+    <div class="hint" style="margin-top:10px;padding:8px 12px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px;line-height:1.7">
+      ⚠️ 两种登录态<b>不能互相切换</b>：想看 A 机器人的记忆就用 A 的密钥进，看 B 就用 B 的密钥进。
+      用 Root 进去只会看到管理员（default）视角，看不到各机器人的记忆。<br>
+      ⚠️ <b>更不要填</b>「模型配置」里那个模型厂商 API Key（智谱等）——那是调用模型用的，与 OpenViking 鉴权无关。
+    </div>
+    <div class="hint" style="margin-top:8px;line-height:1.7">Root 密钥状态：${state}</div>
+    <div id="memRootStatus" class="hint" style="margin-top:4px;line-height:1.7"></div>
+  </div>`;
+}
+
+/** Tab2 主渲染：一键初始化 + Studio 接入指引 + 用户列表（网页管理 / 机器人分组）+ 粒度向导 */
 function renderUsersTab(el, { st, m }) {
   const u = usersSnapshot;
   const healthy = !!st.health?.healthy;
@@ -754,8 +830,9 @@ function renderUsersTab(el, { st, m }) {
       <div class="hint" style="margin-top:6px">ⓘ 1933 网页右上角的身份切换显示的是技术 ID（OpenViking 暂不支持显示名）——哪个 ID 对应哪台机器人，以本页对照为准。</div>
       ${u.authInitNeeded ? `<div class="hint" style="margin-top:10px;padding:9px 14px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px">🔑 待初始化鉴权：网页端用户（web）尚未创建——浏览器打开记忆空间会 401。点右上「⚡ 一键初始化」自动创建网页 + 各机器人用户并签发密钥。</div>` : ''}
       ${u.users.length === 0 && !u.authInitNeeded ? '<div class="hint" style="margin-top:12px">暂无用户——点「⚡ 一键初始化」创建。</div>' : ''}
-      ${group('网页管理', webUsers, '浏览器打开记忆空间用')}
-      ${group('机器人', botUsers, '每个 bot 一把独立密钥（升级 bot×人 后此处可展开聊天者维度）')}
+      ${studioGuideCardHtml(u.rootKey, m.endpoint)}
+      ${group('网页管理', webUsers, '浏览器打开记忆空间用这一把（Studio 里的「用户 API 密钥」也用它）')}
+      ${group('机器人', botUsers, '每个 bot 一把独立密钥；机器人会话由 LCB 自动注入，你不需要手填到任何地方')}
       ${group('聊天者与其他', otherUsers, '历史身份（{appId}-{ou_xxx}）已自动归属到对应机器人')}
       ${granularityCardHtml(gran)}
     </div>`;
@@ -804,6 +881,50 @@ function bindUsersTabActions(el, { m }) {
     } catch (e) { toast(e.message, true); }
     await reload();
   };
+
+  // Root 密钥放行 → 剪贴板 →（可选）打开 Studio。后端顺带做了「拿这把 key 实打服务端」的校验，
+  // 结果直接回显在卡片里：拷贝即用，不必等 Studio 报 401 才回头猜是哪把钥匙不对
+  const showRootResult = (r) => {
+    const box = $('#memRootStatus');
+    if (!box) return;
+    if (r.valid === false) {
+      box.innerHTML = `<span style="color:var(--danger)">⚠ ${esc(r.validDetail || '这把 Root 密钥未通过服务端校验')}</span>`;
+    } else if (r.valid) {
+      box.innerHTML = `<span style="color:var(--ok-tx)">✓ 这把 Root 密钥已通过服务端校验，可直接粘贴</span>`;
+    }
+  };
+  const fetchRootKey = async () => {
+    const r = await api('POST', '/api/memory/users/reveal-root', {});
+    if (!r.ok || !r.key) { toast(r.error || 'Root 密钥未配置', true); return null; }
+    showRootResult(r);
+    return r.key;
+  };
+  const copyRoot = async () => {
+    try {
+      const key = await fetchRootKey();
+      if (!key) return;
+      try { await navigator.clipboard.writeText(key); } catch { return toast('Root 密钥已放行但剪贴板不可用——请手动复制', true); }
+      toast('Root 密钥已复制（查看行为已留痕）——到 Studio 的「Root 或账号管理员 API 密钥」框 Ctrl+V');
+    } catch (e) { toast(e.message, true); }
+  };
+  const openStudio = async () => {
+    try {
+      const key = await fetchRootKey();
+      if (!key) return;
+      let copied = true;
+      try { await navigator.clipboard.writeText(key); } catch { copied = false; }
+      window.open(`${endpoint}/studio`, '_blank', 'noopener');
+      toast(copied
+        ? 'Root 密钥已复制并打开 Studio——在「Root 或账号管理员 API 密钥」框 Ctrl+V 即可进入'
+        : '已打开 Studio（剪贴板不可用，请手动填写 Root 密钥）');
+    } catch (e) { toast(e.message, true); }
+  };
+  const copyRootBtn = $('#memCopyRoot');
+  if (copyRootBtn) copyRootBtn.onclick = copyRoot;
+  const openStudioBtn = $('#memOpenStudio');
+  if (openStudioBtn) openStudioBtn.onclick = openStudio;
+  // 指引卡内的「复制 Root 密钥」（同一 handler，多入口）
+  el.querySelectorAll('[data-root-copy]').forEach((b) => { b.onclick = copyRoot; });
 
   // 打开记忆空间（最终方案 §三 决策 5）：密钥进剪贴板 → 自动新标签开 Web Studio 文件系统页
   //（深链 /studio/filesystem 直落记忆目录树，避开默认的 VikingBot 标签——那是 OpenViking

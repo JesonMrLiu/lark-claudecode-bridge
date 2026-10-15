@@ -30,6 +30,16 @@ const UPDATE_TIMEOUT_MS = 30_000;
  *  真机观测假阴性（300308 Server Internal Error 但请求实际已落地）均为单次超前 1，
  *  上限 3 足够覆盖；跳满仍未对齐说明错位成因未知，弃卡沉底重建兜底 */
 const MAX_SEQ_SKIP = 3;
+/** 沉底撤回旧卡失败后的补撤退避：服务端 500/2200 多为秒级瞬态（1.4.1 真机事故：撤回撞
+ *  2200 Internal Error 一次即降级，旧卡原样冻结成第二张进度卡），1.2s 后补撤一次，
+ *  成功即不产生双卡；仍失败才转「已沉底」迁移标记兜底 */
+const DELETE_RETRY_DELAY_MS = 1_200;
+/** 「已沉底」迁移标记补打间隔：230020 单消息更新限频（撤回前旧卡刚经历每秒级 seq 重试，
+ *  极易触发频控）通常数秒自愈，5s 后补打大概率成功 */
+const SINK_NOTICE_RETRY_DELAY_MS = 5_000;
+/** 「已沉底」迁移标记补打次数上限（不含首次）：轻量加固定位——固定次数放弃，不引入
+ *  常驻弃卡补偿队列（持续重试反而有加剧限频的风险面） */
+const SINK_NOTICE_RETRY_MAX = 3;
 
 /** 给单次更新请求加超时闸：到点 reject 由 flush catch 统一按失败重试 */
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -62,6 +72,11 @@ export class ProgressCard {
   private qaButtonsDirty = false;
   /** 挂起输入期间收到的沉底请求（sinkToBottom 会删卡重发清空输入态）：挂起解除后补执行 */
   private deferSink = false;
+  /** 「已沉底」迁移标记补打状态：沉底撤回失败 → 迁移标记 PATCH 也失败（典型 230020
+   *  单消息更新限频，数秒自愈）时记入，heartbeatTimer 每秒检查、间隔
+   *  SINK_NOTICE_RETRY_DELAY_MS 补打，成功或达 SINK_NOTICE_RETRY_MAX 放弃。
+   *  单槽位：同刻两张以上旧卡残留概率极低，新沉底覆盖旧记录 */
+  private sinkNoticeRetry?: { messageId: string; attempts: number; lastAt: number };
   private state: ProgressState;
   private flushTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
@@ -105,6 +120,7 @@ export class ProgressCard {
     const interval = this.opts.flushIntervalMs ?? 1000;
     this.flushTimer = setInterval(() => void this.flush(), interval).unref();
     this.heartbeatTimer = setInterval(() => {
+      if (this.sinkNoticeRetry) this.retrySinkNotice(); // 沉底迁移标记补打（见 retrySinkNotice）
       if (Date.now() - this.lastActivityAt >= (this.opts.idleHeartbeatMs ?? 30_000)) {
         this.lastActivityAt = Date.now(); // I1 修复：心跳刷过即重置空闲计时，否则退化为每秒连刷
         void this.flush(); // 心跳：刷新运行时长，证明没卡死
@@ -269,6 +285,7 @@ export class ProgressCard {
     this.state.done = true;
     clearInterval(this.flushTimer);
     clearInterval(this.heartbeatTimer);
+    this.sinkNoticeRetry = undefined; // 心跳已停，补打失去驱动；终态后旧卡提示已无意义
     this.state.status = summary;
     this.state.toolLine = '';
     this.state.resultChars = resultChars;
@@ -301,14 +318,32 @@ export class ProgressCard {
     this.messageId = undefined; // 期间 flush 自动跳过，避免 PATCH 打到已删除的旧卡
     this.cardId = undefined;
     if (this.sender.deleteCard) {
-      await this.sender.deleteCard(old).catch((e) => {
+      await this.sender.deleteCard(old).catch(async (e) => {
         // 撤回失败不再静默：1.3.7 真机事故里旧卡冻结在中间态无结束文案，被误读成任务中断。
         // 每次沉底都出现此日志 ≈ 应用缺 im:message:delete 撤回权限（去开发者后台开通并发布）
         console.warn('[进度卡] 旧卡撤回失败(若每次沉底都出现,多为应用缺 im:message:delete 撤回权限,请在飞书开发者后台开通并发布新版本):',
           e instanceof Error ? e.message : e, feishuErrorBody(e) ?? '');
-        // 撤不掉就整卡 PATCH 打迁移标记（消息级 PATCH 无 cardkit sequence 依赖，同 done 分支做法），
-        // 旧卡不再停在中间态；PATCH 也失败则静默（尽力而为，不阻断沉底主流程）
-        void this.sender.updateCard(old, buildSinkNoticeCard(this.state.title)).catch(() => {});
+        // 1.4.1 加固①：撤回失败多为秒级瞬态（2200 Internal Error 等服务端 500）——退避
+        // 补撤一次，成功即不产生双卡；仍失败才转「已沉底」迁移标记兜底
+        await new Promise((r) => setTimeout(r, DELETE_RETRY_DELAY_MS));
+        try {
+          await this.sender.deleteCard!(old);
+          return;
+        } catch (e2) {
+          console.warn('[进度卡] 旧卡补撤仍失败,转迁移标记兜底:',
+            e2 instanceof Error ? e2.message : e2, feishuErrorBody(e2) ?? '');
+        }
+        // 1.4.1 加固②：迁移标记 PATCH 常撞 230020 单消息更新限频（撤回前旧卡刚经历每秒级
+        // seq 重试，极易触发频控，数秒自愈）——首次失败不再静默放弃（静默会让旧卡原样冻结
+        // 在中间态被误读成任务中断，1.4.1 真机事故即「撤回 500 + 标记限频」双失败双卡），
+        // 记入待补由心跳延迟补打（retrySinkNotice）
+        try {
+          await withTimeout(this.sender.updateCard(old, buildSinkNoticeCard(this.state.title)), this.opts.updateTimeoutMs ?? UPDATE_TIMEOUT_MS);
+        } catch (e2) {
+          this.sinkNoticeRetry = { messageId: old, attempts: 1, lastAt: Date.now() };
+          console.warn(`[进度卡] 「已沉底」提示改写失败(限频/网络),将由心跳每 ${SINK_NOTICE_RETRY_DELAY_MS / 1000}s 补打(最多 ${SINK_NOTICE_RETRY_MAX} 次):`,
+            e2 instanceof Error ? e2.message : e2, feishuErrorBody(e2) ?? '');
+        }
       });
     }
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -332,6 +367,30 @@ export class ProgressCard {
         else console.warn('[进度卡] 沉底重发失败，本卡后续更新暂停（任务不受影响）：', e instanceof Error ? e.message : e);
       }
     }
+  }
+
+  /**
+   * 「已沉底」迁移标记心跳补打（heartbeatTimer 每秒调用）：距上次尝试 ≥
+   * SINK_NOTICE_RETRY_DELAY_MS 才发（230020 单消息限频数秒自愈，密集重试反而加剧频控），
+   * 成功清槽；达 SINK_NOTICE_RETRY_MAX 放弃并清槽——轻量加固定位，固定次数后不再照看
+   * （旧卡保持冻结但不影响任务；需无限期照看见「弃卡补偿队列」扩展方向，暂不引入）。
+   * fire-and-forget：不 await，避免阻塞心跳；withTimeout 防网络黑洞挂死槽位。
+   */
+  private retrySinkNotice(): void {
+    const n = this.sinkNoticeRetry!;
+    if (Date.now() - n.lastAt < SINK_NOTICE_RETRY_DELAY_MS) return;
+    void withTimeout(this.sender.updateCard(n.messageId, buildSinkNoticeCard(this.state.title)), this.opts.updateTimeoutMs ?? UPDATE_TIMEOUT_MS)
+      .then(() => { this.sinkNoticeRetry = undefined; })
+      .catch((e) => {
+        if (n.attempts >= SINK_NOTICE_RETRY_MAX) {
+          this.sinkNoticeRetry = undefined;
+          console.warn('[进度卡] 「已沉底」提示补打放弃,旧卡保持冻结(不影响任务):',
+            e instanceof Error ? e.message : e, feishuErrorBody(e) ?? '');
+          return;
+        }
+        n.attempts += 1;
+        n.lastAt = Date.now();
+      });
   }
 
   /**

@@ -21,7 +21,7 @@ import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import type { BridgeConfig, MemoryConfig } from '../types.js';
 import { MANAGED_OV_CONF, MEMORY_MANAGED_DIR } from '../memory-installer.js';
-import { memoryEndpoint, probeMemoryHealth } from '../memory.js';
+import { DEFAULT_MEMORY_ACCOUNT, memoryAccount, memoryEndpoint, ensureRemoteAccount, probeMemoryHealth } from '../memory.js';
 import { maskSecret } from './config-api.js';
 
 /** 网页管理端用户约定 uid（方案 §四 阶段 3：{"user_id":"web"}） */
@@ -79,15 +79,21 @@ async function adminCall(memory: MemoryConfig, rootKey: string, method: string, 
       signal: AbortSignal.timeout(10_000),
     });
     const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-    const msg = typeof json.message === 'string' ? json.message : undefined;
-    return { ok: res.ok, status: res.status, json, ...(msg ? { message: msg } : {}) };
+    // 错误文案：OpenViking 错误体为 {error:{code,message}}，顶层 message 形态只在旧版本出现——
+    // 只读顶层 message 时，所有 404 都退化成裸「HTTP 404」（账号名写错的真因就此隐身）
+    const errObj = json.error && typeof json.error === 'object' ? json.error as Record<string, unknown> : undefined;
+    const code = typeof errObj?.code === 'string' ? errObj.code : undefined;
+    const msg = (typeof errObj?.message === 'string' ? errObj.message : undefined)
+      ?? (typeof json.error === 'string' ? json.error : undefined)
+      ?? (typeof json.message === 'string' ? json.message : undefined);
+    return { ok: res.ok, status: res.status, json, ...(msg ? { message: code ? `${code}: ${msg}` : msg } : {}) };
   } catch (e) {
     return { ok: false, status: 0, json: {}, message: e instanceof Error ? e.message : String(e) };
   }
 }
 
 const adminPath = (memory: MemoryConfig, suffix: string): string =>
-  `/api/v1/admin/accounts/${encodeURIComponent(memory.account ?? 'lcb')}${suffix}`;
+  `/api/v1/admin/accounts/${encodeURIComponent(memoryAccount(memory))}${suffix}`;
 
 // ============ 密钥保险库（DPAPI 加密落盘） ============
 
@@ -235,25 +241,39 @@ export interface MemoryUsersSnapshot {
   totalBytes: number;
   /** 待初始化鉴权（方案 §六 配套细节 2：服务 api_key 模式但 web 用户不存在） */
   authInitNeeded: boolean;
+  /**
+   * Root 密钥状态（**只报存在性与来源，不含明文**）：OpenViking Studio 登录框要的
+   * 「Root 或账号管理员 API 密钥」此前在页面上没有任何线索，用户只能自己翻 ov.conf 或误填模型
+   * API Key。页面据此显示「已配置（来源：…）」并给出复制按钮，把「填哪个」讲死。
+   */
+  rootKey?: { configured: boolean; source: 'config' | 'ov-conf' | 'missing' };
+}
+
+/** Root 密钥状态（供快照携带；明文一律不放行，见 MemoryUsersSnapshot.rootKey） */
+function rootKeyStatus(memory: MemoryConfig | undefined): NonNullable<MemoryUsersSnapshot['rootKey']> {
+  if (!memory) return { configured: false, source: 'missing' };
+  if (memory.apiKey?.trim()) return { configured: true, source: 'config' };
+  if (managedRootKey()) return { configured: true, source: 'ov-conf' };
+  return { configured: false, source: 'missing' };
 }
 
 /** 用户列表聚合：Admin API + 本地磁盘统计。全程容错（服务不可达返回可达性标记，不抛出） */
 export async function listMemoryUsers(config: BridgeConfig): Promise<MemoryUsersSnapshot> {
   const memory = config.memory;
-  const account = memory?.account ?? 'lcb';
+  const account = memory ? memoryAccount(memory) : DEFAULT_MEMORY_ACCOUNT;
   const empty: MemoryUsersSnapshot = { reachable: false, users: [], totalBytes: 0, authInitNeeded: false };
-  if (!memory) return { ...empty, error: 'memory 段未配置' };
+  if (!memory) return { ...empty, error: 'memory 段未配置', rootKey: rootKeyStatus(undefined) };
   const health = await probeMemoryHealth(memoryEndpoint(memory));
-  if (!health.healthy) return { ...empty, error: health.detail ?? '服务不可达', ...(health.authMode ? { authMode: health.authMode } : {}) };
+  if (!health.healthy) return { ...empty, error: health.detail ?? '服务不可达', rootKey: rootKeyStatus(memory), ...(health.authMode ? { authMode: health.authMode } : {}) };
   if (health.authMode !== 'api_key') {
     // dev 模式：Admin API 被服务端禁用（403）——这是「无需用户密钥」的正常形态而非错误
-    return { reachable: true, authMode: health.authMode, users: [], totalBytes: 0, authInitNeeded: false };
+    return { reachable: true, authMode: health.authMode, users: [], totalBytes: 0, authInitNeeded: false, rootKey: rootKeyStatus(memory) };
   }
   const rootKey = resolveRootKey(memory);
-  if (!rootKey) return { ...empty, authMode: health.authMode, error: 'root key 未配置（memory.api_key 与受管 ov.conf 均未见）——请先「检查修复」对齐鉴权' };
+  if (!rootKey) return { ...empty, authMode: health.authMode, rootKey: rootKeyStatus(memory), error: 'root key 未配置（memory.api_key 与受管 ov.conf 均未见）——请先「检查修复」对齐鉴权' };
   const r = await adminCall(memory, rootKey, 'GET', adminPath(memory, '/users'));
   if (!r.ok) {
-    return { ...empty, authMode: health.authMode, error: `用户列表获取失败：HTTP ${r.status}${r.message ? `（${r.message}）` : ''}` };
+    return { ...empty, authMode: health.authMode, rootKey: rootKeyStatus(memory), error: `用户列表获取失败：HTTP ${r.status}${r.message ? `（${r.message}）` : ''}` };
   }
   const rawUsers = (Array.isArray(r.json.result) ? r.json.result : []) as Array<{ user_id?: string; role?: string; api_key?: string }>;
   const botNames = new Map(config.apps.map((a) => [a.appId, a.name] as const));
@@ -289,6 +309,7 @@ export async function listMemoryUsers(config: BridgeConfig): Promise<MemoryUsers
     totalBytes: rows.reduce((s, r2) => s + (r2.sizeBytes ?? 0), 0),
     // 待初始化：api_key 模式跑着但网页端用户还没建（浏览器打开 1933 会 401 重定向的根因）
     authInitNeeded: !rows.some((x) => x.userId === WEB_USER_ID),
+    rootKey: rootKeyStatus(memory),
   };
 }
 
@@ -319,6 +340,17 @@ export async function initMemoryUsers(config: BridgeConfig): Promise<InitOutcome
   }
   const rootKey = resolveRootKey(memory);
   if (!rootKey) return { ...out, errors: ['root key 未配置'], detail: '「检查修复」可对齐 memory.api_key 与受管 ov.conf' };
+  // 账号兜底：服务端只认已存在账号，账号不存在时下面每个用户都会 404（历史上表现为
+  // 「创建 xxx 失败：HTTP 404」全红，用户无从判断是账号问题还是服务没起）→ 缺账号先自动建
+  const account = memoryAccount(memory);
+  const accountReady = await ensureRemoteAccount(memoryEndpoint(memory).replace(/\/+$/, ''), account, rootKey);
+  if (!accountReady.ok) {
+    return {
+      ...out,
+      errors: [`记忆账号「${account}」不可用：${accountReady.detail}`],
+      detail: '请核对 config.yaml 的 memory.account（缺省 default）是否与服务端账号一致',
+    };
+  }
   // 期望用户：web + 每个 bot（appId 即 OpenViking 侧 user_id，与 ensureMemoryUserKeys 签发口径一致）
   const desired = [WEB_USER_ID, ...config.apps.map((a) => a.appId)];
   // 先列表自愈：已存在用户的 key 直接刷保险库（避免对已存在用户重复创建撞 409）
@@ -344,7 +376,11 @@ export async function initMemoryUsers(config: BridgeConfig): Promise<InitOutcome
       out.created.push(uid);
       out.errors.push(`${uid} 已创建但响应未含密钥——已尝试从用户列表回读`);
     } else {
-      out.errors.push(`创建 ${uid} 失败：HTTP ${r.status}${r.message ? `（${r.message}）` : ''}`);
+      const why = r.message ? `（${r.message}）` : '';
+      const hint = r.status === 404
+        ? '——服务端不存在该账号或用户，请核对 config.yaml 的 memory.account（缺省 default）'
+        : r.status === 409 ? '（用户已存在，可直接「重置密钥」）' : '';
+      out.errors.push(`创建 ${uid} 失败：HTTP ${r.status}${why}${hint}`);
     }
   }
   out.ok = out.errors.length === 0;
@@ -354,6 +390,61 @@ export async function initMemoryUsers(config: BridgeConfig): Promise<InitOutcome
 }
 
 // ============ 密钥明文放行（reveal / 复制 / 打开记忆空间共用） ============
+
+// ============ Root 密钥放行（OpenViking Studio 登录用） ============
+
+export interface RevealRootResult {
+  ok: boolean;
+  key?: string;
+  /** 取值来源：config=config.yaml 的 memory.api_key；ov-conf=受管 ov.conf 的 server.root_api_key */
+  source?: 'config' | 'ov-conf';
+  /** 拿这把 key 实打服务端的校验结果（避免用户拷了把错的去 Studio 里 debug） */
+  valid?: boolean;
+  /** 校验失败原因（如 HTTP 401：key 与服务端不匹配） */
+  validDetail?: string;
+  error?: string;
+}
+
+/**
+ * 取 Root 密钥明文（单次放行 + 审计留痕）——**给 OpenViking Studio 的登录框用**。
+ * 背景（用户实测卡点）：Studio 首屏要填「Root 或账号管理员 API 密钥」，而 LCB 配置页此前
+ * 完全没有 root key 的入口，唯一长得像的「模型配置 → API Key」是智谱模型 key，填进去必然 401。
+ * Studio 自己的提示写的是「Root API 密钥位于服务端 ov.conf 的 server.root_api_key」，本页就按
+ * 同一口径给出处 + 复制按钮，别让用户自己在磁盘上翻配置文件。
+ * 顺带校验：带 key 打一次 /api/v1/system/status（api_key 模式下鉴权通过的证明），把「拷贝即用」
+ * 的确定性前置到本页，而不是让用户在 Studio 的报错里猜。
+ */
+export async function revealRootKey(config: BridgeConfig): Promise<RevealRootResult> {
+  const memory = config.memory;
+  if (!memory) return { ok: false, error: 'memory 段未配置' };
+  const fromConfig = memory.apiKey?.trim();
+  const rootKey = resolveRootKey(memory);
+  if (!rootKey) {
+    return {
+      ok: false,
+      error: 'Root 密钥未配置：config.yaml 的 memory.api_key 与受管 ov.conf 的 server.root_api_key 均为空。'
+        + '请到「服务与配置」点「检查修复」重新生成，或手工把 ov.conf 里的 server.root_api_key 回写到 memory.api_key',
+    };
+  }
+  const source: RevealRootResult['source'] = fromConfig ? 'config' : 'ov-conf';
+  auditMemory('reveal-root', { source });
+  // 校验：/system/status 在 api_key 模式下带 X-API-Key 通过即有效；dev 模式不校验直接视为有效
+  const health = await probeMemoryHealth(memoryEndpoint(memory));
+  if (health.authMode && health.authMode !== 'api_key') {
+    return { ok: true, key: rootKey, source, valid: true, validDetail: `服务为 ${health.authMode} 模式，Studio 无需密钥` };
+  }
+  if (!health.healthy) {
+    return { ok: true, key: rootKey, source, valid: false, validDetail: `服务不可达，未能校验（${health.detail ?? '未知原因'}）` };
+  }
+  const r = await adminCall(memory, rootKey, 'GET', '/api/v1/system/status');
+  return {
+    ok: true,
+    key: rootKey,
+    source,
+    valid: r.ok,
+    ...(r.ok ? {} : { validDetail: `校验未通过：HTTP ${r.status}${r.message ? `（${r.message}）` : ''}——这把密钥与服务端不匹配` }),
+  };
+}
 
 export interface RevealResult { ok: boolean; key?: string; error?: string }
 
@@ -440,7 +531,7 @@ export async function deleteMemoryUser(config: BridgeConfig, uid: string): Promi
   if (!memory) return { ok: false, detail: 'memory 段未配置' };
   const rootKey = resolveRootKey(memory);
   if (!rootKey) return { ok: false, detail: 'root key 未配置' };
-  const account = memory.account ?? 'lcb';
+  const account = memoryAccount(memory);
   // 备份前置：打包失败绝不删除（磁盘明文数据是唯一正本）
   let backupPath: string | undefined;
   try {

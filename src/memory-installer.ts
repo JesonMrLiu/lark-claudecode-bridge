@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { parseDocument } from 'yaml';
 import type { BridgeConfig, MemoryConfig, MemoryModelConfig } from './types.js';
-import { probeMemoryHealth, MEMORY_PLUGIN_NAME, memoryEndpoint } from './memory.js';
+import { probeMemoryHealth, MEMORY_PLUGIN_NAME, memoryAccount, memoryEndpoint } from './memory.js';
 
 /** 服务默认 pin 版本（实测环境；memory.version 可覆盖） */
 export const DEFAULT_OPENVIKING_PIN = '0.5.0';
@@ -347,7 +347,8 @@ function isLcbClientConfShape(v: unknown): v is Record<string, string> {
  *  值：保证直连场景 identity 非空 → 插件判 trusted header 身份（dev 模式服务可用）；留空会被
  *  判成 api_key 模式而 401 */
 export function renderOvcliConf(memory: Pick<MemoryConfig, 'endpoint' | 'account'>): Record<string, string> {
-  return { url: memoryEndpoint(memory), account: memory.account ?? 'lcb', user: memory.account ?? 'lcb' };
+  const account = memoryAccount(memory);
+  return { url: memoryEndpoint(memory), account, user: account };
 }
 
 /** 写/刷新客户端配置（幂等可重跑）。决策表：
@@ -440,9 +441,10 @@ const SLOW_START_MAX_MS = 600_000;
 /** launchManagedAndWait 的结果：ready=就绪；crashed=进程已放弃（崩溃超限/被停）；二者皆否 = 慢启动 */
 export interface LaunchOutcome { ready: boolean; crashed: boolean; detail: string; port: number }
 
-async function launchManagedAndWait(bin: string, confPath: string, port: number, external = false): Promise<LaunchOutcome> {
+async function launchManagedAndWait(bin: string, confPath: string, port: number, external = false, opts: { budgetRounds?: number } = {}): Promise<LaunchOutcome> {
+  const budget = opts.budgetRounds ?? PROBE_BUDGET_ROUNDS;
   spawnManaged(bin, confPath, port);
-  for (let i = 1; i <= PROBE_BUDGET_ROUNDS; i++) {
+  for (let i = 1; i <= budget; i++) {
     await new Promise((r) => setTimeout(r, 1000));
     const h = await probeMemoryHealth(`http://127.0.0.1:${port}`, 1500);
     if (h.healthy) {
@@ -459,7 +461,7 @@ async function launchManagedAndWait(bin: string, confPath: string, port: number,
   }
   if (managed) {
     // 预算耗尽但进程存活：绝不杀进程（调用方转后台续等）
-    return { ready: false, crashed: false, port, detail: `探活预算（${PROBE_BUDGET_ROUNDS} 秒）内未见就绪，服务进程仍在运行，转后台继续等待` };
+    return { ready: false, crashed: false, port, detail: `探活预算（${budget} 秒）内未见就绪，服务进程仍在运行，转后台继续等待` };
   }
   return { ready: false, crashed: true, port, detail: `服务进程在等待期间退出。最近输出：\n${managedRecentOutput() || '（无输出）'}` };
 }
@@ -515,7 +517,7 @@ async function finishStartTail(opts: { configPath: string }, port: number, exter
   set('plugin', 'running');
   const pl = await stepPlugin({
     endpoint: `http://127.0.0.1:${port}`,
-    account: await memoryAccount(opts.configPath),
+    account: await readMemoryAccount(opts.configPath),
   });
   set('plugin', pl.skipped ? 'skipped' : 'done', pl.detail);
   if (pl.writeback) {
@@ -607,6 +609,126 @@ export async function runStartPipeline(opts: { configPath: string }): Promise<In
     finalizeInstallState(steps, e);
     return installState;
   }
+}
+
+// ============ 启动自举（LCB 启动时自动拉起受管记忆服务） ============
+
+/**
+ * 自举结果（控制台分步提示 + 配置页状态区展示共用）。ready=false 一律**不阻断 LCB**：
+ * 记忆是增强能力，桥接器本体必须在任何记忆故障下照常服务（与「记忆不可用不阻断机器人」同基调）。
+ * hint 是给用户的下一步指引——自举失败时页面/控制台直接展示「去哪手动起」，不必自己猜。
+ */
+export interface MemoryAutoStartReport {
+  at: string;
+  trigger: 'lcb-start';
+  ready: boolean;
+  /** 本次是否真的拉起了进程（false=已在跑/远程模式/未安装/失败） */
+  started: boolean;
+  detail: string;
+  hint?: string;
+}
+
+let autoStartReport: MemoryAutoStartReport | undefined;
+
+/** 最近一次启动自举结果（配置页状态区展示源；从未自举过则 undefined） */
+export function getMemoryAutoStartReport(): MemoryAutoStartReport | undefined {
+  return autoStartReport;
+}
+
+/** endpoint 是否指向本机回环（远程服务 LCB 不代管拉起） */
+function isLoopbackEndpoint(endpoint: string): boolean {
+  try {
+    const h = new URL(endpoint).hostname;
+    return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '0.0.0.0';
+  } catch { return false; }
+}
+
+/**
+ * 启动自举：LCB 启动时确保受管 OpenViking 服务在跑（embedded + 本机回环才代管）。
+ * 设计约束（三条，缺一不可）：
+ *  ① **绝不阻断启动**：任何失败/超时都只产出 report（ready=false + hint），由调用方打印提示；
+ *  ② **有界等待**：前台最多等 foregroundMs（默认 60s），超时但进程存活 → 转后台续等
+ *     （waitSlowStart），既不空等也不杀进程；崩溃 → 立刻失败并附最近输出；
+ *  ③ **幂等**：已在跑（含外部自管服务占用同一端口且健康）直接 skipped，重启 LCB 无副作用。
+ * 不碰插件接入（stepPlugin 属安装/启动流水线语义）：插件缺失由配置页「检查修复」补齐，
+ * 启动自举只负责「服务在不在」这一件事，避免启动路径被 npm/marketplace 安装拖住。
+ */
+export async function ensureMemoryServiceRunning(opts: {
+  endpoint: string;
+  mode?: string;
+  trigger?: 'lcb-start';
+  foregroundMs?: number;
+}): Promise<MemoryAutoStartReport> {
+  const trigger = opts.trigger ?? 'lcb-start';
+  const foregroundMs = opts.foregroundMs ?? 60_000;
+  const finish = (r: Omit<MemoryAutoStartReport, 'at' | 'trigger'>): MemoryAutoStartReport => {
+    autoStartReport = { at: new Date().toISOString(), trigger, ...r };
+    return autoStartReport;
+  };
+  // 远程模式：只探活不代管（拉起别人的服务是越权）
+  if ((opts.mode ?? 'embedded') !== 'embedded' || !isLoopbackEndpoint(opts.endpoint)) {
+    const h = await probeMemoryHealth(opts.endpoint, 2000);
+    return finish({
+      ready: h.healthy,
+      started: false,
+      detail: h.healthy
+        ? `远程记忆服务正常：${opts.endpoint}`
+        : `远程记忆服务不可达：${h.detail ?? '未知原因'}（LCB 不代管拉起外部服务）`,
+      ...(h.healthy ? {} : { hint: '请自行确认远程记忆服务已启动；本机地址与端口见 config.yaml 的 memory.endpoint' }),
+    });
+  }
+  // 已健康（含用户手工起的外部实例）→ 幂等跳过
+  const before = await probeMemoryHealth(opts.endpoint, 2000);
+  if (before.healthy) {
+    return finish({ ready: true, started: false, detail: `服务已在运行：${opts.endpoint}${before.authMode ? `（${before.authMode} 模式）` : ''}` });
+  }
+  // 定位二进制与配置（与启动流水线 ① 同款判定，缺任一即给「检查修复」指引）
+  const uv = await detectUv();
+  const bin = uv ? await resolveServerBin(uv) : null;
+  if (!bin) {
+    return finish({
+      ready: false, started: false,
+      detail: `服务未运行，且未检测到 OpenViking 运行时（openviking-server）：${before.detail ?? '端口无监听'}`,
+      hint: '请到配置页「记忆增强 → 检查修复」补装运行时与服务',
+    });
+  }
+  const confPath = existsSync(MANAGED_OV_CONF) ? MANAGED_OV_CONF
+    : existsSync(EXTERNAL_OV_CONF) ? EXTERNAL_OV_CONF : undefined;
+  if (!confPath) {
+    return finish({
+      ready: false, started: false,
+      detail: `服务未运行，且未找到服务配置（ov.conf）：${before.detail ?? '端口无监听'}`,
+      hint: '请到配置页「记忆增强」填好模型三件套并保存（生成 ov.conf），再点「检查修复」',
+    });
+  }
+  const external = confPath === EXTERNAL_OV_CONF;
+  const port = readConfPort(confPath);
+  // 受管实例仍在但探不通（假活）→ 先回收再拉起，避免端口占用导致新进程秒退
+  if (managed && !managed.stopped) {
+    stopManagedServer();
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  const r = await launchManagedAndWait(bin, confPath, port, external, { budgetRounds: Math.max(5, Math.ceil(foregroundMs / 1000)) });
+  if (r.ready) {
+    return finish({
+      ready: true, started: true,
+      detail: `已拉起受管记忆服务：http://127.0.0.1:${port}${external ? '（外部 ov.conf，LCB 仅代为拉起、不改写）' : ''}`,
+    });
+  }
+  if (r.crashed) {
+    return finish({
+      ready: false, started: true,
+      detail: `自动拉起失败（服务进程已退出）：${r.detail}`,
+      hint: '请到配置页「记忆增强」检查模型三件套与 ov.conf，或点「检查修复」查看完整安装流水线',
+    });
+  }
+  // 慢启动：进程活着只是还没就绪 → 后台续等，不红叉、不杀进程；后续签发由调用方重试兜上
+  void waitSlowStart(r.port, () => { /* 后台续等进度不进控制台（启动已结束），页面轮询 install 状态即可见 */ });
+  return finish({
+    ready: false, started: true,
+    detail: `记忆服务正在启动（冷启动超过 ${Math.round(foregroundMs / 1000)} 秒，进程仍在运行，已转入后台等待）`,
+    hint: '通常 1-3 分钟内就绪；若长时间未起，请到配置页「记忆增强」查看受管服务输出',
+  });
 }
 
 function spawnManaged(bin: string, confPath: string, port: number): void {
@@ -1041,9 +1163,9 @@ export function writeBackConfig(configPath: string, wb: MemoryWriteback, pluginP
 
 // ============ 主流水线 ============
 
-/** 读 config.yaml 的 memory.account（懒加载；损坏配置降级 undefined → 渲染取缺省 'lcb'）。
+/** 读 config.yaml 的 memory.account（懒加载；损坏配置降级 undefined → 调用方取缺省 default）。
  *  两条流水线原本不读 config.yaml（只有 configPath），stepPlugin 落 ovcli.conf 时需要它 */
-async function memoryAccount(configPath: string): Promise<string | undefined> {
+async function readMemoryAccount(configPath: string): Promise<string | undefined> {
   try {
     const { loadConfig } = await import('./config.js');
     return loadConfig(configPath).memory?.account;
@@ -1067,7 +1189,7 @@ async function finishInstallTail(opts: InstallOptions, port: number, firstInstal
   set('plugin', 'running');
   const pl = await stepPlugin({
     endpoint: `http://127.0.0.1:${port}`,
-    account: await memoryAccount(opts.configPath),
+    account: await readMemoryAccount(opts.configPath),
   });
   set('plugin', pl.skipped ? 'skipped' : 'done', pl.detail);
   // ⑥ 回写 config.yaml——全链成功才落盘（半成品不污染用户配置）：endpoint / mode=embedded /

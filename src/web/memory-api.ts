@@ -7,7 +7,7 @@ import {
   DEFAULT_MEMORY_ENDPOINT, MEMORY_PLUGIN_NAME, memoryEndpoint, probeMemoryHealth,
 } from '../memory.js';
 import {
-  EXTERNAL_OV_CONF, MANAGED_OV_CONF, OVCLI_CONF, classifyClientConf, detectUv, isManagedRunning, locateMemoryPlugin, managedStartedAt, resolveServerBin,
+  EXTERNAL_OV_CONF, MANAGED_OV_CONF, OVCLI_CONF, classifyClientConf, detectUv, getMemoryAutoStartReport, isManagedRunning, locateMemoryPlugin, managedStartedAt, resolveServerBin,
 } from '../memory-installer.js';
 import { maskSecret } from './config-api.js';
 
@@ -35,6 +35,9 @@ async function detectInstallSummary(): Promise<Record<string, unknown>> {
     managedRunning: isManagedRunning(),
     // 受管实例本次拉起时间（前端「运行时间」展示源；外部自管服务无从得知，不输出）
     ...(isManagedRunning() ? { managedSince: managedStartedAt() } : {}),
+    // 最近一次「随 LCB 启动自动拉起记忆服务」的结果（自举失败时前端展示手动开启指引，
+    // 免去用户对着「服务未运行」猜该去哪点）
+    ...(getMemoryAutoStartReport() ? { autoStart: getMemoryAutoStartReport() } : {}),
   };
 }
 
