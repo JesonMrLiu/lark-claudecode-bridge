@@ -504,6 +504,13 @@ export class FeishuGateway {
     return { paths, failures };
   }
 
+  /** 飞书 REST 只读请求口（web 层会话记录页拉群名/会话类型专用，经 gateway-registry 注册暴露）。
+   *  能力面收在 request 一个方法：不新增凭证出口、不影响既有发消息通道 */
+  feishuRequest(payload: { method: string; url: string; params?: Record<string, unknown> }):
+    Promise<{ code?: number; msg?: string; data?: Record<string, unknown> }> {
+    return this.client.request(payload);
+  }
+
   /**
    * 拉取回复链上游消息文本（#5）：用户回复某条消息时把上游最多 3 条消息文本一并拼进 prompt。
    * SDK 1.73.0 未封装 im.message.get（只有 list/create/patch/delete），经 Client.request 调

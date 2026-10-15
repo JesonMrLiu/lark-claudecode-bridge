@@ -33,6 +33,7 @@ import { bridgeStatus, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDeta
 import { getAutostartStatus, setAutostartEnabled } from './autostart.js';
 import { checkUpdate, hasNewerVersion, installMode, runUpdate } from './update.js';
 import { memoryStatus, testMemoryConnection } from './memory-api.js';
+import { chatsTree, chatTopics, chatTimeline } from './chats-api.js';
 import {
   deleteMemoryUser, initMemoryUsers, listMemoryUsers, resetUserKey, revealRootKey, revealUserKey,
 } from './memory-users-api.js';
@@ -424,6 +425,28 @@ async function handle(
     } catch (e) {
       return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
     }
+  }
+  // ---- 会话记录（只读查看器）：LCB 本地 transcripts 时间线 + 话题聚合 + 飞书真群名 ----
+  if (path === '/api/chats/tree' && req.method === 'GET') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先完成 bootstrap 向导' });
+    try {
+      return json(res, 200, await chatsTree(ctx.configPath));
+    } catch (e) {
+      return json(res, 500, { error: `会话树扫描失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+  if (path === '/api/chats/topics' && req.method === 'GET') {
+    return json(res, 200, chatTopics(url.searchParams.get('app') ?? '', url.searchParams.get('chat') ?? ''));
+  }
+  if (path === '/api/chats/timeline' && req.method === 'GET') {
+    const q = (k: string) => url.searchParams.get(k) ?? undefined;
+    const limit = Number(q('limit'));
+    return json(res, 200, chatTimeline(q('app') ?? '', q('chat') ?? '', {
+      date: q('date'),
+      session: q('session'),
+      user: q('user'),
+      ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+    }));
   }
   // ---- B3 一键安装（§6.7 嵌入式流水线）：后台执行 + 进度轮询；失败步骤可整链重跑（幂等跳过） ----
   if (path === '/api/memory/install' && req.method === 'POST') {

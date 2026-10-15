@@ -8,6 +8,7 @@ import { renderBootstrap } from './bootstrap.js';
 import { page as pOverview } from './pages/overview.js';
 import { page as pApps } from './pages/apps.js';
 import { page as pWorkspaces } from './pages/workspaces.js';
+import { page as pChats } from './pages/chats.js';
 import { page as pClaude } from './pages/claude.js';
 import { page as pPermissions } from './pages/permissions.js';
 import { page as pSlash } from './pages/slash.js';
@@ -16,7 +17,7 @@ import { page as pSkills } from './pages/skills.js';
 import { page as pMcp } from './pages/mcp.js';
 import { page as pMemory } from './pages/memory.js';
 
-const PAGES = [pOverview, pApps, pWorkspaces, pClaude, pPermissions, pSlash, pPlugins, pSkills, pMcp, pMemory];
+const PAGES = [pOverview, pApps, pWorkspaces, pChats, pClaude, pPermissions, pSlash, pPlugins, pSkills, pMcp, pMemory];
 const pageById = new Map(PAGES.map((p) => [p.id, p]));
 const DEFAULT_TAB = 'overview';
 

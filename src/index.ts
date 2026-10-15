@@ -15,6 +15,7 @@ import { startWebServer } from './web/server.js';
 import { clearPidFile, writePidFile, stopExistingBridgeAndWait } from './web/lifecycle.js';
 import { AccessControl } from './access/access-control.js';
 import { FeishuGateway } from './gateway/feishu-gateway.js';
+import { registerChatInfoSource } from './gateway/gateway-registry.js';
 import { ProgressCard, feishuErrorBody } from './gateway/progress-card.js';
 import {
   DECISION_TEXT,
@@ -1638,6 +1639,8 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
         if (ev.kind !== 'redact') console.warn(tag, '[安全事件]', ev.kind);
       },
     });
+    // web 配置页「会话记录」拉真群名/会话类型用（进程内注册表；lcb ui 独立进程查无来源 → 自动降级）
+    registerChatInfoSource(app.appId, { request: (p) => gateway.feishuRequest(p) });
     const deps: BridgeDeps = {
       gateway: {
         start: (h) => gateway.start(h),
