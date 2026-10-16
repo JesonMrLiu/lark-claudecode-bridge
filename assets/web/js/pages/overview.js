@@ -1,7 +1,7 @@
 // ============ 概览 ============
 // 桥接器启停 / 版本更新（宿主进程管理：embedded 页面随进程生死，独立页面经 PID 跨进程操作）
 import { S, $, esc, toast, api, refresh } from '../core.js';
-import { bindDialogKeys, confirmDialog, mountDialog, progressDialog } from '../ui.js';
+import { bindDialogKeys, confirmDialog, mountDialog, progressDialog, stepsDialog } from '../ui.js';
 // larkNotConfigured 与后端 needsLarkCliConfig 同源（detail 含 not_configured 即「未配置应用」），
 // 判定只有一份、放在弹窗模块里，避免两处漂移
 import { larkNotConfigured, openLarkCliDeviceDialog } from './larkcli-device.js';
@@ -20,7 +20,6 @@ function showMask(inner) {
   m.innerHTML = `<div class="br-mask-card">${inner}</div>`;
   m.style.display = 'flex';
 }
-function hideMask() { const m = $('#brMask'); if (m) m.style.display = 'none'; }
 
 /** 启停请求的容错：embedded 停止/重启时进程退出可能先于响应到达，网络断开视为已受理 */
 async function bridgeActionSafe(op) {
@@ -31,20 +30,96 @@ async function bridgeActionSafe(op) {
   }
 }
 
-/** 等配置页服务恢复（重启轮询）：连续两次成功才确认，排除旧进程残影 */
-async function waitServerBack(timeoutMs = 45000) {
+/**
+ * 重启进度分步弹窗（两种运行模式统一）。步骤① LCB 重启（探测新进程上线），步骤② 记忆增强
+ * OpenViking（轮询自举状态/健康探活）——两步状态源不同、节奏不同，旧版单句遮罩 + 45s 超时
+ * 报错的做法在 OpenViking 冷启动（30-60s+）时必撞「重启超时」误报，整体重做：
+ * - LCB 自身恢复只取决于 LCB 本体（服务端已把配置页启动前移、记忆自举后台化）
+ * - 记忆增强**永不导致「重启失败」**：未就绪呈现为黄色警示 + 手动开启指引，弹窗可随时关闭
+ */
+async function restartFlow() {
+  const embedded = !!S.status?.embedded;
+  const oldPid = S.status?.bridge?.pid ?? null;
+  const st = [
+    { title: 'LCB 重启中', detail: '正在停止旧进程并拉起新进程…', status: 'running' },
+    { title: '记忆增强（OpenViking）', detail: '等待 LCB 重启完成后检测…', status: 'pending' },
+  ];
+  let stopped = false;
+  const dlg = stepsDialog({ title: '重启桥接器', steps: st });
+  // 关弹窗 = 后台运行：停轮询，稍后刷新概览状态（重启幂等，流程在桥接器侧继续不受影响）
+  dlg.onClose(() => { stopped = true; setTimeout(() => void refresh(), 3000); });
+  const paint = (i, patch) => { Object.assign(st[i], patch); dlg.setSteps(st.map((s) => ({ ...s }))); };
+
+  try { await bridgeActionSafe('restart'); }
+  catch (e) { paint(0, { status: 'failed', detail: e.message }); toast(e.message, true); return; }
+
+  // ---- 步骤①：等 LCB 回归。embedded：本页随进程失联，连续两次 /api/status 成功才算新进程
+  //（排除旧进程残影）；独立：本页不失联，等 PID 文件换新（bridge.running 且 pid 变化）。
+  // 超时不再报「重启失败」退出——如实呈现等待中 + 给手动刷新出口，弹窗保持观测
   const t0 = Date.now();
   await sleep(2500); // 留给旧进程退场：立刻探测可能命中尚未退出的旧 server
-  while (Date.now() - t0 < timeoutMs) {
-    try {
-      await api('GET', '/api/status');
-      await sleep(1000);
-      await api('GET', '/api/status');
-      return;
-    } catch {}
+  let streak = false;
+  let back = false;
+  while (!stopped && Date.now() - t0 < 120_000) {
+    const sec = Math.round((Date.now() - t0) / 1000);
+    let s = null;
+    try { s = await api('GET', '/api/status'); } catch { /* 失联窗口属预期 */ }
+    if (s) {
+      if (embedded) {
+        if (streak) { back = true; break; }
+        streak = true;
+        await sleep(1000); // 快速二次确认（旧实现同口径）
+        continue;
+      }
+      if (s.bridge?.running && (oldPid == null || s.bridge?.pid !== oldPid)) { back = true; break; }
+    } else if (embedded) streak = false;
+    paint(0, { detail: `已等 ${sec} 秒…（新进程上线即自动恢复）` });
     await sleep(1500);
   }
-  throw new Error('重启超时：请手动刷新页面查看状态');
+  if (stopped) return;
+  if (!back) {
+    paint(0, { status: 'failed', detail: '超过 120 秒未见新进程上线——可能端口占用等启动异常，请查看日志' });
+    dlg.setHint('<button class="btn sm" id="sdReload">手动刷新页面</button>');
+    document.querySelector('#sdReload').onclick = () => location.reload();
+    return;
+  }
+  paint(0, { status: 'done', detail: `LCB 已重启（用时 ${Math.round((Date.now() - t0) / 1000)} 秒）` });
+  toast('✅ LCB 已重启'); // 弹窗可能已被用户关掉（后台运行），toast 兜一条完成通知
+
+  // ---- 步骤②：记忆增强 OpenViking。embedded 轮询 /api/memory/status：enabled=false → 跳过；
+  // health 探活通过 → 就绪；自举 phase=starting → 实时「已等 N 秒」；phase=failed → 黄色警示
+  //（不红叉、不阻断——LCB 本体已正常，只是记忆增强没起来）。独立模式本页拿不到桥接器进程内
+  // 的自举报告，以 health 探活为准（新桥接器起来会自动拉起受管服务）。
+  paint(1, { status: 'running', detail: '正在检测记忆服务…' });
+  const MEM_POLL_MAX_MS = embedded ? 620_000 : 150_000; // embedded 与后端慢启动续等窗口（600s）对齐
+  const m0 = Date.now();
+  while (!stopped) {
+    let ms = null;
+    try { ms = await api('GET', '/api/memory/status'); } catch { /* 新进程刚回来时的空窗：静默重试 */ }
+    const sec = Math.round((Date.now() - m0) / 1000);
+    if (ms) {
+      if (ms.memory?.enabled === false) { paint(1, { status: 'skipped', detail: '未启用（config.yaml 的 memory.enabled=false）' }); break; }
+      if (ms.health?.healthy) { paint(1, { status: 'done', detail: `记忆服务已就绪：${ms.memory?.endpoint || ''}` }); break; }
+      const auto = embedded ? ms.install?.autoStart : undefined;
+      if (auto?.phase === 'failed') {
+        paint(1, { status: 'warn', detail: `${auto.detail}${auto.hint ? `。${auto.hint}` : ''}` });
+        break;
+      }
+      if (auto?.phase === 'starting') {
+        const waited = auto.at ? Math.max(0, Math.round((Date.now() - new Date(auto.at).getTime()) / 1000)) : sec;
+        paint(1, { detail: `${auto.detail}（已等 ${waited} 秒）` });
+      } else {
+        paint(1, { detail: embedded ? `检测记忆服务状态…（${sec} 秒）` : `等待桥接器拉起记忆服务…（已等 ${sec} 秒）` });
+      }
+    }
+    if (Date.now() - m0 > MEM_POLL_MAX_MS) {
+      paint(1, { status: 'warn', detail: '长时间未见就绪，请到「记忆增强」页查看服务状态或手动启动' });
+      break;
+    }
+    await sleep(2000);
+  }
+  dlg.setHint('本弹窗可随时关闭（后台运行），重启与记忆启动不受影响');
+  void refresh();
 }
 
 async function startFlow() {
@@ -75,20 +150,6 @@ async function stopFlow() {
       setTimeout(() => refresh(), 4000);
     }
   } catch (e) { toast(e.message, true); }
-}
-
-async function restartFlow() {
-  if (S.status?.embedded) {
-    showMask('<div class="br-spin"></div>正在重启桥接器，页面将自动恢复…');
-    try { await bridgeActionSafe('restart'); } catch (e) { hideMask(); toast(e.message, true); return; }
-    try { await waitServerBack(); hideMask(); toast('✅ 桥接器已重启'); await refresh(); }
-    catch (e) { hideMask(); toast(e.message, true); }
-  } else {
-    try { const r = await bridgeActionSafe('restart'); toast(r.message || '正在重启…'); }
-    catch (e) { toast(e.message, true); return; }
-    setTimeout(() => refresh(), 4000);
-    setTimeout(() => refresh(), 10000);
-  }
 }
 
 function renderUpdateResult() {

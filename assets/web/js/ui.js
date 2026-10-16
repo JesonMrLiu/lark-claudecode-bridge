@@ -305,6 +305,66 @@ export function progressDialog({ title = '执行中', note = '请稍候…', rep
   };
 }
 
+// ============ 分步进度弹窗（重启流程等真实状态驱动的串行步骤展示） ============
+/**
+ * 分步进度弹窗：步骤状态由调用方按**真实探测结果**驱动（区别于 progressDialog 的时间缓动
+ * 假进度），适合「LCB 重启 → 记忆增强启动」这类前后步骤状态源不同的流程。
+ * 视觉沿用记忆页安装流水线 stepper 的 badge 语言（✓/✗/spinner/序号圆），纵向排布。
+ *
+ * 可随时关闭是刻意设计：重启是幂等操作、记忆自举在桥接器进程内后台进行，关弹窗只是
+ * 停止**观看**，不影响流程本身——所以这里不做 progressDialog 那种「完成前禁关」。
+ *
+ * @param {string} opts.title 弹窗标题
+ * @param {Array<{title: string, detail?: string, status?: 'pending'|'running'|'done'|'failed'|'warn'|'skipped'}>} opts.steps 初始步骤
+ * @returns {{ setSteps(steps): void, setHint(html): void, onClose(fn): void, unmount(): void }}
+ *   setSteps 整体替换步骤并重绘；setHint 设置底部提示区（放「手动刷新」等动作）；
+ *   onClose 注册关闭回调（调用方停轮询/刷新状态）；unmount 直接销毁。
+ */
+export function stepsDialog({ title = '执行进度', steps = [] } = {}) {
+  const { mask, unmount } = mountDialog(`
+    <div class="modal dlg" role="dialog" aria-modal="true" style="width:min(520px,94vw)">
+      <div style="display:flex;align-items:center;gap:10px">
+        <b class="dlg-title" style="margin:0;flex:1">${esc(title)}</b>
+        <button class="btn sm" data-sd="close">后台运行</button>
+      </div>
+      <div data-sd="steps" style="display:flex;flex-direction:column;gap:6px;margin-top:14px"></div>
+      <div class="hint" data-sd="hint" style="margin-top:10px"></div>
+    </div>`);
+  const stepsEl = mask.querySelector('[data-sd="steps"]');
+  const hintEl = mask.querySelector('[data-sd="hint"]');
+  let onCloseFn = null;
+  // badge 视觉与 memory.js installStepsHtml 同源：done=绿✓ failed=红✗ running=spinner
+  // pending=序号圈；warn（黄!）为本组件扩展——「未就绪但不构成失败」（记忆增强不阻断语义）
+  const BADGE = {
+    done: '<span style="width:20px;height:20px;border-radius:50%;background:var(--ok-tx);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:11px;flex:0 0 auto">✓</span>',
+    failed: '<span style="width:20px;height:20px;border-radius:50%;background:var(--err-tx);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:11px;flex:0 0 auto">✗</span>',
+    warn: '<span style="width:20px;height:20px;border-radius:50%;background:var(--warn-tx);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:11px;flex:0 0 auto">!</span>',
+    running: '<span class="br-spin-sm" style="margin:0;flex:0 0 auto"></span>',
+    skipped: '<span style="width:20px;height:20px;border-radius:50%;background:var(--muted);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:11px;flex:0 0 auto">–</span>',
+  };
+  const paint = (list) => {
+    stepsEl.innerHTML = list.map((s) => {
+      const status = s.status || 'pending';
+      const badge = BADGE[status]
+        || `<span style="width:20px;height:20px;border-radius:50%;border:1.5px solid var(--muted);color:var(--muted);display:inline-flex;align-items:center;justify-content:center;font-size:11px;flex:0 0 auto">${list.indexOf(s) + 1}</span>`;
+      return `<div style="background:var(--off-bg);border-radius:10px;padding:10px 12px">
+        <div style="display:flex;align-items:center;gap:8px">${badge}<b style="font-size:12.5px">${esc(s.title)}</b></div>
+        <div class="hint" style="margin-top:5px;font-size:11px;line-height:1.55;word-break:break-all">${s.detail ? esc(s.detail) : '&nbsp;'}</div>
+      </div>`;
+    }).join('');
+  };
+  paint(steps);
+  const close = () => { unbind(); unmount(); onCloseFn?.(); };
+  const unbind = bindDialogKeys((k) => { if (k === 'Escape') close(); });
+  mask.querySelector('[data-sd="close"]').onclick = close;
+  return {
+    setSteps(list) { steps = list; paint(list); },
+    setHint(html) { hintEl.innerHTML = html || ''; },
+    onClose(fn) { onCloseFn = fn; },
+    unmount() { unbind(); unmount(); },
+  };
+}
+
 // ============ 可搜索多选字段（分身白名单等；仅限候选内选择，遗留值保留可删） ============
 /** 纯函数（可测）：候选过滤——大小写不敏感子串匹配 value+label+desc；>50 项截断（面板尾行提示） */
 export function filterMselOptions(options, query) {
