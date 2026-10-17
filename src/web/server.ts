@@ -373,7 +373,9 @@ async function handle(
       if ('error' in r) return json(res, 400, { error: r.error });
       return json(res, 200, r);
     }
-    const r = tailLogFile(configPath, url.searchParams.get('file') ?? '', Number(url.searchParams.get('lines')) || 500);
+    const file = url.searchParams.get('file');
+    if (!file) return json(res, 400, { error: '缺少查询参数：请传 from/to（日期范围）或 file（单文件名）' });
+    const r = tailLogFile(configPath, file, Number(url.searchParams.get('lines')) || 500);
     if ('error' in r) return json(res, 400, { error: r.error });
     return json(res, 200, r);
   }

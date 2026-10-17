@@ -535,49 +535,90 @@ async function renderAutostart() {
   paintAutostart(el, r);
 }
 
-// ============ 运行日志查看器（日期范围查询；后端按天聚合 ~/.lark-claudecode-bridge/logs/ 落盘日志） ============
+// ============ 运行日志查看器（快捷时间切换 + 截止天优先 + 关键字全范围检索） ============
 async function logViewer() {
   const pad2 = (n) => String(n).padStart(2, '0');
-  const dateStr = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-  const today = new Date();
-  const weekAgo = new Date(today.getTime() - 6 * 86_400_000);
+  const dpart = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  const tpart = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const at = (dayOffset, h, m) => { const d = new Date(); d.setDate(d.getDate() + dayOffset); d.setHours(h, m, 0, 0); return d; };
+  /** 快捷档 → [开始, 结束]（Date） */
+  const QUICKS = {
+    today: () => [at(0, 0, 0), at(0, 23, 59)],
+    yesterday: () => [at(-1, 0, 0), at(-1, 23, 59)],
+    week: () => [at(-6, 0, 0), at(0, 23, 59)],
+  };
   openDrawer({
     title: '运行日志',
     bodyHtml: `
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
-        <input type="date" id="lgFrom" value="${dateStr(weekAgo)}" style="width:145px;padding:5px 10px;font-size:12.5px">
+      <div class="subtabs" id="lgChips" style="margin-bottom:10px">
+        <button data-q="today" class="active">今天</button>
+        <button data-q="yesterday">昨天</button>
+        <button data-q="week">最近7天</button>
+        <button data-q="custom">自定义</button>
+      </div>
+      <div id="lgCustom" style="display:none;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <input type="datetime-local" id="lgFrom" style="width:210px;padding:5px 10px;font-size:12.5px">
         <span class="mut" style="font-size:12.5px">至</span>
-        <input type="date" id="lgTo" value="${dateStr(today)}" style="width:145px;padding:5px 10px;font-size:12.5px">
+        <input type="datetime-local" id="lgTo" style="width:210px;padding:5px 10px;font-size:12.5px">
         <button class="btn sm primary" id="lgQuery">查询</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px" title="勾选后显示所选时间范围内的全部日志；默认只显示截止那天的日志"><input type="checkbox" id="lgAll"> 显示整个范围</label>
         <select id="lgLevel" style="width:auto;padding:5px 10px;font-size:12.5px">
           <option value="all">全部级别</option>
           <option value="INFO">Info</option>
           <option value="WARN">Warn</option>
           <option value="ERROR">Error</option>
         </select>
-        <input type="search" id="lgQ" placeholder="关键字过滤…" style="width:170px;padding:5px 10px;font-size:12.5px">
+        <input type="search" id="lgQ" placeholder="关键字（在时间范围内检索）…" style="width:200px;padding:5px 10px;font-size:12.5px">
         <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px"><input type="checkbox" id="lgAuto" checked> 自动滚动</label>
         <span style="flex:1"></span>
         <button class="btn sm" id="lgRefresh">↻ 刷新</button>
         <button class="btn sm" id="lgCopy">复制</button>
         <button class="btn sm" id="lgDownload">下载</button>
       </div>
-      <pre id="lgView" style="background:#0d1117;color:#c9d4e6;border:1px solid var(--border);border-radius:10px;padding:14px 16px;font-family:var(--mono);font-size:12px;line-height:1.8;overflow:auto;max-height:calc(100vh - 320px);white-space:pre-wrap;word-break:break-all;margin:0">加载中…</pre>
-      <div class="mini-note" style="margin-top:8px" id="lgNote">日志按天落盘于 <code>~/.lark-claudecode-bridge/logs/</code>（14 天前自动清理）；默认展示最近 7 天，级别与关键字过滤仅影响当前视图。</div>`,
+      <pre id="lgView" style="background:#0d1117;color:#c9d4e6;border:1px solid var(--border);border-radius:10px;padding:14px 16px;font-family:var(--mono);font-size:12px;line-height:1.8;overflow:auto;max-height:calc(100vh - 340px);white-space:pre-wrap;word-break:break-all;margin:0">加载中…</pre>
+      <div class="mini-note" style="margin-top:8px" id="lgNote">默认只显示截止那天的日志；输入关键字或勾选「显示整个范围」时才检索所选范围（最多 7 天）。日志按天落盘于 <code>~/.lark-claudecode-bridge/logs/</code>，14 天前自动清理。</div>`,
     footHtml: `<span class="sp"></span><button class="btn" id="lgClose">关闭</button>`,
   });
   $('#lgClose').onclick = closeDrawer;
   const lvlColor = (l) => (l === 'ERROR' ? '#ff8f94' : l === 'WARN' ? '#ffb45e' : '#7d8aa5');
-  let lines = [];
+  /** 行首日期（YYYY-MM-DD）/ 时刻，解析失败返回 null（该行只受关键字/级别过滤） */
+  const lineDay = (t) => t.match(/^(\d{4}-\d{2}-\d{2})/)?.[1] || null;
+  const lineTime = (t) => {
+    const m = t.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
+    return m ? new Date(`${m[1]}T${m[2]}`).getTime() : null;
+  };
+  let allLines = [];     // 后端返回的时间范围内的全部行（按时间序）
+  let rangeFrom = null;  // Date
+  let rangeTo = null;    // Date
 
-  const paintView = () => {
+  /** 视图行 = 时间窗（默认只显截止天）∩ 级别 ∩ 关键字 */
+  const viewLines = () => {
     const lv = $('#lgLevel').value;
     const q = $('#lgQ').value.trim().toLowerCase();
-    const rows = lines.filter((t) => {
-      const m = t.match(/\b(ERROR|WARN|INFO|DEBUG)\b/);
-      const level = m ? m[1] : 'INFO';
-      return (lv === 'all' || level === lv) && (!q || t.toLowerCase().includes(q));
-    });
+    const wantAll = $('#lgAll').checked || !!q;
+    const fromMs = rangeFrom?.getTime();
+    const toMs = rangeTo?.getTime();
+    const toDay = rangeTo ? dpart(rangeTo) : '';
+    const timeOk = (t) => {
+      if (wantAll) {
+        if (fromMs != null) { const ts = lineTime(t); if (ts != null && ts < fromMs) return false; }
+        if (toMs != null) { const ts = lineTime(t); if (ts != null && ts > toMs) return false; }
+        return true;
+      }
+      // 默认：只看截止那天（且不超过结束时刻）
+      if (toDay && lineDay(t) !== toDay) return false;
+      if (toMs != null) { const ts = lineTime(t); if (ts != null && ts > toMs) return false; }
+      return true;
+    };
+    return allLines.filter((t) => timeOk(t)
+      && ((lv === 'all' || (t.match(/\b(ERROR|WARN|INFO|DEBUG)\b/)?.[1] || 'INFO') === lv))
+      && (!q || t.toLowerCase().includes(q)));
+  };
+
+  const paintView = () => {
+    const rows = viewLines();
     $('#lgView').innerHTML = (rows.length ? rows : ['（无匹配日志行）']).map((t) => {
       const m = t.match(/\b(ERROR|WARN|INFO|DEBUG)\b/);
       const level = m ? m[1] : 'INFO';
@@ -587,41 +628,78 @@ async function logViewer() {
     }).join('\n');
     if ($('#lgAuto').checked) { const v = $('#lgView'); v.scrollTop = v.scrollHeight; }
   };
+
+  const setNote = (extra) => {
+    const q = $('#lgQ').value.trim();
+    const wantAll = $('#lgAll').checked;
+    const span = rangeFrom && rangeTo ? `${dpart(rangeFrom)} ${tpart(rangeFrom)} ~ ${dpart(rangeTo)} ${tpart(rangeTo)}` : '';
+    $('#lgNote').innerHTML = `范围 ${esc(span)}；当前显示：${q ? '关键字命中的整个范围' : wantAll ? '整个范围' : '截止那天'}（${allLines.length} 行已载入${extra ? `，${extra}` : ''}）`;
+  };
+
   const loadRange = async () => {
-    const from = $('#lgFrom').value;
-    const to = $('#lgTo').value;
-    if (!from || !to) { $('#lgView').textContent = '请选择开始与结束日期'; return; }
+    const fromV = $('#lgFrom').value;
+    const toV = $('#lgTo').value;
+    if (!fromV || !toV) { $('#lgView').textContent = '请选择开始与结束时间'; return; }
+    const from = new Date(fromV);
+    const to = new Date(toV);
+    if (to < from) { $('#lgView').textContent = '结束时间不能早于开始时间'; return; }
+    if ((dpart(to) - dpart(from)) / 86_400_000 > 6) {
+      $('#lgView').textContent = '抱歉，最多只能搜索7天范围内日志，请重新选择时间';
+      return;
+    }
     $('#lgView').textContent = '加载中…';
     try {
-      const r = await api('GET', `/api/logs/content?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&lines=2000`);
-      lines = r.lines || [];
-      $('#lgNote').innerHTML = `已并入 ${r.files.length} 天日志（${esc(r.files[0] || '')}${r.files.length > 1 ? ` ~ ${esc(r.files[r.files.length - 1] || '')}` : ''}）${r.truncated ? '，日志量大仅显示末尾部分' : ''}；级别与关键字过滤仅影响当前视图。`;
+      const r = await api('GET', `/api/logs/content?from=${encodeURIComponent(dpart(from))}&to=${encodeURIComponent(dpart(to))}&lines=2000`);
+      allLines = r.lines || [];
+      rangeFrom = from;
+      rangeTo = to;
+      setNote(`${r.files.length} 个日志文件${r.truncated ? '，日志量大仅显示末尾部分' : ''}`);
       paintView();
     } catch (e) {
-      lines = [];
+      allLines = [];
       $('#lgView').textContent = `加载失败：${e.message}`;
     }
   };
+
+  /** 快捷档：设置起止时间并立即查询 */
+  const applyQuick = (key) => {
+    let from; let to;
+    if (key === 'custom') {
+      $('#lgCustom').style.display = 'flex';
+      return; // 自定义等手动改完点「查询」
+    }
+    $('#lgCustom').style.display = 'none';
+    [from, to] = QUICKS[key]();
+    $('#lgFrom').value = `${dpart(from)}T${tpart(from)}`;
+    $('#lgTo').value = `${dpart(to)}T${tpart(to)}`;
+    void loadRange();
+  };
+
+  $('#lgChips').querySelectorAll('button').forEach((b) => {
+    b.onclick = () => {
+      $('#lgChips').querySelectorAll('button').forEach((x) => x.classList.toggle('active', x === b));
+      applyQuick(b.dataset.q);
+    };
+  });
+  $('#lgQuery').onclick = () => void loadRange();
   $('#lgLevel').onchange = paintView;
   $('#lgQ').oninput = paintView;
+  $('#lgAll').onchange = () => { paintView(); setNote(); };
   $('#lgAuto').onchange = paintView;
-  $('#lgQuery').onclick = () => void loadRange();
   $('#lgRefresh').onclick = () => void loadRange();
-  $('#lgFrom').onchange = () => void loadRange();
-  $('#lgTo').onchange = () => void loadRange();
   $('#lgCopy').onclick = async () => {
-    try { await navigator.clipboard.writeText(lines.join('\n')); toast('日志已复制到剪贴板'); }
+    try { await navigator.clipboard.writeText(viewLines().join('\n')); toast('当前视图日志已复制到剪贴板'); }
     catch { toast('复制失败（浏览器剪贴板权限）', true); }
   };
   $('#lgDownload').onclick = () => {
-    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const blob = new Blob([viewLines().join('\n')], { type: 'text/plain;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `lcb-logs-${$('#lgFrom').value || 'start'}-${$('#lgTo').value || 'end'}.log`;
+    a.download = `lcb-logs-${($('#lgFrom').value || 'start').replace(/[:T]/g, '')}-${($('#lgTo').value || 'end').replace(/[:T]/g, '')}.log`;
     a.click();
     URL.revokeObjectURL(a.href);
   };
-  await loadRange();
+  applyQuick('today'); // 默认今天
 }
 
 // ============ 页面 ============
@@ -686,7 +764,7 @@ export const page = {
       })}
     </div>
 
-    <div class="grid2" style="gap:16px;align-items:stretch">
+    <div class="grid2" style="gap:16px;align-items:stretch;margin-bottom: 16px;">
       <div class="panel" style="margin:0">
         <header class="panel-head"><h3>LCB 桥接器 · 版本与更新</h3>
           <div class="panel-actions" id="updLatest"><span class="hint">未检查</span></div>
@@ -717,7 +795,7 @@ export const page = {
       </div>
     </div>
 
-    <div class="panel" style="margin-top:16px">
+    <div class="panel">
       <header class="panel-head"><h3>飞书快捷指令</h3>
         <div class="panel-actions"><button class="btn sm" data-go="slash">管理命令 →</button></div>
       </header>

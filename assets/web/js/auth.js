@@ -40,6 +40,21 @@ export function lockPage() {
   setTimeout(() => $('#lockPwd').focus(), 60);
 }
 
+/** 解锁成功后的统一入口：via='password'（输密码登录，仍默认密码时弹引导）| 'session'（会话恢复免密） */
+async function finishUnlock(meta, via) {
+  AUTH.unlocked = true;
+  AUTH.everUnlocked = true;
+  AUTH.isDefault = !!meta.isDefault;
+  AUTH.lockMinutes = Number(meta.lockMinutes) || 0;
+  AUTH.lastActive = Date.now();
+  $('#lockMask').hidden = true;
+  $('#lockBtn').hidden = false;
+  $('#settingsBtn').hidden = false;
+  await onUnlockCb?.();
+  // 改密引导只在「输密码登录」时弹：会话恢复的刷新不重复打扰（主人反馈：免密本就是为了少打扰）
+  if (AUTH.isDefault && via === 'password') openPwdModal(true);
+}
+
 async function tryUnlock() {
   const pwd = $('#lockPwd').value;
   if (!pwd) { $('#lockErr').textContent = '请输入密码'; return; }
@@ -47,18 +62,9 @@ async function tryUnlock() {
   btn.disabled = true;
   try {
     const r = await api('POST', '/api/auth/verify', { password: pwd });
-    AUTH.unlocked = true;
-    AUTH.everUnlocked = true;
-    AUTH.isDefault = !!r.isDefault;
-    AUTH.lockMinutes = Number(r.lockMinutes) || 0;
     AUTH.enteredPwd = pwd;
-    AUTH.lastActive = Date.now();
-    $('#lockMask').hidden = true;
-    $('#lockBtn').hidden = false;
-    $('#settingsBtn').hidden = false;
     $('#lockPwd').value = '';
-    await onUnlockCb?.();
-    if (AUTH.isDefault) openPwdModal(true);
+    await finishUnlock(r, 'password');
   } catch (e) {
     // 旧进程（页面新、API 旧）：/api/auth/* 不存在 → 404「未知端点」，锁死前先讲清楚
     $('#lockErr').textContent = /未知端点/.test(e.message)
@@ -179,7 +185,7 @@ export async function openSettingsModal() {
   };
 }
 
-/** main.js 启动时调用一次：绑锁屏交互 + 无操作看门狗 + 进页即锁 */
+/** main.js 启动时调用一次：绑锁屏交互 + 无操作看门狗 + 会话恢复（免密） */
 export function initAuth({ onUnlock }) {
   onUnlockCb = onUnlock || null;
   $('#lockUnlock').onclick = () => void tryUnlock();
@@ -199,5 +205,13 @@ export function initAuth({ onUnlock }) {
       toast('已因长时间无操作自动锁屏，请重新输入密码', true);
     }
   }, 30000);
-  lockPage(); // 进页即锁：每次进入配置页都需输入密码
+  // 先盖锁屏（防内容闪烁），再静默恢复会话：服务端会话有效（未超时/未锁屏吊销）→ 直接进入免密；
+  // 无效（首次 / 自动锁屏后 / 手动锁屏后）→ 留在锁屏等输入。锁屏遮罩先出后撤，闪屏可忽略
+  lockPage();
+  void (async () => {
+    try {
+      const meta = await api('GET', '/api/auth/meta');
+      await finishUnlock(meta, 'session');
+    } catch { /* 无会话：留在锁屏（正常路径） */ }
+  })();
 }

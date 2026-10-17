@@ -10,8 +10,8 @@ const LOG_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.log$/;
 const RANGE_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 /** 尾读切块上限：超过就只读文件末尾这一段（首行可能被截断，标记 truncated 丢弃） */
 const TAIL_WINDOW_BYTES = 1_500_000;
-/** 日期范围查询的防呆上限 */
-const RANGE_MAX_DAYS = 31;
+/** 日期范围查询的防呆上限（主人拍板：最多搜 7 天，跨天全量检索代价高且很少需要） */
+const RANGE_MAX_DAYS = 7;
 /** 单文件在范围查询里的行数配额（避免单日巨日志吃光总量配额） */
 const RANGE_PER_FILE_LINES = 1000;
 
@@ -112,7 +112,9 @@ export function tailLogRange(configPath: string, from: string, to: string, maxLi
   const endMs = new Date(`${to}T00:00:00`).getTime();
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return { error: '日期不合法' };
   if (endMs < startMs) return { error: '结束日期不能早于开始日期' };
-  if ((endMs - startMs) / 86_400_000 > RANGE_MAX_DAYS - 1) return { error: `日期范围最多 ${RANGE_MAX_DAYS} 天` };
+  if ((endMs - startMs) / 86_400_000 > RANGE_MAX_DAYS - 1) {
+    return { error: `抱歉，最多只能搜索 ${RANGE_MAX_DAYS} 天范围内日志，请重新选择时间` };
+  }
   const limit = Number.isFinite(maxLines) ? Math.min(Math.max(Math.floor(maxLines), 1), 5000) : 2000;
 
   const dir = resolve(logsDirOf(configPath));

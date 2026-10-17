@@ -11,11 +11,13 @@ const ST = {
   bots: [],            // /api/chats/tree
   app: '', chat: '',   // 当前选中通道
   users: [], dates: [],// 当前通道筛选项（来自树）
-  nameByUser: {},      // userId → 显示名（access 人名，兜底尾号）
+  nameByUser: {},      // userId → 显示名（access 人名 + 飞书解析名，兜底尾号）
   topics: [],          // /api/chats/topics
   topic: '',           // 话题筛选（sessionId；''=按日期浏览）
   date: '',            // 日期筛选（'' = 最新一天）
   user: '',            // 人筛选（''=全部）
+  kw: '',              // 关键词（定位对话用；''=不检索）
+  kwHits: [], kwAt: 0, // 关键词命中的任务索引与当前指向
   tasks: [], truncated: false, partial: false,
 };
 
@@ -49,7 +51,8 @@ export const page = {
             <select id="chBot" style="width:220px"></select></div>
           <button class="btn primary" id="chGo">${svg(IC.search, 13)} 查询会话</button>
         </div>
-        <div class="mini-note" style="margin-top:8px">记录落盘于 <code>~/.lark-claudecode-bridge/transcripts/</code>；默认展示每个通道最近一天的记录，可按话题（CC 会话）/ 日期 / 成员继续筛选。</div>
+        <div class="mini-note" style="margin-top:8px">记录落盘于 <code>~/.lark-claudecode-bridge/transcripts/</code>；默认展示每个通道最近一天的记录，设好筛选后点「查询」加载。</div>
+        <div class="mini-note" id="chPermHint" hidden style="margin-top:4px;color:var(--warn-tx)">ⓘ 当前显示为飞书 ID（ou_…）：请在飞书开放平台为对应机器人应用开通「获取用户基本信息」（contact:user.base:readonly）权限并发布版本；开通后约 10 分钟内自动恢复真名，无须重启。</div>
       </div>
     </div>
     <div class="chats-layout">
@@ -68,6 +71,11 @@ export const page = {
       $('#chDetail').innerHTML = `<div class="empty" style="margin-top:60px">会话树加载失败：${esc(e.message)}</div>`;
       return;
     }
+    // 真名依赖 contact:user.base:readonly 权限：只要还有「未解析的 ou_ 用户」就给出指路提示
+    //（配对过的人名不受影响照常显示；全部解析到真名才隐藏提示）
+    const hasAnonOu = ST.bots.some((b) => b.channels.some((c) => c.users.some((u) => !u.name && /^ou_/i.test(u.userId))));
+    const permHint = $('#chPermHint');
+    if (permHint) permHint.hidden = !hasAnonOu;
     const botSel = $('#chBot');
     botSel.innerHTML = ST.bots.map((b) => `<option value="${esc(b.appId)}">${esc(b.name)}（${esc(b.appId)}）</option>`).join('');
     if (!ST.bots.length) {
@@ -176,13 +184,22 @@ function renderDetailSkeleton() {
       </div></header>
     <div class="panel-body" style="padding-top:6px">
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
-        <select id="chatTopic" style="width:auto;max-width:280px" title="按话题（CC 会话）筛选，跨天聚合"></select>
+        <select id="chatTopic" style="width:auto;max-width:250px" title="按话题（CC 会话）筛选，跨天聚合"></select>
         <select id="chatDate" style="width:auto" title="按天浏览"></select>
         <select id="chatUser" style="width:auto" title="按发信人筛选"></select>
-        <button class="btn sm" id="chatRefresh">刷新</button>
+        <input type="search" id="chatKw" placeholder="关键词：定位对话…" style="width:180px;padding:5px 10px;font-size:12.5px">
+        <button class="btn sm primary" id="chatGo">查询</button>
+        <button class="btn sm" id="chatReset" title="恢复默认筛选并重新加载">重置</button>
+        <button class="btn sm" id="chatRefresh" title="重拉会话树与本通道记录">↻</button>
+        <span id="kwNav" hidden style="display:inline-flex;align-items:center;gap:6px">
+          <span class="mini-note" id="kwPos"></span>
+          <button class="btn sm" id="kwPrev" title="上一处">↑</button>
+          <button class="btn sm" id="kwNext" title="下一处">↓</button>
+          <button class="btn sm ghost" id="kwClear" title="清除关键词">✕</button>
+        </span>
         <span class="mini-note" id="chatScan"></span>
       </div>
-      <div id="chatTl"></div>
+      <div id="chatTl" class="chats-scroll"></div>
     </div>`;
   $('#chDName').innerHTML = `${esc(c?.displayName || ST.chat)} ${c?.chatType === 'group' ? '<span class="tag info">群聊</span>' : '<span class="tag off">私聊</span>'}`;
   $('#chDSub').textContent = `${hit?.bot.name || ''}${ST.topic ? '' : ''} · ${c?.topics ?? 0} 话题 · ${fmtSize(c?.sizeBytes ?? 0)}`;
@@ -190,13 +207,28 @@ function renderDetailSkeleton() {
     try { await navigator.clipboard.writeText(ST.chat); toast(`会话 ID ${ST.chat} 已复制`); }
     catch { toast('复制失败（浏览器剪贴板权限）', true); }
   };
-  $('#chatTopic').onchange = (e) => {
-    ST.topic = e.target.value;
-    $('#chatDate').disabled = !!ST.topic; // 话题视图跨天，日期筛选失效
+  // 查询制：下拉/关键词改动不立即生效，点「查询」统一应用（主人反馈：不要选一下就搜）
+  $('#chatTopic').onchange = (e) => { $('#chatDate').disabled = !!e.target.value; };
+  $('#chatGo').onclick = () => {
+    ST.topic = $('#chatTopic').value;
+    ST.date = $('#chatDate').value;
+    ST.user = $('#chatUser').value;
+    ST.kw = $('#chatKw').value.trim();
     void loadTimeline();
   };
-  $('#chatDate').onchange = (e) => { ST.date = e.target.value; void loadTimeline(); };
-  $('#chatUser').onchange = (e) => { ST.user = e.target.value; void loadTimeline(); };
+  $('#chatKw').onkeydown = (e) => { if (e.key === 'Enter') $('#chatGo').click(); };
+  $('#chatReset').onclick = () => {
+    ST.topic = '';
+    ST.user = '';
+    ST.kw = '';
+    $('#chatKw').value = '';
+    ST.date = ST.dates[0] ?? '';
+    renderFilters();
+    void loadTimeline();
+  };
+  $('#kwPrev').onclick = () => { ST.kwAt--; gotoKwHit(); };
+  $('#kwNext').onclick = () => { ST.kwAt++; gotoKwHit(); };
+  $('#kwClear').onclick = () => { ST.kw = ''; $('#chatKw').value = ''; renderTimeline(); };
   $('#chatRefresh').onclick = () => void fullRefresh();
 }
 
@@ -237,6 +269,12 @@ function renderFilters() {
 async function loadTimeline() {
   const tl = $('#chatTl');
   if (!tl) return;
+  // 筛选值以 DOM 现值为准（查询按钮已把下拉/关键词写入 DOM；selectChannel 流程 renderFilters 刚回填默认）
+  ST.topic = $('#chatTopic')?.value ?? '';
+  ST.date = $('#chatDate')?.value ?? ST.date;
+  ST.user = $('#chatUser')?.value ?? '';
+  ST.kw = ($('#chatKw')?.value || '').trim();
+  ST.kwAt = 0;
   if (!ST.dates.length) {
     tl.innerHTML = '<div class="empty">这一天没有记录<br><span class="mini-note">该通道没有可读的落盘文件（可能已被保留期清理）。</span></div>';
     return;
@@ -301,13 +339,50 @@ function renderTimeline() {
       b.textContent = toRaw ? 'Markdown 视图' : '查看原文';
     };
   });
+  bindKwNav(tl);
+}
+
+// ============ 关键词定位：任务级命中 → n/m 计数 + 上下切换 + 滚动定位 ============
+
+/** 渲染后收集命中并跳到第一处（ST.kw 由「查询」写入） */
+function bindKwNav(tl) {
+  const nav = $('#kwNav');
+  if (!nav) return;
+  ST.kwHits = [];
+  const kw = (ST.kw || '').toLowerCase();
+  if (kw) {
+    ST.tasks.forEach((t, i) => {
+      const hay = `${t.prompt || ''}\n${t.reply || ''}\n${(t.tools || []).map((x) => x.tool || '').join('\n')}`.toLowerCase();
+      if (hay.includes(kw)) ST.kwHits.push(i);
+    });
+  }
+  if (!ST.kwHits.length) { nav.hidden = true; return; }
+  ST.kwAt = Math.min(ST.kwAt, ST.kwHits.length - 1);
+  nav.hidden = false;
+  gotoKwHit();
+}
+
+/** 跳到当前命中：高亮任务块 + 滚动居中（循环） */
+function gotoKwHit() {
+  const tl = $('#chatTl');
+  if (!tl || !ST.kwHits.length) return;
+  ST.kwAt = ((ST.kwAt % ST.kwHits.length) + ST.kwHits.length) % ST.kwHits.length;
+  const idx = ST.kwHits[ST.kwAt];
+  const pos = $('#kwPos');
+  if (pos) pos.textContent = `第 ${ST.kwAt + 1}/${ST.kwHits.length} 处`;
+  tl.querySelectorAll('.kw-active').forEach((n) => n.classList.remove('kw-active'));
+  const node = tl.querySelector(`[data-task-idx="${idx}"]`);
+  if (node) {
+    node.classList.add('kw-active');
+    node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
 }
 
 function taskHtml(t, botName, idx) {
   const who = ST.nameByUser[t.userId] || short(t.userId, 12);
   const meAva = `<span class="m-ava">${esc(who[0] || '?')}</span>`;
   const tools = t.tools?.length ? `
-    <details class="adv" style="margin:6px 0 6px 37px;max-width:min(76%,640px)">
+    <details class="adv" style="margin:6px 0 6px 37px;max-width:min(76%,740px)">
       <summary>⚙ ${t.tools.length} 次工具调用</summary>
       <div class="adv-body">${t.tools.map((x) => `<div class="mono" style="padding:2px 0">${x.ok === false ? '<span style="color:var(--err-tx)">✗</span>' : x.ok === true ? '<span style="color:var(--ok-tx)">✓</span>' : '<span class="dim">·</span>'} ${esc(short(x.tool, 120))}</div>`).join('')}</div>
     </details>` : '';
@@ -331,25 +406,32 @@ function taskHtml(t, botName, idx) {
       </div>
     </div>` : '';
   return `
+  <div class="chat-task" data-task-idx="${idx}">
     <div class="cmsg me">
       ${meAva}
       <div class="m-body">
         <div class="m-meta" style="justify-content:flex-end">${esc(who)} <span>${esc(fmtTime(t.ts))}</span></div>
-        <div class="m-bubble">${bubble(t.prompt)}</div>
+        <div class="m-bubble">${promptHtml(t.prompt, ST.kw)}</div>
       </div>
     </div>
     ${tools}
     ${replyBubble}
-    ${summary}`;
+    ${summary}
+  </div>`;
 }
 
-/** 用户消息长文本折叠（>600 字用「查看完整内容」；保留换行） */
-function bubble(text) {
+/** 用户消息渲染：有关键词时做命中高亮（先分段再各自转义，无 XSS）；>600 字折叠 */
+function promptHtml(text, kw) {
   const s = String(text ?? '');
+  const mark = (str) => {
+    if (!kw) return esc(str);
+    const re = new RegExp(`(${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    return str.split(re).map((p, i) => (i % 2 ? `<mark class="kw-mark">${esc(p)}</mark>` : esc(p))).join('');
+  };
   if (s.length > 600) {
-    return `${esc(s.slice(0, 600))}…<button class="btn sm ghost m-link" data-more>查看完整内容</button><div class="m-full" hidden>${esc(s)}</div>`;
+    return `${mark(s.slice(0, 600))}…<button class="btn sm ghost m-link" data-more>查看完整内容</button><div class="m-full" hidden>${esc(s)}</div>`;
   }
-  return esc(s);
+  return mark(s);
 }
 
 const short = (s, n) => {

@@ -9,7 +9,7 @@
 // 配置读写走标准 doc 管道（saveDoc → PUT /api/config，secret 自动回填）；测试连接走
 // /api/memory/test-connection（表单现值，不落盘）；安装/启停走 /api/memory/install|start|stop。
 import { S, $, esc, api, toast, saveDoc, hooks, refresh } from '../core.js';
-import { confirmDialog } from '../ui.js';
+import { confirmDialog, openModal, closeModal } from '../ui.js';
 
 /** 服务商预设（§6.8 填表助手：只预填已知值，全部可见可改）。预设只填主块（vlm）；
  *  向量块留空沿用主块——跨厂商组合时单独填向量端点/Key（P2 双端点拆分语义） */
@@ -532,7 +532,7 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
     infoCell('server', '运行方式', m.mode === 'embedded'
       ? `LCB 受管${inst.managedRunning ? '' : ' <span class="hint">（未运行）</span>'}`
       : `外部自管 <span class="hint">非 LCB 拉起</span>`),
-    ...(inst.managedSince ? [infoCell('clock', '运行时间', esc(fmtSince(inst.managedSince)))] : []),
+    // 运行时间不单独占格：上面「启动自举」已带（主人反馈 #2）
     // 随 LCB 启动的自动拉起结果：成功只作留痕，失败把「手动开启指引」摆到状态区
     // （自举失败不阻断 LCB，用户必须能从页面一眼看到该去哪手动起）
     ...(inst.autoStart ? [infoCell('clock', '启动自举', inst.autoStart.ready
@@ -732,26 +732,39 @@ function userRowHtml(u) {
 function studioGuideCardHtml(rk, endpoint) {
   const srcLabel = rk?.source === 'config' ? 'config.yaml 的 memory.api_key'
     : rk?.source === 'ov-conf' ? '受管 ov.conf 的 server.root_api_key' : '';
-  const state = rk?.configured
-    ? `已配置（来源：${srcLabel}），查看行为会留痕`
-    : '未配置——请到「服务与配置」点「检查修复」重新生成';
-  // 精简（主人反馈）：说明性长文案全部收进 ⓘ 悬浮提示，卡内只留地址 + 两个动作
-  const tip = [
-    'Root 密钥 = 管理员钥匙：用于列出用户、复制/重置密钥。用它登录 Studio 后身份固定为 default 且不可切换——这是 Studio 设计，不代表机器人记忆没隔离。',
-    '看某个机器人的记忆：在下方列表点该行「打开记忆空间」，以该机器人自己的用户密钥进入，一机一目录、互相隔离。',
-    '两种登录态不能互相切换：看 A 机器人用 A 的密钥进。更不要把「模型配置」里的模型厂商 API Key 填进 Studio——那是调模型用的，与鉴权无关，填了必 401。',
-    `Root 密钥状态：${state}。`,
-  ].join('\n');
+  const stateHtml = rk?.configured
+    ? `<span class="tag ok">✓ 已配置</span> <span class="hint">来源：${esc(srcLabel)}；查看行为会留痕</span>`
+    : '<span class="tag err">✗ 未配置</span> <span class="hint">请到「服务与配置」点「检查修复」重新生成</span>';
+  // 精简（主人反馈）：hover 悬浮塞不下格式化长文 → ⓘ 改为「点击弹说明弹窗」，悬浮只留一句话
   return `<div class="card" style="margin-top:12px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <b style="font-size:13.5px">🌐 连接 OpenViking Studio（${esc((endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, ''))}/studio）</b>
-      <span class="tip" style="align-self:center" data-tip="${esc(tip)}">ⓘ</span>
+      <button class="btn sm ghost" id="memGuideInfo" title="Root 密钥与用户密钥的区别、如何进入某个机器人的记忆空间">ⓘ 连接说明</button>
       <span style="flex:1"></span>
       <button class="btn sm" id="memCopyRoot" title="复制 Root 密钥到剪贴板（查看行为留痕）" ${rk?.configured ? '' : 'disabled style="opacity:.5;cursor:not-allowed"'}>⧉ 复制 Root 密钥</button>
       <button class="btn sm primary" id="memOpenStudio" title="复制 Root 密钥 → 打开 Studio 新标签 → 在「Root 或账号管理员 API 密钥」框 Ctrl+V 即可进入">打开 Studio 并复制</button>
     </div>
     <div id="memRootStatus" class="hint" style="margin-top:6px;line-height:1.7"></div>
-  </div>`;
+  </div>
+  <template id="memGuideState">${stateHtml}</template>`;
+}
+
+/** 「连接说明」弹窗（点击 ⓘ 打开；富文本排版，替代塞不下也看不清的 hover 长提示） */
+function openStudioGuideModal() {
+  const stateHtml = document.getElementById('memGuideState')?.innerHTML || '';
+  openModal({
+    title: '连接 OpenViking Studio 说明',
+    width: 'min(560px,92vw)',
+    bodyHtml: `
+      <div class="sub-title">方式一 · 管理员（Root 密钥）</div>
+      <div class="desc" style="margin:0 0 4px">用于<b>管理</b>：列出用户、复制/重置他人密钥、账号设置。用它登录后，Studio 里的身份<b>固定显示为 <code>default</code> 且无法切换</b>——这是 Studio 的设计（管理员凭证不含具体用户身份），<b>不代表机器人记忆没隔离</b>。</div>
+      <div class="sub-title" style="margin-top:14px">方式二 · 查看某个机器人的记忆（该机器人的用户密钥）</div>
+      <div class="desc" style="margin:0 0 4px">在下方用户列表点那一行<b>「打开记忆空间」</b>：密钥自动进剪贴板并打开该身份的记忆页，粘贴一次即可进入。每个机器人一把独立密钥、一机一目录，数据物理隔离。</div>
+      <div class="banner warn" style="margin-top:12px"><span>⚠️ 两种登录态<b>不能互相切换</b>：看 A 机器人就用 A 的密钥进。<br>⚠️ <b>不要</b>把「模型配置」里的模型厂商 API Key（智谱等）填进 Studio——那是调模型用的，与鉴权无关，填了必 401。</span></div>
+      <div class="hint" style="margin-top:12px">Root 密钥状态：${stateHtml}</div>`,
+    footHtml: `<span class="sp"></span><button class="btn primary" id="mgOk">知道了</button>`,
+  });
+  $('#mgOk').onclick = closeModal;
 }
 
 /** Tab2 主渲染：一键初始化 + Studio 接入指引 + 用户列表（网页管理 / 机器人分组）+ 粒度向导 */
@@ -903,6 +916,9 @@ function bindUsersTabActions(el, { m }) {
   if (openStudioBtn) openStudioBtn.onclick = openStudio;
   // 指引卡内的「复制 Root 密钥」（同一 handler，多入口）
   el.querySelectorAll('[data-root-copy]').forEach((b) => { b.onclick = copyRoot; });
+  // ⓘ 连接说明 → 点击弹富文本弹窗（hover 塞不下长文案）
+  const guideBtn = $('#memGuideInfo');
+  if (guideBtn) guideBtn.onclick = openStudioGuideModal;
 
   // 打开记忆空间（最终方案 §三 决策 5）：密钥进剪贴板 → 自动新标签开 Web Studio 文件系统页
   //（深链 /studio/filesystem 直落记忆目录树，避开默认的 VikingBot 标签——那是 OpenViking
