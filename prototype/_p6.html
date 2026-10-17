@@ -1,0 +1,545 @@
+<script>
+/* ═══════════ 补遗：缺失图标 ═══════════ */
+IC.warn = '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 20h16a2 2 0 0 0 1.73-2Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>';
+
+/* ═══════════ 页面：插件 ═══════════ */
+PAGES.plugins = {
+  id:'plugins', title:'插件', desc:'两处目录的 Claude Code 插件统一管理，改动下一条消息自动生效', legend:false,
+  badge(){ const n = DB.plugins.filter(p=>p.latest).length; return n ? `<span class="nav-badge">${n}</span>` : ''; },
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>已安装插件</h3>
+        <div class="panel-actions"><button class="btn sm" id="plCheck">检查更新</button></div></header>
+      <div class="panel-body">
+        <table><thead><tr><th>插件</th><th style="width:100px">市场</th><th style="width:130px">来源</th><th style="width:170px">版本</th><th style="width:84px">状态</th><th style="width:196px"></th></tr></thead>
+        <tbody>${DB.plugins.map((p,i)=>`
+          <tr><td><b>${esc(p.name)}</b></td><td>${esc(p.market)}</td>
+          <td>${p.source==='bridge'?'<span class="tag warn">bridge 托管</span>':'<span class="tag off">本机 ~/.claude</span>'}</td>
+          <td><span class="mono">v${esc(p.version)}</span> ${p.latest?`<span class="tag warn">→ v${esc(p.latest)}</span>`:''}</td>
+          <td><span class="tag ${p.enabled?'ok':'off'}">${p.enabled?'已启用':'未启用'}</span></td>
+          <td class="ops">
+            <button class="btn sm" data-plupd="${i}">更新</button>
+            <button class="btn sm" data-pltog="${i}">${p.enabled?'停用':'启用'}</button>
+            <button class="btn sm danger" data-plrm="${i}">卸载</button></td></tr>`).join('')}
+        </tbody></table>
+      </div>
+      <footer class="panel-foot">${I(IC.info,13)} bridge 托管目录优先加载；启停 / 更新后<b>下一条消息生效</b>，无须重启。</footer>
+    </div>
+    <div class="grid2" style="gap:16px;align-items:start">
+      <div class="panel" style="margin:0">
+        <header class="panel-head"><h3>从市场安装</h3></header>
+        <div class="panel-body">
+          <label class="fld">搜索插件 <span class="tip" data-tip="候选来自已添加市场的全部插件；也可在飞书端 /plugin install xxx@marketplace（仅管理员）">${I(IC.info,13)}</span></label>
+          <div class="input-btn"><input type="text" id="plQ" placeholder="如 code-review、db-doc…"><button class="btn primary" id="plGo">安装</button></div>
+          <label class="fld" style="margin-top:12px">安装到</label>
+          <select id="plDir"><option value="user">本机 ~/.claude（推荐：本机 CLI 与桥接器共用一份）</option><option value="bridge">bridge 托管目录</option></select>
+          <div class="sub-title" style="margin:16px 0 2px">市场可装（${DB.installTargets.available.length}）</div>
+          ${DB.installTargets.available.map(a=>`<div class="urow" style="padding:8px 0">
+            <div class="u-main"><div class="u-name">${esc(a.name)} <span class="tag off">${esc(a.market)}</span></div>
+            <div class="u-sub">${esc(a.desc)}</div></div>
+            <button class="btn sm" data-plainst="${esc(a.key)}">安装</button></div>`).join('')}
+        </div>
+      </div>
+      <div class="panel" style="margin:0">
+        <header class="panel-head"><h3>管理市场</h3></header>
+        <div class="panel-body">
+          <label class="fld">已添加</label>
+          <div style="display:flex;flex-wrap:wrap;gap:7px">${DB.installTargets.markets.map(m=>`<span class="chip" style="font-family:inherit">${esc(m.name)}<span class="mut" style="font-family:inherit">· ${m.plugins} 插件</span></span>`).join('')}</div>
+          <label class="fld" style="margin-top:14px">添加市场（git 地址或本机路径）</label>
+          <div class="input-btn"><input type="text" id="plMk" placeholder="https://github.com/…/marketplace"><button class="btn" id="plMkAdd">添加</button></div>
+          <label class="fld" style="margin-top:14px">批量</label>
+          <div class="input-btn"><select id="plMkDir"><option value="user">本机 ~/.claude</option><option value="bridge">bridge 托管目录</option></select>
+            <button class="btn" id="plUpdAll">全部更新</button></div>
+          <div class="mini-note" style="margin-top:8px">「全部更新」= 刷新市场索引 + 逐个更新该目录已装插件（可中断查看日志）。</div>
+        </div>
+      </div>
+    </div>`;
+    $('#pageActions').innerHTML = '';
+    $$('[data-plupd]').forEach(b=> b.onclick = async ()=>{
+      const p = DB.plugins[+b.dataset.plupd];
+      if (await confirmDlg({title:'更新插件', msg:`更新 <code>${esc(p.name)}</code> 到 v${esc(p.latest||p.version)}？更新后下一条消息按新版本加载。`, okText:'更新'})){ p.version = p.latest||p.version; p.latest=''; await fakeSave('插件已更新'); render(); }
+    });
+    $$('[data-pltog]').forEach(b=> b.onclick = async ()=>{
+      const p = DB.plugins[+b.dataset.pltog];
+      if (p.enabled && !(await confirmDlg({title:'停用插件', msg:`停用 <code>${esc(p.name)}</code>？停用后下一条消息不再加载，可随时再启用。`, okText:'停用'}))) return;
+      p.enabled = !p.enabled; await fakeSave(p.enabled?'插件已启用':'插件已停用'); render();
+    });
+    $$('[data-plrm]').forEach(b=> b.onclick = async ()=>{
+      const p = DB.plugins[+b.dataset.plrm];
+      if (await confirmDlg({title:'卸载插件', msg:`卸载 <code>${esc(p.name)}</code>？卸载后需重新安装才能恢复，进行中的会话不受影响。`, danger:true, okText:'卸载'})){ DB.plugins.splice(+b.dataset.plrm,1); await fakeSave('插件已卸载'); render(); }
+    });
+    $$('[data-plainst]').forEach(b=> b.onclick = async ()=>{
+      b.disabled = true; b.textContent = '安装中…'; await sleep(800);
+      const key = b.dataset.plainst; const [name, market] = key.split('@');
+      DB.plugins.push({ name, market, source: $('#plDir').value, version:'1.0.0', latest:'', enabled:true });
+      await fakeSave(`${name} 已安装`); render();
+    });
+    $('#plGo').onclick = ()=> toast('原型：请从左侧「市场可装」列表点安装，或输入关键词后从候选选择');
+    $('#plCheck').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.innerHTML='<span class="spin"></span>检查中'; await sleep(900); b.disabled=false; b.textContent='检查更新'; const n=DB.plugins.filter(p=>p.latest).length; toast(n?`${n} 个插件有新版本（见列表「→ 版本」标注）`:'所有插件均为最新版本'); };
+    $('#plMkAdd').onclick = async ()=>{ const v=$('#plMk').value.trim(); if(!v) return toast('请填写 marketplace git 地址或本机路径', true); DB.installTargets.markets.push({name:v.split('/').pop().replace(/\.git$/,''), plugins:0}); await fakeSave('市场已添加'); render(); };
+    $('#plUpdAll').onclick = async ()=>{ if (await confirmDlg({title:'全部更新', msg:'将刷新市场索引，并逐个更新所选目录下全部已装插件。确定继续？', okText:'全部更新'})){ await sleep(600); await fakeSave('全部更新完成'); render(); } };
+  },
+};
+
+/* ═══════════ 页面：Skills ═══════════ */
+const SK_SOURCE = (s)=>{
+  if (s.source==='project') return `项目级 · ${esc(s.ws||'?')}`;
+  if (s.source==='plugin') return `插件 · ${esc(s.plugin||'?')}${s.enabled===false?'（未启用）':''}`;
+  if (s.source==='bridge') return '用户级 · bridge';
+  return '用户级 · 本机';
+};
+const SK_FILES = {
+  'content-produce': {
+    'SKILL.md': `---\nname: content-produce\ndescription: 内容生产主编排：像素级复刻指定链接，结合产品生成图文\n---\n\n# 内容生产主编排\n\n统筹任务分配，不亲自执行具体任务。\n\n## 流程\n1. explore-product / explore-ip-profile 归纳素材\n2. fetch-content 拆解目标写法\n3. generate-content 生成正文与配图提示词\n4. generate-images 出图、assemble-content 校验回填\n5. publish 人工审核后发布`,
+    'references/tone.md': `# 语气参考\n\n- 短句为主，先结论后展开\n- 用户视角说人话，避免堆术语\n- 每段只讲一件事`,
+    'scripts/render.js': `// 渲染脚本示例\nexport function render(data) {\n  return \`<h1>\${data.title}</h1>\`;\n}`,
+  },
+};
+const skFile = (name, path)=> (SK_FILES[name] && SK_FILES[name][path]) || `# ${path}\n\n（原型演示：此处展示该文件内容。）`;
+
+function skillDrawer(s){
+  const files = SK_FILES[s.name] ? Object.keys(SK_FILES[s.name]) : ['SKILL.md'];
+  openDrawer({
+    title:`${s.name} · 文件浏览`,
+    body:`<div class="mini-note" style="margin-bottom:10px"><code>${esc(s.path||'')}</code></div>
+      <div class="dw-layout">
+        <nav class="dw-nav" id="skTree" style="width:200px"></nav>
+        <div class="dw-pane">
+          <div class="mut" id="skName" style="font-size:12px;margin-bottom:8px"></div>
+          <pre id="skView" style="margin:0;background:var(--sunk);border:1px solid var(--border);border-radius:10px;padding:14px;font-size:12px;line-height:1.75;overflow:auto;max-height:58vh;white-space:pre-wrap;font-family:var(--mono)"></pre>
+        </div>
+      </div>`,
+    foot:`<span class="sp"></span><button class="btn" id="skClose">关闭</button>`,
+  });
+  $('#skClose').onclick = closeDrawer;
+  const open = (f)=>{
+    $('#skName').textContent = f;
+    $('#skView').textContent = skFile(s.name, f);
+    $$('#skTree button').forEach(b=> b.classList.toggle('active', b.dataset.f===f));
+  };
+  $('#skTree').innerHTML = files.map(f=>`<button data-f="${esc(f)}" style="${f.includes('/')?'padding-left:24px':''}">📄 ${esc(f.split('/').pop())}</button>`).join('');
+  $$('#skTree button').forEach(b=> b.onclick = ()=> open(b.dataset.f));
+  open(files[0]);
+}
+
+PAGES.skills = {
+  id:'skills', title:'Skills', desc:'四个来源的技能聚合：本机 / bridge / 项目 / 插件（只读）', legend:false,
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>技能列表</h3>
+        <div class="panel-actions">
+          <input type="search" id="skQ" placeholder="过滤：名字 / 来源 / 路径…" style="width:210px;padding:4px 10px;font-size:12.5px">
+          <button class="btn sm" id="skZip">导入 zip</button>
+          <button class="btn primary sm" id="skAdd">＋ 新建</button>
+        </div></header>
+      <div class="panel-body">
+        <table><thead><tr><th style="width:220px">名字</th><th>说明</th><th style="width:190px">来源</th><th style="width:130px"></th></tr></thead>
+        <tbody id="skBody"></tbody></table>
+      </div>
+      <footer class="panel-foot">${I(IC.info,13)} 新增 / 导入统一落盘用户级生效目录 <code>.lark-claudecode-bridge/claude/skills</code>；改动即时生效。</footer>
+    </div>`;
+    const drawRows = ()=>{
+      $('#skBody').innerHTML = DB.skills.map((s,i)=>`
+        <tr data-skt="${esc((s.name+' '+SK_SOURCE(s)+' '+(s.path||'')+' '+(s.desc||'')).toLowerCase())}">
+          <td><b>${esc(s.name)}</b>${s.path?`<div class="mini-note" style="margin-top:2px"><code>${esc(s.path)}</code></div>`:''}</td>
+          <td>${esc(s.desc)||'<span class="mut">（无说明）</span>'}</td>
+          <td><span class="tag ${s.source==='bridge'?'info':s.source==='plugin'?(s.enabled===false?'warn':'off'):'ghost'}">${SK_SOURCE(s)}</span></td>
+          <td class="ops"><button class="btn sm" data-skview="${i}">查看</button>
+            ${(s.source!=='project'&&s.source!=='plugin')?`<button class="btn sm danger" data-skdel="${i}">删除</button>`:'<span class="dim" style="font-size:11.5px">只读</span>'}</td>
+        </tr>`).join('') || '<tr class="empty"><td colspan="4">暂无 skill（四个来源均未发现 SKILL.md）</td></tr>';
+      $$('[data-skview]').forEach(b=> b.onclick = ()=> skillDrawer(DB.skills[+b.dataset.skview]));
+      $$('[data-skdel]').forEach(b=> b.onclick = async ()=>{
+        const s = DB.skills[+b.dataset.skdel];
+        if (await confirmDlg({title:'删除 skill', msg:`删除 <b>${esc(s.name)}</b>（${SK_SOURCE(s)}）？目录会被整体移除，不可恢复。`, danger:true, okText:'删除'})){ DB.skills.splice(+b.dataset.skdel,1); await fakeSave('skill 已删除'); render(); }
+      });
+    };
+    drawRows();
+    $('#skQ').oninput = (e)=>{
+      const q = e.target.value.trim().toLowerCase();
+      $$('#skBody tr[data-skt]').forEach(tr=> tr.hidden = q && !tr.dataset.skt.includes(q));
+    };
+    $('#skZip').onclick = ()=> toast('原型：此处选择 zip 导入（≤10MB，落盘用户级目录）');
+    $('#skAdd').onclick = ()=>{
+      openDrawer({ title:'新建 skill（用户级）', narrow:true,
+        body:`<label class="fld">名字（字母 / 数字 / 连字符，1-64 位）</label><input type="text" id="nskName" placeholder="my-skill">
+              <label class="fld">说明（frontmatter description）</label><input type="text" id="nskDesc" placeholder="这个 skill 做什么、什么时候用">
+              <div class="mini-note" style="margin-top:10px">创建后生成目录与 SKILL.md 模板，请到目录中补充正文与脚本。</div>`,
+        foot:`<span class="sp"></span><button class="btn" id="nskCancel">取消</button><button class="btn primary" id="nskSave">创建</button>` });
+      $('#nskCancel').onclick = closeDrawer;
+      $('#nskSave').onclick = async ()=>{
+        const name = $('#nskName').value.trim();
+        if (!name) return toast('请填写名字', true);
+        DB.skills.push({ name, desc:$('#nskDesc').value.trim(), source:'bridge', path:'.lark-claudecode-bridge/claude/skills/'+name });
+        if (await fakeSave('已创建（含默认 SKILL.md 模板）')){ closeDrawer(); render(); }
+      };
+    };
+  },
+};
+
+/* ═══════════ 页面：MCP ═══════════ */
+const MCP_ENV = {
+  github:[{k:'GITHUB_TOKEN', raw:'${GITHUB_TOKEN:-}', missing:true}],
+};
+const mcpSource = (s)=> s.source==='plugin' ? `插件 · ${esc(s.plugin||'?')}` : s.source==='project' ? '项目级' : s.source==='bridge' ? 'bridge · 可管理' : '用户级 · 本机';
+function mcpDrawer(s){
+  const editable = s.source==='bridge';
+  const cfg = s.type==='stdio' ? { type:'stdio', command:s.conn } : { type:s.type, url:s.conn };
+  const envs = MCP_ENV[s.name]||[];
+  const renderEnv = ()=> envs.length ? envs.map(e=>`
+    <tr><td><code>${esc(e.k)}</code></td><td><code>${esc(e.raw)}</code></td>
+    <td>${e.missing?'<span style="color:var(--err-tx)">未设置（展开后为空）</span>':`<code>${esc(e.raw)}</code>`}</td></tr>`).join('')
+    : '<tr><td colspan="3" class="mut">（无 env 配置）</td></tr>';
+  openDrawer({
+    title:`MCP · ${s.name}`,
+    body:`<div class="mini-note" style="margin-bottom:8px">来源：${mcpSource(s)}</div>
+      ${s.source!=='bridge'&&s.source!=='user'?'<div class="banner warn" style="margin-bottom:10px">只读来源——此 MCP 由插件 / 项目自带，请到对应目录修改。</div>':''}
+      ${s.source==='user'?'<div class="banner warn" style="margin-bottom:10px">本机 ~/.claude.json 来源不支持页面编辑（可删除）；如需修改请手动改，或删除后到本页重新添加。</div>':''}
+      <label class="fld">配置（JSON${editable?'，可编辑':''}）</label>
+      <textarea id="mcJson" rows="8" ${editable?'':'readonly'}>${esc(JSON.stringify(cfg,null,2))}</textarea>
+      <label class="fld" style="margin-top:12px">环境变量 <span class="tip" data-tip="当前值已合并：飞书应用 env › Claude 认证 env › settings.json env › 系统环境，支持 \${VAR:-默认值}">${I(IC.info,13)}</span></label>
+      <table><thead><tr><th style="width:150px">变量</th><th>配置值</th><th>当前值</th></tr></thead><tbody>${renderEnv()}</tbody></table>`,
+    foot:`${editable?'<button class="btn" id="mcEdit">编辑</button><button class="btn primary" id="mcSave" style="display:none">保存</button>':''}<span class="sp"></span><button class="btn" id="mcClose">关闭</button>`,
+  });
+  $('#mcClose').onclick = closeDrawer;
+  if (editable){
+    $('#mcEdit').onclick = ()=>{ $('#mcJson').removeAttribute('readonly'); $('#mcEdit').style.display='none'; $('#mcSave').style.display=''; };
+    $('#mcSave').onclick = async ()=>{
+      try{ JSON.parse($('#mcJson').value); }catch(err){ return toast('JSON 解析失败：'+err.message, true); }
+      if (await fakeSave('已保存（任务级热生效，无须重启）')){ closeDrawer(); render(); }
+    };
+  }
+}
+
+PAGES.mcp = {
+  id:'mcp', title:'MCP', desc:'四个来源的 MCP server 聚合；bridge 来源页面可管理，任务级热生效', legend:false,
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>MCP Servers</h3>
+        <div class="panel-actions">
+          <input type="search" id="mcQ" placeholder="过滤：名字 / 来源 / 连接…" style="width:210px;padding:4px 10px;font-size:12.5px">
+          <button class="btn sm" id="mcRefresh">刷新</button>
+          <button class="btn primary sm" id="mcAdd">＋ 添加 MCP</button>
+        </div></header>
+      <div class="panel-body">
+        <table><thead><tr><th style="width:140px">名字</th><th>类型 / 连接</th><th style="width:140px">来源</th><th style="width:150px">状态 <span class="tip" data-tip="点击状态格检测该 server">ⓘ</span></th><th style="width:130px"></th></tr></thead>
+        <tbody id="mcBody"></tbody></table>
+      </div>
+      <footer class="panel-foot">${I(IC.info,13)} bridge 自管配置：<code>mcp/servers.json</code>（页面添加落这里）· 插件目录扫到 4 个插件，其中 1 个含 MCP 定义。</footer>
+    </div>`;
+    const drawRows = ()=>{
+      $('#mcBody').innerHTML = DB.mcp.map((s,i)=>`
+        <tr data-mct="${esc((s.name+' '+mcpSource(s)+' '+s.type+' '+s.conn).toLowerCase())}">
+          <td><b>${esc(s.name)}</b></td>
+          <td><span class="tag ghost">${esc(s.type)}</span> <span class="mono" style="font-size:11.5px">${esc(s.conn)}</span></td>
+          <td><span class="tag ${s.source==='bridge'?'info':s.source==='plugin'?'off':'ghost'}">${mcpSource(s)}</span></td>
+          <td class="mcp-status" data-mcst="${i}" style="cursor:pointer" title="点击检测">${s.status==='ok'?'<span style="color:var(--ok-tx)">✔ 正常</span>':s.status==='warn'?`<span style="color:var(--warn-tx)">⚠ 不可达</span><div class="mini-note">${esc(s.detail||'')}</div>`:'<span class="mut">未检测</span>'}</td>
+          <td class="ops"><button class="btn sm" data-mcview="${i}">查看</button>
+            ${(s.source==='bridge'||s.source==='user')?`<button class="btn sm danger" data-mcdel="${i}">删除</button>`:'<span class="dim" style="font-size:11.5px">只读</span>'}</td>
+        </tr>`).join('') || '<tr class="empty"><td colspan="5">暂无 MCP server</td></tr>';
+      $$('[data-mcst]').forEach(c=> c.onclick = async ()=>{
+        const s = DB.mcp[+c.dataset.mcst];
+        c.innerHTML = '<span class="mut">检测中…</span>'; await sleep(700);
+        c.innerHTML = s.status==='ok'?'<span style="color:var(--ok-tx)">✔ 正常</span>':s.status==='warn'?`<span style="color:var(--warn-tx)">⚠ 不可达</span><div class="mini-note">${esc(s.detail||'')}</div>`:'<span style="color:var(--ok-tx)">✔ 正常</span>';
+      });
+      $$('[data-mcview]').forEach(b=> b.onclick = ()=> mcpDrawer(DB.mcp[+b.dataset.mcview]));
+      $$('[data-mcdel]').forEach(b=> b.onclick = async ()=>{
+        const s = DB.mcp[+b.dataset.mcdel];
+        if (await confirmDlg({title:'删除 MCP server', msg:`删除 <b>${esc(s.name)}</b>（${mcpSource(s)}）？引用它的任务将无法启动该 server。`, danger:true, okText:'删除'})){ DB.mcp.splice(+b.dataset.mcdel,1); await fakeSave('已删除'); render(); }
+      });
+    };
+    drawRows();
+    $('#mcQ').oninput = (e)=>{ const q=e.target.value.trim().toLowerCase(); $$('#mcBody tr[data-mct]').forEach(tr=> tr.hidden = q && !tr.dataset.mct.includes(q)); };
+    $('#mcRefresh').onclick = ()=>{ drawRows(); toast('已刷新（原型演示）'); };
+    $('#mcAdd').onclick = ()=>{
+      openDrawer({ title:'添加 MCP（存 bridge 自管目录）',
+        body:`<div class="subtabs"><button class="active" data-at="cmd">原生命令</button><button data-at="json">JSON 配置</button></div>
+          <div data-ap="cmd"><label class="fld">粘贴 claude mcp add 命令（自动解析）</label>
+            <textarea id="amCmd" placeholder='claude mcp add my-mcp -e API_KEY=xxx -- npx -y @scope/mcp-server'></textarea>
+            <div class="mini-note" style="margin-top:6px">名字取命令第 4 个参数；scope（-s）忽略，统一存 bridge 目录。</div></div>
+          <div data-ap="json" style="display:none"><label class="fld">名字</label><input type="text" id="amName" placeholder="my-mcp">
+            <label class="fld">配置 JSON</label>
+            <textarea id="amCfg" placeholder='{"type":"stdio","command":"npx","args":["-y","mcp-server-foo"]}'></textarea></div>`,
+        foot:`<span class="sp"></span><button class="btn" id="amCancel">取消</button><button class="btn primary" id="amSave">添加</button>` });
+      $$('.subtabs [data-at]').forEach(b=> b.onclick = ()=>{
+        $$('.subtabs [data-at]').forEach(x=> x.classList.toggle('active', x===b));
+        $('[data-ap=cmd]').style.display = b.dataset.at==='cmd'?'':'none';
+        $('[data-ap=json]').style.display = b.dataset.at==='json'?'':'none';
+      });
+      $('#amCancel').onclick = closeDrawer;
+      $('#amSave').onclick = async ()=>{
+        const isCmd = $('[data-ap=cmd]').style.display !== 'none';
+        let name;
+        if (isCmd){
+          const cmd = $('#amCmd').value.trim();
+          if (!cmd) return toast('请粘贴 claude mcp add 命令', true);
+          name = cmd.split(/\s+/)[3] || '';
+          if (!name) return toast('命令中缺少名字（claude mcp add <名字> …）', true);
+          DB.mcp.push({ name, type:'stdio', conn:cmd.split('-- ').pop()||cmd, source:'bridge', status:'untested' });
+        } else {
+          name = $('#amName').value.trim();
+          const raw = $('#amCfg').value.trim();
+          if (!name) return toast('请填写名字', true);
+          let cfg; try{ cfg = JSON.parse(raw); }catch(err){ return toast('JSON 解析失败：'+err.message, true); }
+          DB.mcp.push({ name, type:cfg.type||'stdio', conn:cfg.command||cfg.url||'', source:'bridge', status:'untested' });
+        }
+        if (await fakeSave('已添加（任务级热生效，无须重启）')){ closeDrawer(); render(); }
+      };
+    };
+  },
+};
+
+/* ═══════════ 页面：记忆增强（双 Tab） ═══════════ */
+const MEM_PRESETS = {
+  glm:{ label:'智谱 GLM', base:'https://open.bigmodel.cn/api/paas/v4', vlm:'glm-4.7', emb:'embedding-3', keyHint:'open.bigmodel.cn 的 API Key' },
+  volcengine:{ label:'火山方舟', base:'https://ark.cn-beijing.volces.com/api/v3', vlm:'', emb:'', keyHint:'方舟 API Key；模型名填推理接入点 EP ID' },
+  openai:{ label:'OpenAI 兼容（中转 / 自建）', base:'', vlm:'', emb:'', keyHint:'任意 OpenAI 协议端点的 Key（本地端点可留空）' },
+  ollama:{ label:'Ollama 本地（零 Key）', base:'http://127.0.0.1:11434/v1', vlm:'qwen3:8b', emb:'nomic-embed-text', keyHint:'本地服务无需 Key' },
+};
+let memTab = 'svc';
+PAGES.memory = {
+  id:'memory', title:'记忆增强', desc:'OpenViking 长期记忆：自动召回历史、归档提炼，按机器人命名空间隔离', legend:false,
+  render(el){
+    const m = DB.memory;
+    el.innerHTML = `
+    <div class="tabs">
+      <button data-mt="svc" class="${memTab==='svc'?'active':''}">服务与配置</button>
+      <button data-mt="users" class="${memTab==='users'?'active':''}">用户与密钥 <span class="tag off" style="margin-left:4px">${m.users.length}</span></button>
+    </div><div id="memPane"></div>`;
+    $$('.tabs button', el).forEach(b=> b.onclick = ()=>{ memTab=b.dataset.mt; render(); });
+    memTab==='svc' ? memSvcPane($('#memPane')) : memUsersPane($('#memPane'));
+  },
+};
+
+function memSvcPane(pane){
+  const m = DB.memory;
+  const running = m.state==='running';
+  pane.innerHTML = `
+  <div class="panel">
+    <div class="panel-body" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:14px 18px">
+      <label class="switch"><input type="checkbox" id="memOn" ${m.enabled?'checked':''}><span class="track"></span></label>
+      <span class="switch-label" style="font-weight:600">启用长期记忆</span>
+      <span class="tip" data-tip="开启后每个机器人的每条消息自动注入记忆召回；关闭后行为与未安装完全一致">${I(IC.info,14)}</span>
+      <span style="flex:1"></span>
+      <span class="tag ${running?'ok':'err'}">${running?'运行中':'服务异常'} · v${esc(m.version)}</span>
+    </div>
+  </div>
+  <div class="panel">
+    <header class="panel-head"><h3>服务状态</h3>
+      <div class="panel-actions">
+        <button class="btn sm" id="memFix">检查修复</button>
+        <button class="btn sm" id="memRefresh">↻ 刷新</button>
+        ${running?'<button class="btn sm danger" id="memStop">停止</button>':'<button class="btn sm primary" id="memStart">▶ 启动服务</button>'}
+      </div></header>
+    <div class="panel-body">
+      <div class="banner ${running?'info':'warn'}" style="margin-bottom:14px"><span><b>${running?'服务运行正常':'服务未运行'}</b> — ${running?'记忆召回与归档已就绪，运行 '+esc(m.since):'点「▶ 启动服务」一键拉起（检查 → 拉起 → 接入插件）'}。</span></div>
+      <table class="kv">
+        <tr><td>服务地址</td><td><code>${esc(m.endpoint)}</code> <button class="btn sm" id="memCopy" style="padding:2px 9px">⧉</button> <span class="tag off">本机</span></td></tr>
+        <tr><td>运行方式</td><td>LCB 受管（embedded）</td></tr>
+        <tr><td>鉴权模式</td><td>api_key <span class="tip" data-tip="api_key 模式：网页与每个机器人各持一把独立用户密钥；root 密钥用于管理">${I(IC.info,13)}</span></td></tr>
+        <tr><td>记忆插件</td><td><span style="color:var(--ok-tx)">✓</span> <code>${esc(m.plugin.name)}</code> v${esc(m.plugin.version)} <span class="tag off">${esc(m.plugin.source)}</span><span class="dim" style="font-size:11.5px"> · ${esc(m.plugin.client)}</span></td></tr>
+      </table>
+      <details class="adv" style="margin-top:12px"><summary>安装流水线（5 / 5 就绪）</summary>
+        <div class="adv-body" style="display:flex;gap:6px;flex-wrap:wrap">
+          ${['运行时（uv）','安装 OpenViking 服务','生成服务配置（ov.conf）','拉起受管服务','接入记忆插件'].map(s=>`<span class="tag ok">✓ ${s}</span>`).join('')}
+        </div></details>
+    </div>
+  </div>
+  <div class="panel">
+    <header class="panel-head"><h3>模型配置</h3>
+      <span class="panel-sub">提炼（vlm）与向量化（embedding）可各自独立端点与 Key</span>
+      <div class="panel-actions">
+        <button class="btn sm" id="memTest">测试连接</button>
+        <button class="btn sm primary" id="memSaveModel">保存配置</button>
+      </div></header>
+    <div class="panel-body">
+      <div class="grid2" style="gap:14px;align-items:start">
+        <div style="border:1px solid var(--border);border-radius:10px;padding:14px 16px;background:var(--sunk)">
+          <div class="sub-title">提炼主模型 <span class="dim" style="font-weight:400">vlm · 归档时提炼记忆</span></div>
+          <label class="fld">服务商预设（填表助手，只预填空字段）</label>
+          <select id="memProvider"><option value="">— 选择预设 —</option>${Object.entries(MEM_PRESETS).map(([k,p])=>`<option value="${k}" ${m.model.provider===k?'selected':''}>${p.label}</option>`).join('')}</select>
+          <label class="fld">API 端点</label><input type="text" id="memApiBase" value="${esc(m.model.apiBase)}" placeholder="https://…/v1">
+          <label class="fld">API Key ${m.model.keyHint?`<span class="tag off">已保存 ${esc(m.model.keyHint)}</span>`:''}</label>
+          <input type="password" id="memApiKey" placeholder="${esc(MEM_PRESETS[m.model.provider]?.keyHint||'sk-…')}">
+          <label class="fld">提炼模型（vlm）</label><input type="text" id="memVlm" value="${esc(m.model.vlm)}" placeholder="glm-4.7">
+        </div>
+        <div style="border:1px solid var(--border);border-radius:10px;padding:14px 16px;background:var(--sunk)">
+          <div class="sub-title">向量模型 <span class="dim" style="font-weight:400">embedding · 向量化入库与召回</span></div>
+          <label class="fld">向量模型</label><input type="text" id="memEmb" value="${esc(m.model.emb)}" placeholder="embedding-3">
+          <label class="fld">向量端点（独立）</label><input type="text" id="memEmbBase" value="${esc(m.model.embBase)}" placeholder="留空沿用主端点">
+          <label class="fld">向量 Key（独立）</label><input type="password" id="memEmbKey" placeholder="${m.model.embKeyOwn?'已保存，留空不修改':'留空沿用主 Key（可单独指定）'}">
+          <div class="mini-note" style="margin-top:10px">跨厂商组合时（如主模型 glm + 向量 OpenAI 系）才需单独填向量端点 / Key。</div>
+        </div>
+      </div>
+      <label class="fld" style="margin-top:14px">服务端点（OpenViking server）</label>
+      <div class="input-btn" style="max-width:460px"><input type="text" id="memEndpoint" value="${esc(m.endpoint)}"><span class="tip" style="align-self:center" data-tip="一般无须修改：一键安装自动回写；远程模式填外部服务地址">${I(IC.info,14)}</span></div>
+      <div id="memTestResult" style="margin-top:12px"></div>
+    </div>
+    <footer class="panel-foot">${I(IC.info,13)} 保存后可一键「立即生效」——重渲染配置并重启<b>记忆服务</b>，桥接器与进行中任务不受影响。</footer>
+  </div>`;
+  $('#memOn').onchange = async (e)=>{
+    const next = e.target.checked;
+    if (next && !(await confirmDlg({title:'启用长期记忆', msg:'开启后每个机器人的每条消息将自动：注入记忆召回（hooks）+ 按命名空间隔离读写。确认开启？', okText:'开启'}))){ e.target.checked=false; return; }
+    m.enabled = next; await fakeSave(next?'记忆增强已开启':'记忆增强已关闭'); render();
+  };
+  $('#memCopy').onclick = ()=> toast('服务地址已复制');
+  $('#memFix').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.innerHTML='<span class="spin"></span>检查中'; await sleep(1100); b.disabled=false; b.textContent='检查修复'; toast('✅ 全部就绪（原型演示）'); };
+  $('#memRefresh').onclick = ()=> render();
+  if ($('#memStart')) $('#memStart').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.innerHTML='<span class="spin"></span>启动中'; await sleep(1200); m.state='running'; await fakeSave('服务已启动'); render(); };
+  if ($('#memStop')) $('#memStop').onclick = async ()=>{ if (await confirmDlg({title:'停止受管服务', msg:'停止 LCB 托管的 OpenViking 服务？记忆功能将不可用，可随时重新拉起。', danger:true, okText:'停止'})){ m.state='stopped'; await fakeSave('服务已停止'); render(); } };
+  $('#memProvider').onchange = (e)=>{
+    const p = MEM_PRESETS[e.target.value]; if (!p) return;
+    if (!$('#memApiBase').value.trim()) $('#memApiBase').value = p.base;
+    if (!$('#memVlm').value.trim()) $('#memVlm').value = p.vlm;
+    if (!$('#memEmb').value.trim()) $('#memEmb').value = p.emb;
+    $('#memApiKey').placeholder = p.keyHint;
+  };
+  $('#memTest').onclick = async (e)=>{
+    const b = e.currentTarget; b.disabled = true;
+    $('#memTestResult').innerHTML = '<span class="mut">测试中（真实调用 embedding + 提炼模型各一次）…</span>';
+    await sleep(1000);
+    $('#memTestResult').innerHTML = '<span class="tag ok">双绿通过</span> <span class="mut" style="font-size:12px">✅ 向量模型 embedding-3 正常返回 · ✅ 提炼模型 glm-4.7 正常返回</span>';
+    b.disabled = false;
+  };
+  $('#memSaveModel').onclick = async ()=>{
+    m.model.provider = $('#memProvider').value;
+    m.model.apiBase = $('#memApiBase').value.trim();
+    m.model.vlm = $('#memVlm').value.trim();
+    m.model.emb = $('#memEmb').value.trim();
+    m.model.embBase = $('#memEmbBase').value.trim();
+    if (await fakeSave('模型配置已保存')){
+      if (await confirmDlg({title:'使新配置立即生效', msg:'模型配置已保存。<br><br>记忆服务需<b>重渲染配置并重启</b>才能应用新模型。<br>立即生效？', okText:'立即生效'})) toast('✅ 已应用（重渲染 → 重启服务 → 校验插件）');
+      else toast('已保存。稍后可点「检查修复」应用');
+    }
+  };
+}
+
+function memUsersPane(pane){
+  const m = DB.memory;
+  const groups = [
+    ['网页管理', m.users.filter(u=>u.kind==='web'), '浏览器打开记忆空间用这一把'],
+    ['机器人', m.users.filter(u=>u.kind==='bot'), '每个 bot 一把独立密钥；会话由 LCB 自动注入，无须手填'],
+  ];
+  pane.innerHTML = `
+  <div class="panel">
+    <header class="panel-head"><h3>用户与密钥</h3>
+      <span class="panel-sub">${m.users.length} 个用户 · 合计 16.6 MB 记忆数据 · 密钥脱敏显示、查看留痕</span>
+      <div class="panel-actions">
+        <button class="btn sm primary" id="memInit">⚡ 一键初始化</button>
+        <button class="btn sm" id="memURefresh">↻ 刷新</button>
+      </div></header>
+    <div class="panel-body">
+      <div class="banner info" style="margin-bottom:14px">
+        <div style="min-width:0">
+          <b>🌐 连接 OpenViking Studio</b> <code style="font-size:11.5px">${esc(m.endpoint)}/studio</code>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px">
+            <div style="flex:1;min-width:240px;border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:var(--card)">
+              <b style="font-size:12.5px">方式一 · 管理员（Root 密钥）</b>
+              <div class="mini-note" style="margin-top:4px">用于管理用户与密钥。登录后身份固定为 default，看不到各机器人记忆——这是 Studio 设计，不代表没隔离。</div>
+            </div>
+            <div style="flex:1;min-width:240px;border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:var(--card)">
+              <b style="font-size:12.5px">方式二 · 看某个机器人的记忆</b>
+              <div class="mini-note" style="margin-top:4px">在下方列表点该行「打开记忆空间」，以该机器人身份进入，与其他机器人完全隔离。</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+            <button class="btn sm" id="memCopyRoot">⧉ 复制 Root 密钥</button>
+            <button class="btn sm primary" id="memOpenStudio">打开 Studio 并复制</button>
+            <span class="mini-note" style="align-self:center">Root 密钥：✓ 已配置（受管 ov.conf 的 server.root_api_key）· 不要填「模型配置」里的厂商 API Key</span>
+          </div>
+        </div>
+      </div>
+      ${groups.map(([title, rows, hint])=>`
+        <div class="sub-title" style="margin:14px 0 2px">${title} <span class="dim" style="font-weight:400">${hint}</span></div>
+        ${rows.map(u=>`
+        <div class="urow">
+          <span class="u-ava">${esc((u.name||'?')[0])}</span>
+          <div class="u-main">
+            <div class="u-name">${esc(u.name)} <code style="font-size:11px">${esc(u.uid)}</code></div>
+            <div class="u-sub">密钥 <code>${esc(u.key)}</code> · ${esc(u.size)} · 活跃于 ${esc(u.active)}</div>
+          </div>
+          <div class="u-ops">
+            <button class="btn sm primary" data-uopen="${esc(u.uid)}">打开记忆空间</button>
+            <button class="btn sm" data-ucopy="${esc(u.uid)}">⧉ 复制 key</button>
+            <button class="btn sm" data-ureset="${esc(u.uid)}">重置</button>
+            <button class="btn sm danger" data-udel="${esc(u.uid)}">删除</button>
+          </div>
+        </div>`).join('')||'<div class="mini-note" style="padding:6px 0">（无用户）</div>'}`).join('')}
+    </div>
+  </div>
+  <div class="panel">
+    <header class="panel-head"><h3>记忆粒度</h3>
+      <span class="panel-sub">${m.granularity==='bot-user'?'已选择 bot × 人（每位聊天者独立空间）':'当前：每 bot 一把密钥（默认）'}</span></header>
+    <div class="panel-body">
+      <div class="switch-row" style="margin:0">
+        <label class="switch"><input type="checkbox" id="memGran" ${m.granularity==='bot-user'?'checked':''}><span class="track"></span></label>
+        <span class="switch-label">升级到 bot × 人</span>
+        <span class="tip" data-tip="增量演进：既有密钥与记忆不受影响，仅为新聊天者追加独立签发。同一 bot 服务 2 人以上且内容敏感时建议开启">${I(IC.info,14)}</span>
+      </div>
+    </div>
+  </div>`;
+  $('#memInit').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.textContent='初始化中…'; await sleep(900); b.disabled=false; b.textContent='⚡ 一键初始化'; toast('✅ 已创建网页 + 各机器人用户并签发密钥'); };
+  $('#memURefresh').onclick = ()=> render();
+  $('#memCopyRoot').onclick = ()=> toast('Root 密钥已复制（查看行为已留痕）');
+  $('#memOpenStudio').onclick = ()=> toast('Root 密钥已复制并打开 Studio——粘贴一次即可进入（原型演示）');
+  $$('[data-uopen]').forEach(b=> b.onclick = ()=> toast('密钥已复制并打开该身份的记忆空间（原型演示）'));
+  $$('[data-ucopy]').forEach(b=> b.onclick = ()=> toast(`已复制 ${b.dataset.ucopy} 的密钥（查看行为已留痕）`));
+  $$('[data-ureset]').forEach(b=> b.onclick = async ()=>{
+    if (await confirmDlg({title:'重置密钥', msg:`重置 <b>${esc(b.dataset.ureset)}</b> 的密钥？<br>旧密钥<b>立即失效</b>，所有使用方需同步更新。`, danger:true, okText:'重置'})) await fakeSave('新密钥已生成并复制到剪贴板');
+  });
+  $$('[data-udel]').forEach(b=> b.onclick = async ()=>{
+    if (await confirmDlg({title:'删除用户', msg:`删除 <b>${esc(b.dataset.udel)}</b>？删除前会自动把本地记忆目录打包备份到 <code>openviking/backups/</code>。`, danger:true, okText:'删除'})){
+      DB.memory.users = DB.memory.users.filter(u=>u.uid!==b.dataset.udel);
+      await fakeSave('已删除'); render();
+    }
+  });
+  $('#memGran').onchange = (e)=>{ m.granularity = e.target.checked?'bot-user':'bot'; fakeSave(e.target.checked?'已记录升级意向：bot×人':'已回到每 bot 一把密钥'); };
+}
+
+/* ═══════════ 概览页「飞书 CLI 授权」→ mock 扫码抽屉（capture 拦截占位 toast） ═══════════ */
+document.addEventListener('click', (e)=>{
+  const t = e.target instanceof Element && e.target.closest('[data-a="cli-auth"]');
+  if (!t) return;
+  e.stopPropagation(); e.preventDefault();
+  openDrawer({ title:'飞书授权（扫码完成）', narrow:true,
+    body:`<div class="banner info" style="margin-bottom:12px"><span>用飞书扫描二维码完成授权；全程无须终端，SSH 环境同样可用。</span></div>
+      <div style="display:flex;justify-content:center;padding:10px 0 4px">
+        <div style="width:190px;height:190px;border-radius:14px;border:1px solid var(--border);background:
+          repeating-linear-gradient(0deg,var(--ink) 0 6px,transparent 6px 12px),
+          repeating-linear-gradient(90deg,var(--ink) 0 6px,transparent 6px 12px);
+          opacity:.82;position:relative;overflow:hidden" aria-label="二维码占位">
+          <span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:var(--card);margin:70px 70px;border-radius:8px;color:var(--mut);font-size:10px;text-align:center;line-height:1.4">二维码<br>占位</span>
+        </div>
+      </div>
+      <div class="mini-note" style="text-align:center;margin-top:10px">二维码 2:00 后过期，可重新生成 · device_code 只存后端内存，不下发浏览器</div>`,
+    foot:`<button class="btn" id="lqTerm">改用终端窗口</button><span class="sp"></span><button class="btn primary" id="lqDone">完成</button>` });
+  $('#lqDone').onclick = ()=>{ closeDrawer(); toast('✅ 授权完成'); };
+  $('#lqTerm').onclick = ()=> toast('原型：此处打开终端授权指引');
+}, true);
+
+/* ═══════════ 启动 ═══════════ */
+/* 每次渲染用全新 #view 节点，避免页面级监听跨渲染叠加 */
+const _baseRender = render;
+render = function(){
+  const v = $('#view');
+  if (v){ const nv = v.cloneNode(false); v.replaceWith(nv); }
+  _baseRender();
+};
+
+/* 主题切换 */
+const themeBtn = $('#themeBtn');
+const setTheme = (t)=>{
+  document.documentElement.dataset.theme = t;
+  themeBtn.innerHTML = I(t==='dark'?IC.sun:IC.moon, 15);
+  try{ localStorage.setItem('lcb-proto-theme', t); }catch{}
+};
+themeBtn.onclick = ()=> setTheme(document.documentElement.dataset.theme==='dark' ? 'light' : 'dark');
+let _savedTheme = null; try{ _savedTheme = localStorage.getItem('lcb-proto-theme'); }catch{}
+setTheme(_savedTheme || 'light');
+
+window.addEventListener('hashchange', render);
+SaveBar.init(snapshotDB, render);
+render();
+</script>

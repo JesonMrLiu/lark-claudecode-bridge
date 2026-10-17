@@ -1,0 +1,2718 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>飞书 Claude Code 桥接器 · 配置台（重构原型）</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%233370ff'/%3E%3Cg stroke='%23fff' stroke-width='1.9' fill='none' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 7 5.5 9.5 8 12'/%3E%3Cpath d='M5.5 9.5H15'/%3E%3Cpath d='M16 12 18.5 14.5 16 17'/%3E%3Cpath d='M18.5 14.5H9'/%3E%3C/g%3E%3C/svg%3E">
+<!--
+  ══════════════════════════════════════════════════════════════
+  配置台重构原型 · 纯静态 Mock，不依赖后端，浏览器直接打开即可
+  相对现有 assets/web 的主要改动（供评审对照）：
+  1. 侧边栏按「总览 / 机器人接入 / 模型与扩展 / 安全与记忆」分组
+  2. 统一卡片语法：panel = 标题(≤1行说明) + 操作区 + 内容，
+     长文案收进 ⓘ 悬浮提示或「高级」折叠
+  3. 概览改为状态看板：4 张状态瓦片 + 快捷操作，2 秒可判读
+  4. 应用编辑抽屉：顶部横向 Tab（基本信息/机器人角色/模型/触发词/
+     环境变量）；人格并入基本信息；抽屉左缘可拖拽调宽
+  5. Claude 认证 / 插件 / 记忆增强等长页改为页内 Tab 拆分
+  6. 需重启生效的配置项统一挂「需重启」角标
+  7. 未保存改动统一为底部悬浮保存条（还原 / 保存）
+  ══════════════════════════════════════════════════════════════
+-->
+<style>
+/* ═══ Tokens ═══ */
+:root{
+  color-scheme:light;
+  --bg:#f3f5f9; --card:#fff; --field:#fff; --sunk:#f6f8fb;
+  --border:#e4e8f0; --border2:#cfd6e4;
+  --ink:#1c2333; --mut:#697180; --faint:#9aa3b4;
+  --pri:#3370ff; --pri-h:#2b5fe3; --pri-w:#edf3ff; --pri-ring:rgba(51,112,255,.18);
+  --ok:#1f9d55; --ok-bg:#e7f6ec; --ok-tx:#177c43;
+  --warn:#d97706; --warn-bg:#fdf3e2; --warn-tx:#a85d03;
+  --err:#e5484d; --err-bg:#fdecec; --err-tx:#c7363b;
+  --off-bg:#eef0f5; --off-tx:#7a8294;
+  --code-bg:rgba(28,35,51,.06);
+  --mono:"JetBrains Mono","SF Mono",Consolas,"Cascadia Mono",Menlo,monospace;
+  --r:12px; --r-s:8px;
+  --shadow:0 1px 2px rgba(16,24,40,.05);
+  --shadow-2:0 10px 32px rgba(16,24,40,.14);
+  --header-bg:rgba(255,255,255,.86);
+  --nav-w:212px;
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#0f1218; --card:#161b26; --field:#10141d; --sunk:#1a2030;
+  --border:#272e3f; --border2:#3a4358;
+  --ink:#e8ebf2; --mut:#98a1b3; --faint:#6b7488;
+  --pri:#4d80ff; --pri-h:#6996ff; --pri-w:rgba(77,128,255,.15); --pri-ring:rgba(77,128,255,.3);
+  --ok:#43c072; --ok-bg:rgba(46,161,33,.14); --ok-tx:#5ad286;
+  --warn:#f09d3e; --warn-bg:rgba(255,136,0,.12); --warn-tx:#ffb45e;
+  --err:#ff7076; --err-bg:rgba(229,72,77,.14); --err-tx:#ff8f94;
+  --off-bg:rgba(255,255,255,.06); --off-tx:#98a1b3;
+  --code-bg:rgba(255,255,255,.09);
+  --shadow:0 1px 2px rgba(0,0,0,.3);
+  --shadow-2:0 10px 32px rgba(0,0,0,.5);
+  --header-bg:rgba(17,21,29,.86);
+}
+
+/* ═══ Base ═══ */
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;
+  font:13.5px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  background:var(--bg); color:var(--ink);
+}
+::selection{background:var(--pri-w)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:8px;border:2px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-track{background:transparent}
+*{scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
+a{color:var(--pri);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--mono);font-size:.9em;background:var(--code-bg);border-radius:5px;padding:1px 5px;word-break:break-all}
+h1,h2,h3,h4{margin:0;font-weight:650}
+button{font:inherit}
+:focus-visible{outline:2px solid var(--pri);outline-offset:2px;border-radius:4px}
+
+/* ═══ Header ═══ */
+.topbar{
+  height:54px; padding:0 20px;
+  display:flex; align-items:center; gap:12px;
+  background:var(--header-bg);
+  -webkit-backdrop-filter:blur(14px) saturate(1.4); backdrop-filter:blur(14px) saturate(1.4);
+  border-bottom:1px solid var(--border);
+  position:sticky; top:0; z-index:30;
+}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.brand .logo{
+  width:28px;height:28px;border-radius:8px;flex:0 0 auto;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,#3370ff,#7c5bff 130%);
+  box-shadow:0 2px 8px rgba(51,112,255,.32);
+}
+.brand h1{font-size:14.5px;letter-spacing:.01em;white-space:nowrap}
+.pill{
+  font-size:11.5px;color:var(--mut);background:var(--card);
+  border:1px solid var(--border);border-radius:999px;padding:1px 10px;
+  font-variant-numeric:tabular-nums;white-space:nowrap;
+}
+.topbar .sp{flex:1}
+.theme-btn{
+  width:32px;height:30px;border-radius:8px;border:1px solid var(--border);
+  background:var(--card);color:var(--mut);cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;
+  transition:color .15s,border-color .15s;
+}
+.theme-btn:hover{color:var(--ink);border-color:var(--border2)}
+
+/* ═══ Layout / Sidebar ═══ */
+.layout{display:flex;min-height:calc(100vh - 54px)}
+.sidenav{
+  width:var(--nav-w);flex:0 0 auto;
+  padding:14px 10px 28px;
+  position:sticky;top:54px;align-self:flex-start;
+  max-height:calc(100vh - 54px);overflow-y:auto;
+}
+.nav-search{position:relative;margin:0 4px 12px}
+.nav-search svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--faint);pointer-events:none}
+.nav-search input{
+  width:100%;padding:7px 10px 7px 30px;font:inherit;font-size:12.5px;
+  border:1px solid var(--border);border-radius:var(--r-s);
+  background:var(--field);color:var(--ink);
+}
+.nav-search input:focus{outline:none;border-color:var(--pri);box-shadow:0 0 0 3px var(--pri-ring)}
+.nav-group{margin-bottom:6px}
+.nav-group-label{
+  font-size:11px;color:var(--faint);font-weight:600;letter-spacing:.06em;
+  padding:10px 12px 4px;white-space:nowrap;
+}
+.nav-item{
+  display:flex;align-items:center;gap:9px;width:100%;
+  padding:7px 12px;margin:1px 0;border:0;background:none;border-radius:var(--r-s);
+  cursor:pointer;font-size:13px;color:var(--ink);text-align:left;
+  transition:background .14s,color .14s;position:relative;
+}
+.nav-item .ico{display:flex;color:var(--mut);transition:color .14s;flex:0 0 auto}
+.nav-item:hover{background:rgba(127,140,170,.1)}
+.nav-item:hover .ico{color:var(--ink)}
+.nav-item.active{background:var(--pri-w);color:var(--pri);font-weight:600}
+.nav-item.active .ico{color:var(--pri)}
+.nav-item .nav-badge{
+  margin-left:auto;min-width:16px;height:16px;padding:0 5px;border-radius:999px;
+  background:var(--err-bg);color:var(--err-tx);font-size:10px;font-weight:600;
+  display:inline-flex;align-items:center;justify-content:center;
+}
+.nav-item.nav-hide{display:none}
+
+main{flex:1;min-width:0;padding:22px 30px 90px}
+@media (min-width:1760px){main{max-width:1400px}}
+
+/* ═══ Page head ═══ */
+.page-head{display:flex;align-items:flex-start;gap:13px;margin:2px 0 20px;flex-wrap:wrap}
+.page-head .ico{
+  width:38px;height:38px;border-radius:11px;flex:0 0 auto;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:var(--pri-w);color:var(--pri);
+}
+.page-head h2{font-size:18px;letter-spacing:.01em}
+.page-head .page-desc{color:var(--mut);font-size:12.5px;margin-top:2px}
+.page-head .page-actions{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#view{animation:fadein .18s ease}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}}
+
+/* ═══ Panel（统一卡片） ═══ */
+.panel{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--r);
+  box-shadow:var(--shadow);margin-bottom:16px;overflow:hidden;
+}
+.panel-head{
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  padding:14px 18px 0;
+}
+.panel-head h3{font-size:14.5px}
+.panel-sub{color:var(--mut);font-size:12px;margin-top:1px}
+.panel-actions{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.panel-body{padding:14px 18px 18px}
+.panel-foot{
+  padding:10px 18px;border-top:1px solid var(--border);
+  color:var(--faint);font-size:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+}
+.panel > hr{border:0;border-top:1px solid var(--border);margin:14px 0}
+.sub-title{font-size:12.5px;font-weight:650;margin:0 0 10px;display:flex;align-items:center;gap:8px}
+
+/* ═══ Status tiles（概览看板） ═══ */
+.tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:16px}
+@media (max-width:1280px){.tiles{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:640px){.tiles{grid-template-columns:1fr}}
+.tile{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--r);
+  box-shadow:var(--shadow);padding:14px 16px 12px;
+  display:flex;flex-direction:column;gap:3px;min-width:0;
+}
+.tile-top{display:flex;align-items:center;gap:7px}
+.tile-top .tile-ico{margin-left:auto;color:var(--faint);display:flex}
+.tile-state{font-size:12.5px;font-weight:650}
+.tile-name{font-size:15px;font-weight:650;margin-top:2px}
+.tile-sub{color:var(--mut);font-size:12px;min-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tile-actions{display:flex;gap:6px;margin-top:8px}
+.tile-actions .btn{padding:4px 10px;font-size:12px}
+
+/* ═══ Dot / Tag ═══ */
+.dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;display:inline-block}
+.dot.ok{background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
+.dot.off{background:var(--faint)}
+.dot.warn{background:var(--warn);box-shadow:0 0 0 3px var(--warn-bg)}
+.dot.err{background:var(--err);box-shadow:0 0 0 3px var(--err-bg)}
+.tag{
+  display:inline-flex;align-items:center;gap:5px;white-space:nowrap;
+  padding:1px 9px;border-radius:999px;font-size:11px;font-weight:550;vertical-align:1px;
+}
+.tag.ok{background:var(--ok-bg);color:var(--ok-tx)}
+.tag.warn{background:var(--warn-bg);color:var(--warn-tx)}
+.tag.err{background:var(--err-bg);color:var(--err-tx)}
+.tag.off{background:var(--off-bg);color:var(--off-tx)}
+.tag.info{background:var(--pri-w);color:var(--pri)}
+.tag.ghost{background:none;border:1px dashed var(--border2);color:var(--mut)}
+
+/* ═══ Buttons ═══ */
+.btn{
+  display:inline-flex;align-items:center;gap:6px;white-space:nowrap;
+  padding:6px 14px;border-radius:var(--r-s);
+  border:1px solid var(--border2);background:var(--card);color:var(--ink);
+  cursor:pointer;font-size:13px;line-height:1.5;
+  transition:background .15s,border-color .15s,color .15s,transform .06s;
+}
+.btn:hover{border-color:var(--pri);color:var(--pri);background:var(--pri-w)}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.primary{background:var(--pri);border-color:var(--pri);color:#fff;box-shadow:0 1px 6px rgba(51,112,255,.3)}
+.btn.primary:hover{background:var(--pri-h);border-color:var(--pri-h);color:#fff}
+.btn.danger{color:var(--err)}
+.btn.danger:hover{border-color:var(--err);background:var(--err-bg);color:var(--err)}
+.btn.danger-solid{background:var(--err);border-color:var(--err);color:#fff}
+.btn.danger-solid:hover{background:#d6383d;border-color:#d6383d;color:#fff;filter:brightness(1.05)}
+.btn.sm{padding:3px 10px;font-size:12px;border-radius:7px}
+.btn.ghost{border-color:transparent;background:none;color:var(--mut)}
+.btn.ghost:hover{color:var(--pri);background:var(--pri-w);border-color:transparent}
+.btn .spin{
+  width:13px;height:13px;border-radius:50%;flex:0 0 auto;
+  border:2px solid var(--border2);border-top-color:var(--pri);
+  animation:spin .8s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+<style>
+/* ═══ Forms ═══ */
+label.fld{display:block;font-size:12px;color:var(--mut);margin:12px 0 5px}
+label.fld:first-child{margin-top:0}
+input[type=text],input[type=password],input[type=number],input[type=search],select,textarea{
+  width:100%;padding:7px 11px;
+  border:1px solid var(--border2);border-radius:var(--r-s);
+  font:inherit;font-size:13px;background:var(--field);color:var(--ink);
+  transition:border-color .15s,box-shadow .15s;
+}
+input:hover,select:hover,textarea:hover{border-color:var(--faint)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--pri);box-shadow:0 0 0 3px var(--pri-ring)}
+textarea{font-family:var(--mono);font-size:12.5px;min-height:90px;line-height:1.6;resize:vertical}
+select{cursor:pointer}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 18px}
+@media (max-width:860px){.grid2{grid-template-columns:1fr}}
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:2px 16px}
+@media (max-width:1100px){.grid3{grid-template-columns:1fr}}
+.frow{display:flex;gap:12px;align-items:flex-start}
+.frow>*{flex:1;min-width:0}
+.frow .btn,.frow .btn-wrap{flex:0 0 auto;align-self:flex-end}
+.input-btn{display:flex;gap:8px}
+.input-btn>input{flex:1;min-width:0}
+.input-btn>.btn{flex:0 0 auto;align-self:center}
+
+/* ═══ Radio cards ═══ */
+.rcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:10px 0}
+.rcard{
+  border:1px solid var(--border2);border-radius:10px;padding:12px 14px;cursor:pointer;
+  display:flex;gap:10px;align-items:flex-start;background:var(--field);
+  transition:border-color .15s,background .15s;
+}
+.rcard:hover{border-color:var(--pri)}
+.rcard input{margin-top:3px;accent-color:var(--pri)}
+.rcard.on{border-color:var(--pri);background:var(--pri-w)}
+.rcard b{font-size:13px;display:block}
+.rcard .hint{margin-top:2px}
+
+/* ═══ Switch ═══ */
+.switch-row{display:flex;align-items:center;gap:10px;margin:8px 0}
+.switch{position:relative;display:inline-flex;flex:0 0 auto;width:40px;height:23px;margin:0;cursor:pointer}
+.switch input{position:absolute;width:0;height:0;opacity:0}
+.switch .track{position:absolute;inset:0;border-radius:999px;background:var(--border2);transition:background .16s}
+.switch .track::after{
+  content:'';position:absolute;top:2px;left:2px;width:19px;height:19px;border-radius:50%;
+  background:#fff;box-shadow:var(--shadow);transition:transform .16s;
+}
+.switch input:checked+.track{background:var(--pri)}
+.switch input:checked+.track::after{transform:translateX(17px)}
+.switch input:focus-visible+.track{box-shadow:0 0 0 3px var(--pri-ring)}
+.switch-label{font-size:13px}
+
+/* ═══ Tables ═══ */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+thead th{color:var(--mut);font-weight:550;font-size:11.5px;letter-spacing:.04em;border-bottom:1px solid var(--border2)}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:rgba(127,140,170,.05)}
+tbody tr:last-child td{border-bottom:0}
+tr.empty td{text-align:center;padding:26px 10px;color:var(--mut)}
+td.ops{white-space:nowrap}
+tr.rowlink{cursor:pointer}
+.kv td:first-child{width:150px;color:var(--mut);font-size:12.5px}
+
+/* ═══ Chips（可编辑名单） ═══ */
+.echips{display:flex;flex-wrap:wrap;gap:7px;align-items:center;padding:9px 11px;min-height:40px}
+.echips.on-box{border:1px solid var(--border2);border-radius:var(--r-s);background:var(--field)}
+.chip{
+  display:inline-flex;align-items:center;gap:6px;
+  background:var(--card);border:1px solid var(--border);
+  padding:2px 6px 2px 11px;border-radius:999px;
+  font-size:12px;font-family:var(--mono);color:var(--ink);white-space:nowrap;
+}
+.chip .x{
+  border:0;background:none;color:var(--faint);cursor:pointer;
+  font-size:13px;line-height:1;padding:1px 4px;border-radius:50%;
+}
+.chip .x:hover{color:var(--err);background:var(--err-bg)}
+.chip.src{font-family:inherit;background:var(--off-bg);border-color:transparent;color:var(--mut)}
+
+/* ═══ Tabs ═══ */
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-bottom:16px;flex-wrap:wrap}
+.tabs button{
+  padding:8px 16px;border:0;background:none;cursor:pointer;font:inherit;font-size:13.5px;
+  color:var(--mut);border-bottom:2px solid transparent;margin-bottom:-1px;
+  transition:color .15s,border-color .15s;
+}
+.tabs button:hover{color:var(--ink)}
+.tabs button.active{color:var(--pri);border-bottom-color:var(--pri);font-weight:600}
+.tabs .dot{margin-left:5px;vertical-align:1px}
+.subtabs{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap}
+.subtabs button{
+  padding:5px 14px;border-radius:999px;border:1px solid var(--border2);
+  background:none;cursor:pointer;font:inherit;font-size:12.5px;color:var(--ink);
+  transition:all .15s;
+}
+.subtabs button:hover{border-color:var(--pri);color:var(--pri)}
+.subtabs button.active{background:var(--pri-w);color:var(--pri);border-color:var(--pri);font-weight:600}
+
+/* ═══ Drawer ═══ */
+.mask{position:fixed;inset:0;background:rgba(13,17,26,.42);z-index:50;display:flex;justify-content:flex-end;animation:fadein .16s ease}
+.mask.center{justify-content:center;align-items:center}
+.mask[hidden]{display:none}
+.drawer{
+  position:relative; /* 左缘拖拽手柄的定位基准 */
+  width:min(960px,94vw);height:100%;background:var(--card);
+  border-left:1px solid var(--border);display:flex;flex-direction:column;
+  box-shadow:-12px 0 40px rgba(13,17,26,.2);
+  animation:slidein .22s cubic-bezier(.22,.8,.36,1);
+}
+.drawer.narrow{width:min(560px,94vw)}
+@keyframes slidein{from{transform:translateX(40px);opacity:.4}}
+/* 左边缘拖拽调宽手柄（与实际配置页 assets/web 同款交互）：8px 命中区，视觉条 2px、悬停/拖拽显主题色 */
+.drawer-resize{position:absolute;left:-4px;top:0;bottom:0;width:8px;cursor:ew-resize;z-index:2;touch-action:none}
+.drawer-resize::after{content:'';position:absolute;left:3px;top:0;bottom:0;width:2px;background:transparent;transition:background .15s}
+.drawer-resize:hover::after,.drawer-resize.dragging::after{background:var(--pri)}
+body.drawer-resizing{cursor:ew-resize;user-select:none}
+.drawer>header{
+  display:flex;align-items:center;gap:12px;padding:0 20px;height:52px;
+  border-bottom:1px solid var(--border);flex:0 0 auto;
+}
+.drawer>header h3{font-size:14.5px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.drawer-body{flex:1;overflow-y:auto;padding:18px 22px}
+.drawer-foot{
+  padding:12px 20px;border-top:1px solid var(--border);
+  display:flex;gap:10px;align-items:center;flex:0 0 auto;
+}
+.drawer-foot .sp{flex:1}
+/* 抽屉内子模块导航 */
+.dw-layout{display:flex;gap:20px;align-items:flex-start}
+.dw-nav{width:150px;flex:0 0 auto;position:sticky;top:0;display:flex;flex-direction:column;gap:2px}
+.dw-nav button{
+  display:flex;align-items:center;gap:8px;width:100%;padding:7px 11px;
+  border:0;background:none;border-radius:var(--r-s);cursor:pointer;
+  font:inherit;font-size:12.5px;color:var(--mut);text-align:left;transition:all .14s;
+}
+.dw-nav button:hover{background:rgba(127,140,170,.09);color:var(--ink)}
+.dw-nav button.active{background:var(--pri-w);color:var(--pri);font-weight:600}
+.dw-nav button .cnt{margin-left:auto;font-size:11px;color:var(--faint)}
+.dw-pane{flex:1;min-width:0}
+@media (max-width:760px){.dw-layout{flex-direction:column}.dw-nav{flex-direction:row;flex-wrap:wrap;width:100%;position:static}}
+
+/* ═══ Modal / Dialog ═══ */
+.dlg{
+  width:min(430px,92vw);background:var(--card);border-radius:14px;padding:20px 22px 16px;
+  box-shadow:var(--shadow-2);border:1px solid var(--border);
+  animation:pop .16s cubic-bezier(.22,.8,.36,1);
+}
+@keyframes pop{from{transform:scale(.96);opacity:.5}}
+.dlg-title{font-size:15px;display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.dlg-title.danger{color:var(--err)}
+.dlg-msg{font-size:13px;line-height:1.75;white-space:pre-line;word-break:break-word;color:var(--ink)}
+.dlg-foot{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+
+/* ═══ Modal（通用居中弹窗：openModal() 用，宽度可配） ═══ */
+.modal{
+  background:var(--card);border-radius:14px;border:1px solid var(--border);
+  box-shadow:var(--shadow-2);width:min(520px,92vw);max-height:88vh;
+  display:flex;flex-direction:column;
+  animation:pop .16s cubic-bezier(.22,.8,.36,1);
+}
+.modal-head{
+  display:flex;align-items:center;gap:10px;flex:0 0 auto;
+  padding:16px 20px 12px;border-bottom:1px solid var(--border);
+}
+.modal-head h3{font-size:14.5px;flex:1;min-width:0}
+.modal-body{padding:16px 20px;overflow-y:auto}
+.modal-foot{
+  padding:12px 20px 16px;border-top:1px solid var(--border);flex:0 0 auto;
+  display:flex;gap:10px;align-items:center;justify-content:flex-end;
+}
+.modal-foot .sp{flex:1}
+
+/* ═══ Toast ═══ */
+#toast{
+  position:fixed;top:20px;left:50%;transform:translateX(-50%) translateY(-12px);
+  background:rgba(28,35,51,.94);color:#fff;
+  -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
+  padding:9px 20px;border-radius:999px;font-size:13px;
+  box-shadow:var(--shadow-2);opacity:0;transition:opacity .25s,transform .25s;
+  pointer-events:none;max-width:80vw;z-index:100;
+}
+#toast.show{opacity:.97;transform:translateX(-50%) translateY(0)}
+#toast.err{background:var(--err)}
+
+/* ═══ Tooltip（信息收納：ⓘ 悬浮显示） ═══ */
+.tip{position:relative;display:inline-flex;color:var(--faint);cursor:help;vertical-align:-2px}
+.tip:hover{color:var(--pri)}
+.tip::after{
+  content:attr(data-tip);
+  position:absolute;left:50%;bottom:calc(100% + 7px);transform:translateX(-50%) translateY(4px);
+  background:rgba(28,35,51,.95);color:#fff;font-size:11.5px;font-weight:400;line-height:1.6;
+  padding:7px 11px;border-radius:8px;width:max-content;max-width:280px;white-space:normal;
+  opacity:0;pointer-events:none;transition:opacity .15s,transform .15s;z-index:60;
+  text-align:left;font-family:inherit;
+}
+.tip:hover::after{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* ═══ Savebar（统一未保存条） ═══ */
+.savebar{
+  position:fixed;bottom:22px;left:50%;transform:translateX(-50%);
+  background:var(--card);border:1px solid var(--warn);border-radius:999px;
+  box-shadow:var(--shadow-2);padding:8px 10px 8px 18px;
+  display:flex;align-items:center;gap:12px;z-index:40;
+  animation:rise .2s ease;
+}
+@keyframes rise{from{transform:translate(-50%,10px);opacity:0}}
+.savebar .state{font-size:12.5px;color:var(--warn-tx);display:flex;align-items:center;gap:7px}
+.savebar[hidden]{display:none}
+
+/* ═══ Banner / Empty / Misc ═══ */
+.banner{border-radius:10px;padding:9px 13px;font-size:12.5px;line-height:1.7;display:flex;gap:8px;align-items:flex-start}
+.banner.warn{background:var(--warn-bg);color:var(--warn-tx)}
+.banner.err{background:var(--err-bg);color:var(--err-tx)}
+.banner.info{background:var(--pri-w);color:var(--pri)}
+.banner b{font-weight:650}
+.empty{text-align:center;padding:30px 16px;color:var(--mut)}
+.empty .btn{margin-top:10px}
+.mono{font-family:var(--mono);font-size:12px}
+.mut{color:var(--mut)}
+.dim{color:var(--faint)}
+details.adv{border:1px solid var(--border);border-radius:10px;padding:0 14px;background:var(--sunk)}
+details.adv>summary{cursor:pointer;font-size:12.5px;color:var(--mut);padding:10px 0;list-style:none;display:flex;align-items:center;gap:6px}
+details.adv>summary::before{content:'▸';transition:transform .15s;font-size:10px}
+details.adv[open]>summary::before{transform:rotate(90deg)}
+details.adv>.adv-body{padding:2px 2px 14px}
+.mini-note{font-size:11.5px;color:var(--faint);line-height:1.7}
+
+/* ═══ App 卡片网格 ═══ */
+.cardgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.acard{
+  background:var(--card);border:1px solid var(--border);border-radius:var(--r);
+  box-shadow:var(--shadow);padding:16px;cursor:pointer;
+  transition:border-color .15s,box-shadow .15s;display:flex;flex-direction:column;gap:9px;
+}
+.acard:hover{border-color:var(--pri);box-shadow:var(--shadow-2)}
+.acard-head{display:flex;align-items:center;gap:8px}
+.acard-head b{font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acard-head .dot{margin-left:auto}
+.acard-meta{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--mut);font-size:12px}
+.acard-meta span{display:inline-flex;align-items:center;gap:5px;min-width:0}
+.acard-foot{display:flex;gap:6px;margin-top:2px}
+.acard.newcard{
+  border-style:dashed;border-color:var(--border2);background:none;
+  align-items:center;justify-content:center;color:var(--mut);min-height:130px;
+  box-shadow:none;gap:6px;
+}
+.acard.newcard:hover{color:var(--pri);border-color:var(--pri);background:var(--pri-w)}
+
+/* ═══ pickChips（可输入筛选的下拉多选，用于分身白名单） ═══ */
+.pick{position:relative}
+.pick .pick-pop{
+  position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:30;
+  background:var(--card);border:1px solid var(--border2);border-radius:10px;
+  box-shadow:var(--shadow-2);max-height:220px;overflow-y:auto;padding:4px;
+}
+.pick .pick-pop[hidden]{display:none}
+.pick .pick-opt{
+  display:flex;align-items:center;gap:8px;width:100%;text-align:left;
+  border:0;background:none;cursor:pointer;font:inherit;font-size:12.5px;color:var(--ink);
+  padding:6px 9px;border-radius:7px;transition:background .12s;
+}
+.pick .pick-opt:hover{background:var(--pri-w)}
+.pick .pick-opt .sub{color:var(--faint);font-size:11px;margin-left:auto;font-family:var(--mono)}
+.pick .pick-empty{padding:10px;color:var(--faint);font-size:12px;text-align:center}
+
+/* ═══ 厂商档案卡（加宽版网格） ═══ */
+.cardgrid.wide{grid-template-columns:repeat(auto-fill,minmax(420px,1fr))}
+@media (max-width:960px){.cardgrid.wide{grid-template-columns:1fr}}
+/* 档案单选小卡（生效配置 Tab） */
+.pfcards{display:flex;flex-wrap:wrap;gap:10px}
+.pfcard{
+  border:1px solid var(--border2);border-radius:10px;padding:10px 14px;cursor:pointer;
+  background:var(--field);min-width:180px;transition:border-color .15s,background .15s;
+}
+.pfcard:hover{border-color:var(--pri)}
+.pfcard.on{border-color:var(--pri);background:var(--pri-w);box-shadow:0 0 0 3px var(--pri-ring)}
+.pfcard b{font-size:13px;display:flex;align-items:center;gap:7px}
+.pfcard .hint{margin-top:3px;font-size:11.5px}
+
+/* ═══ 工作区卡片列表（对齐参考图2） ═══ */
+.ws-list{display:flex;flex-direction:column}
+.ws-item{
+  display:flex;align-items:center;gap:13px;padding:12px 4px;
+  border-bottom:1px solid var(--border);
+}
+.ws-item:last-child{border-bottom:0}
+.ws-item .ws-ico{
+  width:36px;height:36px;border-radius:10px;flex:0 0 auto;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:var(--warn-bg);color:var(--warn);
+}
+.ws-item .ws-main{flex:1;min-width:120px}
+.ws-item .ws-name{font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:8px}
+.ws-item .ws-path{color:var(--mut);font-size:11.5px;font-family:var(--mono);margin-top:2px;word-break:break-all}
+.ws-item .ws-ops{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+/* 选目录弹窗内已选路径卡 */
+.picked-path{
+  display:flex;align-items:center;gap:11px;border:1px solid var(--border);
+  border-radius:10px;padding:11px 14px;background:var(--sunk);
+}
+.picked-path .ws-ico{width:32px;height:32px;border-radius:9px}
+.picked-path b{font-size:13px}
+.picked-path .hint{font-size:11.5px;color:var(--mut)}
+
+/* ═══ 会话页（对齐参考图3） ═══ */
+.chats-layout{display:grid;grid-template-columns:290px minmax(0,1fr);gap:14px;align-items:start}
+@media (max-width:1080px){.chats-layout{grid-template-columns:1fr}}
+.chat-list-panel{padding:0!important}
+.chat-obj{
+  display:flex;gap:10px;padding:11px 14px;cursor:pointer;
+  border-bottom:1px solid var(--border);transition:background .12s;align-items:flex-start;
+}
+.chat-obj:last-child{border-bottom:0}
+.chat-obj:hover{background:rgba(127,140,170,.06)}
+.chat-obj.active{background:var(--pri-w)}
+.chat-obj .c-ava{
+  width:34px;height:34px;border-radius:9px;flex:0 0 auto;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:var(--pri-w);color:var(--pri);font-size:12.5px;font-weight:650;
+}
+.chat-obj .c-main{flex:1;min-width:0}
+.chat-obj .c-top{display:flex;align-items:center;gap:6px}
+.chat-obj .c-name{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-obj .c-time{margin-left:auto;color:var(--faint);font-size:11px;flex:0 0 auto}
+.chat-obj .c-prev{color:var(--mut);font-size:11.5px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-obj .c-topic{font-size:12px;font-weight:600;color:var(--ink);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-obj .c-badges{display:flex;gap:5px;margin-top:4px;align-items:center}
+.cmsg-day{display:flex;align-items:center;gap:12px;color:var(--faint);font-size:11.5px;margin:16px 0 10px}
+.cmsg-day::before,.cmsg-day::after{content:'';flex:1;border-top:1px solid var(--border)}
+.cmsg{display:flex;margin:8px 0;gap:9px}
+.cmsg .m-ava{
+  width:28px;height:28px;border-radius:8px;flex:0 0 auto;margin-top:2px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:var(--off-bg);color:var(--mut);font-size:11px;font-weight:650;
+}
+.cmsg .m-body{max-width:min(76%,640px)}
+.cmsg .m-meta{font-size:11px;color:var(--faint);margin-bottom:3px;display:flex;gap:8px;align-items:center}
+.cmsg .m-bubble{
+  background:var(--card);border:1px solid var(--border);border-radius:11px;
+  padding:8px 13px;font-size:13px;line-height:1.7;word-break:break-word;
+}
+.cmsg.me{flex-direction:row-reverse}
+.cmsg.me .m-body{display:flex;flex-direction:column;align-items:flex-end}
+.cmsg.me .m-bubble{background:var(--pri-w);border-color:transparent}
+.cmsg .m-link{font-size:11.5px;margin-top:4px}
+.cmsg .m-full{margin-top:6px;font-size:12.5px;color:var(--mut);background:var(--sunk);border:1px dashed var(--border2);border-radius:9px;padding:9px 12px;line-height:1.7;white-space:pre-wrap}
+.cmsg .m-full[hidden]{display:none}
+.csum{
+  border:1px solid var(--border);border-radius:11px;background:var(--card);
+  padding:11px 14px;margin:10px 0 10px 37px;max-width:min(76%,640px);
+}
+.csum-top{display:flex;align-items:center;gap:8px}
+.csum-top b{font-size:13px}
+.csum-top .tag{margin-left:auto}
+.csum-stats{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px;font-size:12px;color:var(--mut)}
+.csum-stats b{color:var(--ink);font-variant-numeric:tabular-nums}
+
+/* ═══ 设置 / 密码锁屏 ═══ */
+.lockmask{
+  position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;
+  background:rgba(13,17,26,.55);
+  -webkit-backdrop-filter:blur(18px) saturate(1.2);backdrop-filter:blur(18px) saturate(1.2);
+  animation:fadein .18s ease;
+}
+.lockmask[hidden]{display:none}
+.lockcard{
+  width:min(360px,92vw);background:var(--card);border:1px solid var(--border);
+  border-radius:18px;box-shadow:var(--shadow-2);padding:30px 28px 24px;text-align:center;
+  animation:pop .18s cubic-bezier(.22,.8,.36,1);
+}
+.lockcard .lock-logo{
+  width:46px;height:46px;border-radius:13px;margin:0 auto 14px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,#3370ff,#7c5bff 130%);color:#fff;
+  box-shadow:0 4px 14px rgba(51,112,255,.35);
+}
+.lockcard h3{font-size:16px}
+.lockcard .lock-sub{color:var(--mut);font-size:12.5px;margin:5px 0 18px}
+.lockcard input{margin-bottom:10px;text-align:center;letter-spacing:.2em}
+.lock-err{color:var(--err-tx);font-size:12px;min-height:18px;margin-bottom:6px}
+.lock-tip{color:var(--faint);font-size:11px;margin-top:12px;line-height:1.7}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-7px)}75%{transform:translateX(7px)}}
+.shake{animation:shake .28s ease}
+
+/* ═══ User row（记忆用户） ═══ */
+.urow{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.urow:last-child{border-bottom:0}
+.urow .u-ava{
+  width:32px;height:32px;border-radius:9px;flex:0 0 auto;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:var(--pri-w);color:var(--pri);font-size:13px;font-weight:650;
+}
+.urow .u-main{flex:1;min-width:180px}
+.urow .u-name{font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.urow .u-sub{color:var(--mut);font-size:11.5px;margin-top:1px}
+.urow .u-ops{display:flex;gap:6px;flex-wrap:wrap}
+
+/* ═══ Responsive ═══ */
+@media (max-width:900px){
+  .layout{flex-direction:column}
+  .sidenav{
+    width:auto;max-height:none;position:sticky;top:54px;z-index:20;
+    display:flex;gap:4px;overflow-x:auto;padding:8px 12px;
+    background:var(--header-bg);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
+    border-bottom:1px solid var(--border);
+  }
+  .nav-search{display:none}
+  .nav-group{display:contents}
+  .nav-group-label{display:none}
+  .nav-item{width:auto;flex:0 0 auto;padding:6px 12px}
+  main{padding:16px 16px 90px}
+  .page-head .page-actions{margin-left:0;width:100%}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg></span>
+    <h1>飞书 Claude Code 桥接器</h1>
+  </div>
+  <span class="pill" id="hVer">v2.3.1</span>
+  <span class="pill" id="hHost">127.0.0.1:8217</span>
+  <span class="sp"></span>
+  <span class="pill" style="background:var(--pri-w);border-color:transparent;color:var(--pri)">原型 · Mock 数据</span>
+  <button class="theme-btn" id="lockBtn" title="锁定配置页" aria-label="锁定配置页"></button>
+  <button class="theme-btn" id="settingsBtn" title="设置（密码 / 自动锁屏）" aria-label="设置"></button>
+  <button class="theme-btn" id="themeBtn" title="切换亮 / 暗" aria-label="切换主题"></button>
+</header>
+<div class="layout">
+  <nav class="sidenav" id="nav"></nav>
+  <main>
+    <div class="page-head" id="pageHead"></div>
+    <div id="view"></div>
+    <div class="mini-note" style="margin-top:26px" id="pageLegend"></div>
+  </main>
+</div>
+<div class="mask" id="drawerMask" hidden>
+  <aside class="drawer" role="dialog" aria-modal="true" id="drawerBox">
+    <div class="drawer-resize" id="drawerResize" title="拖拽调宽 · 双击恢复默认" aria-hidden="true"></div>
+    <header><h3 id="drawerTitle"></h3><button class="btn ghost" id="drawerClose" aria-label="关闭">✕</button></header>
+    <div class="drawer-body" id="drawerBody"></div>
+    <footer class="drawer-foot" id="drawerFoot"></footer>
+  </aside>
+</div>
+<div class="mask center" id="modalMask" hidden>
+  <div class="modal" role="dialog" aria-modal="true" id="modalBox">
+    <div class="modal-head"><h3 id="modalTitle"></h3><button class="btn ghost" id="modalClose" aria-label="关闭">✕</button></div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot" id="modalFoot"></div>
+  </div>
+</div>
+<div class="mask center" id="dlgMask" hidden>
+  <div class="dlg" role="alertdialog" aria-modal="true">
+    <div class="dlg-title" id="dlgTitle"></div>
+    <div class="dlg-msg" id="dlgMsg"></div>
+    <div class="dlg-foot">
+      <button class="btn" id="dlgCancel">取消</button>
+      <button class="btn primary" id="dlgOk">确定</button>
+    </div>
+  </div>
+</div>
+<div class="lockmask" id="lockMask" hidden>
+  <div class="lockcard">
+    <span class="lock-logo"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
+    <h3>配置页已锁定</h3>
+    <div class="lock-sub">请输入密码解锁配置页</div>
+    <input type="password" id="lockPwd" placeholder="••••••" autocomplete="off">
+    <div class="lock-err" id="lockErr"></div>
+    <button class="btn primary" id="lockUnlock" style="width:100%;justify-content:center">解锁</button>
+    <div class="lock-tip">长时间未操作会自动锁屏 · 密码可在页面右上角「设置」中修改<br>（原型演示：默认密码 123456，仅存于浏览器本地）</div>
+  </div>
+</div>
+<div id="toast" role="status"></div>
+<div class="savebar" id="savebar" hidden>
+  <span class="state"><span class="dot warn"></span>有未保存的更改</span>
+  <button class="btn sm" id="sbRevert">还原</button>
+  <button class="btn sm primary" id="sbSave">保存</button>
+</div>
+<script>
+/* ═══════════ 图标（Lucide 风格线性 SVG） ═══════════ */
+const I = (d, s=15) => `<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const IC = {
+  overview:'<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+  apps:'<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>',
+  workspaces:'<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  claude:'<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/>',
+  permissions:'<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>',
+  slash:'<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>',
+  plugins:'<path d="M19.4 7.9 21 9.4a2.4 2.4 0 0 1 0 3.4l-1.6 1.6a1 1 0 0 1-.8.3 2.5 2.5 0 1 0-3.2 3.2 1 1 0 0 1 .3.8l-1.6 1.6a2.4 2.4 0 0 1-3.4 0l-1.6-1.6a1 1 0 0 0-.9-.3 2.5 2.5 0 1 1-3.2-3.2 1 1 0 0 1 .3-.9L1.9 12a2.4 2.4 0 0 1 0-3.4l1.6-1.6"/>',
+  skills:'<path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>',
+  mcp:'<circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4M5 5l2.8 2.8m8.4 8.4L19 19M19 5l-2.8 2.8M7.8 16.2L5 19"/>',
+  memory:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
+  plus:'<path d="M12 5v14"/><path d="M5 12h14"/>',
+  search:'<circle cx="11" cy="11" r="7"/><path d="m21 21-3.5-3.5"/>',
+  refresh:'<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>',
+  check:'<path d="M20 6 9 17l-5-5"/>',
+  x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  info:'<circle cx="12" cy="12" r="9"/><path d="M12 8h.01"/><path d="M12 12v4"/>',
+  play:'<path d="m6 4 14 8-14 8z"/>',
+  stop:'<rect width="12" height="12" x="6" y="6" rx="2"/>',
+  rotate:'<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/>',
+  copy:'<rect width="13" height="13" x="9" y="9" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  edit:'<path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
+  trash:'<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  external:'<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+  folder:'<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  zap:'<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>',
+  download:'<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
+  key:'<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/>',
+  bot:'<rect width="16" height="12" x="4" y="8" rx="2"/><path d="M12 8V4M8 4h8"/><path d="M9 13v2M15 13v2"/>',
+  user:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6 8-6s8 2 8 6"/>',
+  eye:'<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
+  sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.3 11.3 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4m11.3-11.3 1.4-1.4"/>',
+  moon:'<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+  globe:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18"/>',
+  clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
+  server:'<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 7.5h.01M7 17h.01"/>',
+  settings:'<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+  lock:'<rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  chats:'<path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z"/><path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/>',
+  file:'<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>',
+  folderOpen:'<path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/>',
+};
+
+/* ═══════════ Mock 数据 ═══════════ */
+const DB = {
+  bridge:{ running:true, pid:14092, embedded:true, autostart:true, version:'2.3.1', latest:'2.4.0' },
+  claudeStat:{ ready:true, mode:'managed', baseUrl:'https://relay.example.com/v1', model:'claude-sonnet-5', token:'sk-···a3f2', key:null, envCount:2,
+    settingsPath:'.lark-claudecode-bridge/claude/settings.json' },
+  larkCli:{ installed:true, version:'2.51.0', latest:'2.52.0', auth:'authorized', skill:true },
+  memory:{ enabled:true, state:'running', version:'0.9.2', endpoint:'http://127.0.0.1:1933', mode:'embedded', since:'2 天 5 小时',
+    plugin:{ found:true, name:'openviking-memory', version:'0.4.1', source:'LCB 自管副本', client:'LCB 托管' },
+    model:{ provider:'glm', apiBase:'https://open.bigmodel.cn/api/paas/v4', keyHint:'sk-···7c21', vlm:'glm-4.7', emb:'embedding-3', embBase:'', embKeyOwn:false },
+    granularity:'bot', rootKey:true,
+    users:[
+      { kind:'web', name:'网页管理', uid:'default', key:'ovk_···9f2c', size:'3.2 MB', active:'今天' },
+      { kind:'bot', name:'小助手', uid:'cli_a1f8k2m9x0-bot', key:'ovk_···71bd', size:'12.6 MB', active:'昨天' },
+      { kind:'bot', name:'素材收集', uid:'cli_b7t3nq6w1-bot', key:'ovk_···04aa', size:'840 KB', active:'3 天前' },
+    ] },
+  apps:[
+    { name:'小助手', appId:'cli_a1f8k2m9x0', secretSet:'···e2', domain:'feishu', ws:'电商项目', cc:4, role:'primary',
+      profile:'中转站A', profileModel:'claude-sonnet-5', status:'running',
+      persona:'你是我的超级助手，擅长代码开发与文案编写，回复简洁直接。',
+      triggers:[ {m:'/produce', r:'请执行内容生产流程：{args}', ask:true}, {m:'日报', r:'/produce 生成今日日报', ask:false} ],
+      env:{ HTTP_PROXY:'http://127.0.0.1:7890' } },
+    { name:'素材收集', appId:'cli_b7t3nq6w1', secretSet:'', domain:'lark', ws:'', cc:'', role:'deputy',
+      profile:'智谱GLM', profileModel:'glm-4.7', status:'running',
+      persona:'', skills:['content-produce','lark-doc','dataviz'], dws:['内容工场'], plugins:['content-producer'],
+      triggers:[], env:{} },
+  ],
+  workspaces:[
+    { name:'电商项目', path:'E:/workspace/e-comm' },
+    { name:'内容工场', path:'C:/Users/me/content' },
+    { name:'实验沙盒', path:'C:/Users/me/sandbox' },
+  ],
+  defaults:{ ws:'电商项目', concurrency:3, ctxRemind:150000, cardWidth:'default' },
+  claude:{
+    mode:'managed', credType:'auth_token', baseUrl:'https://relay.example.com/v1', model:'claude-sonnet-5',
+    env:{ 'CUSTOM_TRACE_HEADER':'lcb-web' },
+    profiles:[
+      { name:'中转站A', cred:'AUTH_TOKEN', baseUrl:'https://relay.example.com/v1', keyHint:'sk-···a3f2', models:['claude-sonnet-5','claude-haiku-4[1m]','glm-5.2'], def:'claude-sonnet-5', active:true },
+      { name:'官方', cred:'API_KEY', baseUrl:'', keyHint:'sk-ant-···88f1', models:['claude-opus-5'], def:'claude-opus-5', active:false },
+      { name:'智谱GLM', cred:'AUTH_TOKEN', baseUrl:'https://open.bigmodel.cn/api/paas/v4', keyHint:'···7c21', models:['glm-5.2','glm-4.7'], def:'glm-5.2', active:false },
+    ] },
+  permissions:{
+    allowAll:true,
+    tools:['Read','Glob','Grep','WebFetch','TodoWrite'],
+    toolsDefault:['Read','Glob','Grep','WebFetch','TodoWrite'],
+    dangerous:['\\bgit\\s+push\\b.*--force','\\brm\\s+-rf\\b','\\bsudo\\b','\\bshutdown\\b','\\bdocker\\s+system\\s+prune'] },
+  slash:[
+    { cmd:'new', desc:'开新会话', icon:'plus' },
+    { cmd:'stop', desc:'停止当前任务', icon:'stop' },
+    { cmd:'status', desc:'查看运行状态', icon:'clock' },
+    { cmd:'plan', desc:'切换计划模式', icon:'edit' },
+    { cmd:'memory', desc:'记忆检索', icon:'memory' },
+    { cmd:'help', desc:'命令帮助', icon:'info' },
+  ],
+  plugins:[
+    { name:'content-producer', market:'official', source:'bridge', version:'1.4.0', latest:'1.5.0', enabled:true },
+    { name:'openviking-memory', market:'openviking', source:'user', version:'0.4.1', latest:'', enabled:true },
+    { name:'lark-suite', market:'official', source:'user', version:'2.0.3', latest:'', enabled:false },
+    { name:'playwright-bridge', market:'official', source:'user', version:'1.1.0', latest:'1.2.0', enabled:true },
+  ],
+  skills:[
+    { name:'content-produce', desc:'内容生产主编排：复刻指定链接生成图文', source:'bridge', path:'.lcb/claude/skills/content-produce' },
+    { name:'lark-doc', desc:'飞书云文档读写与编辑', source:'user', path:'~/.claude/skills/lark-doc' },
+    { name:'dataviz', desc:'图表与数据可视化设计规范', source:'user', path:'~/.claude/skills/dataviz' },
+    { name:'qc-checklist', desc:'电商项目上线前质检清单', source:'project', ws:'电商项目', path:'E:/workspace/e-comm/.claude/skills/qc-checklist' },
+    { name:'feishu-api', desc:'飞书开放平台 API 用法（来自插件）', source:'plugin', plugin:'lark-suite', enabled:true },
+  ],
+  mcp:[
+    { name:'feishu', type:'stdio', conn:'npx -y @larksuite/mcp-server', source:'bridge', status:'ok' },
+    { name:'github', type:'http', conn:'https://api.githubcopilot.com/mcp', source:'user', status:'untested' },
+    { name:'context7', type:'http', conn:'https://mcp.context7.com/mcp', source:'user', status:'warn', detail:'响应超时（5s）' },
+    { name:'lark-bitable', type:'stdio', conn:'插件 lark-suite 内置', source:'plugin', plugin:'lark-suite' },
+  ],
+  slashCmds:{ apps:['小助手（cli_a1f8k2m9x0）'] },
+  chats:{
+    bots:['小助手','素材收集'],
+    /* 以「会话」为维度：同一聊天对象可有多条会话记录（每次对话一条），按时间倒序 */
+    sessions:{
+      '小助手':[
+        { id:'oc_3fe21ba9d8', group:true, name:'项目研发讨论群', topic:'重启失败问题排查', unread:3, time:'今天 08:06',
+          prev:'你没有动重启按钮的启动逻辑吧，它应该还是 lcb start 启动吧…',
+          msgs:[
+            { day:'2026 年 10 月 16 日 星期五' },
+            { who:'me', group:true, name:'群成员·用户', time:'07:38',
+              text:'在使用 lcb 的过程中，我在配置页重启时，经常会重启失败。我怀疑记忆增强的 OpenViking 启动过程导致重启超时。建议先确保 LCB 自身完成重启，再检查是否需要启动 OpenViking，并展示清晰的启动状态。' },
+            { who:'bot', group:true, name:'法光先森的助手', time:'07:44',
+              text:'建议将 LCB 主进程重启与 OpenViking 服务启动解耦。先确认 LCB 已正常启动，再异步检查记忆增强服务状态，避免外部服务影响主服务可用性。',
+              more:'完整回复正文（原型演示占位）——\n\n1. 启动顺序：LCB 主进程先完成 PID 写入与长连接建立，配置页立即可用；\n2. OpenViking 转后台拉起，超时不阻塞、不判「重启失败」；\n3. 自举结果异步回写自举报告，配置页轮询展示分步进度；\n4. 相关改动涉及 start.js / web 状态接口 / 重启弹窗三处。',
+              summary:{ tools:79, rounds:148, files:4, dur:'6 分 24 秒', done:true } },
+            { who:'me', group:true, name:'群成员·用户', time:'08:06',
+              text:'你没有动重启按钮的启动逻辑吧，它应该还是 lcb start 启动吧，我验证直接发布后再验证。' },
+          ]},
+        { id:'om_x100b62183', group:false, name:'刘先生', topic:'本地代码提交与自测', unread:0, time:'今天 08:00', prev:'你知道吗？本地修改的代码还没提交。',
+          msgs:[
+            { day:'今天' },
+            { who:'me', group:false, name:'我', time:'07:58', text:'你知道吗？本地修改的代码还没提交，我先自测一遍原型效果。' },
+            { who:'bot', group:false, name:'法光先森的助手', time:'08:00', text:'收到。建议按模块拆分提交：概览页、应用抽屉、工作区、会话页各自一个 commit，方便回滚与评审。' },
+          ]},
+        { id:'oc_3fe21ba9d8_s2', group:true, name:'项目研发讨论群', topic:'启动顺序解耦方案讨论', unread:0, time:'昨天 17:40', prev:'分步进度条弹窗的交互细节确认。',
+          msgs:[
+            { day:'昨天' },
+            { who:'me', group:true, name:'群成员·用户', time:'17:32', text:'重启弹窗的分步进度怎么展示？LCB 重启中和记忆增强启动中要分开吗？' },
+            { who:'bot', group:true, name:'法光先森的助手', time:'17:40', text:'建议分开：第一步 LCB 启动（配置页先恢复），第二步记忆增强后台拉起。弹窗可随时关闭，完成后打绿色勾并停留提示。' },
+          ]},
+        { id:'oc_55aa12cc01', group:true, name:'产品体验反馈群', topic:'会话记录检索条件需求', unread:0, time:'昨天 17:21', prev:'会话记录页面能否增加检索条件？',
+          msgs:[
+            { day:'昨天' },
+            { who:'me', group:true, name:'群成员·用户', time:'17:21', text:'会话记录页面能否增加检索条件？想按机器人 + 时间过滤。' },
+            { who:'bot', group:true, name:'法光先森的助手', time:'17:24', text:'可以，已在规划中：查询条件支持机器人、时间范围（今天 / 近 7 天 / 近 30 天 / 自定义），结果页支持对象级继续筛选。' },
+          ]},
+        { id:'om_test0001', group:false, name:'测试账号', topic:'锁屏逻辑验证安排', unread:1, time:'昨天 16:40', prev:'发布之后再另验证一下。',
+          msgs:[
+            { day:'昨天' },
+            { who:'me', group:false, name:'我', time:'16:40', text:'发布之后再另验证一下锁屏逻辑。' },
+            { who:'bot', group:false, name:'法光先森的助手', time:'16:41', text:'好的。验证点：默认密码首次登录强制改密、超时自动锁屏、修改密码后旧密码失效。' },
+          ]},
+      ],
+      '素材收集':[
+        { id:'oc_prod_group', group:true, name:'内容生产小组', topic:'本周选题清单整理', unread:0, time:'今天 09:12', prev:'本周选题清单已整理完毕，请查收。',
+          msgs:[
+            { day:'今天' },
+            { who:'me', group:true, name:'群成员·王工', time:'09:05', text:'@素材收集 帮我整理下本周选题清单。' },
+            { who:'bot', group:true, name:'素材收集', time:'09:12', text:'已整理完毕：本周共 6 个候选选题，按热度排序如下……',
+              summary:{ tools:23, rounds:31, files:2, dur:'2 分 08 秒', done:true } },
+          ]},
+        { id:'om_wang', group:false, name:'王同学', topic:'素材邮箱交接', unread:0, time:'周二 14:02', prev:'好的，素材我发你邮箱。',
+          msgs:[
+            { day:'周二' },
+            { who:'me', group:false, name:'我', time:'14:02', text:'素材我发你邮箱，注意查收。' },
+            { who:'bot', group:false, name:'素材收集', time:'14:03', text:'收到，入库后会按项目自动归类。' },
+          ]},
+      ],
+    },
+  },
+  installTargets:{ markets:[ {name:'official', plugins:12}, {name:'openviking', plugins:3} ],
+    available:[ {key:'code-review@official', name:'code-review', market:'official', desc:'Diff 代码评审'}, {key:'db-doc@official', name:'db-doc', market:'official', desc:'数据库文档生成'}, {key:'viking-bot@openviking', name:'viking-bot', market:'openviking', desc:'OpenViking 记忆问答'} ] },
+};
+
+/* ═══════════ 基础工具 ═══════════ */
+const $ = (s, el=document) => el.querySelector(s);
+const $$ = (s, el=document) => [...el.querySelectorAll(s)];
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c)=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const sleep = (ms) => new Promise(r=>setTimeout(r, ms));
+
+function toast(msg, isErr){
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'show' + (isErr ? ' err' : '');
+  clearTimeout(t._h);
+  t._h = setTimeout(()=>{ t.className=''; }, isErr ? 4200 : 2600);
+}
+/* 原型内统一假保存 */
+const fakeSave = (what='已保存') => new Promise(res=>setTimeout(()=>{ toast('✅ ' + what + '（原型演示）'); res(true); }, 350));
+
+let dlgResolve = null;
+function confirmDlg({title, msg, danger=false, okText='确定'}){
+  $('#dlgTitle').innerHTML = (danger ? I(IC.warn,16) + ' ' : '') + title;
+  $('#dlgTitle').className = 'dlg-title' + (danger ? ' danger' : '');
+  $('#dlgMsg').innerHTML = msg;
+  const ok = $('#dlgOk');
+  ok.textContent = okText;
+  ok.className = 'btn ' + (danger ? 'danger-solid' : 'primary');
+  $('#dlgMask').hidden = false;
+  const res = (v) => { $('#dlgMask').hidden = true; const r = dlgResolve; dlgResolve=null; r && r(v); };
+  ok.onclick = () => res(true);
+  $('#dlgCancel').onclick = () => res(false);
+  $('#dlgMask').onclick = (e) => { if (e.target === $('#dlgMask')) res(false); };
+  return new Promise(r => { dlgResolve = r; });
+}
+
+/* 抽屉 */
+let drawerOnClose = null;
+function openDrawer({title, body, foot='', narrow=false, onClose=null}){
+  $('#drawerTitle').textContent = title;
+  $('#drawerBody').innerHTML = body;
+  $('#drawerFoot').innerHTML = foot;
+  $('#drawerBox').classList.toggle('narrow', narrow);
+  $('#drawerMask').hidden = false;
+  drawerOnClose = onClose;
+  return $('#drawerBody');
+}
+function closeDrawer(){ $('#drawerMask').hidden = true; const f = drawerOnClose; drawerOnClose=null; f && f(); }
+$('#drawerClose').onclick = closeDrawer;
+$('#drawerMask').onclick = (e) => { if (e.target === $('#drawerMask')) closeDrawer(); };
+document.addEventListener('keydown', (e)=>{ if (e.key==='Escape'){ if(!$('#dlgMask').hidden){$('#dlgCancel').click();} else if(!$('#modalMask').hidden){ if(modalOnClose) closeModal(); } else if(!$('#drawerMask').hidden) closeDrawer(); } });
+
+/* ═══ 抽屉宽度拖拽（与实际配置页同款：localStorage 记忆 · 双击手柄恢复默认） ═══ */
+const PROTO_DRAWER_WIDTH_KEY = 'lcb-proto-drawer-width';
+const DRAWER_MIN_WIDTH = 420;
+const clampDrawerWidth = (px, vw) => Math.max(DRAWER_MIN_WIDTH, Math.min(Math.round(px), Math.floor(vw*0.94)));
+const drawerEl = () => $('#drawerBox');
+const applyDrawerWidth = (px) => { drawerEl().style.width = `min(${px}px, 94vw)`; };
+(function initDrawerResize(){
+  let saved = NaN; try{ saved = Number(localStorage.getItem(PROTO_DRAWER_WIDTH_KEY)); }catch{}
+  if (Number.isFinite(saved) && saved >= DRAWER_MIN_WIDTH) applyDrawerWidth(saved);
+  const handle = $('#drawerResize');
+  handle.addEventListener('pointerdown', (e)=>{
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add('dragging');
+    document.body.classList.add('drawer-resizing');
+    const startWidth = drawerEl().getBoundingClientRect().width;
+    const startX = e.clientX;
+    const move = (ev)=> applyDrawerWidth(clampDrawerWidth(startWidth + (startX - ev.clientX), window.innerWidth));
+    const up = ()=>{
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.classList.remove('dragging');
+      document.body.classList.remove('drawer-resizing');
+      const w = clampDrawerWidth(drawerEl().getBoundingClientRect().width, window.innerWidth);
+      try{ localStorage.setItem(PROTO_DRAWER_WIDTH_KEY, String(w)); }catch{}
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+  });
+  handle.addEventListener('dblclick', ()=>{
+    try{ localStorage.removeItem(PROTO_DRAWER_WIDTH_KEY); }catch{}
+    drawerEl().style.width = '';
+  });
+})();
+
+/* ═══ 通用居中弹窗（授权/设置/改密/工作区选目录等；Esc 与遮罩顺序：确认框 → 本弹窗 → 抽屉） ═══ */
+let modalOnClose = null;
+function openModal({title, body, foot='', width='', onClose=null, closeOnMask=true}){
+  $('#modalTitle').textContent = title;
+  $('#modalBody').innerHTML = body;
+  $('#modalFoot').innerHTML = foot;
+  $('#modalBox').style.width = width || '';
+  modalOnClose = onClose;
+  $('#modalMask').dataset.closeOnMask = closeOnMask ? '1' : '';
+  $('#modalMask').hidden = false;
+  return $('#modalBody');
+}
+function closeModal(){ $('#modalMask').hidden = true; $('#modalBox').style.width=''; const f = modalOnClose; modalOnClose=null; f && f(); }
+$('#modalClose').onclick = closeModal;
+$('#modalMask').onclick = (e) => { if (e.target === $('#modalMask') && $('#modalMask').dataset.closeOnMask) closeModal(); };
+
+/* ═══ pickChips：可输入筛选的下拉多选（候选项来自已有数据，不再纯手打） ═══ */
+function pickChips(mount, values, {options=[], placeholder='输入筛选，点选添加', onChange=null, subOf=null}={}){
+  mount.classList.add('pick');
+  const norm = (v)=> String(v||'').trim();
+  const render = ()=>{
+    mount.innerHTML = `
+      <div class="echips on-box" style="position:relative">
+        ${values.map((v,i)=>`<span class="chip">${esc(v)}<button class="x" data-i="${i}" aria-label="移除">×</button></span>`).join('')}
+        <input type="text" style="flex:1;min-width:110px;border:0;background:none;box-shadow:none;padding:4px 2px;font-size:12.5px" placeholder="${esc(placeholder)}">
+      </div>
+      <div class="pick-pop" hidden></div>`;
+    const pop = $('.pick-pop', mount), inp = $('input', mount);
+    const closePop = ()=> pop.hidden = true;
+    const showPop = ()=>{
+      const q = norm(inp.value).toLowerCase();
+      const rest = options.filter(o=>!values.includes(o));
+      const hits = rest.filter(o=>o.toLowerCase().includes(q));
+      pop.innerHTML = hits.length
+        ? hits.map(o=>`<button type="button" class="pick-opt">${esc(o)}${subOf?`<span class="sub">${esc(subOf(o))}</span>`:''}</button>`).join('')
+        : '<div class="pick-empty">无匹配项</div>';
+      pop.hidden = false;
+      $$('.pick-opt', pop).forEach(b=> b.onclick = ()=>{
+        values.push(b.firstChild.textContent);
+        inp.value=''; closePop(); render(); onChange && onChange([...values]);
+      });
+    };
+    inp.onfocus = showPop;
+    inp.oninput = showPop;
+    inp.onkeydown = (e)=>{
+      if (e.key==='Enter'){ e.preventDefault();
+        const first = $('.pick-opt', pop);
+        const q = norm(inp.value);
+        if (first) first.click();
+        else if (q && !options.includes(q)) { values.push(q); inp.value=''; closePop(); render(); onChange && onChange([...values]); toast(`「${q}」不在候选中，已按自定义值添加`); }
+      }
+      if (e.key==='Escape' && !pop.hidden){ e.stopPropagation(); closePop(); }
+    };
+    inp.onblur = ()=> setTimeout(closePop, 160);
+    $$('.x', mount).forEach(b=> b.onclick = ()=>{ values.splice(+b.dataset.i,1); render(); onChange && onChange([...values]); });
+  };
+  render();
+  return { render };
+}
+
+/* 可编辑 chips 名单 */
+function echips(mount, values, {placeholder='输入后回车添加', onChange=null}={}){
+  const render = () => {
+    mount.innerHTML = values.map((v,i)=>`<span class="chip">${esc(v)}<button class="x" data-i="${i}" aria-label="移除">×</button></span>`).join('')
+      + `<input type="text" style="flex:1;min-width:120px;border:0;background:none;box-shadow:none;padding:4px 2px;font-size:12.5px" placeholder="${esc(placeholder)}">`;
+    $$('.x', mount).forEach(b => b.onclick = ()=>{ values.splice(+b.dataset.i,1); render(); onChange && onChange([...values]); });
+    const inp = $('input', mount);
+    inp.onkeydown = (e)=>{ if(e.key==='Enter' && inp.value.trim()){ e.preventDefault(); values.push(inp.value.trim()); inp.value=''; render(); onChange && onChange([...values]); } };
+  };
+  render();
+  return { render };
+}
+
+/* 统一未保存条 */
+const SaveBar = {
+  el: null, _snap: null, _redraw: null,
+  init(getSnap, redraw){
+    this.el = $('#savebar'); this._getSnap = getSnap; this._redraw = redraw;
+    this._snap = getSnap();
+    this.el.hidden = true;
+    $('#sbSave').onclick = async ()=>{ if (await fakeSave('配置已保存')){ this._snap = getSnap(); this.el.hidden = true; redraw && redraw(); } };
+    $('#sbRevert').onclick = ()=>{ DBSnapshot = JSON.parse(JSON.stringify(this._snap)); this._snap = DBSnapshot; this.el.hidden = true; toast('已还原'); render(); };
+  },
+  check(){
+    if (!this.el) return;
+    const dirty = JSON.stringify(this._getSnap()) !== JSON.stringify(this._snap);
+    this.el.hidden = !dirty;
+  },
+};
+
+let DBSnapshot = null;
+const snapshotDB = ()=> JSON.parse(JSON.stringify(DB));
+</script>
+<script>
+/* ═══════════ 路由与导航 ═══════════ */
+const NAV = [
+  { group:'总览', items:[['overview','概览'],['chats','会话']] },
+  { group:'机器人接入', items:[['apps','飞书应用'],['workspaces','工作区'],['slash','斜杠命令']] },
+  { group:'模型与扩展', items:[['claude','Claude 认证'],['plugins','插件'],['skills','Skills'],['mcp','MCP']] },
+  { group:'安全与记忆', items:[['permissions','权限'],['memory','记忆增强']] },
+];
+const PAGES = {};
+const DEFAULT_TAB = 'overview';
+const curTab = () => { const id = location.hash.slice(1); return PAGES[id] ? id : DEFAULT_TAB; };
+
+function renderNav(){
+  const q = ($('#navQ')?.value || '').trim();
+  $('#nav').innerHTML = `
+    <div class="nav-search">${I(IC.search,13)}<input id="navQ" placeholder="搜索页面…" value="${esc(q)}"></div>` +
+    NAV.map(g => {
+      const items = g.items.filter(([id]) => PAGES[id]);
+      if (!items.length) return '';
+      return `<div class="nav-group"><div class="nav-group-label">${g.group}</div>` +
+        items.map(([id,label]) => {
+          const p = PAGES[id];
+          const badge = p.badge ? p.badge() : '';
+          return `<button class="nav-item ${id===curTab()?'active':''}" data-k="${id}" data-label="${esc(label)}"><span class="ico">${I(IC[id]||IC.info)}</span><span>${label}</span>${badge}</button>`;
+        }).join('') + '</div>';
+    }).join('');
+  $$('#nav .nav-item').forEach(b => b.onclick = ()=>{ location.hash = b.dataset.k; });
+  /* 过滤只切换菜单项显隐、不重建 DOM；组合输入（中文 IME）期间暂停过滤，
+     compositionend 后再过滤——避免重建/重焦点打断输入法候选词（拼音直接落框的问题） */
+  const inp = $('#navQ');
+  const applyFilter = ()=>{
+    const kw = (inp.value||'').trim().toLowerCase();
+    $$('#nav .nav-item').forEach(b=> b.classList.toggle('nav-hide', !!kw && !b.dataset.label.toLowerCase().includes(kw)));
+    $$('#nav .nav-group').forEach(g=> g.style.display = $$('.nav-item', g).some(b=>!b.classList.contains('nav-hide')) ? '' : 'none');
+  };
+  let composing = false;
+  inp.addEventListener('compositionstart', ()=>{ composing = true; });
+  inp.addEventListener('compositionend', ()=>{ composing = false; applyFilter(); });
+  inp.oninput = ()=>{ if (!composing) applyFilter(); };
+  applyFilter();
+}
+
+const LEGEND = '<span class="tag warn">需重启</span> 标记的配置保存后需重启桥接器生效；其余改动下一条消息自动生效。';
+
+function render(){
+  renderNav();
+  const page = PAGES[curTab()];
+  $('#pageHead').innerHTML = `
+    <span class="ico">${I(IC[page.id]||IC.info,19)}</span>
+    <div><h2>${page.title}</h2><div class="page-desc">${page.desc}</div></div>
+    <div class="page-actions" id="pageActions"></div>`;
+  $('#pageLegend').innerHTML = page.legend === false ? '' : LEGEND;
+  $('#view').innerHTML = '';
+  page.render($('#view'));
+}
+
+/* ═══════════ 运行日志查看器（对应实际 ~/.lark-claudecode-bridge/logs/ 下的落盘日志） ═══════════ */
+const LOG_FILES = {
+  'bridge.log':{ desc:'桥接器主进程（stdout/stderr 落盘）', lines:[
+    ['INFO','2026-10-17 08:02:11.104 bridge v2.3.1 启动，配置加载自 config.yaml（2 个应用）'],
+    ['INFO','2026-10-17 08:02:11.318 [步骤 1/2] LCB 启动：写 PID 14092 → 注册信号处理 → 拉起飞书长连接'],
+    ['INFO','2026-10-17 08:02:12.045 应用「小助手」长连接就绪（cli_a1f8k2m9x0 · feishu）'],
+    ['INFO','2026-10-17 08:02:12.190 应用「素材收集」长连接就绪（cli_b7t3nq6w1 · lark）'],
+    ['INFO','2026-10-17 08:02:12.210 Web 配置页已就绪：http://127.0.0.1:8217'],
+    ['INFO','2026-10-17 08:02:12.215 [步骤 2/2] 记忆增强 OpenViking 转后台拉起（不阻塞主服务）'],
+    ['INFO','2026-10-17 08:02:41.872 收到消息：会话 om_x100b621… → 入队（并发 1/4）'],
+    ['INFO','2026-10-17 08:02:42.001 Claude 子进程启动（--model claude-sonnet-5 · 托管 settings）'],
+    ['WARN','2026-10-17 08:04:56.330 Claude 子进程 180s 无输出，发送保活提示卡'],
+    ['INFO','2026-10-17 08:05:02.881 任务完成：148 轮对话 · 产出 4 个文件 · 耗时 6m24s'],
+    ['INFO','2026-10-17 08:11:20.514 收到消息：群聊 oc_3fe21ba9… 命中触发词 /produce → 改写后入队'],
+    ['ERROR','2026-10-17 08:26:03.900 中转站 relay.example.com 返回 429，已按退避策略重试（第 1 次，2s）'],
+    ['INFO','2026-10-17 08:26:06.112 重试成功，任务继续'],
+    ['INFO','2026-10-17 09:00:00.006 定时任务：会话记录归档完成（transcripts/ 7 天滚动清理）'],
+  ]},
+  'feishu-ws.log':{ desc:'飞书 SDK 长连接与事件回调', lines:[
+    ['INFO','2026-10-17 08:02:12.040 [ws] 连接网关 wss://gateway.feishu.cn（域名 feishu）'],
+    ['INFO','2026-10-17 08:02:12.180 [ws] sdk 连接成功，trace_id=7f3a…c21'],
+    ['INFO','2026-10-17 08:02:41.801 [event] im.message.receive_v1（p2p）seq=1042'],
+    ['INFO','2026-10-17 08:02:42.400 [card] 发送任务受理卡（om_x100b621…）'],
+    ['INFO','2026-10-17 08:05:03.010 [card] 更新为完成卡：含 diff 汇总（git 仓库工作区）'],
+    ['WARN','2026-10-17 08:44:19.772 [ws] 心跳超时一次，SDK 自动重连成功（耗时 1.2s）'],
+    ['INFO','2026-10-17 09:12:55.330 [event] im.message.receive_v1（group，命中 @机器人）'],
+  ]},
+  'openviking.log':{ desc:'记忆增强 OpenViking（受管服务）', lines:[
+    ['INFO','2026-10-17 08:02:12.220 自举开始：检测运行时 uv → 版本满足'],
+    ['INFO','2026-10-17 08:02:12.905 已存在受管服务实例（PID 8821），跳过重复拉起'],
+    ['INFO','2026-10-17 08:02:13.001 记忆插件 openviking-memory v0.4.1 校验通过（LCB 自管副本）'],
+    ['INFO','2026-10-17 08:02:13.080 签发 bot 记忆身份：小助手（cli_a1f8k2m9x0-bot）'],
+    ['INFO','2026-10-17 08:02:13.141 签发 bot 记忆身份：素材收集（cli_b7t3nq6w1-bot）'],
+    ['INFO','2026-10-17 08:05:03.500 归档完成：本轮会话提炼 3 条记忆（vlm=glm-4.7）'],
+    ['WARN','2026-10-17 08:05:04.112 embedding 端点响应 820ms（阈值 500ms），已放行'],
+  ]},
+};
+function logViewer(){
+  let curFile = 'bridge.log';
+  openDrawer({
+    title:'运行日志',
+    body:`
+      <div class="subtabs" id="lgFiles" style="margin-bottom:10px"></div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <select id="lgLevel" style="width:auto;padding:5px 10px;font-size:12.5px">
+          <option value="all">全部级别</option>
+          <option value="INFO">Info</option>
+          <option value="WARN">Warn</option>
+          <option value="ERROR">Error</option>
+        </select>
+        <input type="search" id="lgQ" placeholder="关键字过滤…" style="width:190px;padding:5px 10px;font-size:12.5px">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px"><input type="checkbox" id="lgAuto" checked> 自动滚动到底部</label>
+        <span style="flex:1"></span>
+        <button class="btn sm" id="lgRefresh">↻ 刷新</button>
+        <button class="btn sm" id="lgCopy">复制</button>
+        <button class="btn sm" id="lgDownload">下载</button>
+      </div>
+      <pre id="lgView" style="margin:0;background:#0d1117;color:#c9d4e6;border:1px solid var(--border);border-radius:10px;padding:14px 16px;font-family:var(--mono);font-size:12px;line-height:1.8;overflow:auto;max-height:calc(100vh - 320px);white-space:pre-wrap;word-break:break-all"></pre>
+      <div class="mini-note" style="margin-top:8px">日志文件落盘于 <code>~/.lark-claudecode-bridge/logs/</code>；此处展示最近 500 行，级别与关键字过滤仅影响当前视图。</div>`,
+    foot:`<span class="sp"></span><button class="btn" id="lgClose">关闭</button>`,
+  });
+  $('#lgClose').onclick = closeDrawer;
+  const lvlColor = (l)=> l==='ERROR' ? '#ff8f94' : l==='WARN' ? '#ffb45e' : '#7d8aa5';
+  const paint = ()=>{
+    $('#lgFiles').innerHTML = Object.entries(LOG_FILES).map(([f,v])=>
+      `<button data-f="${f}" class="${f===curFile?'active':''}">${f}<span class="mut" style="margin-left:5px;font-size:11px">${v.desc.split('（')[0]}</span></button>`).join('');
+    $$('#lgFiles button').forEach(btn=> btn.onclick = ()=>{ curFile = btn.dataset.f; paint(); });
+    const lv = $('#lgLevel').value, q = $('#lgQ').value.trim().toLowerCase();
+    const rows = LOG_FILES[curFile].lines.filter(([l,txt])=> (lv==='all'||l===lv) && (!q||txt.toLowerCase().includes(q)));
+    $('#lgView').innerHTML = (rows.length ? rows : [['INFO','（无匹配日志行）']]).map(([l,txt])=>
+      `<span style="color:${lvlColor(l)};font-weight:600">[${l.padEnd(5)}]</span> <span style="color:#8b97ad">${txt.slice(0,23)}</span><span>${esc(txt.slice(23))}</span>`).join('\n');
+    if ($('#lgAuto').checked){ const v=$('#lgView'); v.scrollTop = v.scrollHeight; }
+  };
+  $('#lgLevel').onchange = paint;
+  $('#lgQ').oninput = paint;
+  $('#lgAuto').onchange = paint;
+  $('#lgRefresh').onclick = ()=>{ paint(); toast('已刷新（原型演示）'); };
+  $('#lgCopy').onclick = ()=> toast('日志已复制到剪贴板');
+  $('#lgDownload').onclick = ()=> toast('原型：此处下载 ' + curFile);
+  paint();
+}
+
+/* ═══════════ 页面：概览 ═══════════ */
+PAGES.overview = {
+  id:'overview', title:'概览', desc:'桥接器运行状态、版本与快捷入口',
+  render(el){
+    const b = DB.bridge, c = DB.claudeStat, l = DB.larkCli, m = DB.memory;
+    const tile = ({dot,dstate,name,sub,icon,actions=''}) => `
+      <div class="tile">
+        <div class="tile-top"><span class="dot ${dot}"></span><span class="tile-state" style="color:var(--${dot}-tx)">${dstate}</span><span class="tile-ico">${I(icon,16)}</span></div>
+        <div class="tile-name">${name}</div>
+        <div class="tile-sub" title="${esc(sub)}">${sub}</div>
+        <div class="tile-actions">${actions}</div>
+      </div>`;
+    el.innerHTML = `
+    <div class="tiles">
+      ${tile({dot:b.running?'ok':'off', dstate:b.running?'运行中':'未运行', name:'桥接器进程', sub:`PID ${b.pid} · ${b.embedded?'随 lcb start 常驻':'独立页面托管'}`, icon:IC.apps,
+        actions: b.running
+          ? '<button class="btn" data-a="restart">重启</button><button class="btn danger" data-a="stop">停止</button>'
+          : '<button class="btn primary" data-a="start">启动</button>'})}
+      ${tile({dot:c.ready?'ok':'err', dstate:c.ready?'已就绪':'未认证', name:'Claude 认证', sub:`${c.mode==='managed'?'bridge 托管':'继承本机'} · ${c.model||'CLI 默认'}`, icon:IC.claude,
+        actions:'<button class="btn" data-go="claude">管理</button>'})}
+      ${tile({dot:l.installed?(l.auth==='authorized'?'ok':'warn'):'off', dstate:l.installed?(l.auth==='authorized'?'已授权':'未授权'):'未安装', name:'飞书 CLI', sub:`v${l.version} · SKILL ${l.skill?'已装':'未装'}`, icon:IC.zap,
+        actions:`<button class="btn" data-a="cli-auth">${l.auth==='authorized'?'重新授权':'去授权'}</button>`})}
+      ${tile({dot:m.enabled?(m.state==='running'?'ok':'warn'):'off', dstate:m.enabled?(m.state==='running'?'运行中':'服务异常'):'已停用', name:'记忆增强', sub:`OpenViking v${m.version} · ${m.since}`, icon:IC.memory,
+        actions:'<button class="btn" data-go="memory">管理</button>'})}
+    </div>
+
+    <div class="grid2" style="gap:16px;align-items:start">
+      <div class="panel" style="margin:0">
+        <header class="panel-head"><h3>LCB 桥接器 · 版本与更新</h3>
+          <div class="panel-actions">${b.latest!==b.version?'<span class="tag warn">可更新</span>':'<span class="tag ok">已是最新</span>'}</div>
+        </header>
+        <div class="panel-body">
+          <table class="kv">
+            <tr><td>当前版本</td><td><span class="chip">v${b.version}</span></td></tr>
+            <tr><td>最新版本</td><td>${b.latest!==b.version?`<span class="chip">v${b.latest}</span>`:`<span class="tag ok">v${b.version}</span>`}</td></tr>
+            <tr><td>开机自启</td><td><span class="switch-row" style="margin:0"><label class="switch"><input type="checkbox" id="ovAuto" ${b.autostart?'checked':''}><span class="track"></span></label><span class="hint">登录时自动运行 lcb start</span></span></td></tr>
+          </table>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn sm" id="ovCheckLcb">检查更新</button>
+            ${b.latest!==b.version?`<button class="btn sm primary" data-a="update">更新到 v${b.latest}</button>`:''}
+          </div>
+        </div>
+      </div>
+      <div class="panel" style="margin:0">
+        <header class="panel-head"><h3>飞书 CLI · 版本与更新</h3>
+          <div class="panel-actions">${l.latest!==l.version?'<span class="tag warn">可更新</span>':'<span class="tag ok">已是最新</span>'} <span class="tag ${l.skill?'ok':'warn'}">SKILL ${l.skill?'已装':'未装'}</span></div>
+        </header>
+        <div class="panel-body">
+          <table class="kv">
+            <tr><td>当前版本</td><td><span class="chip">v${l.version}</span></td></tr>
+            <tr><td>最新版本</td><td>${l.latest!==l.version?`<span class="chip">v${l.latest}</span>`:`<span class="tag ok">v${l.version}</span>`}</td></tr>
+            <tr><td>授权状态</td><td>${l.auth==='authorized'?'<span class="tag ok">已授权</span>':'<span class="tag warn">未授权</span>'} <button class="btn sm" data-a="cli-auth" style="margin-left:6px">${l.auth==='authorized'?'重新授权':'去授权'}</button></td></tr>
+          </table>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn sm" id="ovCheckCli">检查更新</button>
+            ${l.latest!==l.version?`<button class="btn sm primary" data-a="update-cli">更新到 v${l.latest}</button>`:''}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <header class="panel-head"><h3>机器人</h3>
+        <div class="panel-actions"><button class="btn sm" data-go="apps">全部应用 →</button></div>
+      </header>
+      <div class="panel-body" style="padding-top:4px">
+        ${DB.apps.map(a=>`<div class="urow">
+          <span class="u-ava">${esc((a.name||'?')[0])}</span>
+          <div class="u-main"><div class="u-name">${esc(a.name||a.appId)} ${a.role==='deputy'?'<span class="tag off">分身</span>':''}</div>
+          <div class="u-sub mono">${esc(a.appId)} · ${a.domain} · ${a.ws||'全局默认工作区'}</div></div>
+          <span class="tag ${a.status==='running'?'ok':'err'}">${a.status==='running'?'运行中':'启动失败'}</span>
+        </div>`).join('')}
+      </div>
+    </div>
+
+    <div class="panel">
+      <header class="panel-head"><h3>飞书快捷指令</h3>
+        <div class="panel-actions"><button class="btn sm" data-go="slash">管理命令 →</button></div>
+      </header>
+      <div class="panel-body" style="padding-top:8px">
+        <div style="display:flex;flex-wrap:wrap;gap:8px">
+          ${DB.slash.map(s=>`<span class="chip" style="font-size:12.5px;padding:4px 12px">/${esc(s.cmd)}<span class="mut" style="font-family:inherit;margin-left:4px">${esc(s.desc)}</span></span>`).join('')}
+        </div>
+        <div class="mini-note" style="margin-top:10px">在飞书聊天框输入 / 触发；其它 / 开头的消息原文透传给 Claude Code。</div>
+      </div>
+    </div>`;
+    $('#pageActions').innerHTML = `<button class="btn primary" data-a="openlog">${I(IC.file,14)} 查看日志</button>`;
+    // 页头按钮在 #view 之外，需单独绑定（原先绑在 #view 委托上，导致「查看日志」点了没反应）
+    $('#pageActions [data-a="openlog"]').onclick = ()=> logViewer();
+    // 快捷操作（重启入口只保留在「桥接器进程」瓦片，页头不再重复）
+    el.addEventListener('click', async (e)=>{
+      const a = e.target.closest('[data-a]'); if(!a) return;
+      const op = a.dataset.a;
+      if (op==='restart'){ a.disabled=true; a.innerHTML='<span class="spin"></span>重启中'; await sleep(1200); toast('✅ 桥接器已重启'); render(); }
+      if (op==='stop'){ if (await confirmDlg({title:'停止桥接器', msg:'停止后机器人将不再响应消息。配置页也会随进程关闭，可运行 lcb ui 重开。', danger:true, okText:'停止'})){ toast('已发送停止信号'); render(); } }
+      if (op==='start'){ toast('已在后台启动'); render(); }
+      if (op==='update'){ a.disabled=true; a.textContent='更新中…'; await sleep(1500); toast('✅ LCB 桥接器已更新到 v'+b.latest+' 并重启'); render(); }
+      if (op==='update-cli'){ a.disabled=true; a.textContent='更新中…'; await sleep(1500); toast('✅ 飞书 CLI 已更新到 v'+l.latest); render(); }
+      if (op==='openlog'){ logViewer(); }
+    });
+    el.addEventListener('click', (e)=>{ const g=e.target.closest('[data-go]'); if(g) location.hash=g.dataset.go; });
+    $('#ovCheckLcb').onclick = async (e)=>{ const btn=e.currentTarget; btn.disabled=true; btn.innerHTML='<span class="spin"></span>检查中'; await sleep(900); btn.disabled=false; btn.textContent='检查更新'; toast(b.latest!==b.version?'LCB 发现新版本 v'+b.latest:'LCB 已是最新版本'); };
+    $('#ovCheckCli').onclick = async (e)=>{ const btn=e.currentTarget; btn.disabled=true; btn.innerHTML='<span class="spin"></span>检查中'; await sleep(900); btn.disabled=false; btn.textContent='检查更新'; toast(l.latest!==l.version?'飞书 CLI 发现新版本 v'+l.latest:'飞书 CLI 已是最新版本'); };
+    $('#ovAuto').onchange = async (e)=>{ b.autostart = e.target.checked; if (await fakeSave(e.target.checked?'已注册开机自启':'已关闭开机自启')) render(); };
+  },
+};
+
+/* ═══════════ 页面：会话（查询条件 + 聊天对象列表 + 消息流，对齐参考图3） ═══════════ */
+let chatsBot = '小助手';
+let chatsObj = 0;
+let chatsQ = '';
+PAGES.chats = {
+  id:'chats', title:'会话', desc:'按机器人、会话对象与时间范围检索历史对话，查看完整消息与任务执行详情', legend:false,
+  render(el){
+    const bots = DB.chats.bots;
+    if (!bots.includes(chatsBot)) chatsBot = bots[0];
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>查询条件</h3>
+        <div class="panel-actions"><span class="dim" style="font-size:11.5px">选择机器人和时间范围后，点「查询会话」加载记录</span></div></header>
+      <div class="panel-body">
+        <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+          <div><label class="fld">飞书机器人 *</label>
+            <select id="chBot" style="width:200px">${bots.map(b=>`<option ${b===chatsBot?'selected':''}>${esc(b)}</option>`).join('')}</select></div>
+          <div><label class="fld">时间范围</label>
+            <select id="chRange" style="width:150px"><option>今天</option><option selected>近 7 天</option><option>近 30 天</option><option value="custom">自定义时间</option></select></div>
+          <div id="chDates" style="display:none;gap:8px;align-items:center">
+            <input type="date" style="width:150px"><span class="mut">至</span><input type="date" style="width:150px">
+          </div>
+          <button class="btn primary" id="chGo">${I(IC.search,13)} 查询会话</button>
+        </div>
+        <div class="mini-note" style="margin-top:8px">默认查询最近 7 天的记录；结果按时间倒序，同一聊天对象的每次对话各为一条会话。</div>
+      </div>
+    </div>
+    <div class="chats-layout">
+      <div class="panel" style="margin:0">
+        <header class="panel-head"><h3>会话列表</h3>
+          <div class="panel-actions"><span class="tag off" id="chCnt"></span></div></header>
+        <div style="padding:10px 12px 8px"><input type="search" id="chQ" placeholder="搜索对象、会话主题或消息…" value="${esc(chatsQ)}"></div>
+        <div class="chat-list-panel" id="chList" style="border-top:1px solid var(--border)"></div>
+      </div>
+      <div class="panel" style="margin:0;min-height:440px" id="chDetail"></div>
+    </div>`;
+    const sessions = ()=> DB.chats.sessions[chatsBot]||[];
+    const drawList = ()=>{
+      const q = chatsQ.trim().toLowerCase();
+      const list = sessions().filter(s=> !q || (s.name+' '+(s.topic||'')+' '+(s.prev||'')).toLowerCase().includes(q));
+      $('#chCnt').textContent = `${list.length} 条会话`;
+      $('#chList').innerHTML = list.length ? list.map((s)=>{
+        const gi = sessions().indexOf(s);
+        return `
+        <div class="chat-obj ${gi===chatsObj?'active':''}" data-chsi="${gi}" role="button" tabindex="0">
+          <span class="c-ava">${s.group?I(IC.chats,15):esc((s.name||'?')[0])}</span>
+          <div class="c-main">
+            <div class="c-top"><span class="c-name">${esc(s.name)}</span><span class="c-time">${esc(s.time)}</span></div>
+            ${s.topic?`<div class="c-topic">${esc(s.topic)}</div>`:''}
+            <div class="c-prev">${esc(s.prev||'')}</div>
+            <div class="c-badges">${s.group?'<span class="tag info">群聊</span>':'<span class="tag off">私聊</span>'}
+              ${s.unread?`<span class="nav-badge" style="position:static">${s.unread}</span>`:''}</div>
+          </div>
+        </div>`;
+      }).join('') : '<div class="empty">无匹配的会话</div>';
+      $$('[data-chsi]').forEach(c=> c.onclick = ()=>{ chatsObj = +c.dataset.chsi; drawList(); drawDetail(); });
+    };
+    const csumHtml = (s)=>`<div class="csum">
+      <div class="csum-top"><b>任务执行摘要</b><span class="tag ${s.done?'ok':'warn'}">${s.done?'已完成':'进行中'}</span></div>
+      <div class="csum-stats">
+        <span>工具调用 <b>${s.tools}</b> 次</span>
+        <span>对话轮次 <b>${s.rounds}</b> 轮</span>
+        <span>产出文件 <b>${s.files}</b> 个</span>
+        <span>执行耗时 <b>${s.dur}</b></span>
+      </div></div>`;
+    const msgHtml = (m)=>{
+      if (m.day) return `<div class="cmsg-day">${esc(m.day)}</div>`;
+      const me = m.who==='me';
+      const ava = `<span class="m-ava">${esc((m.name||'?')[0])}</span>`;
+      return `<div class="cmsg ${me?'me':''}">
+        ${me?'':ava}
+        <div class="m-body">
+          <div class="m-meta" ${me?'style="justify-content:flex-end"':''}>${esc(m.name||'')} <span>${esc(m.time)}</span></div>
+          <div class="m-bubble">${esc(m.text)}</div>
+          ${m.more?`<button class="btn sm ghost m-link" data-more>查看完整内容</button><div class="m-full" hidden>${esc(m.more)}</div>`:''}
+          ${m.summary?csumHtml(m.summary):''}
+        </div>
+        ${me?ava:''}
+      </div>`;
+    };
+    const drawDetail = ()=>{
+      const s = sessions()[chatsObj];
+      const d = $('#chDetail');
+      if (!s){ d.innerHTML = '<div class="empty" style="margin-top:80px">选择左侧聊天对象查看会话详情</div>'; return; }
+      d.innerHTML = `
+      <header class="panel-head" style="padding-bottom:12px;border-bottom:1px solid var(--border)">
+        <h3>${esc(s.name)} ${s.group?'<span class="tag info">群聊</span>':'<span class="tag off">私聊</span>'}</h3>
+        <span class="panel-sub">${esc(chatsBot)}${s.topic?` · ${esc(s.topic)}`:''} · 最近活跃 ${esc(s.time)} · 会话 ID <code>${esc(s.id)}</code></span>
+        <div class="panel-actions">
+          ${s.group?`<button class="btn sm" id="chAll">${I(IC.chats,13)} 群聊记录</button>`:''}
+          <button class="btn sm" id="chCopyId">${I(IC.copy,13)} 复制会话 ID</button>
+        </div></header>
+      <div class="panel-body" style="padding-top:6px">
+        ${s.msgs.map(msgHtml).join('')}
+      </div>`;
+      $$('[data-more]', d).forEach(b=> b.onclick = ()=>{
+        const f = b.nextElementSibling;
+        f.hidden = !f.hidden;
+        b.textContent = f.hidden ? '查看完整内容' : '收起完整内容';
+      });
+      const all = $('#chAll'); if (all) all.onclick = ()=> toast('原型：跳转该群全部会话列表');
+      $('#chCopyId').onclick = ()=> toast(`会话 ID ${s.id} 已复制`);
+    };
+    $('#chBot').onchange = (e)=>{ chatsBot = e.target.value; chatsObj = 0; drawList(); drawDetail(); };
+    $('#chRange').onchange = (e)=>{ $('#chDates').style.display = e.target.value==='custom' ? 'flex' : 'none'; };
+    $('#chGo').onclick = ()=>{ drawList(); drawDetail(); toast(`已加载「${chatsBot}」的会话记录（原型演示）`); };
+    $('#chQ').oninput = (e)=>{ chatsQ = e.target.value; drawList(); };
+    drawList();
+    drawDetail();
+  },
+};
+
+/* ═══════════ 页面：飞书应用 ═══════════ */
+PAGES.apps = {
+  id:'apps', title:'飞书应用', desc:'每个应用一条独立长连接与独立会话池',
+  render(el){
+    el.innerHTML = `<div class="cardgrid">
+      ${DB.apps.map((a,i)=>`
+      <div class="acard" data-i="${i}" tabindex="0" role="button" aria-label="编辑 ${esc(a.name)}">
+        <div class="acard-head"><b>${esc(a.name||a.appId||'未命名')}</b>
+          ${a.role==='deputy'?'<span class="tag info">分身</span>':''}
+          <span class="dot ${a.status==='running'?'ok':'err'}" title="${a.status==='running'?'运行中':'启动失败'}"></span></div>
+        <div class="acard-meta">
+          <span title="App ID">${I(IC.bot,12)}<span class="mono">${esc(a.appId)}</span></span>
+          <span>${I(IC.globe,12)}${a.domain==='lark'?'lark 国际':'feishu 国内'}</span>
+          <span>${I(IC.workspaces,12)}${esc(a.ws||'全局默认')}</span>
+        </div>
+        <div class="acard-meta">
+          <span>${I(IC.claude,12)}${esc(a.profile||'跟随全局')}${a.profileModel?' · '+esc(a.profileModel):''}</span>
+          <span>${I(IC.slash,12)}触发词 ${a.triggers.length}</span>
+        </div>
+        <div class="acard-foot">
+          <button class="btn sm" data-edit="${i}">编辑</button>
+          <button class="btn sm danger" data-del="${i}">删除</button>
+          <span class="mut" style="font-size:11px;align-self:center;margin-left:auto">${a.role==='deputy'?'艾特即用':'配对码准入'}</span>
+        </div>
+      </div>`).join('')}
+      <div class="acard newcard" id="addApp" tabindex="0" role="button">${I(IC.plus,18)}<span>新增应用</span></div>
+    </div>`;
+    $('#pageActions').innerHTML = '<button class="btn primary" id="addAppTop">新增应用</button>';
+    const openEdit = (i)=> appDrawer(i);
+    $$('.acard[data-i]', el).forEach(c=>{
+      c.onclick = (e)=>{ if (e.target.closest('button')) return; openEdit(+c.dataset.i); };
+      c.onkeydown = (e)=>{ if(e.key==='Enter') openEdit(+c.dataset.i); };
+    });
+    $$('[data-edit]', el).forEach(b=> b.onclick = ()=> openEdit(+b.dataset.edit));
+    $$('[data-del]', el).forEach(b=> b.onclick = async ()=>{
+      if (DB.apps.length<=1) return toast('至少保留一个应用', true);
+      const a = DB.apps[+b.dataset.del];
+      if (await confirmDlg({title:'删除应用', msg:`确认删除应用「${a.name}」？删除将立即保存。`, danger:true, okText:'删除'})){ DB.apps.splice(+b.dataset.del,1); await fakeSave('应用已删除'); render(); }
+    });
+    const add = ()=> appDrawer(-1);
+    $('#addApp').onclick = add;
+    $('#addAppTop').onclick = add;
+  },
+};
+
+/* 应用编辑抽屉：顶部横向 Tab（基本信息/模型/触发词/环境变量）；人格与分身白名单并入基本信息 */
+function appDrawer(idx){
+  const isNew = idx < 0;
+  const app = isNew
+    ? { name:'', appId:'', secretSet:'', domain:'feishu', ws:'', cc:'', role:'primary', profile:'', profileModel:'', status:'off', persona:'', triggers:[], env:{}, skills:[], dws:[], plugins:[] }
+    : JSON.parse(JSON.stringify(DB.apps[idx]));
+  const secs = [
+    ['base','基本信息'],['role','机器人角色'],['model','模型'],['trig','触发词'],['env','环境变量'],
+  ];
+  const cnt = (s)=> s==='trig' ? (app.triggers?.length||'') : s==='env' ? (Object.keys(app.env||{}).length||'') : '';
+  let cur = 'base';
+  const wsNames = DB.workspaces.map(w=>w.name);
+  const profiles = DB.claude.profiles.map(p=>p.name);
+
+  const body = openDrawer({
+    title: isNew ? '新增应用' : `应用：${app.name || app.appId}`,
+    body: `<div class="tabs" id="dwTabs" style="margin-bottom:18px"></div><div id="dwPane"></div>`,
+    foot: `${isNew?'':'<button class="btn danger" id="dwDel">删除应用</button>'}<span class="sp"></span><button class="btn" id="dwCancel">取消</button><button class="btn primary" id="dwSave">保存</button>`,
+  });
+
+  const paneBase = () => {
+    return `
+    <div class="sub-title" style="margin-bottom:2px">应用身份
+      ${(app.appId&&!isNew)?'<span class="tag ok" style="margin-left:auto">已连接</span>':'<span class="tag off" style="margin-left:auto">未连接</span>'}
+    </div>
+    <div class="mut" style="font-size:12px;margin-bottom:8px">配置机器人连接信息与默认行为。</div>
+    <div class="grid2">
+      <div><label class="fld">应用名称 <span class="tip" data-tip="概览页与飞书 /status 显示用，缺省取 App ID">${I(IC.info,13)}</span></label>
+        <input type="text" data-f="name" value="${esc(app.name)}" placeholder="素材收集"></div>
+      <div><label class="fld">App ID</label><input type="text" data-f="appId" value="${esc(app.appId)}" placeholder="cli_…"></div>
+    </div>
+    <label class="fld">App Secret ${app.secretSet?`<span class="tag off">已设置 ${esc(app.secretSet)}</span>`:''} <span class="tip" data-tip="已脱敏保存；留空 = 保持不变，输入 = 覆盖">${I(IC.info,13)}</span></label>
+    <div class="input-btn">
+      <input type="password" data-f="secret" placeholder="${app.secretSet?'••••••••（留空保持不变）':'未设置'}">
+      <button class="btn" type="button" id="dwSecretShow">显示</button>
+    </div>
+    <div class="mini-note" style="margin-top:5px">密钥已保存。保存时留空或不修改，将继续使用现有密钥。</div>
+    <div class="grid3" style="margin-top:6px">
+      <div><label class="fld">域名</label><select data-f="domain">
+        <option value="feishu" ${app.domain!=='lark'?'selected':''}>feishu（国内）</option>
+        <option value="lark" ${app.domain==='lark'?'selected':''}>lark（国际）</option></select></div>
+      <div><label class="fld">默认工作区</label><select data-f="ws">
+        <option value="">（全局默认）</option>
+        ${wsNames.map(n=>`<option ${app.ws===n?'selected':''}>${esc(n)}</option>`).join('')}</select></div>
+      <div><label class="fld">并发上限 <span class="tag warn">需重启</span></label>
+        <input type="number" min="1" max="100" data-f="cc" value="${esc(app.cc)}" placeholder="缺省用全局"></div>
+    </div>
+    <label class="fld">人格补充 <span class="tag off">可选</span> <span class="tag warn">需重启</span> <span class="tip" data-tip="追加到该机器人每个会话的 system prompt，用于多机器人差异化定位">${I(IC.info,13)}</span></label>
+    <textarea data-f="persona" style="min-height:76px;font-family:inherit" placeholder="你是我的超级助手，擅长代码开发、文案编写…">${esc(app.persona||'')}</textarea>
+    <div class="mini-note" style="margin-top:6px">${(app.persona||'').length} 字 · 建议只写角色差异与表达偏好，避免重复全局指令。</div>`;
+  };
+
+  const paneRole = () => {
+    const deputy = app.role==='deputy';
+    return `
+    <label class="fld">机器人角色 <span class="tip" data-tip="主机器人=全权限、配对码准入；分身机器人=限定能力、群内艾特即用">${I(IC.info,13)}</span></label>
+    <div class="rcards">
+      <label class="rcard ${!deputy?'on':''}"><input type="radio" name="dwRole" value="primary" ${!deputy?'checked':''}><span><b>主机器人</b><span class="hint">全权限，配对码准入</span></span></label>
+      <label class="rcard ${deputy?'on':''}"><input type="radio" name="dwRole" value="deputy" ${deputy?'checked':''}><span><b>分身机器人</b><span class="hint">限定能力，供他人在群里艾特使用</span></span></label>
+    </div>
+    ${deputy?`
+    <label class="fld" style="margin-top:16px">允许的技能（必填）</label><div id="msSkills"></div>
+    <label class="fld">允许的工作区（必填，任务锁定第一个）</label><div id="msWs"></div>
+    <label class="fld">允许的插件（可选）</label><div id="msPlg"></div>`:''}`;
+  };
+
+  const paneModel = () => `
+    <div class="grid2">
+      <div><label class="fld">厂商档案</label><select id="dwProfile">
+        <option value="">（跟随全局）</option>
+        ${profiles.map(n=>`<option ${app.profile===n?'selected':''}>${esc(n)}</option>`).join('')}</select></div>
+      <div><label class="fld">模型 ${app.profile?'':'<span class="tag off">需先选档案</span>'}</label>
+        <select id="dwModel" ${app.profile?'':'disabled'}>
+          <option value="">（档案默认模型）</option>
+          ${(DB.claude.profiles.find(p=>p.name===app.profile)?.models||[]).map(n=>`<option ${app.profileModel===n?'selected':''}>${esc(n)}</option>`).join('')}
+        </select></div>
+    </div>
+    <div class="mini-note" style="margin-top:10px">认证经独立 settings 注入，模型经 --model 参数注入；改动下一条消息热生效。档案在「Claude 认证」页维护。</div>`;
+
+  const paneTrig = () => `
+    <div class="banner info" style="margin-bottom:10px">命中即改写消息后入队；<code>{text}</code>=原文，<code>{args}</code>=首词后的参数。可指向 bridge 本地命令（如 rewrite=/new）。<span class="tag info" style="margin-left:6px">热生效</span></div>
+    <table><thead><tr><th style="width:32%">match</th><th>rewrite</th><th style="width:64px" class="tip" data-tip="开启后命中先追问补充内容，下一条消息与原文合并再执行">追问</th><th style="width:90px"></th></tr></thead>
+    <tbody id="trigBody"></tbody></table>
+    <button class="btn sm" id="trigAdd" style="margin-top:8px">＋ 添加规则</button>`;
+
+  const paneEnv = () => `
+    <div class="mini-note" style="margin-bottom:8px">注入该机器人的 Claude 子进程，覆盖本机同名值。<span class="tag warn" style="margin-left:4px">需重启</span></div>
+    <table><thead><tr><th style="width:36%">KEY</th><th>VALUE</th><th style="width:90px"></th></tr></thead>
+    <tbody id="envBody"></tbody></table>
+    <button class="btn sm" id="envAdd" style="margin-top:8px">＋ 添加变量</button>`;
+
+  const panes = { base:paneBase, role:paneRole, model:paneModel, trig:paneTrig, env:paneEnv };
+
+  const paintTabs = ()=>{
+    $('#dwTabs').innerHTML = secs.map(([id,label])=>
+      `<button data-s="${id}" class="${id===cur?'active':''}">${label}${cnt(id)!==''?`<span class="tag off" style="margin-left:4px">${cnt(id)}</span>`:''}</button>`).join('');
+    $$('#dwTabs button').forEach(b=> b.onclick = ()=>{ cur=b.dataset.s; paint(); });
+  };
+  const paint = ()=>{
+    paintTabs();
+    $('#dwPane').innerHTML = panes[cur]();
+    bindPane();
+  };
+
+  const bindPane = ()=>{
+    const p = $('#dwPane');
+    if (cur==='base'){
+      $$('[data-f]', p).forEach(inp=> inp.oninput = ()=>{
+        const f = inp.dataset.f;
+        if (f==='secret'){ if (inp.value.trim()) app.secretSet = inp.value.slice(-2) ? '···'+inp.value.slice(-2) : '···'; }
+        else if (f==='cc'){ app.cc = inp.value ? +inp.value : ''; }
+        else app[f] = inp.value;
+      });
+      const showBtn = $('#dwSecretShow');
+      if (showBtn) showBtn.onclick = ()=>{
+        const sec = $('[data-f=secret]', p);
+        const hide = sec.type === 'password';
+        sec.type = hide ? 'text' : 'password';
+        showBtn.textContent = hide ? '隐藏' : '显示';
+      };
+    }
+    if (cur==='role'){
+      $$('.rcard', p).forEach(r=> r.onclick = (e)=>{ e.preventDefault(); app.role = $('input',r).value; paint(); });
+      if (app.role==='deputy'){
+        pickChips($('#msSkills'), app.skills||(app.skills=[]), {options:DB.skills.map(s=>s.name), placeholder:'输入筛选技能，点选添加', subOf:(n)=>{ const s=DB.skills.find(x=>x.name===n); return s?SK_SOURCE(s):''; }, onChange:v=>app.skills=v});
+        pickChips($('#msWs'), app.dws||(app.dws=[]), {options:DB.workspaces.map(w=>w.name), placeholder:'输入筛选工作区，点选添加', subOf:(n)=>{ const w=DB.workspaces.find(x=>x.name===n); return w?w.path:''; }, onChange:v=>app.dws=v});
+        pickChips($('#msPlg'), app.plugins||(app.plugins=[]), {options:DB.plugins.map(x=>x.name), placeholder:'输入筛选插件，点选添加', onChange:v=>app.plugins=v});
+      }
+    }
+    if (cur==='model'){
+      $('#dwProfile').onchange = (e)=>{ app.profile = e.target.value; app.profileModel=''; paint(); };
+      $('#dwModel').onchange = (e)=>{ app.profileModel = e.target.value; };
+    }
+    if (cur==='trig'){
+      const tb = $('#trigBody');
+      const draw = ()=>{
+        tb.innerHTML = app.triggers.length ? app.triggers.map((t,i)=>`
+          <tr><td><input type="text" value="${esc(t.m)}" placeholder="/produce 或 关键词" data-t="${i}" data-c="m"></td>
+          <td><input type="text" value="${esc(t.r)}" placeholder="改写后的消息" data-t="${i}" data-c="r"></td>
+          <td style="text-align:center"><label class="switch tight"><input type="checkbox" data-t="${i}" data-ask ${t.ask?'checked':''}><span class="track"></span></label></td>
+          <td><button class="btn sm danger" data-trm="${i}">删除</button></td></tr>`).join('')
+          : '<tr class="empty"><td colspan="4">暂无规则</td></tr>';
+        $$('input[data-t]', tb).forEach(inp=> inp.oninput = inp.onchange = ()=>{
+          const t = app.triggers[+inp.dataset.t];
+          if (inp.dataset.ask) t.ask = inp.checked; else t[inp.dataset.c] = inp.value;
+        });
+        $$('button[data-trm]', tb).forEach(b=> b.onclick = ()=>{ app.triggers.splice(+b.dataset.trm,1); draw(); paintTabs(); });
+      };
+      draw();
+      $('#trigAdd').onclick = ()=>{ app.triggers.push({m:'',r:'',ask:false}); draw(); paintTabs(); };
+    }
+    if (cur==='env'){
+      const rows = Object.entries(app.env||{});
+      const tb = $('#envBody');
+      const draw = ()=>{
+        tb.innerHTML = rows.length ? rows.map(([k,v],i)=>`
+          <tr><td><input type="text" value="${esc(k)}" data-e="${i}" data-c="k"></td>
+          <td><input type="text" value="${esc(v)}" data-e="${i}" data-c="v"></td>
+          <td><button class="btn sm danger" data-erm="${i}">删除</button></td></tr>`).join('')
+          : '<tr class="empty"><td colspan="3">暂无变量</td></tr>';
+        $$('input[data-e]', tb).forEach(inp=> inp.oninput = ()=>{
+          const r = rows[+inp.dataset.e];
+          r[inp.dataset.c==='k'?0:1] = inp.value;
+          const obj = {}; rows.forEach(([kk,vv])=>{ if(kk.trim()) obj[kk.trim()]=vv; });
+          app.env = obj;
+        });
+        $$('button[data-erm]', tb).forEach(b=> b.onclick = ()=>{ rows.splice(+b.dataset.erm,1); const obj={}; rows.forEach(([kk,vv])=>obj[kk]=vv); app.env=obj; draw(); paintTabs(); });
+      };
+      draw();
+      $('#envAdd').onclick = ()=>{ rows.push(['','']); draw(); paintTabs(); };
+    }
+  };
+
+  paint();
+
+  $('#dwCancel').onclick = closeDrawer;
+  const delBtn = $('#dwDel');
+  if (delBtn) delBtn.onclick = async ()=>{
+    if (await confirmDlg({title:'删除应用', msg:`确认删除应用「${app.name||app.appId}」？`, danger:true, okText:'删除'})){ DB.apps.splice(idx,1); await fakeSave('应用已删除'); closeDrawer(); render(); }
+  };
+  $('#dwSave').onclick = async ()=>{
+    if (app.role==='deputy'){
+      if (!(app.skills||[]).length) return toast('分身必须配置「允许的技能」', true);
+      if (!(app.dws||[]).length) return toast('分身必须配置「允许的工作区」', true);
+    }
+    if (isNew) DB.apps.push(app); else DB.apps[idx] = app;
+    if (await fakeSave('应用配置已保存')){ closeDrawer(); render(); }
+  };
+}
+</script>
+<script>
+/* ═══════════ 页面：工作区（卡片列表 + 选目录弹窗，对齐参考图2） ═══════════ */
+const WS_DEMO_DIRS = ['E:/workspace/e-comm','C:/Users/me/content','D:/projects/2026-new','E:/workspace/experiment'];
+function wsFolderModal(idx){
+  const isNew = idx < 0;
+  const w = isNew ? {name:'',path:''} : JSON.parse(JSON.stringify(DB.workspaces[idx]));
+  let dirIdx = 0;
+  const paint = ()=>{
+    openModal({
+      title: isNew?'添加工作区':'修改工作区', width:'min(460px,92vw)',
+      body:`
+        <div class="mut" style="font-size:12.5px;margin:-4px 0 12px">第一步选择文件夹，接着填写名称。</div>
+        ${w.path
+          ?`<div class="picked-path"><span class="ws-ico">${I(IC.folderOpen,16)}</span>
+              <div><b>${esc(w.path.split(/[\\/]/).pop())}</b><div class="hint mono">${esc(w.path)}</div></div></div>
+            <button class="btn sm" id="wsPick" style="margin-top:8px">${I(IC.folder,13)} 重新选择文件夹</button>`
+          :`<button class="btn primary" id="wsPick">${I(IC.folder,14)} 选择文件夹</button>`}
+        <label class="fld" style="margin-top:16px">工作区名称</label>
+        <input type="text" id="wsName" value="${esc(w.name)}" placeholder="如 电商项目">
+        <div class="mini-note" style="margin-top:6px">名称用于在工作区列表中识别，可随时修改。</div>
+        ${w.path?'':'<div class="mini-note" style="margin-top:10px">如需更换目录，请点击上方按钮重新选择。</div>'}`,
+      foot:`<span class="sp"></span><button class="btn" id="wsMCancel">取消</button><button class="btn primary" id="wsMOk">${isNew?'确认添加':'保存'}</button>`,
+      closeOnMask:true,
+    });
+    $('#wsPick').onclick = ()=>{
+      w.path = WS_DEMO_DIRS[dirIdx % WS_DEMO_DIRS.length]; dirIdx++;
+      if (!w.name) w.name = w.path.split(/[\\/]/).pop();
+      paint();
+    };
+    $('#wsMCancel').onclick = closeModal;
+    $('#wsMOk').onclick = async ()=>{
+      if (!w.path) return toast('请先选择文件夹', true);
+      w.name = $('#wsName').value.trim();
+      if (!w.name) return toast('请填写工作区名称', true);
+      if (isNew) DB.workspaces.push(w); else DB.workspaces[idx] = w;
+      closeModal();
+      if (await fakeSave('工作区已保存')) render();
+    };
+  };
+  paint();
+}
+
+PAGES.workspaces = {
+  id:'workspaces', title:'工作区', desc:'Claude 的工作目录白名单与全局默认',
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>工作区目录</h3>
+        <span class="panel-sub">选择本机文件夹并设置一个便于识别的名称</span>
+        <div class="panel-actions"><button class="btn primary sm" id="wsAdd">＋ 添加工作区</button></div>
+      </header>
+      <div class="panel-body"><div class="ws-list" id="wsList"></div></div>
+      <footer class="panel-foot">${I(IC.info,13)} git 仓库工作区的任务收尾会自动发送汇总 diff 卡片。</footer>
+    </div>
+    <div class="panel">
+      <header class="panel-head"><h3>全局默认</h3>
+        <span class="panel-sub">用于新会话的默认行为；默认工作区在上方列表行内「设为默认」</span></header>
+      <div class="panel-body">
+        <div class="grid2">
+          <div><label class="fld">全局并发</label><input type="number" id="defCc" min="1" max="100" value="${DB.defaults.concurrency}"></div>
+          <div><label class="fld">上下文提醒阈值 <span class="tip" data-tip="会话上下文超过该 token 数时提醒 /new，0=关闭">${I(IC.info,13)}</span></label>
+            <input type="number" id="defCtx" min="0" value="${DB.defaults.ctxRemind}"></div>
+          <div><label class="fld">飞书卡片宽度</label><select id="defCard">
+            <option value="default" ${DB.defaults.cardWidth==='default'?'selected':''}>默认</option>
+            <option value="fill" ${DB.defaults.cardWidth==='fill'?'selected':''}>撑满聊天窗口</option></select></div>
+        </div>
+      </div>
+    </div>`;
+    const drawRows = ()=>{
+      $('#wsList').innerHTML = DB.workspaces.map((w,i)=>`
+        <div class="ws-item">
+          <span class="ws-ico">${I(IC.folder,16)}</span>
+          <div class="ws-main">
+            <div class="ws-name">${esc(w.name)||'<span class="mut">（未命名）</span>'} ${DB.defaults.ws===w.name?'<span class="tag ok">默认</span>':''}</div>
+            <div class="ws-path">${esc(w.path)||'（未选择目录）'}</div>
+          </div>
+          <div class="ws-ops">
+            ${DB.defaults.ws===w.name?'':`<button class="btn sm" data-wdef="${i}">设为默认</button>`}
+            <button class="btn sm" data-wedit="${i}">修改</button>
+            <button class="btn sm danger" data-wdel="${i}">删除</button>
+          </div>
+        </div>`).join('') || '<div class="empty">暂无工作区，点右上「＋ 添加工作区」开始</div>';
+      $$('[data-wdef]').forEach(b=> b.onclick = async ()=>{ DB.defaults.ws = DB.workspaces[+b.dataset.wdef].name; await fakeSave('默认工作区已切换'); render(); });
+      $$('[data-wedit]').forEach(b=> b.onclick = ()=> wsFolderModal(+b.dataset.wedit));
+      $$('[data-wdel]').forEach(b=> b.onclick = async ()=>{
+        if (DB.workspaces.length<=1) return toast('至少保留一个工作区', true);
+        const w = DB.workspaces[+b.dataset.wdel];
+        if (await confirmDlg({title:'删除工作区', msg:`删除工作区「${w.name}」？点底部保存后生效。`, danger:true, okText:'删除'})){ DB.workspaces.splice(+b.dataset.wdel,1); drawRows(); SaveBar.check(); }
+      });
+    };
+    drawRows();
+    SaveBar.init(snapshotDB, render);
+    const bindDef = (sel, key, num=false)=>{ const n=$(sel); if(!n) return; const h=()=>{ DB.defaults[key] = num ? (+n.value||0) : n.value; SaveBar.check(); }; n.oninput = h; n.onchange = h; };
+    bindDef('#defCc','concurrency',true); bindDef('#defCtx','ctxRemind',true); bindDef('#defCard','cardWidth');
+    $('#wsAdd').onclick = ()=> wsFolderModal(-1);
+  },
+};
+
+/* ═══════════ 页面：Claude 认证（生效配置 = 档案化选择；凭证不再手填） ═══════════ */
+let claudeTab = 'cur';
+PAGES.claude = {
+  id:'claude', title:'Claude 认证', desc:'认证模式、生效凭证与厂商档案；bridge 托管时从档案中选择，无须手填',
+  badge: ()=> '',
+  render(el){
+    const c = DB.claude;
+    el.innerHTML = `
+    <div class="tabs">
+      <button data-t="cur" class="${claudeTab==='cur'?'active':''}">生效配置</button>
+      <button data-t="pf" class="${claudeTab==='pf'?'active':''}">厂商档案 <span class="tag off" style="margin-left:4px">${c.profiles.length}</span></button>
+    </div><div id="claudePane"></div>`;
+    $$('.tabs button', el).forEach(b=> b.onclick = ()=>{ claudeTab=b.dataset.t; render(); });
+    const pane = $('#claudePane');
+    if (claudeTab==='cur'){
+      const cs = DB.claudeStat;
+      const ap = c.profiles.find(p=>p.active);
+      pane.innerHTML = `
+      <div class="panel">
+        <header class="panel-head"><h3>当前生效</h3>
+          <div class="panel-actions"><span class="tag ${cs.ready?'ok':'err'}">${cs.ready?'已就绪':'未认证'}</span></div></header>
+        <div class="panel-body"><table class="kv">
+          <tr><td>认证模式</td><td>${c.mode==='managed'?`bridge 托管 · 档案「${esc(ap?ap.name:'未选择')}」`:'继承本机 ~/.claude'}</td></tr>
+          <tr><td>BASE_URL</td><td><code>${c.mode==='managed'?(ap?(esc(ap.baseUrl)||'api.anthropic.com（官方默认）'):'—（先选择档案）'):'本机 ~/.claude 配置'}</code></td></tr>
+          <tr><td>模型</td><td><code>${esc(c.model||'CLI 默认')}</code></td></tr>
+          <tr><td>凭证</td><td><code>${c.mode==='managed'?(ap?.keyHint||'未设置'):'本机登录态'}</code></td></tr>
+          <tr><td>settings.json</td><td><code>${esc(cs.settingsPath)}</code></td></tr>
+        </table></div>
+      </div>
+      <div class="panel">
+        <header class="panel-head"><h3>认证模式</h3></header>
+        <div class="panel-body">
+          <div class="rcards">
+            <label class="rcard ${c.mode!=='managed'?'on':''}"><input type="radio" name="clMode" value="inherit" ${c.mode!=='managed'?'checked':''}><span><b>继承本机</b><span class="hint">沿用本机 claude login 的登录态</span></span></label>
+            <label class="rcard ${c.mode==='managed'?'on':''}"><input type="radio" name="clMode" value="managed" ${c.mode==='managed'?'checked':''}><span><b>bridge 托管</b><span class="hint">凭证来自厂商档案，无需本机登录</span></span></label>
+          </div>
+          ${c.mode==='managed'?`
+          <hr>
+          <label class="fld" style="font-size:12.5px;color:var(--ink);font-weight:600">选择厂商档案 <span class="tip" data-tip="凭证类型、BASE_URL 与密钥都在档案中维护；此处只做选择，改档案请到「厂商档案」页签">${I(IC.info,13)}</span></label>
+          <div class="pfcards" id="clPfs">
+            ${c.profiles.map((p,i)=>`
+            <div class="pfcard ${p.active?'on':''}" data-clpf="${i}" role="button" tabindex="0" aria-label="选择档案 ${esc(p.name)}">
+              <b>${esc(p.name)} ${p.active?'<span class="tag ok">使用中</span>':''}</b>
+              <div class="hint mut">${p.baseUrl?`<span class="mono">${esc(p.baseUrl)}</span>`:'官方默认端点'} · ${esc(p.cred)} · ${esc(p.keyHint||'')}</div>
+            </div>`).join('')}
+          </div>
+          <div style="display:flex;gap:14px;align-items:flex-end;margin-top:14px;flex-wrap:wrap">
+            <div style="flex:1;min-width:240px"><label class="fld">模型 <span class="dim" style="font-weight:400">${esc(ap?ap.name+' 候选':'（先选择档案）')}</span></label>
+              <select id="clModel">
+                ${ap?ap.models.map(m=>`<option value="${esc(m)}" ${c.model===m?'selected':''}>${esc(m)}${ap.def===m?'（档案默认）':''}</option>`).join(''):'<option value="">（先选择档案）</option>'}
+              </select></div>
+            <button class="btn" id="clGotoPf">去管理厂商档案 →</button>
+          </div>
+          <details class="adv" style="margin-top:14px"><summary>高级：环境变量（写入托管 settings.json）</summary>
+            <div class="adv-body">
+              <table><tbody id="clEnvBody"></tbody></table>
+              <button class="btn sm" id="clEnvAdd" style="margin-top:8px">＋ 添加变量</button>
+            </div></details>
+          `:`
+          <div class="banner info" style="margin-top:12px">继承本机登录态：LCB 不写托管凭证，Claude CLI 直接使用本机 <code>~/.claude</code> 的登录与配置。如需固定凭证 / 模型，请切到「bridge 托管」并选择厂商档案。</div>`}
+          <div style="margin-top:14px"><button class="btn primary" id="clModeSave">保存</button></div>
+        </div>
+        <footer class="panel-foot">凭证与 BASE_URL 由所选厂商档案统一维护（本页只读展示）；托管模式与本机 ~/.claude 完全隔离；模式切换需重启，模型选择即时生效。</footer>
+      </div>`;
+      $$('.rcard', pane).forEach(r=> r.onclick = (e)=>{ e.preventDefault(); c.mode = $('input',r).value; render(); });
+      $$('[data-clpf]', pane).forEach(card=> card.onclick = ()=>{
+        const p = c.profiles[+card.dataset.clpf];
+        c.profiles.forEach(x=> x.active = false);
+        p.active = true;
+        c.model = p.def || p.models[0] || c.model;
+        render();
+      });
+      const msel = $('#clModel');
+      if (msel) msel.onchange = (e)=>{ c.model = e.target.value; };
+      $('#clGotoPf').onclick = ()=>{ claudeTab='pf'; render(); };
+      $('#clModeSave').onclick = ()=> fakeSave('认证配置已保存');
+      const rows = Object.entries(c.env||{});
+      const drawEnv = ()=>{
+        $('#clEnvBody').innerHTML = rows.map(([k,v],i)=>`<tr><td style="width:38%"><input type="text" value="${esc(k)}" data-ce="${i}" data-c="k"></td><td><div class="input-btn"><input type="text" value="${esc(v)}" data-ce="${i}" data-c="v"><button class="btn sm danger" data-cerm="${i}">删除</button></div></td></tr>`).join('')
+          || '<tr><td colspan="2" class="mut">未配置</td></tr>';
+        $$('input[data-ce]').forEach(inp=> inp.oninput = ()=>{ rows[+inp.dataset.ce][inp.dataset.c==='k'?0:1]=inp.value; const o={}; rows.forEach(([k,v])=>{if(k.trim())o[k]=v}); c.env=o; });
+        $$('button[data-cerm]').forEach(b=> b.onclick = ()=>{ rows.splice(+b.dataset.cerm,1); drawEnv(); });
+      };
+      drawEnv();
+      $('#clEnvAdd').onclick = ()=>{ rows.push(['','']); drawEnv(); };
+    }
+    if (claudeTab==='pf'){
+      pane.innerHTML = `
+      <div class="cardgrid wide">
+        ${c.profiles.map((p,i)=>`
+        <div class="acard" style="cursor:default">
+          <div class="acard-head"><b>${esc(p.name)}</b>${p.active?'<span class="tag ok">使用中</span>':''}</div>
+          <div class="acard-meta"><span>${I(IC.key,12)}${esc(p.cred)}</span><span>${I(IC.globe,12)}${p.baseUrl?`<span class="mono">${esc(p.baseUrl)}</span>`:'官方默认'}</span></div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            ${p.models.map(m=>`<button class="btn sm ${p.active&&m===c.model?'primary':''}" data-usemodel="${i}" data-m="${esc(m)}" title="点击切换为当前模型">${esc(m)}${p.active&&m===c.model?' ✓':''}</button>`).join('')||'<span class="mut">无候选模型</span>'}
+          </div>
+          <div class="acard-foot">
+            <button class="btn sm" data-pfedit="${i}">编辑</button>
+            <button class="btn sm danger" data-pfdel="${i}">删除</button>
+            <span class="mut" style="font-size:11px;align-self:center;margin-left:auto">默认 ${esc(p.def||'—')}</span>
+          </div>
+        </div>`).join('')}
+        <div class="acard newcard" id="pfAdd">${I(IC.plus,18)}<span>新增档案</span></div>
+      </div>`;
+      $('#pageActions').innerHTML = '<button class="btn primary" id="pfAddTop">新增档案</button>';
+      $$('[data-usemodel]').forEach(b=> b.onclick = async ()=>{
+        const p = c.profiles[+b.dataset.usemodel];
+        const r = p.models.includes(b.dataset.m);
+        c.model = b.dataset.m;
+        c.profiles.forEach(x=> x.active = false);
+        p.active = r;
+        await fakeSave(`已切换模型：${b.dataset.m}`); render();
+      });
+      $$('[data-pfedit]').forEach(b=> b.onclick = ()=> profileDrawer(+b.dataset.pfedit));
+      $$('[data-pfdel]').forEach(b=> b.onclick = async ()=>{
+        const p = c.profiles[+b.dataset.pfdel];
+        if (await confirmDlg({title:'删除档案', msg:`确认删除档案「${p.name}」？删除立即生效。`, danger:true, okText:'删除'})){ c.profiles.splice(+b.dataset.pfdel,1); await fakeSave('档案已删除'); render(); }
+      });
+      $('#pfAdd').onclick = ()=> profileDrawer(-1);
+      $('#pfAddTop').onclick = ()=> profileDrawer(-1);
+    }
+  },
+};
+
+function profileDrawer(idx){
+  const isNew = idx<0;
+  const p = isNew ? {name:'',cred:'AUTH_TOKEN',baseUrl:'',models:[],def:''} : JSON.parse(JSON.stringify(DB.claude.profiles[idx]));
+  openDrawer({
+    title: isNew?'新增厂商档案':`档案：${p.name}`,
+    narrow:true,
+    body:`
+      <label class="fld">档案名</label><input type="text" id="pfName" value="${esc(p.name)}" placeholder="中转站A">
+      <label class="fld">凭证类型</label><select id="pfCred">
+        <option value="AUTH_TOKEN" ${p.cred!=='API_KEY'?'selected':''}>AUTH_TOKEN（Bearer）</option>
+        <option value="API_KEY" ${p.cred==='API_KEY'?'selected':''}>API_KEY（x-api-key）</option></select>
+      <label class="fld">凭证</label><input type="password" placeholder="sk-…（留空保持不变）">
+      <label class="fld">BASE_URL（官方留空）</label><input type="text" id="pfBase" value="${esc(p.baseUrl)}" placeholder="https://relay.example.com">
+      <label class="fld">候选模型 <span class="tip" data-tip="列表页点模型名即时切换当前模型；勾选 1M 添加的模型带 [1m] 后缀">${I(IC.info,13)}</span></label>
+      <div class="echips on-box" id="pfModels"></div>
+      <div class="frow" style="margin-top:10px">
+        <div><input type="text" id="pfNewModel" placeholder="输入模型名"></div>
+        <label style="display:inline-flex;align-items:center;gap:5px;font-size:12.5px;flex:0 0 auto;padding-top:6px"><input type="checkbox" id="pf1M"> 1M 上下文</label>
+        <div class="btn-wrap"><button class="btn" id="pfAddModel">添加</button></div>
+        <div class="btn-wrap"><button class="btn" id="pfPull">拉取模型</button></div>
+      </div>
+      <label class="fld" style="margin-top:14px">默认模型</label>
+      <select id="pfDef"><option value="">（不指定）</option>${p.models.map(m=>`<option ${p.def===m?'selected':''}>${esc(m)}</option>`).join('')}</select>`,
+    foot:`${isNew?'':'<button class="btn danger" id="pfDel">删除</button>'}<span class="sp"></span><button class="btn" id="pfCancel">取消</button><button class="btn primary" id="pfSave">保存</button>`,
+  });
+  echips($('#pfModels'), p.models, {placeholder:'输入后回车添加', onChange:v=>{ p.models=v; $('#pfDef').innerHTML='<option value="">（不指定）</option>'+v.map(m=>`<option ${p.def===m?'selected':''}>${esc(m)}</option>`).join(''); }});
+  $('#pfName').oninput = e=> p.name = e.target.value.trim();
+  $('#pfBase').oninput = e=> p.baseUrl = e.target.value.trim();
+  $('#pfAddModel').onclick = ()=>{
+    const v = $('#pfNewModel').value.trim(); if(!v) return;
+    const full = $('#pf1M').checked ? v+'[1m]' : v;
+    if (!p.models.includes(full)) p.models.push(full);
+    $('#pfNewModel').value=''; $('#pf1M').checked=false;
+    echips($('#pfModels'), p.models, {placeholder:'输入后回车添加', onChange:vv=>{ p.models=vv; }});
+    $('#pfDef').innerHTML='<option value="">（不指定）</option>'+p.models.map(m=>`<option ${p.def===m?'selected':''}>${esc(m)}</option>`).join('');
+  };
+  $('#pfPull').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.innerHTML='<span class="spin"></span>拉取中'; await sleep(800); b.disabled=false; b.textContent='拉取模型'; toast('获取到 8 个模型（原型演示）'); };
+  $('#pfCancel').onclick = closeDrawer;
+  const del = $('#pfDel');
+  if (del) del.onclick = async ()=>{ if (await confirmDlg({title:'删除档案', msg:`确认删除「${p.name}」？`, danger:true, okText:'删除'})){ DB.claude.profiles.splice(idx,1); await fakeSave(); closeDrawer(); render(); } };
+  $('#pfSave').onclick = async ()=>{ if(!p.name) return toast('请填写档案名', true); if (isNew) DB.claude.profiles.push(p); else DB.claude.profiles[idx]=p; if (await fakeSave('档案已保存')){ closeDrawer(); render(); } };
+}
+
+/* ═══════════ 页面：权限 ═══════════ */
+let permTab = 'allow';
+PAGES.permissions = {
+  id:'permissions', title:'权限', desc:'工具免确认名单与危险命令黑名单，改动即时生效',
+  render(el){
+    const p = DB.permissions;
+    el.innerHTML = `
+    <div class="tabs">
+      <button data-t="allow" class="${permTab==='allow'?'active':''}">免确认工具</button>
+      <button data-t="danger" class="${permTab==='danger'?'active':''}">危险命令黑名单 <span class="tag off" style="margin-left:4px">${p.dangerous.length}</span></button>
+    </div><div id="permPane"></div>`;
+    $$('.tabs button', el).forEach(b=> b.onclick = ()=>{ permTab=b.dataset.t; render(); });
+    const pane = $('#permPane');
+    if (permTab==='allow'){
+      const isDefault = JSON.stringify(p.tools)===JSON.stringify(p.toolsDefault);
+      pane.innerHTML = `
+      <div class="panel">
+        <header class="panel-head"><h3>免确认工具</h3>
+          <div class="panel-actions">${isDefault?'<span class="tag off">与内置默认一致</span>':''}</div></header>
+        <div class="panel-body">
+          <div class="switch-row" style="margin-top:0">
+            <label class="switch"><input type="checkbox" id="allowAll" ${p.allowAll?'checked':''}><span class="track"></span></label>
+            <span class="switch-label">全部工具免确认</span>
+            <span class="tip" data-tip="开启后除命中黑名单的 Bash 外，所有工具（含写入）都不再弹确认卡">${I(IC.info,13)}</span>
+          </div>
+          ${p.allowAll?'<div class="banner warn" style="margin:8px 0">已开启全部放行——下方名单暂不生效，黑名单是唯一安全网。</div>':''}
+          <div style="${p.allowAll?'opacity:.45;pointer-events:none':''}">
+            <div class="echips on-box" id="toolChips" style="margin-top:6px"></div>
+            <div style="display:flex;gap:8px;margin-top:10px">
+              <input type="text" id="newTool" placeholder="工具名，如 Write" style="max-width:300px">
+              <button class="btn" id="addTool">添加</button>
+              <button class="btn" id="resetTools">恢复默认</button>
+            </div>
+          </div>
+        </div>
+        <footer class="panel-foot">命中名单的工具直接放行；未命中弹确认卡。改动即时生效。</footer>
+      </div>`;
+      echips($('#toolChips'), p.tools, {placeholder:'回车添加', onChange:()=>SaveBar_checkPerm()});
+      function SaveBar_checkPerm(){ fakeSave('权限已更新'); }
+      $('#addTool').onclick = ()=>{ const v=$('#newTool').value.trim(); if(v && !p.tools.includes(v)){ p.tools.push(v); render(); } };
+      $('#resetTools').onclick = async ()=>{ if (await confirmDlg({title:'恢复默认', msg:'恢复为内置默认名单？当前自定义项将被覆盖。', okText:'恢复默认'})){ p.tools=[...p.toolsDefault]; render(); } };
+      $('#allowAll').onchange = async (e)=>{
+        const next = e.target.checked;
+        if (next && !(await confirmDlg({title:'开启全部工具免确认', msg:'开启后除命中黑名单的 Bash 外，所有工具（含写入）都不再弹确认卡。确定开启？', danger:true, okText:'开启'}))){ e.target.checked=false; return; }
+        p.allowAll = next; render();
+      };
+      // echips 的 onChange 已覆盖删除；添加走按钮
+    } else {
+      pane.innerHTML = `
+      <div class="panel">
+        <header class="panel-head"><h3>危险命令黑名单</h3>
+          <div class="panel-actions"><span class="tip" data-tip="正则（不区分大小写），命中的 Bash 命令弹确认卡">${I(IC.info,14)}</span></div></header>
+        <div class="panel-body">
+          ${p.dangerous.length===0?'<div class="banner err" style="margin-bottom:10px">黑名单为空——所有 Bash 命令（含 rm -rf）将免确认直通。</div>':''}
+          <div class="echips on-box" id="dcChips"></div>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <input type="text" id="newDc" placeholder='正则，如 \\bgit\\s+push\\b.*--force' style="max-width:420px">
+            <button class="btn" id="addDc">添加</button>
+          </div>
+        </div>
+        <footer class="panel-foot">删除正则 = 放宽对应命令为直通，请谨慎。改动即时生效。</footer>
+      </div>`;
+      const m = echips($('#dcChips'), p.dangerous, {placeholder:'回车添加', onChange:()=>fakeSave('黑名单已更新')});
+      $('#addDc').onclick = ()=>{ const v=$('#newDc').value.trim(); if(!v) return; try{ new RegExp(v,'i'); }catch(err){ return toast('正则无效：'+err.message, true); } p.dangerous.push(v); render(); };
+    }
+  },
+};
+
+/* ═══════════ 页面：斜杠命令 ═══════════ */
+PAGES.slash = {
+  id:'slash', title:'斜杠命令', desc:'注册到飞书开放平台的指令面板，聊天框输入 / 触发',
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>已注册命令</h3>
+        <div class="panel-actions">
+          <select id="scApp" style="width:auto;padding:4px 10px;font-size:12.5px"><option>小助手（cli_a1f8k2m9x0）</option></select>
+          <button class="btn sm" id="scReload">刷新</button>
+          <button class="btn sm" id="scBuiltins">补齐内置</button>
+        </div></header>
+      <div class="panel-body">
+        <table><thead><tr><th style="width:160px">命令</th><th>描述</th><th style="width:150px">操作</th></tr></thead>
+        <tbody>${DB.slash.map((s,i)=>`
+          <tr><td><code>/${esc(s.cmd)}</code></td><td>${esc(s.desc)}</td>
+          <td class="ops"><button class="btn sm" data-scedit="${i}">编辑</button> <button class="btn sm danger" data-scdel="${i}">删除</button></td></tr>`).join('')}
+        </tbody></table>
+      </div>
+      <footer class="panel-foot">${I(IC.info,13)} 本页直接读写飞书开放平台（需 application:app_slash_command 权限），改动约 5 分钟生效，与配置保存无关。</footer>
+    </div>`;
+    $('#pageActions').innerHTML = '<button class="btn primary" id="scAdd">新增命令</button>';
+    const edit = (i=-1)=>{
+      const s = i>=0 ? DB.slash[i] : {cmd:'',desc:'',icon:''};
+      openDrawer({ title: i>=0?`编辑 /${s.cmd}`:'新增命令', narrow:true,
+        body:`<label class="fld">命令（不带 /${i>=0?'，飞书侧不可改名':''}）</label><input type="text" id="dcCmd" value="${esc(s.cmd)}" ${i>=0?'disabled':''} placeholder="produce">
+              <label class="fld">描述</label><input type="text" id="dcDesc" value="${esc(s.desc)}" placeholder="指令面板展示文案">`,
+        foot:`<span class="sp"></span><button class="btn" id="dcCancel">取消</button><button class="btn primary" id="dcSave">${i>=0?'保存':'创建'}</button>`,
+      });
+      $('#dcCancel').onclick = closeDrawer;
+      $('#dcSave').onclick = async ()=>{
+        const cmd = $('#dcCmd').value.trim(), desc = $('#dcDesc').value.trim();
+        if (!desc) return toast('描述不能为空', true);
+        if (i>=0){ s.desc = desc; } else { if(!cmd) return toast('命令名不能为空', true); DB.slash.push({cmd,desc,icon:''}); }
+        if (await fakeSave('已提交飞书')){ closeDrawer(); render(); }
+      };
+    };
+    $('#scAdd').onclick = ()=>edit();
+    $$('[data-scedit]').forEach(b=> b.onclick = ()=>edit(+b.dataset.scedit));
+    $$('[data-scdel]').forEach(b=> b.onclick = async ()=>{
+      const s = DB.slash[+b.dataset.scdel];
+      if (await confirmDlg({title:'删除命令', msg:`确认删除远端命令 /${s.cmd}？约 5 分钟后从飞书面板消失。`, danger:true, okText:'删除'})){ DB.slash.splice(+b.dataset.scdel,1); await fakeSave('已删除'); render(); }
+    });
+    $('#scReload').onclick = ()=>toast('已刷新（原型演示）');
+    $('#scBuiltins').onclick = ()=>toast('✅ 内置命令已补齐（原型演示）');
+  },
+};
+</script>
+<script>
+/* ═══════════ 补遗：缺失图标 ═══════════ */
+IC.warn = '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 20h16a2 2 0 0 0 1.73-2Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>';
+
+/* ═══════════ 页面：插件 ═══════════ */
+PAGES.plugins = {
+  id:'plugins', title:'插件', desc:'两处目录的 Claude Code 插件统一管理，改动下一条消息自动生效', legend:false,
+  badge(){ const n = DB.plugins.filter(p=>p.latest).length; return n ? `<span class="nav-badge">${n}</span>` : ''; },
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>已安装插件</h3>
+        <div class="panel-actions"><button class="btn sm" id="plCheck">检查更新</button></div></header>
+      <div class="panel-body">
+        <table><thead><tr><th>插件</th><th style="width:100px">市场</th><th style="width:130px">来源</th><th style="width:170px">版本</th><th style="width:84px">状态</th><th style="width:196px"></th></tr></thead>
+        <tbody>${DB.plugins.map((p,i)=>`
+          <tr><td><b>${esc(p.name)}</b></td><td>${esc(p.market)}</td>
+          <td>${p.source==='bridge'?'<span class="tag warn">bridge 托管</span>':'<span class="tag off">本机 ~/.claude</span>'}</td>
+          <td><span class="mono">v${esc(p.version)}</span> ${p.latest?`<span class="tag warn">→ v${esc(p.latest)}</span>`:''}</td>
+          <td><span class="tag ${p.enabled?'ok':'off'}">${p.enabled?'已启用':'未启用'}</span></td>
+          <td class="ops">
+            <button class="btn sm" data-plupd="${i}">更新</button>
+            <button class="btn sm" data-pltog="${i}">${p.enabled?'停用':'启用'}</button>
+            <button class="btn sm danger" data-plrm="${i}">卸载</button></td></tr>`).join('')}
+        </tbody></table>
+      </div>
+      <footer class="panel-foot">${I(IC.info,13)} bridge 托管目录优先加载；启停 / 更新后<b>下一条消息生效</b>，无须重启。</footer>
+    </div>
+    <div class="grid2" style="gap:16px;align-items:start">
+      <div class="panel" style="margin:0">
+        <header class="panel-head"><h3>管理市场</h3></header>
+        <div class="panel-body">
+          <label class="fld">已添加</label>
+          <div style="display:flex;flex-wrap:wrap;gap:7px">${DB.installTargets.markets.map(m=>`<span class="chip" style="font-family:inherit">${esc(m.name)}<span class="mut" style="font-family:inherit">· ${m.plugins} 插件</span></span>`).join('')}</div>
+          <label class="fld" style="margin-top:14px">添加市场（git 地址或本机路径）</label>
+          <div class="input-btn"><input type="text" id="plMk" placeholder="https://github.com/…/marketplace"><button class="btn" id="plMkAdd">添加</button></div>
+          <label class="fld" style="margin-top:14px">批量</label>
+          <div class="input-btn"><select id="plMkDir"><option value="user">本机 ~/.claude</option><option value="bridge">bridge 托管目录</option></select>
+            <button class="btn" id="plUpdAll">全部更新</button></div>
+          <div class="mini-note" style="margin-top:8px">「全部更新」= 刷新市场索引 + 逐个更新该目录已装插件（可中断查看日志）。</div>
+        </div>
+      </div>
+      <div class="panel" style="margin:0">
+        <header class="panel-head"><h3>从市场安装</h3></header>
+        <div class="panel-body">
+          <label class="fld">搜索插件 <span class="tip" data-tip="候选来自已添加市场的全部插件；也可在飞书端 /plugin install xxx@marketplace（仅管理员）">${I(IC.info,13)}</span></label>
+          <div class="input-btn"><input type="text" id="plQ" placeholder="如 code-review、db-doc…"><button class="btn primary" id="plGo">安装</button></div>
+          <label class="fld" style="margin-top:12px">安装到</label>
+          <select id="plDir"><option value="user">本机 ~/.claude（推荐：本机 CLI 与桥接器共用一份）</option><option value="bridge">bridge 托管目录</option></select>
+          <div class="sub-title" style="margin:16px 0 2px">市场可装（${DB.installTargets.available.length}）</div>
+          ${DB.installTargets.available.map(a=>`<div class="urow" style="padding:8px 0">
+            <div class="u-main"><div class="u-name">${esc(a.name)} <span class="tag off">${esc(a.market)}</span></div>
+            <div class="u-sub">${esc(a.desc)}</div></div>
+            <button class="btn sm" data-plainst="${esc(a.key)}">安装</button></div>`).join('')}
+        </div>
+      </div>
+    </div>`;
+    $('#pageActions').innerHTML = '';
+    $$('[data-plupd]').forEach(b=> b.onclick = async ()=>{
+      const p = DB.plugins[+b.dataset.plupd];
+      if (await confirmDlg({title:'更新插件', msg:`更新 <code>${esc(p.name)}</code> 到 v${esc(p.latest||p.version)}？更新后下一条消息按新版本加载。`, okText:'更新'})){ p.version = p.latest||p.version; p.latest=''; await fakeSave('插件已更新'); render(); }
+    });
+    $$('[data-pltog]').forEach(b=> b.onclick = async ()=>{
+      const p = DB.plugins[+b.dataset.pltog];
+      if (p.enabled && !(await confirmDlg({title:'停用插件', msg:`停用 <code>${esc(p.name)}</code>？停用后下一条消息不再加载，可随时再启用。`, okText:'停用'}))) return;
+      p.enabled = !p.enabled; await fakeSave(p.enabled?'插件已启用':'插件已停用'); render();
+    });
+    $$('[data-plrm]').forEach(b=> b.onclick = async ()=>{
+      const p = DB.plugins[+b.dataset.plrm];
+      if (await confirmDlg({title:'卸载插件', msg:`卸载 <code>${esc(p.name)}</code>？卸载后需重新安装才能恢复，进行中的会话不受影响。`, danger:true, okText:'卸载'})){ DB.plugins.splice(+b.dataset.plrm,1); await fakeSave('插件已卸载'); render(); }
+    });
+    $$('[data-plainst]').forEach(b=> b.onclick = async ()=>{
+      b.disabled = true; b.textContent = '安装中…'; await sleep(800);
+      const key = b.dataset.plainst; const [name, market] = key.split('@');
+      DB.plugins.push({ name, market, source: $('#plDir').value, version:'1.0.0', latest:'', enabled:true });
+      await fakeSave(`${name} 已安装`); render();
+    });
+    $('#plGo').onclick = ()=> toast('原型：请从左侧「市场可装」列表点安装，或输入关键词后从候选选择');
+    $('#plCheck').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.innerHTML='<span class="spin"></span>检查中'; await sleep(900); b.disabled=false; b.textContent='检查更新'; const n=DB.plugins.filter(p=>p.latest).length; toast(n?`${n} 个插件有新版本（见列表「→ 版本」标注）`:'所有插件均为最新版本'); };
+    $('#plMkAdd').onclick = async ()=>{ const v=$('#plMk').value.trim(); if(!v) return toast('请填写 marketplace git 地址或本机路径', true); DB.installTargets.markets.push({name:v.split('/').pop().replace(/\.git$/,''), plugins:0}); await fakeSave('市场已添加'); render(); };
+    $('#plUpdAll').onclick = async ()=>{ if (await confirmDlg({title:'全部更新', msg:'将刷新市场索引，并逐个更新所选目录下全部已装插件。确定继续？', okText:'全部更新'})){ await sleep(600); await fakeSave('全部更新完成'); render(); } };
+  },
+};
+
+/* ═══════════ 页面：Skills ═══════════ */
+const SK_SOURCE = (s)=>{
+  if (s.source==='project') return `项目级 · ${esc(s.ws||'?')}`;
+  if (s.source==='plugin') return `插件 · ${esc(s.plugin||'?')}${s.enabled===false?'（未启用）':''}`;
+  if (s.source==='bridge') return '用户级 · bridge';
+  return '用户级 · 本机';
+};
+const SK_FILES = {
+  'content-produce': {
+    'SKILL.md': `---\nname: content-produce\ndescription: 内容生产主编排：像素级复刻指定链接，结合产品生成图文\n---\n\n# 内容生产主编排\n\n统筹任务分配，不亲自执行具体任务。\n\n## 流程\n1. explore-product / explore-ip-profile 归纳素材\n2. fetch-content 拆解目标写法\n3. generate-content 生成正文与配图提示词\n4. generate-images 出图、assemble-content 校验回填\n5. publish 人工审核后发布`,
+    'references/tone.md': `# 语气参考\n\n- 短句为主，先结论后展开\n- 用户视角说人话，避免堆术语\n- 每段只讲一件事`,
+    'scripts/render.js': `// 渲染脚本示例\nexport function render(data) {\n  return \`<h1>\${data.title}</h1>\`;\n}`,
+  },
+};
+const skFile = (name, path)=> (SK_FILES[name] && SK_FILES[name][path]) || `# ${path}\n\n（原型演示：此处展示该文件内容。）`;
+
+function skillDrawer(s){
+  const files = SK_FILES[s.name] ? Object.keys(SK_FILES[s.name]) : ['SKILL.md'];
+  openDrawer({
+    title:`${s.name} · 文件浏览`,
+    body:`<div class="mini-note" style="margin-bottom:10px"><code>${esc(s.path||'')}</code></div>
+      <div class="dw-layout">
+        <nav class="dw-nav" id="skTree" style="width:200px"></nav>
+        <div class="dw-pane">
+          <div class="mut" id="skName" style="font-size:12px;margin-bottom:8px"></div>
+          <pre id="skView" style="margin:0;background:var(--sunk);border:1px solid var(--border);border-radius:10px;padding:14px;font-size:12px;line-height:1.75;overflow:auto;max-height:58vh;white-space:pre-wrap;font-family:var(--mono)"></pre>
+        </div>
+      </div>`,
+    foot:`<span class="sp"></span><button class="btn" id="skClose">关闭</button>`,
+  });
+  $('#skClose').onclick = closeDrawer;
+  const open = (f)=>{
+    $('#skName').textContent = f;
+    $('#skView').textContent = skFile(s.name, f);
+    $$('#skTree button').forEach(b=> b.classList.toggle('active', b.dataset.f===f));
+  };
+  $('#skTree').innerHTML = files.map(f=>`<button data-f="${esc(f)}" style="${f.includes('/')?'padding-left:24px':''}">📄 ${esc(f.split('/').pop())}</button>`).join('');
+  $$('#skTree button').forEach(b=> b.onclick = ()=> open(b.dataset.f));
+  open(files[0]);
+}
+
+PAGES.skills = {
+  id:'skills', title:'Skills', desc:'四个来源的技能聚合：本机 / bridge / 项目 / 插件（只读）', legend:false,
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>技能列表</h3>
+        <div class="panel-actions">
+          <input type="search" id="skQ" placeholder="过滤：名称 / 说明…" style="width:210px;padding:4px 10px;font-size:12.5px">
+          <button class="btn sm" id="skZip">导入 zip</button>
+          <button class="btn primary sm" id="skAdd">＋ 新建</button>
+        </div></header>
+      <div class="panel-body">
+        <table><thead><tr><th style="width:220px">名字</th><th>说明</th><th style="width:190px">来源</th><th style="width:130px"></th></tr></thead>
+        <tbody id="skBody"></tbody></table>
+      </div>
+      <footer class="panel-foot">${I(IC.info,13)} 新增 / 导入统一落盘用户级生效目录 <code>.lark-claudecode-bridge/claude/skills</code>；改动即时生效。</footer>
+    </div>`;
+    const drawRows = ()=>{
+      $('#skBody').innerHTML = DB.skills.map((s,i)=>`
+        <tr data-skt="${esc((s.name+' '+(s.desc||'')).toLowerCase())}">
+          <td><b>${esc(s.name)}</b>${s.path?`<div class="mini-note" style="margin-top:2px;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="完整目录：${esc(s.path)}"><code>${esc(s.path)}</code></div>`:''}</td>
+          <td>${esc(s.desc)||'<span class="mut">（无说明）</span>'}</td>
+          <td><span class="tag ${s.source==='bridge'?'info':s.source==='plugin'?(s.enabled===false?'warn':'off'):'ghost'}">${SK_SOURCE(s)}</span></td>
+          <td class="ops"><button class="btn sm" data-skview="${i}">查看</button>
+            ${(s.source!=='project'&&s.source!=='plugin')?`<button class="btn sm danger" data-skdel="${i}">删除</button>`:'<span class="dim" style="font-size:11.5px">只读</span>'}</td>
+        </tr>`).join('') || '<tr class="empty"><td colspan="4">暂无 skill（四个来源均未发现 SKILL.md）</td></tr>';
+      $$('[data-skview]').forEach(b=> b.onclick = ()=> skillDrawer(DB.skills[+b.dataset.skview]));
+      $$('[data-skdel]').forEach(b=> b.onclick = async ()=>{
+        const s = DB.skills[+b.dataset.skdel];
+        if (await confirmDlg({title:'删除 skill', msg:`删除 <b>${esc(s.name)}</b>（${SK_SOURCE(s)}）？目录会被整体移除，不可恢复。`, danger:true, okText:'删除'})){ DB.skills.splice(+b.dataset.skdel,1); await fakeSave('skill 已删除'); render(); }
+      });
+    };
+    drawRows();
+    $('#skQ').oninput = (e)=>{
+      const q = e.target.value.trim().toLowerCase();
+      $$('#skBody tr[data-skt]').forEach(tr=> tr.hidden = q && !tr.dataset.skt.includes(q));
+    };
+    $('#skZip').onclick = ()=> toast('原型：此处选择 zip 导入（≤10MB，落盘用户级目录）');
+    $('#skAdd').onclick = ()=>{
+      openDrawer({ title:'新建 skill（用户级）', narrow:true,
+        body:`<label class="fld">名字（字母 / 数字 / 连字符，1-64 位）</label><input type="text" id="nskName" placeholder="my-skill">
+              <label class="fld">说明（frontmatter description）</label><input type="text" id="nskDesc" placeholder="这个 skill 做什么、什么时候用">
+              <div class="mini-note" style="margin-top:10px">创建后生成目录与 SKILL.md 模板，请到目录中补充正文与脚本。</div>`,
+        foot:`<span class="sp"></span><button class="btn" id="nskCancel">取消</button><button class="btn primary" id="nskSave">创建</button>` });
+      $('#nskCancel').onclick = closeDrawer;
+      $('#nskSave').onclick = async ()=>{
+        const name = $('#nskName').value.trim();
+        if (!name) return toast('请填写名字', true);
+        DB.skills.push({ name, desc:$('#nskDesc').value.trim(), source:'bridge', path:'.lark-claudecode-bridge/claude/skills/'+name });
+        if (await fakeSave('已创建（含默认 SKILL.md 模板）')){ closeDrawer(); render(); }
+      };
+    };
+  },
+};
+
+/* ═══════════ 页面：MCP ═══════════ */
+const MCP_ENV = {
+  github:[{k:'GITHUB_TOKEN', raw:'${GITHUB_TOKEN:-}', missing:true}],
+};
+const mcpSource = (s)=> s.source==='plugin' ? `插件 · ${esc(s.plugin||'?')}` : s.source==='project' ? '项目级' : s.source==='bridge' ? 'bridge · 可管理' : '用户级 · 本机';
+function mcpDrawer(s){
+  const editable = s.source==='bridge';
+  const cfg = s.type==='stdio' ? { type:'stdio', command:s.conn } : { type:s.type, url:s.conn };
+  const envs = MCP_ENV[s.name]||[];
+  const renderEnv = ()=> envs.length ? envs.map(e=>`
+    <tr><td><code>${esc(e.k)}</code></td><td><code>${esc(e.raw)}</code></td>
+    <td>${e.missing?'<span style="color:var(--err-tx)">未设置（展开后为空）</span>':`<code>${esc(e.raw)}</code>`}</td></tr>`).join('')
+    : '<tr><td colspan="3" class="mut">（无 env 配置）</td></tr>';
+  openDrawer({
+    title:`MCP · ${s.name}`,
+    body:`<div class="mini-note" style="margin-bottom:8px">来源：${mcpSource(s)}</div>
+      ${s.source!=='bridge'&&s.source!=='user'?'<div class="banner warn" style="margin-bottom:10px">只读来源——此 MCP 由插件 / 项目自带，请到对应目录修改。</div>':''}
+      ${s.source==='user'?'<div class="banner warn" style="margin-bottom:10px">本机 ~/.claude.json 来源不支持页面编辑（可删除）；如需修改请手动改，或删除后到本页重新添加。</div>':''}
+      <label class="fld">配置（JSON${editable?'，可编辑':''}）</label>
+      <textarea id="mcJson" rows="8" ${editable?'':'readonly'}>${esc(JSON.stringify(cfg,null,2))}</textarea>
+      <label class="fld" style="margin-top:12px">环境变量 <span class="tip" data-tip="当前值已合并：飞书应用 env › Claude 认证 env › settings.json env › 系统环境，支持 \${VAR:-默认值}">${I(IC.info,13)}</span></label>
+      <table><thead><tr><th style="width:150px">变量</th><th>配置值</th><th>当前值</th></tr></thead><tbody>${renderEnv()}</tbody></table>`,
+    foot:`${editable?'<button class="btn" id="mcEdit">编辑</button><button class="btn primary" id="mcSave" style="display:none">保存</button>':''}<span class="sp"></span><button class="btn" id="mcClose">关闭</button>`,
+  });
+  $('#mcClose').onclick = closeDrawer;
+  if (editable){
+    $('#mcEdit').onclick = ()=>{ $('#mcJson').removeAttribute('readonly'); $('#mcEdit').style.display='none'; $('#mcSave').style.display=''; };
+    $('#mcSave').onclick = async ()=>{
+      try{ JSON.parse($('#mcJson').value); }catch(err){ return toast('JSON 解析失败：'+err.message, true); }
+      if (await fakeSave('已保存（任务级热生效，无须重启）')){ closeDrawer(); render(); }
+    };
+  }
+}
+
+PAGES.mcp = {
+  id:'mcp', title:'MCP', desc:'四个来源的 MCP server 聚合；bridge 来源页面可管理，任务级热生效', legend:false,
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>MCP Servers</h3>
+        <div class="panel-actions">
+          <input type="search" id="mcQ" placeholder="过滤：名称…" style="width:210px;padding:4px 10px;font-size:12.5px">
+          <button class="btn sm" id="mcRefresh">刷新</button>
+          <button class="btn primary sm" id="mcAdd">＋ 添加 MCP</button>
+        </div></header>
+      <div class="panel-body">
+        <table><thead><tr><th style="width:140px">名字</th><th>类型 / 连接</th><th style="width:140px">来源</th><th style="width:150px">状态 <span class="tip" data-tip="点击状态格检测该 server">ⓘ</span></th><th style="width:130px"></th></tr></thead>
+        <tbody id="mcBody"></tbody></table>
+      </div>
+      <footer class="panel-foot">${I(IC.info,13)} bridge 自管配置：<code>mcp/servers.json</code>（页面添加落这里）· 插件目录扫到 4 个插件，其中 1 个含 MCP 定义。</footer>
+    </div>`;
+    const drawRows = ()=>{
+      $('#mcBody').innerHTML = DB.mcp.map((s,i)=>`
+        <tr data-mct="${esc(s.name.toLowerCase())}">
+          <td><b>${esc(s.name)}</b></td>
+          <td><span class="tag ghost">${esc(s.type)}</span> <span class="mono" style="font-size:11.5px">${esc(s.conn)}</span></td>
+          <td><span class="tag ${s.source==='bridge'?'info':s.source==='plugin'?'off':'ghost'}">${mcpSource(s)}</span></td>
+          <td class="mcp-status" data-mcst="${i}" style="cursor:pointer" title="点击检测">${s.status==='ok'?'<span style="color:var(--ok-tx)">✔ 正常</span>':s.status==='warn'?`<span style="color:var(--warn-tx)">⚠ 不可达</span><div class="mini-note">${esc(s.detail||'')}</div>`:'<span class="mut">未检测</span>'}</td>
+          <td class="ops"><button class="btn sm" data-mcview="${i}">查看</button>
+            ${(s.source==='bridge'||s.source==='user')?`<button class="btn sm danger" data-mcdel="${i}">删除</button>`:'<span class="dim" style="font-size:11.5px">只读</span>'}</td>
+        </tr>`).join('') || '<tr class="empty"><td colspan="5">暂无 MCP server</td></tr>';
+      $$('[data-mcst]').forEach(c=> c.onclick = async ()=>{
+        const s = DB.mcp[+c.dataset.mcst];
+        c.innerHTML = '<span class="mut">检测中…</span>'; await sleep(700);
+        c.innerHTML = s.status==='ok'?'<span style="color:var(--ok-tx)">✔ 正常</span>':s.status==='warn'?`<span style="color:var(--warn-tx)">⚠ 不可达</span><div class="mini-note">${esc(s.detail||'')}</div>`:'<span style="color:var(--ok-tx)">✔ 正常</span>';
+      });
+      $$('[data-mcview]').forEach(b=> b.onclick = ()=> mcpDrawer(DB.mcp[+b.dataset.mcview]));
+      $$('[data-mcdel]').forEach(b=> b.onclick = async ()=>{
+        const s = DB.mcp[+b.dataset.mcdel];
+        if (await confirmDlg({title:'删除 MCP server', msg:`删除 <b>${esc(s.name)}</b>（${mcpSource(s)}）？引用它的任务将无法启动该 server。`, danger:true, okText:'删除'})){ DB.mcp.splice(+b.dataset.mcdel,1); await fakeSave('已删除'); render(); }
+      });
+    };
+    drawRows();
+    $('#mcQ').oninput = (e)=>{ const q=e.target.value.trim().toLowerCase(); $$('#mcBody tr[data-mct]').forEach(tr=> tr.hidden = q && !tr.dataset.mct.includes(q)); };
+    $('#mcRefresh').onclick = ()=>{ drawRows(); toast('已刷新（原型演示）'); };
+    $('#mcAdd').onclick = ()=>{
+      openDrawer({ title:'添加 MCP（存 bridge 自管目录）',
+        body:`<div class="subtabs"><button class="active" data-at="cmd">原生命令</button><button data-at="json">JSON 配置</button></div>
+          <div data-ap="cmd"><label class="fld">粘贴 claude mcp add 命令（自动解析）</label>
+            <textarea id="amCmd" placeholder='claude mcp add my-mcp -e API_KEY=xxx -- npx -y @scope/mcp-server'></textarea>
+            <div class="mini-note" style="margin-top:6px">名字取命令第 4 个参数；scope（-s）忽略，统一存 bridge 目录。</div></div>
+          <div data-ap="json" style="display:none"><label class="fld">名字</label><input type="text" id="amName" placeholder="my-mcp">
+            <label class="fld">配置 JSON</label>
+            <textarea id="amCfg" placeholder='{"type":"stdio","command":"npx","args":["-y","mcp-server-foo"]}'></textarea></div>`,
+        foot:`<span class="sp"></span><button class="btn" id="amCancel">取消</button><button class="btn primary" id="amSave">添加</button>` });
+      $$('.subtabs [data-at]').forEach(b=> b.onclick = ()=>{
+        $$('.subtabs [data-at]').forEach(x=> x.classList.toggle('active', x===b));
+        $('[data-ap=cmd]').style.display = b.dataset.at==='cmd'?'':'none';
+        $('[data-ap=json]').style.display = b.dataset.at==='json'?'':'none';
+      });
+      $('#amCancel').onclick = closeDrawer;
+      $('#amSave').onclick = async ()=>{
+        const isCmd = $('[data-ap=cmd]').style.display !== 'none';
+        let name;
+        if (isCmd){
+          const cmd = $('#amCmd').value.trim();
+          if (!cmd) return toast('请粘贴 claude mcp add 命令', true);
+          name = cmd.split(/\s+/)[3] || '';
+          if (!name) return toast('命令中缺少名字（claude mcp add <名字> …）', true);
+          DB.mcp.push({ name, type:'stdio', conn:cmd.split('-- ').pop()||cmd, source:'bridge', status:'untested' });
+        } else {
+          name = $('#amName').value.trim();
+          const raw = $('#amCfg').value.trim();
+          if (!name) return toast('请填写名字', true);
+          let cfg; try{ cfg = JSON.parse(raw); }catch(err){ return toast('JSON 解析失败：'+err.message, true); }
+          DB.mcp.push({ name, type:cfg.type||'stdio', conn:cfg.command||cfg.url||'', source:'bridge', status:'untested' });
+        }
+        if (await fakeSave('已添加（任务级热生效，无须重启）')){ closeDrawer(); render(); }
+      };
+    };
+  },
+};
+
+/* ═══════════ 页面：记忆增强（双 Tab） ═══════════ */
+const MEM_PRESETS = {
+  glm:{ label:'智谱 GLM', base:'https://open.bigmodel.cn/api/paas/v4', vlm:'glm-4.7', emb:'embedding-3', keyHint:'open.bigmodel.cn 的 API Key' },
+  volcengine:{ label:'火山方舟', base:'https://ark.cn-beijing.volces.com/api/v3', vlm:'', emb:'', keyHint:'方舟 API Key；模型名填推理接入点 EP ID' },
+  openai:{ label:'OpenAI 兼容（中转 / 自建）', base:'', vlm:'', emb:'', keyHint:'任意 OpenAI 协议端点的 Key（本地端点可留空）' },
+  ollama:{ label:'Ollama 本地（零 Key）', base:'http://127.0.0.1:11434/v1', vlm:'qwen3:8b', emb:'nomic-embed-text', keyHint:'本地服务无需 Key' },
+};
+let memTab = 'svc';
+PAGES.memory = {
+  id:'memory', title:'记忆增强', desc:'OpenViking 长期记忆：自动召回历史、归档提炼，按机器人命名空间隔离', legend:false,
+  render(el){
+    const m = DB.memory;
+    el.innerHTML = `
+    <div class="tabs">
+      <button data-mt="svc" class="${memTab==='svc'?'active':''}">服务与配置</button>
+      <button data-mt="users" class="${memTab==='users'?'active':''}">用户与密钥 <span class="tag off" style="margin-left:4px">${m.users.length}</span></button>
+    </div><div id="memPane"></div>`;
+    $$('.tabs button', el).forEach(b=> b.onclick = ()=>{ memTab=b.dataset.mt; render(); });
+    memTab==='svc' ? memSvcPane($('#memPane')) : memUsersPane($('#memPane'));
+  },
+};
+
+function memSvcPane(pane){
+  const m = DB.memory;
+  const running = m.state==='running';
+  pane.innerHTML = `
+  <div class="panel">
+    <div class="panel-body" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:14px 18px">
+      <label class="switch"><input type="checkbox" id="memOn" ${m.enabled?'checked':''}><span class="track"></span></label>
+      <span class="switch-label" style="font-weight:600">启用长期记忆</span>
+      <span class="tip" data-tip="开启后每个机器人的每条消息自动注入记忆召回；关闭后行为与未安装完全一致">${I(IC.info,14)}</span>
+      <span style="flex:1"></span>
+      <span class="tag ${running?'ok':'err'}">${running?'运行中':'服务异常'} · v${esc(m.version)}</span>
+    </div>
+  </div>
+  <div class="panel">
+    <header class="panel-head"><h3>服务状态</h3>
+      <div class="panel-actions">
+        <button class="btn sm" id="memFix">检查修复</button>
+        <button class="btn sm" id="memRefresh">↻ 刷新</button>
+        ${running?'<button class="btn sm danger" id="memStop">停止</button>':'<button class="btn sm primary" id="memStart">▶ 启动服务</button>'}
+      </div></header>
+    <div class="panel-body">
+      <div class="banner ${running?'info':'warn'}" style="margin-bottom:14px"><span><b>${running?'服务运行正常':'服务未运行'}</b> — ${running?'记忆召回与归档已就绪，运行 '+esc(m.since):'点「▶ 启动服务」一键拉起（检查 → 拉起 → 接入插件）'}。</span></div>
+      <table class="kv">
+        <tr><td>服务地址</td><td><code>${esc(m.endpoint)}</code> <button class="btn sm" id="memCopy" style="padding:2px 9px">⧉</button> <span class="tag off">本机</span></td></tr>
+        <tr><td>运行方式</td><td>LCB 受管（embedded）</td></tr>
+        <tr><td>鉴权模式</td><td>api_key <span class="tip" data-tip="api_key 模式：网页与每个机器人各持一把独立用户密钥；root 密钥用于管理">${I(IC.info,13)}</span></td></tr>
+        <tr><td>记忆插件</td><td><span style="color:var(--ok-tx)">✓</span> <code>${esc(m.plugin.name)}</code> v${esc(m.plugin.version)} <span class="tag off">${esc(m.plugin.source)}</span><span class="dim" style="font-size:11.5px"> · ${esc(m.plugin.client)}</span></td></tr>
+      </table>
+      <details class="adv" style="margin-top:12px"><summary>安装流水线（5 / 5 就绪）</summary>
+        <div class="adv-body" style="display:flex;gap:6px;flex-wrap:wrap">
+          ${['运行时（uv）','安装 OpenViking 服务','生成服务配置（ov.conf）','拉起受管服务','接入记忆插件'].map(s=>`<span class="tag ok">✓ ${s}</span>`).join('')}
+        </div></details>
+    </div>
+  </div>
+  <div class="panel">
+    <header class="panel-head"><h3>模型配置</h3>
+      <span class="panel-sub">提炼（vlm）与向量化（embedding）可各自独立端点与 Key</span>
+      <div class="panel-actions">
+        <button class="btn sm" id="memTest">测试连接</button>
+        <button class="btn sm primary" id="memSaveModel">保存配置</button>
+      </div></header>
+    <div class="panel-body">
+      <div class="grid2" style="gap:14px;align-items:start">
+        <div style="border:1px solid var(--border);border-radius:10px;padding:14px 16px;background:var(--sunk)">
+          <div class="sub-title">提炼主模型 <span class="dim" style="font-weight:400">vlm · 归档时提炼记忆</span></div>
+          <label class="fld">服务商预设（填表助手，只预填空字段）</label>
+          <select id="memProvider"><option value="">— 选择预设 —</option>${Object.entries(MEM_PRESETS).map(([k,p])=>`<option value="${k}" ${m.model.provider===k?'selected':''}>${p.label}</option>`).join('')}</select>
+          <label class="fld">API 端点</label><input type="text" id="memApiBase" value="${esc(m.model.apiBase)}" placeholder="https://…/v1">
+          <label class="fld">API Key ${m.model.keyHint?`<span class="tag off">已保存 ${esc(m.model.keyHint)}</span>`:''}</label>
+          <input type="password" id="memApiKey" placeholder="${esc(MEM_PRESETS[m.model.provider]?.keyHint||'sk-…')}">
+          <label class="fld">提炼模型（vlm）</label><input type="text" id="memVlm" value="${esc(m.model.vlm)}" placeholder="glm-4.7">
+        </div>
+        <div style="border:1px solid var(--border);border-radius:10px;padding:14px 16px;background:var(--sunk)">
+          <div class="sub-title">向量模型 <span class="dim" style="font-weight:400">embedding · 向量化入库与召回</span></div>
+          <label class="fld">向量模型</label><input type="text" id="memEmb" value="${esc(m.model.emb)}" placeholder="embedding-3">
+          <label class="fld">向量端点（独立）</label><input type="text" id="memEmbBase" value="${esc(m.model.embBase)}" placeholder="留空沿用主端点">
+          <label class="fld">向量 Key（独立）</label><input type="password" id="memEmbKey" placeholder="${m.model.embKeyOwn?'已保存，留空不修改':'留空沿用主 Key（可单独指定）'}">
+          <div class="mini-note" style="margin-top:10px">跨厂商组合时（如主模型 glm + 向量 OpenAI 系）才需单独填向量端点 / Key。</div>
+        </div>
+      </div>
+      <label class="fld" style="margin-top:14px">服务端点（OpenViking server）</label>
+      <div class="input-btn" style="max-width:460px"><input type="text" id="memEndpoint" value="${esc(m.endpoint)}"><span class="tip" style="align-self:center" data-tip="一般无须修改：一键安装自动回写；远程模式填外部服务地址">${I(IC.info,14)}</span></div>
+      <div id="memTestResult" style="margin-top:12px"></div>
+    </div>
+    <footer class="panel-foot">${I(IC.info,13)} 保存后可一键「立即生效」——重渲染配置并重启<b>记忆服务</b>，桥接器与进行中任务不受影响。</footer>
+  </div>`;
+  $('#memOn').onchange = async (e)=>{
+    const next = e.target.checked;
+    if (next && !(await confirmDlg({title:'启用长期记忆', msg:'开启后每个机器人的每条消息将自动：注入记忆召回（hooks）+ 按命名空间隔离读写。确认开启？', okText:'开启'}))){ e.target.checked=false; return; }
+    m.enabled = next; await fakeSave(next?'记忆增强已开启':'记忆增强已关闭'); render();
+  };
+  $('#memCopy').onclick = ()=> toast('服务地址已复制');
+  $('#memFix').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.innerHTML='<span class="spin"></span>检查中'; await sleep(1100); b.disabled=false; b.textContent='检查修复'; toast('✅ 全部就绪（原型演示）'); };
+  $('#memRefresh').onclick = ()=> render();
+  if ($('#memStart')) $('#memStart').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.innerHTML='<span class="spin"></span>启动中'; await sleep(1200); m.state='running'; await fakeSave('服务已启动'); render(); };
+  if ($('#memStop')) $('#memStop').onclick = async ()=>{ if (await confirmDlg({title:'停止受管服务', msg:'停止 LCB 托管的 OpenViking 服务？记忆功能将不可用，可随时重新拉起。', danger:true, okText:'停止'})){ m.state='stopped'; await fakeSave('服务已停止'); render(); } };
+  $('#memProvider').onchange = (e)=>{
+    const p = MEM_PRESETS[e.target.value]; if (!p) return;
+    if (!$('#memApiBase').value.trim()) $('#memApiBase').value = p.base;
+    if (!$('#memVlm').value.trim()) $('#memVlm').value = p.vlm;
+    if (!$('#memEmb').value.trim()) $('#memEmb').value = p.emb;
+    $('#memApiKey').placeholder = p.keyHint;
+  };
+  $('#memTest').onclick = async (e)=>{
+    const b = e.currentTarget; b.disabled = true;
+    $('#memTestResult').innerHTML = '<span class="mut">测试中（真实调用 embedding + 提炼模型各一次）…</span>';
+    await sleep(1000);
+    $('#memTestResult').innerHTML = '<span class="tag ok">双绿通过</span> <span class="mut" style="font-size:12px">✅ 向量模型 embedding-3 正常返回 · ✅ 提炼模型 glm-4.7 正常返回</span>';
+    b.disabled = false;
+  };
+  $('#memSaveModel').onclick = async ()=>{
+    m.model.provider = $('#memProvider').value;
+    m.model.apiBase = $('#memApiBase').value.trim();
+    m.model.vlm = $('#memVlm').value.trim();
+    m.model.emb = $('#memEmb').value.trim();
+    m.model.embBase = $('#memEmbBase').value.trim();
+    if (await fakeSave('模型配置已保存')){
+      if (await confirmDlg({title:'使新配置立即生效', msg:'模型配置已保存。<br><br>记忆服务需<b>重渲染配置并重启</b>才能应用新模型。<br>立即生效？', okText:'立即生效'})) toast('✅ 已应用（重渲染 → 重启服务 → 校验插件）');
+      else toast('已保存。稍后可点「检查修复」应用');
+    }
+  };
+}
+
+function memUsersPane(pane){
+  const m = DB.memory;
+  const groups = [
+    ['网页管理', m.users.filter(u=>u.kind==='web'), '浏览器打开记忆空间用这一把'],
+    ['机器人', m.users.filter(u=>u.kind==='bot'), '每个 bot 一把独立密钥；会话由 LCB 自动注入，无须手填'],
+  ];
+  pane.innerHTML = `
+  <div class="panel">
+    <header class="panel-head"><h3>用户与密钥</h3>
+      <span class="panel-sub">${m.users.length} 个用户 · 合计 16.6 MB 记忆数据 · 密钥脱敏显示、查看留痕</span>
+      <div class="panel-actions">
+        <button class="btn sm primary" id="memInit">⚡ 一键初始化</button>
+        <button class="btn sm" id="memURefresh">↻ 刷新</button>
+      </div></header>
+    <div class="panel-body">
+      <div class="banner info" style="margin-bottom:14px">
+        <div style="min-width:0">
+          <b>🌐 连接 OpenViking Studio</b> <code style="font-size:11.5px">${esc(m.endpoint)}/studio</code>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px">
+            <div style="flex:1;min-width:240px;border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:var(--card)">
+              <b style="font-size:12.5px">方式一 · 管理员（Root 密钥）</b>
+              <div class="mini-note" style="margin-top:4px">用于管理用户与密钥。登录后身份固定为 default，看不到各机器人记忆——这是 Studio 设计，不代表没隔离。</div>
+            </div>
+            <div style="flex:1;min-width:240px;border:1px solid var(--border);border-radius:10px;padding:10px 12px;background:var(--card)">
+              <b style="font-size:12.5px">方式二 · 看某个机器人的记忆</b>
+              <div class="mini-note" style="margin-top:4px">在下方列表点该行「打开记忆空间」，以该机器人身份进入，与其他机器人完全隔离。</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+            <button class="btn sm" id="memCopyRoot">⧉ 复制 Root 密钥</button>
+            <button class="btn sm primary" id="memOpenStudio">打开 Studio 并复制</button>
+            <span class="mini-note" style="align-self:center">Root 密钥：✓ 已配置（受管 ov.conf 的 server.root_api_key）· 不要填「模型配置」里的厂商 API Key</span>
+          </div>
+        </div>
+      </div>
+      ${groups.map(([title, rows, hint])=>`
+        <div class="sub-title" style="margin:14px 0 2px">${title} <span class="dim" style="font-weight:400">${hint}</span></div>
+        ${rows.map(u=>`
+        <div class="urow">
+          <span class="u-ava">${esc((u.name||'?')[0])}</span>
+          <div class="u-main">
+            <div class="u-name">${esc(u.name)} <code style="font-size:11px">${esc(u.uid)}</code></div>
+            <div class="u-sub">密钥 <code>${esc(u.key)}</code> · ${esc(u.size)} · 活跃于 ${esc(u.active)}</div>
+          </div>
+          <div class="u-ops">
+            <button class="btn sm primary" data-uopen="${esc(u.uid)}">打开记忆空间</button>
+            <button class="btn sm" data-ucopy="${esc(u.uid)}">⧉ 复制 key</button>
+            <button class="btn sm" data-ureset="${esc(u.uid)}">重置</button>
+            <button class="btn sm danger" data-udel="${esc(u.uid)}">删除</button>
+          </div>
+        </div>`).join('')||'<div class="mini-note" style="padding:6px 0">（无用户）</div>'}`).join('')}
+    </div>
+  </div>
+  <div class="panel">
+    <header class="panel-head"><h3>记忆粒度</h3>
+      <span class="panel-sub">${m.granularity==='bot-user'?'已选择 bot × 人（每位聊天者独立空间）':'当前：每 bot 一把密钥（默认）'}</span></header>
+    <div class="panel-body">
+      <div class="switch-row" style="margin:0">
+        <label class="switch"><input type="checkbox" id="memGran" ${m.granularity==='bot-user'?'checked':''}><span class="track"></span></label>
+        <span class="switch-label">升级到 bot × 人</span>
+        <span class="tip" data-tip="增量演进：既有密钥与记忆不受影响，仅为新聊天者追加独立签发。同一 bot 服务 2 人以上且内容敏感时建议开启">${I(IC.info,14)}</span>
+      </div>
+    </div>
+  </div>`;
+  $('#memInit').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.textContent='初始化中…'; await sleep(900); b.disabled=false; b.textContent='⚡ 一键初始化'; toast('✅ 已创建网页 + 各机器人用户并签发密钥'); };
+  $('#memURefresh').onclick = ()=> render();
+  $('#memCopyRoot').onclick = ()=> toast('Root 密钥已复制（查看行为已留痕）');
+  $('#memOpenStudio').onclick = ()=> toast('Root 密钥已复制并打开 Studio——粘贴一次即可进入（原型演示）');
+  $$('[data-uopen]').forEach(b=> b.onclick = ()=> toast('密钥已复制并打开该身份的记忆空间（原型演示）'));
+  $$('[data-ucopy]').forEach(b=> b.onclick = ()=> toast(`已复制 ${b.dataset.ucopy} 的密钥（查看行为已留痕）`));
+  $$('[data-ureset]').forEach(b=> b.onclick = async ()=>{
+    if (await confirmDlg({title:'重置密钥', msg:`重置 <b>${esc(b.dataset.ureset)}</b> 的密钥？<br>旧密钥<b>立即失效</b>，所有使用方需同步更新。`, danger:true, okText:'重置'})) await fakeSave('新密钥已生成并复制到剪贴板');
+  });
+  $$('[data-udel]').forEach(b=> b.onclick = async ()=>{
+    if (await confirmDlg({title:'删除用户', msg:`删除 <b>${esc(b.dataset.udel)}</b>？删除前会自动把本地记忆目录打包备份到 <code>openviking/backups/</code>。`, danger:true, okText:'删除'})){
+      DB.memory.users = DB.memory.users.filter(u=>u.uid!==b.dataset.udel);
+      await fakeSave('已删除'); render();
+    }
+  });
+  $('#memGran').onchange = (e)=>{ m.granularity = e.target.checked?'bot-user':'bot'; fakeSave(e.target.checked?'已记录升级意向：bot×人':'已回到每 bot 一把密钥'); };
+}
+
+/* ═══════════ 概览页「飞书 CLI 授权」→ 居中弹窗（不再用抽屉） ═══════════ */
+document.addEventListener('click', (e)=>{
+  const t = e.target instanceof Element && e.target.closest('[data-a="cli-auth"]');
+  if (!t) return;
+  e.stopPropagation(); e.preventDefault();
+  openModal({ title:'飞书 CLI 授权', width:'min(440px,92vw)',
+    body:`<div class="banner info" style="margin-bottom:12px"><span>用飞书扫描二维码完成授权；全程无须终端，SSH 环境同样可用。</span></div>
+      <div style="display:flex;justify-content:center;padding:8px 0 2px">
+        <div style="width:190px;height:190px;border-radius:14px;border:1px solid var(--border);background:
+          repeating-linear-gradient(0deg,var(--ink) 0 6px,transparent 6px 12px),
+          repeating-linear-gradient(90deg,var(--ink) 0 6px,transparent 6px 12px);
+          opacity:.82;position:relative;overflow:hidden" aria-label="二维码占位">
+          <span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:var(--card);margin:70px 70px;border-radius:8px;color:var(--mut);font-size:10px;text-align:center;line-height:1.4">二维码<br>占位</span>
+        </div>
+      </div>
+      <div class="mini-note" style="text-align:center;margin-top:10px">二维码 2:00 后过期，可重新生成 · device_code 只存后端内存，不下发浏览器</div>`,
+    foot:`<button class="btn" id="lqTerm">改用终端窗口</button><span class="sp"></span><button class="btn primary" id="lqDone">完成</button>` });
+  $('#lqDone').onclick = ()=>{ closeModal(); toast('✅ 授权完成'); };
+  $('#lqTerm').onclick = ()=> toast('原型：此处打开终端授权指引');
+}, true);
+
+/* ═══════════ 设置与密码锁屏（原型 mock：密码/时长仅存 localStorage，实际实现应存服务端哈希 + 会话令牌） ═══════════ */
+const LOCK = {
+  PWD_KEY:'lcb-proto-pwd', MINS_KEY:'lcb-proto-lock-mins',
+  pwd:'123456', mins:1800,          // 无操作锁屏时长（分钟），默认 30 小时
+  unlocked:false, lastActive:Date.now(),
+  load(){ try{
+    this.pwd = localStorage.getItem(this.PWD_KEY) || '123456';
+    const raw = localStorage.getItem(this.MINS_KEY);
+    if (raw !== null){ const m = Number(raw); if (Number.isFinite(m) && m >= 0) this.mins = m; }
+  }catch{} },
+  savePwd(p){ this.pwd = p; try{ localStorage.setItem(this.PWD_KEY, p); }catch{} },
+  saveMins(m){ this.mins = m; try{ localStorage.setItem(this.MINS_KEY, String(m)); }catch{} },
+  isDefault(){ return this.pwd === '123456'; },
+};
+LOCK.load();
+const minsText = (m)=> m>=60 ? (m/60)+' 小时' : m+' 分钟';
+
+const lockPage = ()=>{
+  LOCK.unlocked = false;
+  $('#lockPwd').value = ''; $('#lockErr').textContent = '';
+  $('#lockMask').hidden = false;
+  setTimeout(()=> $('#lockPwd').focus(), 60);
+};
+const tryUnlock = ()=>{
+  if ($('#lockPwd').value === LOCK.pwd){
+    LOCK.unlocked = true; LOCK.lastActive = Date.now();
+    $('#lockMask').hidden = true;
+    if (LOCK.isDefault()) guideChangePwd();
+    else toast('✅ 已解锁');
+  } else {
+    $('#lockErr').textContent = '密码错误，请重试';
+    const card = $('.lockcard');
+    card.classList.remove('shake'); void card.offsetWidth; card.classList.add('shake');
+  }
+};
+$('#lockUnlock').onclick = tryUnlock;
+$('#lockPwd').onkeydown = (e)=>{ if (e.key==='Enter') tryUnlock(); };
+
+/* 修改密码弹窗（guided=true：仍为默认密码时的强制引导） */
+const pwdModal = (guided)=>{
+  openModal({
+    title: guided?'安全提示：请修改默认密码':'修改配置页密码',
+    width:'min(440px,92vw)', closeOnMask:!guided,
+    body:`
+      ${guided?'<div class="banner warn" style="margin-bottom:12px"><span>当前仍在使用默认密码 <b>123456</b>。同一内网的其他人可能通过「你的内网 IP + 端口」直接打开配置页查看信息，请立即修改密码。</span></div>':''}
+      ${guided?'':`<label class="fld">当前密码</label><input type="password" id="pwOld" autocomplete="off">`}
+      <label class="fld">新密码（≥6 位，不能是 123456）</label><input type="password" id="pwNew" autocomplete="off">
+      <label class="fld">确认新密码</label><input type="password" id="pwNew2" autocomplete="off">
+      <div class="lock-err" id="pwErr" style="margin-top:6px"></div>
+      <div class="mini-note">密码用于保护本机配置页（含会话页）。原型演示存于浏览器本地；实际实现应存服务端哈希并配合会话令牌。</div>`,
+    foot:`${guided?'<button class="btn" id="pwSkip">暂不修改</button>':''}<span class="sp"></span><button class="btn primary" id="pwOk">确认修改</button>`,
+  });
+  const sk = $('#pwSkip');
+  if (sk) sk.onclick = ()=>{ closeModal(); toast('已跳过。下次仍用默认密码进入时会再次提醒', true); };
+  $('#pwOk').onclick = ()=>{
+    const oldv = guided ? LOCK.pwd : ($('#pwOld') ? $('#pwOld').value : '');
+    const n1 = $('#pwNew').value, n2 = $('#pwNew2').value, err = $('#pwErr');
+    const bad = (m)=>{ err.textContent = m; return false; };
+    if (!guided && oldv !== LOCK.pwd) return bad('当前密码不正确');
+    if (n1.length < 6) return bad('新密码至少 6 位');
+    if (n1 === '123456') return bad('新密码不能是默认密码 123456');
+    if (n1 !== n2) return bad('两次输入的新密码不一致');
+    LOCK.savePwd(n1);
+    closeModal();
+    toast('✅ 密码已修改，下次登录请使用新密码');
+  };
+};
+const guideChangePwd = ()=> pwdModal(true);
+
+/* 设置弹窗（顶栏右上角 ⚙） */
+const settingsModal = ()=>{
+  const opts = [[30,'30 分钟'],[60,'1 小时'],[240,'4 小时'],[1440,'24 小时'],[1800,'30 小时'],[0,'永不']];
+  openModal({
+    title:'设置', width:'min(460px,92vw)',
+    body:`
+      <div class="sub-title">配置页密码</div>
+      <div class="mut" style="font-size:12px;margin-bottom:10px">防止同一内网其他用户通过「IP + 端口」查看你的配置信息；每次进入配置页都需要输入密码${LOCK.isDefault()?'。<b style="color:var(--warn-tx)">当前仍为默认密码 123456，建议立即修改。</b>':'。'}</div>
+      <button class="btn" id="stPwd">${I(IC.key,13)} 修改密码</button>
+      <hr>
+      <div class="sub-title" style="margin-top:4px">自动锁屏</div>
+      <label class="fld">长时间无操作后锁屏（再次使用需输入密码）</label>
+      <select id="stMins">${opts.map(([v,l])=>`<option value="${v}" ${LOCK.mins===v?'selected':''}>${l}</option>`).join('')}</select>
+      <div class="mini-note" style="margin-top:8px">当前设定：${LOCK.mins?`无操作 ${minsText(LOCK.mins)} 后自动锁屏`:'不自动锁屏'}。演示提示：可临时选「30 分钟」，或点顶栏 🔒 立即体验锁屏。</div>`,
+    foot:`<span class="sp"></span><button class="btn" id="stCancel">关闭</button><button class="btn primary" id="stSave">保存</button>`,
+  });
+  $('#stCancel').onclick = closeModal;
+  $('#stPwd').onclick = ()=> pwdModal(false);
+  $('#stSave').onclick = ()=>{
+    const v = Number($('#stMins').value);
+    LOCK.saveMins(v);
+    closeModal();
+    toast(v?`✅ 已设置：无操作 ${minsText(v)} 后自动锁屏`:'✅ 已关闭自动锁屏');
+  };
+};
+$('#settingsBtn').onclick = settingsModal;
+$('#lockBtn').onclick = lockPage;
+
+/* 锁屏看门狗：每 30 秒检查一次无操作时长 */
+['mousemove','keydown','click','wheel','touchstart'].forEach(ev=> document.addEventListener(ev, ()=>{ LOCK.lastActive = Date.now(); }, {passive:true}));
+setInterval(()=>{
+  if (!LOCK.unlocked || !LOCK.mins) return;
+  if (Date.now() - LOCK.lastActive > LOCK.mins*60000){ lockPage(); toast('已因长时间无操作自动锁屏', true); }
+}, 30000);
+
+/* ═══════════ 启动 ═══════════ */
+/* 每次渲染用全新 #view 节点，避免页面级监听跨渲染叠加 */
+const _baseRender = render;
+render = function(){
+  const v = $('#view');
+  if (v){ const nv = v.cloneNode(false); v.replaceWith(nv); }
+  _baseRender();
+};
+
+/* 主题切换 */
+const themeBtn = $('#themeBtn');
+const setTheme = (t)=>{
+  document.documentElement.dataset.theme = t;
+  themeBtn.innerHTML = I(t==='dark'?IC.sun:IC.moon, 15);
+  try{ localStorage.setItem('lcb-proto-theme', t); }catch{}
+};
+themeBtn.onclick = ()=> setTheme(document.documentElement.dataset.theme==='dark' ? 'light' : 'dark');
+let _savedTheme = null; try{ _savedTheme = localStorage.getItem('lcb-proto-theme'); }catch{}
+setTheme(_savedTheme || 'light');
+
+/* 顶栏按钮图标 + 进页即锁（每次进入配置页都需输密码） */
+$('#settingsBtn').innerHTML = I(IC.settings, 15);
+$('#lockBtn').innerHTML = I(IC.lock, 14);
+lockPage();
+
+window.addEventListener('hashchange', render);
+SaveBar.init(snapshotDB, render);
+render();
+</script>
+
+</body>
+</html>

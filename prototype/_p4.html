@@ -1,0 +1,349 @@
+<script>
+/* ═══════════ 路由与导航 ═══════════ */
+const NAV = [
+  { group:'总览', items:[['overview','概览']] },
+  { group:'机器人接入', items:[['apps','飞书应用'],['workspaces','工作区'],['slash','斜杠命令']] },
+  { group:'模型与扩展', items:[['claude','Claude 认证'],['plugins','插件'],['skills','Skills'],['mcp','MCP']] },
+  { group:'安全与记忆', items:[['permissions','权限'],['memory','记忆增强']] },
+];
+const PAGES = {};
+const DEFAULT_TAB = 'overview';
+const curTab = () => { const id = location.hash.slice(1); return PAGES[id] ? id : DEFAULT_TAB; };
+
+function renderNav(){
+  const q = ($('#navQ')?.value || '').trim().toLowerCase();
+  $('#nav').innerHTML = `
+    <div class="nav-search">${I(IC.search,13)}<input id="navQ" placeholder="搜索页面…" value="${esc(q)}"></div>` +
+    NAV.map(g => {
+      const items = g.items.filter(([id]) => PAGES[id]);
+      if (!items.length) return '';
+      return `<div class="nav-group"><div class="nav-group-label">${g.group}</div>` +
+        items.map(([id,label]) => {
+          const p = PAGES[id];
+          const hide = q && !label.toLowerCase().includes(q) ? 'nav-hide' : '';
+          const badge = p.badge ? p.badge() : '';
+          return `<button class="nav-item ${id===curTab()?'active':''} ${hide}" data-k="${id}"><span class="ico">${I(IC[id]||IC.info)}</span><span>${label}</span>${badge}</button>`;
+        }).join('') + '</div>';
+    }).join('');
+  $$('#nav .nav-item').forEach(b => b.onclick = ()=>{ location.hash = b.dataset.k; });
+  const inp = $('#navQ');
+  if (inp){ inp.oninput = ()=>{ renderNav(); const n=$('#navQ'); n.focus(); n.setSelectionRange(n.value.length,n.value.length); }; }
+}
+
+const LEGEND = '<span class="tag warn">需重启</span> 标记的配置保存后需重启桥接器生效；其余改动下一条消息自动生效。';
+
+function render(){
+  renderNav();
+  const page = PAGES[curTab()];
+  $('#pageHead').innerHTML = `
+    <span class="ico">${I(IC[page.id]||IC.info,19)}</span>
+    <div><h2>${page.title}</h2><div class="page-desc">${page.desc}</div></div>
+    <div class="page-actions" id="pageActions"></div>`;
+  $('#pageLegend').innerHTML = page.legend === false ? '' : LEGEND;
+  $('#view').innerHTML = '';
+  page.render($('#view'));
+}
+
+/* ═══════════ 页面：概览 ═══════════ */
+PAGES.overview = {
+  id:'overview', title:'概览', desc:'桥接器运行状态、版本与快捷入口',
+  render(el){
+    const b = DB.bridge, c = DB.claudeStat, l = DB.larkCli, m = DB.memory;
+    const tile = ({dot,dstate,name,sub,icon,actions=''}) => `
+      <div class="tile">
+        <div class="tile-top"><span class="dot ${dot}"></span><span class="tile-state" style="color:var(--${dot}-tx)">${dstate}</span><span class="tile-ico">${I(icon,16)}</span></div>
+        <div class="tile-name">${name}</div>
+        <div class="tile-sub" title="${esc(sub)}">${sub}</div>
+        <div class="tile-actions">${actions}</div>
+      </div>`;
+    el.innerHTML = `
+    <div class="tiles">
+      ${tile({dot:b.running?'ok':'off', dstate:b.running?'运行中':'未运行', name:'桥接器进程', sub:`PID ${b.pid} · ${b.embedded?'随 lcb start 常驻':'独立页面托管'}`, icon:IC.apps,
+        actions: b.running
+          ? '<button class="btn" data-a="restart">重启</button><button class="btn danger" data-a="stop">停止</button>'
+          : '<button class="btn primary" data-a="start">启动</button>'})}
+      ${tile({dot:c.ready?'ok':'err', dstate:c.ready?'已就绪':'未认证', name:'Claude 认证', sub:`${c.mode==='managed'?'bridge 托管':'继承本机'} · ${c.model||'CLI 默认'}`, icon:IC.claude,
+        actions:'<button class="btn" data-go="claude">管理</button>'})}
+      ${tile({dot:l.installed?(l.auth==='authorized'?'ok':'warn'):'off', dstate:l.installed?(l.auth==='authorized'?'已授权':'未授权'):'未安装', name:'飞书 CLI', sub:`v${l.version} · SKILL ${l.skill?'已装':'未装'}`, icon:IC.zap,
+        actions:`<button class="btn" data-a="cli-auth">${l.auth==='authorized'?'重新授权':'去授权'}</button>`})}
+      ${tile({dot:m.enabled?(m.state==='running'?'ok':'warn'):'off', dstate:m.enabled?(m.state==='running'?'运行中':'服务异常'):'已停用', name:'记忆增强', sub:`OpenViking v${m.version} · ${m.since}`, icon:IC.memory,
+        actions:'<button class="btn" data-go="memory">管理</button>'})}
+    </div>
+
+    <div class="panel">
+      <header class="panel-head"><h3>版本与更新</h3>
+        <div class="panel-actions"><button class="btn sm" id="ovCheck">检查更新</button></div>
+      </header>
+      <div class="panel-body">
+        <table class="kv">
+          <tr><td>LCB 桥接器</td><td id="ovLcb"><span class="chip">v${b.version}</span> ${b.latest!==b.version?'<span class="tag warn">可更新 → v'+b.latest+'</span> <button class="btn sm" data-a="update">一键更新</button>':'<span class="tag ok">已是最新</span>'}</td></tr>
+          <tr><td>飞书 CLI</td><td><span class="chip">v${l.version}</span> ${l.latest!==l.version?'<span class="tag warn">可更新 → v'+l.latest+'</span>':'<span class="tag ok">已是最新</span>'} <span class="tag ${l.skill?'ok':'warn'}">SKILL ${l.skill?'已装':'未装'}</span></td></tr>
+          <tr><td>开机自启</td><td><span class="switch-row tight" style="margin:0"><label class="switch"><input type="checkbox" id="ovAuto" ${b.autostart?'checked':''}><span class="track"></span></label><span class="hint">登录时自动运行 lcb start</span></span></td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <header class="panel-head"><h3>机器人</h3>
+        <div class="panel-actions"><button class="btn sm" data-go="apps">全部应用 →</button></div>
+      </header>
+      <div class="panel-body" style="padding-top:4px">
+        ${DB.apps.map(a=>`<div class="urow">
+          <span class="u-ava">${esc((a.name||'?')[0])}</span>
+          <div class="u-main"><div class="u-name">${esc(a.name||a.appId)} ${a.role==='deputy'?'<span class="tag off">分身</span>':''}</div>
+          <div class="u-sub mono">${esc(a.appId)} · ${a.domain} · ${a.ws||'全局默认工作区'}</div></div>
+          <span class="tag ${a.status==='running'?'ok':'err'}">${a.status==='running'?'运行中':'启动失败'}</span>
+        </div>`).join('')}
+      </div>
+    </div>
+
+    <div class="panel">
+      <header class="panel-head"><h3>飞书快捷指令</h3>
+        <div class="panel-actions"><button class="btn sm" data-go="slash">管理命令 →</button></div>
+      </header>
+      <div class="panel-body" style="padding-top:8px">
+        <div style="display:flex;flex-wrap:wrap;gap:8px">
+          ${DB.slash.map(s=>`<span class="chip" style="font-size:12.5px;padding:4px 12px">/${esc(s.cmd)}<span class="mut" style="font-family:inherit;margin-left:4px">${esc(s.desc)}</span></span>`).join('')}
+        </div>
+        <div class="mini-note" style="margin-top:10px">在飞书聊天框输入 / 触发；其它 / 开头的消息原文透传给 Claude Code。</div>
+      </div>
+    </div>`;
+    $('#pageActions').innerHTML = `<button class="btn" data-a="restart">重启</button><button class="btn primary" data-a="openlog">查看日志</button>`;
+    // 快捷操作
+    el.addEventListener('click', async (e)=>{
+      const a = e.target.closest('[data-a]'); if(!a) return;
+      const op = a.dataset.a;
+      if (op==='restart'){ a.disabled=true; a.innerHTML='<span class="spin"></span>重启中'; await sleep(1200); toast('✅ 桥接器已重启'); render(); }
+      if (op==='stop'){ if (await confirmDlg({title:'停止桥接器', msg:'停止后机器人将不再响应消息。配置页也会随进程关闭，可运行 lcb ui 重开。', danger:true, okText:'停止'})){ toast('已发送停止信号'); render(); } }
+      if (op==='start'){ toast('已在后台启动'); render(); }
+      if (op==='update'){ a.disabled=true; a.textContent='更新中…'; await sleep(1500); toast('✅ 已更新到 v'+b.latest+' 并重启'); render(); }
+      if (op==='cli-auth'){ toast('原型：此处打开扫码授权弹窗'); }
+      if (op==='openlog'){ toast('原型：此处打开日志查看器'); }
+    });
+    el.addEventListener('click', (e)=>{ const g=e.target.closest('[data-go]'); if(g) location.hash=g.dataset.go; });
+    $('#ovCheck').onclick = async (e)=>{ const btn=e.currentTarget; btn.disabled=true; btn.innerHTML='<span class="spin"></span>检查中'; await sleep(900); btn.disabled=false; btn.textContent='检查更新'; toast(b.latest!==b.version?'发现新版本 v'+b.latest:'已是最新版本'); };
+    $('#ovAuto').onchange = async (e)=>{ b.autostart = e.target.checked; if (await fakeSave(e.target.checked?'已注册开机自启':'已关闭开机自启')) render(); };
+  },
+};
+
+/* ═══════════ 页面：飞书应用 ═══════════ */
+PAGES.apps = {
+  id:'apps', title:'飞书应用', desc:'每个应用一条独立长连接与独立会话池',
+  render(el){
+    el.innerHTML = `<div class="cardgrid">
+      ${DB.apps.map((a,i)=>`
+      <div class="acard" data-i="${i}" tabindex="0" role="button" aria-label="编辑 ${esc(a.name)}">
+        <div class="acard-head"><b>${esc(a.name||a.appId||'未命名')}</b>
+          ${a.role==='deputy'?'<span class="tag info">分身</span>':''}
+          <span class="dot ${a.status==='running'?'ok':'err'}" title="${a.status==='running'?'运行中':'启动失败'}"></span></div>
+        <div class="acard-meta">
+          <span title="App ID">${I(IC.bot,12)}<span class="mono">${esc(a.appId)}</span></span>
+          <span>${I(IC.globe,12)}${a.domain==='lark'?'lark 国际':'feishu 国内'}</span>
+          <span>${I(IC.workspaces,12)}${esc(a.ws||'全局默认')}</span>
+        </div>
+        <div class="acard-meta">
+          <span>${I(IC.claude,12)}${esc(a.profile||'跟随全局')}${a.profileModel?' · '+esc(a.profileModel):''}</span>
+          <span>${I(IC.slash,12)}触发词 ${a.triggers.length}</span>
+        </div>
+        <div class="acard-foot">
+          <button class="btn sm" data-edit="${i}">编辑</button>
+          <button class="btn sm danger" data-del="${i}">删除</button>
+          <span class="mut" style="font-size:11px;align-self:center;margin-left:auto">${a.role==='deputy'?'艾特即用':'配对码准入'}</span>
+        </div>
+      </div>`).join('')}
+      <div class="acard newcard" id="addApp" tabindex="0" role="button">${I(IC.plus,18)}<span>新增应用</span></div>
+    </div>`;
+    $('#pageActions').innerHTML = '<button class="btn primary" id="addAppTop">新增应用</button>';
+    const openEdit = (i)=> appDrawer(i);
+    $$('.acard[data-i]', el).forEach(c=>{
+      c.onclick = (e)=>{ if (e.target.closest('button')) return; openEdit(+c.dataset.i); };
+      c.onkeydown = (e)=>{ if(e.key==='Enter') openEdit(+c.dataset.i); };
+    });
+    $$('[data-edit]', el).forEach(b=> b.onclick = ()=> openEdit(+b.dataset.edit));
+    $$('[data-del]', el).forEach(b=> b.onclick = async ()=>{
+      if (DB.apps.length<=1) return toast('至少保留一个应用', true);
+      const a = DB.apps[+b.dataset.del];
+      if (await confirmDlg({title:'删除应用', msg:`确认删除应用「${a.name}」？删除将立即保存。`, danger:true, okText:'删除'})){ DB.apps.splice(+b.dataset.del,1); await fakeSave('应用已删除'); render(); }
+    });
+    const add = ()=> appDrawer(-1);
+    $('#addApp').onclick = add;
+    $('#addAppTop').onclick = add;
+  },
+};
+
+/* 应用编辑抽屉：左侧子模块导航（原单页长表单 → 6 个子模块） */
+function appDrawer(idx){
+  const isNew = idx < 0;
+  const app = isNew
+    ? { name:'', appId:'', secretSet:'', domain:'feishu', ws:'', cc:'', role:'primary', profile:'', profileModel:'', status:'off', persona:'', triggers:[], env:{}, skills:[], dws:[], plugins:[] }
+    : JSON.parse(JSON.stringify(DB.apps[idx]));
+  const secs = [
+    ['base','基本信息'],['model','模型'],['deputy','分身与白名单'],['trig','触发词'],['env','环境变量'],['persona','人格'],
+  ];
+  const cnt = (s)=> s==='trig' ? (app.triggers?.length||'') : s==='env' ? (Object.keys(app.env||{}).length||'') : '';
+  let cur = 'base';
+  const wsNames = DB.workspaces.map(w=>w.name);
+  const profiles = DB.claude.profiles.map(p=>p.name);
+
+  const body = openDrawer({
+    title: isNew ? '新增应用' : `应用：${app.name || app.appId}`,
+    body: `<div class="dw-layout"><nav class="dw-nav" id="dwNav"></nav><div class="dw-pane" id="dwPane"></div></div>`,
+    foot: `${isNew?'':'<button class="btn danger" id="dwDel">删除应用</button>'}<span class="sp"></span><button class="btn" id="dwCancel">取消</button><button class="btn primary" id="dwSave">保存</button>`,
+  });
+
+  const paneBase = () => `
+    <div class="grid2">
+      <div><label class="fld">应用名称 <span class="tip" data-tip="概览页与飞书 /status 显示用，缺省取 App ID">${I(IC.info,13)}</span></label>
+        <input type="text" data-f="name" value="${esc(app.name)}" placeholder="素材收集"></div>
+      <div><label class="fld">App ID</label><input type="text" data-f="appId" value="${esc(app.appId)}" placeholder="cli_…"></div>
+    </div>
+    <label class="fld">App Secret ${app.secretSet?`<span class="tag off">已设置 ${esc(app.secretSet)}</span>`:''} <span class="tip" data-tip="已脱敏保存；留空 = 保持不变，输入 = 覆盖">${I(IC.info,13)}</span></label>
+    <input type="password" data-f="secret" placeholder="${app.secretSet?'••••••••（留空保持不变）':'未设置'}">
+    <div class="grid3">
+      <div><label class="fld">域名</label><select data-f="domain">
+        <option value="feishu" ${app.domain!=='lark'?'selected':''}>feishu（国内）</option>
+        <option value="lark" ${app.domain==='lark'?'selected':''}>lark（国际）</option></select></div>
+      <div><label class="fld">默认工作区</label><select data-f="ws">
+        <option value="">（全局默认）</option>
+        ${wsNames.map(n=>`<option ${app.ws===n?'selected':''}>${esc(n)}</option>`).join('')}</select></div>
+      <div><label class="fld">并发上限 <span class="tag warn">需重启</span></label>
+        <input type="number" min="1" max="100" data-f="cc" value="${esc(app.cc)}" placeholder="缺省用全局"></div>
+    </div>
+    <label class="fld">角色 <span class="tip" data-tip="主机器人=全权限、配对码准入；分身机器人=限定能力、群内艾特即用">${I(IC.info,13)}</span></label>
+    <div class="rcards">
+      <label class="rcard ${app.role!=='deputy'?'on':''}"><input type="radio" name="dwRole" value="primary" ${app.role!=='deputy'?'checked':''}><span><b>主机器人</b><span class="hint">全权限，配对码准入</span></span></label>
+      <label class="rcard ${app.role==='deputy'?'on':''}"><input type="radio" name="dwRole" value="deputy" ${app.role==='deputy'?'checked':''}><span><b>分身机器人</b><span class="hint">限定能力，供他人在群里艾特使用</span></span></label>
+    </div>`;
+
+  const paneModel = () => `
+    <div class="grid2">
+      <div><label class="fld">厂商档案</label><select id="dwProfile">
+        <option value="">（跟随全局）</option>
+        ${profiles.map(n=>`<option ${app.profile===n?'selected':''}>${esc(n)}</option>`).join('')}</select></div>
+      <div><label class="fld">模型 ${app.profile?'':'<span class="tag off">需先选档案</span>'}</label>
+        <select id="dwModel" ${app.profile?'':'disabled'}>
+          <option value="">（档案默认模型）</option>
+          ${(DB.claude.profiles.find(p=>p.name===app.profile)?.models||[]).map(n=>`<option ${app.profileModel===n?'selected':''}>${esc(n)}</option>`).join('')}
+        </select></div>
+    </div>
+    <div class="mini-note" style="margin-top:10px">认证经独立 settings 注入，模型经 --model 参数注入；改动下一条消息热生效。档案在「Claude 认证」页维护。</div>`;
+
+  const paneDeputy = () => {
+    const off = app.role!=='deputy';
+    return `
+    ${off?'<div class="banner info">切到「分身机器人」后，此处可限定技能 / 插件 / 工作区白名单。</div>':'<div class="banner warn">未列入白名单的技能 / 插件对模型不可见；任务锁定在第一个允许的工作区。<span class="tag warn" style="margin-left:6px">需重启</span></div>'}
+    <div style="${off?'opacity:.45;pointer-events:none':''}">
+      <label class="fld">允许的技能（必填）</label><div class="echips on-box" id="msSkills"></div>
+      <label class="fld">允许的工作区（必填，任务锁定第一个）</label><div class="echips on-box" id="msWs"></div>
+      <label class="fld">允许的插件（可选）</label><div class="echips on-box" id="msPlg"></div>
+    </div>`;
+  };
+
+  const paneTrig = () => `
+    <div class="banner info" style="margin-bottom:10px">命中即改写消息后入队；<code>{text}</code>=原文，<code>{args}</code>=首词后的参数。可指向 bridge 本地命令（如 rewrite=/new）。<span class="tag info" style="margin-left:6px">热生效</span></div>
+    <table><thead><tr><th style="width:32%">match</th><th>rewrite</th><th style="width:70px" class="tip" data-tip="开启后命中先追问补充内容，下一条消息与原文合并再执行">追问</th><th style="width:52px"></th></tr></thead>
+    <tbody id="trigBody"></tbody></table>
+    <button class="btn sm" id="trigAdd" style="margin-top:8px">＋ 添加规则</button>`;
+
+  const paneEnv = () => `
+    <div class="mini-note" style="margin-bottom:8px">注入该机器人的 Claude 子进程，覆盖本机同名值。<span class="tag warn" style="margin-left:4px">需重启</span></div>
+    <table><thead><tr><th style="width:36%">KEY</th><th>VALUE</th><th style="width:52px"></th></tr></thead>
+    <tbody id="envBody"></tbody></table>
+    <button class="btn sm" id="envAdd" style="margin-top:8px">＋ 添加变量</button>`;
+
+  const panePersona = () => `
+    <label class="fld">人格补充 <span class="tip" data-tip="追加到该机器人每个会话的 system prompt，用于多机器人差异化定位"><span>${I(IC.info,13)}</span></span> <span class="tag warn" style="margin-left:4px">需重启</span></label>
+    <textarea data-f="persona" placeholder="你是我的超级助手，擅长代码开发、文案编写…">${esc(app.persona||'')}</textarea>
+    <div class="mini-note" style="margin-top:8px">${(app.persona||'').length} 字</div>`;
+
+  const panes = { base:paneBase, model:paneModel, deputy:paneDeputy, trig:paneTrig, env:paneEnv, persona:panePersona };
+
+  const renderNav2 = ()=>{
+    $('#dwNav').innerHTML = secs.map(([id,label])=>
+      `<button data-s="${id}" class="${id===cur?'active':''}">${label}${cnt(id)?`<span class="cnt">${cnt(id)}</span>`:''}</button>`).join('');
+    $$('#dwNav button').forEach(b=> b.onclick = ()=>{ cur=b.dataset.s; paint(); });
+  };
+  const paint = ()=>{
+    renderNav2();
+    $('#dwPane').innerHTML = panes[cur]();
+    bindPane();
+  };
+
+  const bindPane = ()=>{
+    const p = $('#dwPane');
+    if (cur==='base'){
+      $$('.rcard', p).forEach(r=> r.onclick = (e)=>{ e.preventDefault(); app.role = $('input',r).value; paint(); });
+      $$('[data-f]', p).forEach(inp=> inp.oninput = ()=>{
+        const f = inp.dataset.f;
+        if (f==='secret'){ if (inp.value.trim()) app.secretSet = inp.value.slice(-2) ? '···'+inp.value.slice(-2) : '···'; }
+        else if (f==='cc'){ app.cc = inp.value ? +inp.value : ''; }
+        else app[f] = inp.value;
+      });
+    }
+    if (cur==='model'){
+      $('#dwProfile').onchange = (e)=>{ app.profile = e.target.value; app.profileModel=''; paint(); };
+      $('#dwModel').onchange = (e)=>{ app.profileModel = e.target.value; };
+    }
+    if (cur==='deputy'){
+      echips($('#msSkills'), app.skills||[], {placeholder:'如 content-produce，回车添加', onChange:v=>app.skills=v});
+      echips($('#msWs'), app.dws||[], {placeholder:'工作区名，回车添加', onChange:v=>app.dws=v});
+      echips($('#msPlg'), app.plugins||[], {placeholder:'插件名，回车添加', onChange:v=>app.plugins=v});
+    }
+    if (cur==='trig'){
+      const tb = $('#trigBody');
+      const draw = ()=>{
+        tb.innerHTML = app.triggers.length ? app.triggers.map((t,i)=>`
+          <tr><td><input type="text" value="${esc(t.m)}" placeholder="/produce 或 关键词" data-t="${i}" data-c="m"></td>
+          <td><input type="text" value="${esc(t.r)}" placeholder="改写后的消息" data-t="${i}" data-c="r"></td>
+          <td style="text-align:center"><label class="switch tight"><input type="checkbox" data-t="${i}" data-ask ${t.ask?'checked':''}><span class="track"></span></label></td>
+          <td><button class="btn sm danger" data-trm="${i}">删</button></td></tr>`).join('')
+          : '<tr class="empty"><td colspan="4">暂无规则</td></tr>';
+        $$('input[data-t]', tb).forEach(inp=> inp.oninput = inp.onchange = ()=>{
+          const t = app.triggers[+inp.dataset.t];
+          if (inp.dataset.ask) t.ask = inp.checked; else t[inp.dataset.c] = inp.value;
+        });
+        $$('button[data-trm]', tb).forEach(b=> b.onclick = ()=>{ app.triggers.splice(+b.dataset.trm,1); draw(); renderNav2(); });
+      };
+      draw();
+      $('#trigAdd').onclick = ()=>{ app.triggers.push({m:'',r:'',ask:false}); draw(); renderNav2(); };
+    }
+    if (cur==='env'){
+      const rows = Object.entries(app.env||{});
+      const tb = $('#envBody');
+      const draw = ()=>{
+        tb.innerHTML = rows.length ? rows.map(([k,v],i)=>`
+          <tr><td><input type="text" value="${esc(k)}" data-e="${i}" data-c="k"></td>
+          <td><input type="text" value="${esc(v)}" data-e="${i}" data-c="v"></td>
+          <td><button class="btn sm danger" data-erm="${i}">删</button></td></tr>`).join('')
+          : '<tr class="empty"><td colspan="3">暂无变量</td></tr>';
+        $$('input[data-e]', tb).forEach(inp=> inp.oninput = ()=>{
+          const r = rows[+inp.dataset.e]; const oldK = r[0];
+          r[inp.dataset.c==='k'?0:1] = inp.value;
+          const obj = {}; rows.forEach(([kk,vv])=>{ if(kk.trim()) obj[kk.trim()]=vv; });
+          app.env = obj;
+        });
+        $$('button[data-erm]', tb).forEach(b=> b.onclick = ()=>{ rows.splice(+b.dataset.erm,1); const obj={}; rows.forEach(([kk,vv])=>obj[kk]=vv); app.env=obj; draw(); renderNav2(); });
+      };
+      draw();
+      $('#envAdd').onclick = ()=>{ rows.push(['','']); draw(); renderNav2(); };
+    }
+    if (cur==='persona'){ $('[data-f=persona]', p).oninput = (e)=> app.persona = e.target.value; }
+  };
+
+  paint();
+
+  $('#dwCancel').onclick = closeDrawer;
+  const delBtn = $('#dwDel');
+  if (delBtn) delBtn.onclick = async ()=>{
+    if (await confirmDlg({title:'删除应用', msg:`确认删除应用「${app.name||app.appId}」？`, danger:true, okText:'删除'})){ DB.apps.splice(idx,1); await fakeSave('应用已删除'); closeDrawer(); render(); }
+  };
+  $('#dwSave').onclick = async ()=>{
+    if (app.role==='deputy'){
+      if (!(app.skills||[]).length) return toast('分身必须配置「允许的技能」', true);
+      if (!(app.dws||[]).length) return toast('分身必须配置「允许的工作区」', true);
+    }
+    if (isNew) DB.apps.push(app); else DB.apps[idx] = app;
+    if (await fakeSave('应用配置已保存')){ closeDrawer(); render(); }
+  };
+}
+</script>

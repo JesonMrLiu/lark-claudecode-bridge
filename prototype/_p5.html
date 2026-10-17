@@ -1,0 +1,332 @@
+<script>
+/* ═══════════ 页面：工作区 ═══════════ */
+PAGES.workspaces = {
+  id:'workspaces', title:'工作区', desc:'Claude 的工作目录白名单与全局默认',
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>工作区</h3>
+        <div class="panel-actions"><button class="btn primary sm" id="wsAdd">＋ 添加工作区</button></div>
+      </header>
+      <div class="panel-body">
+        <table><thead><tr><th style="width:180px">名字</th><th>路径</th><th style="width:120px"></th></tr></thead>
+        <tbody id="wsBody"></tbody></table>
+      </div>
+      <footer class="panel-foot">${I(IC.info,13)} git 仓库工作区的任务收尾会自动发送汇总 diff 卡片。</footer>
+    </div>
+    <div class="panel">
+      <header class="panel-head"><h3>全局默认</h3></header>
+      <div class="panel-body">
+        <div class="grid2">
+          <div><label class="fld">默认工作区</label><select id="defWs">
+            <option value="">（未设置）</option>
+            ${DB.workspaces.map(w=>`<option ${DB.defaults.ws===w.name?'selected':''}>${esc(w.name)}</option>`).join('')}</select></div>
+          <div><label class="fld">全局并发</label><input type="number" id="defCc" min="1" max="100" value="${DB.defaults.concurrency}"></div>
+          <div><label class="fld">上下文提醒阈值 <span class="tip" data-tip="会话上下文超过该 token 数时提醒 /new，0=关闭">${I(IC.info,13)}</span></label>
+            <input type="number" id="defCtx" min="0" value="${DB.defaults.ctxRemind}"></div>
+          <div><label class="fld">飞书卡片宽度</label><select id="defCard">
+            <option value="default" ${DB.defaults.cardWidth==='default'?'selected':''}>默认</option>
+            <option value="fill" ${DB.defaults.cardWidth==='fill'?'selected':''}>撑满聊天窗口</option></select></div>
+        </div>
+      </div>
+    </div>`;
+    const drawRows = ()=>{
+      $('#wsBody').innerHTML = DB.workspaces.map((w,i)=>`
+        <tr><td><input type="text" value="${esc(w.name)}" data-w="${i}" data-c="name"></td>
+        <td><div class="input-btn"><input type="text" value="${esc(w.path)}" data-w="${i}" data-c="path">
+          <button class="btn sm" data-browse="${i}">浏览</button></div></td>
+        <td class="ops"><button class="btn sm danger" data-wdel="${i}">删除</button></td></tr>`).join('')
+        || '<tr class="empty"><td colspan="3">暂无工作区</td></tr>';
+      $$('input[data-w]').forEach(inp=> inp.oninput = ()=>{ DB.workspaces[+inp.dataset.w][inp.dataset.c] = inp.value; SaveBar.check(); });
+      $$('button[data-browse]').forEach(b=> b.onclick = ()=> toast('原型：此处打开目录选择器'));
+      $$('button[data-wdel]').forEach(b=> b.onclick = async ()=>{
+        if (DB.workspaces.length<=1) return toast('至少保留一个工作区', true);
+        const w = DB.workspaces[+b.dataset.wdel];
+        if (await confirmDlg({title:'删除工作区', msg:`删除工作区「${w.name}」？点底部保存后生效。`, danger:true, okText:'删除'})){ DB.workspaces.splice(+b.dataset.wdel,1); drawRows(); SaveBar.check(); }
+      });
+    };
+    drawRows();
+    SaveBar.init(snapshotDB, render);
+    const bindDef = (sel, key, num=false)=>{ const n=$(sel); if(!n) return; const h=()=>{ DB.defaults[key] = num ? (+n.value||0) : n.value; SaveBar.check(); }; n.oninput = h; n.onchange = h; };
+    bindDef('#defWs','ws'); bindDef('#defCc','concurrency',true); bindDef('#defCtx','ctxRemind',true); bindDef('#defCard','cardWidth');
+    $('#wsAdd').onclick = ()=>{ DB.workspaces.push({name:'',path:''}); drawRows(); SaveBar.check(); };
+  },
+};
+
+/* ═══════════ 页面：Claude 认证 ═══════════ */
+let claudeTab = 'cur';
+PAGES.claude = {
+  id:'claude', title:'Claude 认证', desc:'认证方式、当前生效凭证与厂商档案切换',
+  badge: ()=> '',
+  render(el){
+    const c = DB.claude;
+    el.innerHTML = `
+    <div class="tabs">
+      <button data-t="cur" class="${claudeTab==='cur'?'active':''}">当前生效</button>
+      <button data-t="mode" class="${claudeTab==='mode'?'active':''}">模式与凭证</button>
+      <button data-t="pf" class="${claudeTab==='pf'?'active':''}">厂商档案 <span class="tag off" style="margin-left:4px">${c.profiles.length}</span></button>
+    </div><div id="claudePane"></div>`;
+    $$('.tabs button', el).forEach(b=> b.onclick = ()=>{ claudeTab=b.dataset.t; render(); });
+    const pane = $('#claudePane');
+    if (claudeTab==='cur'){
+      const cs = DB.claudeStat;
+      pane.innerHTML = `
+      <div class="panel">
+        <header class="panel-head"><h3>当前生效</h3>
+          <div class="panel-actions"><span class="tag ${cs.ready?'ok':'err'}">${cs.ready?'已就绪':'未认证'}</span></div></header>
+        <div class="panel-body"><table class="kv">
+          <tr><td>认证模式</td><td>${cs.mode==='managed'?'bridge 托管':'继承本机 ~/.claude'}</td></tr>
+          <tr><td>BASE_URL</td><td><code>${esc(cs.baseUrl||'api.anthropic.com（官方默认）')}</code></td></tr>
+          <tr><td>模型</td><td><code>${esc(cs.model||'CLI 默认')}</code></td></tr>
+          <tr><td>Auth Token</td><td><code>${esc(cs.token||'未设置')}</code></td></tr>
+          <tr><td>API Key</td><td>${cs.key?`<code>${esc(cs.key)}</code>`:'<span class="mut">未设置</span>'}</td></tr>
+          <tr><td>自定义环境变量</td><td>${cs.envCount||0} 个 <span class="dim">（MCP 工具可用）</span></td></tr>
+          <tr><td>settings.json</td><td><code>${esc(cs.settingsPath)}</code></td></tr>
+        </table></div>
+        <footer class="panel-footer panel-foot">切换厂商 / 模型请到「厂商档案」页签，点模型名即时切换。</footer>
+      </div>`;
+    }
+    if (claudeTab==='mode'){
+      pane.innerHTML = `
+      <div class="panel">
+        <header class="panel-head"><h3>认证模式</h3></header>
+        <div class="panel-body">
+          <div class="rcards">
+            <label class="rcard ${c.mode!=='managed'?'on':''}"><input type="radio" name="clMode" value="inherit" ${c.mode!=='managed'?'checked':''}><span><b>继承本机</b><span class="hint">沿用本机 claude login 的登录态</span></span></label>
+            <label class="rcard ${c.mode==='managed'?'on':''}"><input type="radio" name="clMode" value="managed" ${c.mode==='managed'?'checked':''}><span><b>bridge 托管</b><span class="hint">填 API Key / Token，无需本机登录</span></span></label>
+          </div>
+          <div id="mgBox" style="${c.mode==='managed'?'':'display:none'}">
+            <hr>
+            <div class="grid2">
+              <div><label class="fld">凭证类型</label><select id="clCred">
+                <option value="auth_token" ${c.credType!=='api_key'?'selected':''}>AUTH_TOKEN（Bearer，中转站常用）</option>
+                <option value="api_key" ${c.credType==='api_key'?'selected':''}>API_KEY（x-api-key，官方）</option></select></div>
+              <div><label class="fld">凭证 <span class="tag off">已设置 sk-···a3f2</span></label>
+                <input type="password" placeholder="留空保持不变"></div>
+            </div>
+            <label class="fld">BASE_URL（官方留空）</label>
+            <input type="text" id="clBase" value="${esc(c.baseUrl)}" placeholder="https://relay.example.com">
+            <div class="frow" style="margin-top:12px">
+              <div><label class="fld">模型</label><input type="text" id="clModel" value="${esc(c.model)}" placeholder="claude-sonnet-5"></div>
+              <button class="btn" id="clPull">拉取模型</button>
+            </div>
+            <details class="adv" style="margin-top:14px"><summary>环境变量（写入托管 settings.json）</summary>
+              <div class="adv-body">
+                <table><tbody id="clEnvBody"></tbody></table>
+                <button class="btn sm" id="clEnvAdd" style="margin-top:8px">＋ 添加变量</button>
+              </div></details>
+            <div style="margin-top:14px"><button class="btn primary" id="clModeSave">保存</button></div>
+          </div>
+        </div>
+        <footer class="panel-foot">托管模式与本机 ~/.claude 完全隔离；模式切换需重启。</footer>
+      </div>`;
+      $$('.rcard', pane).forEach(r=> r.onclick = (e)=>{ e.preventDefault(); c.mode = $('input',r).value; render(); });
+      $('#clPull').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.innerHTML='<span class="spin"></span>拉取中'; await sleep(900); b.disabled=false; b.textContent='拉取模型'; toast('获取到 12 个模型（原型演示）'); };
+      $('#clModeSave').onclick = ()=> fakeSave('认证配置已保存');
+      const rows = Object.entries(c.env||{});
+      const drawEnv = ()=>{
+        $('#clEnvBody').innerHTML = rows.map(([k,v],i)=>`<tr><td style="width:38%"><input type="text" value="${esc(k)}" data-ce="${i}" data-c="k"></td><td><div class="input-btn"><input type="text" value="${esc(v)}" data-ce="${i}" data-c="v"><button class="btn sm danger" data-cerm="${i}">删</button></div></td></tr>`).join('')
+          || '<tr><td colspan="2" class="mut">未配置</td></tr>';
+        $$('input[data-ce]').forEach(inp=> inp.oninput = ()=>{ rows[+inp.dataset.ce][inp.dataset.c==='k'?0:1]=inp.value; const o={}; rows.forEach(([k,v])=>{if(k.trim())o[k]=v}); c.env=o; });
+        $$('button[data-cerm]').forEach(b=> b.onclick = ()=>{ rows.splice(+b.dataset.cerm,1); drawEnv(); });
+      };
+      drawEnv();
+      $('#clEnvAdd').onclick = ()=>{ rows.push(['','']); drawEnv(); };
+    }
+    if (claudeTab==='pf'){
+      pane.innerHTML = `
+      <div class="cardgrid">
+        ${c.profiles.map((p,i)=>`
+        <div class="acard" style="cursor:default">
+          <div class="acard-head"><b>${esc(p.name)}</b>${p.active?'<span class="tag ok">使用中</span>':''}</div>
+          <div class="acard-meta"><span>${I(IC.key,12)}${esc(p.cred)}</span><span>${I(IC.globe,12)}${p.baseUrl?`<span class="mono">${esc(p.baseUrl)}</span>`:'官方默认'}</span></div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            ${p.models.map(m=>`<button class="btn sm ${p.active&&m===c.model?'primary':''}" data-usemodel="${i}" data-m="${esc(m)}" title="点击切换为当前模型">${esc(m)}${p.active&&m===c.model?' ✓':''}</button>`).join('')||'<span class="mut">无候选模型</span>'}
+          </div>
+          <div class="acard-foot">
+            <button class="btn sm" data-pfedit="${i}">编辑</button>
+            <button class="btn sm danger" data-pfdel="${i}">删除</button>
+            <span class="mut" style="font-size:11px;align-self:center;margin-left:auto">默认 ${esc(p.def||'—')}</span>
+          </div>
+        </div>`).join('')}
+        <div class="acard newcard" id="pfAdd">${I(IC.plus,18)}<span>新增档案</span></div>
+      </div>`;
+      $('#pageActions').innerHTML = '<button class="btn primary" id="pfAddTop">新增档案</button>';
+      $$('[data-usemodel]').forEach(b=> b.onclick = async ()=>{
+        const p = c.profiles[+b.dataset.usemodel];
+        const r = p.models.includes(b.dataset.m);
+        c.model = b.dataset.m;
+        c.profiles.forEach(x=> x.active = false);
+        p.active = r;
+        await fakeSave(`已切换模型：${b.dataset.m}`); render();
+      });
+      $$('[data-pfedit]').forEach(b=> b.onclick = ()=> profileDrawer(+b.dataset.pfedit));
+      $$('[data-pfdel]').forEach(b=> b.onclick = async ()=>{
+        const p = c.profiles[+b.dataset.pfdel];
+        if (await confirmDlg({title:'删除档案', msg:`确认删除档案「${p.name}」？删除立即生效。`, danger:true, okText:'删除'})){ c.profiles.splice(+b.dataset.pfdel,1); await fakeSave('档案已删除'); render(); }
+      });
+      $('#pfAdd').onclick = ()=> profileDrawer(-1);
+      $('#pfAddTop').onclick = ()=> profileDrawer(-1);
+    }
+  },
+};
+
+function profileDrawer(idx){
+  const isNew = idx<0;
+  const p = isNew ? {name:'',cred:'AUTH_TOKEN',baseUrl:'',models:[],def:''} : JSON.parse(JSON.stringify(DB.claude.profiles[idx]));
+  openDrawer({
+    title: isNew?'新增厂商档案':`档案：${p.name}`,
+    narrow:true,
+    body:`
+      <label class="fld">档案名</label><input type="text" id="pfName" value="${esc(p.name)}" placeholder="中转站A">
+      <label class="fld">凭证类型</label><select id="pfCred">
+        <option value="AUTH_TOKEN" ${p.cred!=='API_KEY'?'selected':''}>AUTH_TOKEN（Bearer）</option>
+        <option value="API_KEY" ${p.cred==='API_KEY'?'selected':''}>API_KEY（x-api-key）</option></select>
+      <label class="fld">凭证</label><input type="password" placeholder="sk-…（留空保持不变）">
+      <label class="fld">BASE_URL（官方留空）</label><input type="text" id="pfBase" value="${esc(p.baseUrl)}" placeholder="https://relay.example.com">
+      <label class="fld">候选模型 <span class="tip" data-tip="列表页点模型名即时切换当前模型；勾选 1M 添加的模型带 [1m] 后缀">${I(IC.info,13)}</span></label>
+      <div class="echips on-box" id="pfModels"></div>
+      <div class="frow" style="margin-top:10px">
+        <div><input type="text" id="pfNewModel" placeholder="输入模型名"></div>
+        <label style="display:inline-flex;align-items:center;gap:5px;font-size:12.5px;flex:0 0 auto;padding-top:6px"><input type="checkbox" id="pf1M"> 1M 上下文</label>
+        <div class="btn-wrap"><button class="btn" id="pfAddModel">添加</button></div>
+        <div class="btn-wrap"><button class="btn" id="pfPull">拉取模型</button></div>
+      </div>
+      <label class="fld" style="margin-top:14px">默认模型</label>
+      <select id="pfDef"><option value="">（不指定）</option>${p.models.map(m=>`<option ${p.def===m?'selected':''}>${esc(m)}</option>`).join('')}</select>`,
+    foot:`${isNew?'':'<button class="btn danger" id="pfDel">删除</button>'}<span class="sp"></span><button class="btn" id="pfCancel">取消</button><button class="btn primary" id="pfSave">保存</button>`,
+  });
+  echips($('#pfModels'), p.models, {placeholder:'输入后回车添加', onChange:v=>{ p.models=v; $('#pfDef').innerHTML='<option value="">（不指定）</option>'+v.map(m=>`<option ${p.def===m?'selected':''}>${esc(m)}</option>`).join(''); }});
+  $('#pfName').oninput = e=> p.name = e.target.value.trim();
+  $('#pfBase').oninput = e=> p.baseUrl = e.target.value.trim();
+  $('#pfAddModel').onclick = ()=>{
+    const v = $('#pfNewModel').value.trim(); if(!v) return;
+    const full = $('#pf1M').checked ? v+'[1m]' : v;
+    if (!p.models.includes(full)) p.models.push(full);
+    $('#pfNewModel').value=''; $('#pf1M').checked=false;
+    echips($('#pfModels'), p.models, {placeholder:'输入后回车添加', onChange:vv=>{ p.models=vv; }});
+    $('#pfDef').innerHTML='<option value="">（不指定）</option>'+p.models.map(m=>`<option ${p.def===m?'selected':''}>${esc(m)}</option>`).join('');
+  };
+  $('#pfPull').onclick = async (e)=>{ const b=e.currentTarget; b.disabled=true; b.innerHTML='<span class="spin"></span>拉取中'; await sleep(800); b.disabled=false; b.textContent='拉取模型'; toast('获取到 8 个模型（原型演示）'); };
+  $('#pfCancel').onclick = closeDrawer;
+  const del = $('#pfDel');
+  if (del) del.onclick = async ()=>{ if (await confirmDlg({title:'删除档案', msg:`确认删除「${p.name}」？`, danger:true, okText:'删除'})){ DB.claude.profiles.splice(idx,1); await fakeSave(); closeDrawer(); render(); } };
+  $('#pfSave').onclick = async ()=>{ if(!p.name) return toast('请填写档案名', true); if (isNew) DB.claude.profiles.push(p); else DB.claude.profiles[idx]=p; if (await fakeSave('档案已保存')){ closeDrawer(); render(); } };
+}
+
+/* ═══════════ 页面：权限 ═══════════ */
+let permTab = 'allow';
+PAGES.permissions = {
+  id:'permissions', title:'权限', desc:'工具免确认名单与危险命令黑名单，改动即时生效',
+  render(el){
+    const p = DB.permissions;
+    el.innerHTML = `
+    <div class="tabs">
+      <button data-t="allow" class="${permTab==='allow'?'active':''}">免确认工具</button>
+      <button data-t="danger" class="${permTab==='danger'?'active':''}">危险命令黑名单 <span class="tag off" style="margin-left:4px">${p.dangerous.length}</span></button>
+    </div><div id="permPane"></div>`;
+    $$('.tabs button', el).forEach(b=> b.onclick = ()=>{ permTab=b.dataset.t; render(); });
+    const pane = $('#permPane');
+    if (permTab==='allow'){
+      const isDefault = JSON.stringify(p.tools)===JSON.stringify(p.toolsDefault);
+      pane.innerHTML = `
+      <div class="panel">
+        <header class="panel-head"><h3>免确认工具</h3>
+          <div class="panel-actions">${isDefault?'<span class="tag off">与内置默认一致</span>':''}</div></header>
+        <div class="panel-body">
+          <div class="switch-row" style="margin-top:0">
+            <label class="switch"><input type="checkbox" id="allowAll" ${p.allowAll?'checked':''}><span class="track"></span></label>
+            <span class="switch-label">全部工具免确认</span>
+            <span class="tip" data-tip="开启后除命中黑名单的 Bash 外，所有工具（含写入）都不再弹确认卡">${I(IC.info,13)}</span>
+          </div>
+          ${p.allowAll?'<div class="banner warn" style="margin:8px 0">已开启全部放行——下方名单暂不生效，黑名单是唯一安全网。</div>':''}
+          <div style="${p.allowAll?'opacity:.45;pointer-events:none':''}">
+            <div class="echips on-box" id="toolChips" style="margin-top:6px"></div>
+            <div style="display:flex;gap:8px;margin-top:10px">
+              <input type="text" id="newTool" placeholder="工具名，如 Write" style="max-width:300px">
+              <button class="btn" id="addTool">添加</button>
+              <button class="btn" id="resetTools">恢复默认</button>
+            </div>
+          </div>
+        </div>
+        <footer class="panel-foot">命中名单的工具直接放行；未命中弹确认卡。改动即时生效。</footer>
+      </div>`;
+      echips($('#toolChips'), p.tools, {placeholder:'回车添加', onChange:()=>SaveBar_checkPerm()});
+      function SaveBar_checkPerm(){ fakeSave('权限已更新'); }
+      $('#addTool').onclick = ()=>{ const v=$('#newTool').value.trim(); if(v && !p.tools.includes(v)){ p.tools.push(v); render(); } };
+      $('#resetTools').onclick = async ()=>{ if (await confirmDlg({title:'恢复默认', msg:'恢复为内置默认名单？当前自定义项将被覆盖。', okText:'恢复默认'})){ p.tools=[...p.toolsDefault]; render(); } };
+      $('#allowAll').onchange = async (e)=>{
+        const next = e.target.checked;
+        if (next && !(await confirmDlg({title:'开启全部工具免确认', msg:'开启后除命中黑名单的 Bash 外，所有工具（含写入）都不再弹确认卡。确定开启？', danger:true, okText:'开启'}))){ e.target.checked=false; return; }
+        p.allowAll = next; render();
+      };
+      // echips 的 onChange 已覆盖删除；添加走按钮
+    } else {
+      pane.innerHTML = `
+      <div class="panel">
+        <header class="panel-head"><h3>危险命令黑名单</h3>
+          <div class="panel-actions"><span class="tip" data-tip="正则（不区分大小写），命中的 Bash 命令弹确认卡">${I(IC.info,14)}</span></div></header>
+        <div class="panel-body">
+          ${p.dangerous.length===0?'<div class="banner err" style="margin-bottom:10px">黑名单为空——所有 Bash 命令（含 rm -rf）将免确认直通。</div>':''}
+          <div class="echips on-box" id="dcChips"></div>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <input type="text" id="newDc" placeholder='正则，如 \\bgit\\s+push\\b.*--force' style="max-width:420px">
+            <button class="btn" id="addDc">添加</button>
+          </div>
+        </div>
+        <footer class="panel-foot">删除正则 = 放宽对应命令为直通，请谨慎。改动即时生效。</footer>
+      </div>`;
+      const m = echips($('#dcChips'), p.dangerous, {placeholder:'回车添加', onChange:()=>fakeSave('黑名单已更新')});
+      $('#addDc').onclick = ()=>{ const v=$('#newDc').value.trim(); if(!v) return; try{ new RegExp(v,'i'); }catch(err){ return toast('正则无效：'+err.message, true); } p.dangerous.push(v); render(); };
+    }
+  },
+};
+
+/* ═══════════ 页面：斜杠命令 ═══════════ */
+PAGES.slash = {
+  id:'slash', title:'斜杠命令', desc:'注册到飞书开放平台的指令面板，聊天框输入 / 触发',
+  render(el){
+    el.innerHTML = `
+    <div class="panel">
+      <header class="panel-head"><h3>已注册命令</h3>
+        <div class="panel-actions">
+          <select id="scApp" style="width:auto;padding:4px 10px;font-size:12.5px"><option>小助手（cli_a1f8k2m9x0）</option></select>
+          <button class="btn sm" id="scReload">刷新</button>
+          <button class="btn sm" id="scBuiltins">补齐内置</button>
+        </div></header>
+      <div class="panel-body">
+        <table><thead><tr><th style="width:160px">命令</th><th>描述</th><th style="width:150px">操作</th></tr></thead>
+        <tbody>${DB.slash.map((s,i)=>`
+          <tr><td><code>/${esc(s.cmd)}</code></td><td>${esc(s.desc)}</td>
+          <td class="ops"><button class="btn sm" data-scedit="${i}">编辑</button> <button class="btn sm danger" data-scdel="${i}">删除</button></td></tr>`).join('')}
+        </tbody></table>
+      </div>
+      <footer class="panel-foot">${I(IC.info,13)} 本页直接读写飞书开放平台（需 application:app_slash_command 权限），改动约 5 分钟生效，与配置保存无关。</footer>
+    </div>`;
+    $('#pageActions').innerHTML = '<button class="btn primary" id="scAdd">新增命令</button>';
+    const edit = (i=-1)=>{
+      const s = i>=0 ? DB.slash[i] : {cmd:'',desc:'',icon:''};
+      openDrawer({ title: i>=0?`编辑 /${s.cmd}`:'新增命令', narrow:true,
+        body:`<label class="fld">命令（不带 /${i>=0?'，飞书侧不可改名':''}）</label><input type="text" id="dcCmd" value="${esc(s.cmd)}" ${i>=0?'disabled':''} placeholder="produce">
+              <label class="fld">描述</label><input type="text" id="dcDesc" value="${esc(s.desc)}" placeholder="指令面板展示文案">`,
+        foot:`<span class="sp"></span><button class="btn" id="dcCancel">取消</button><button class="btn primary" id="dcSave">${i>=0?'保存':'创建'}</button>`,
+      });
+      $('#dcCancel').onclick = closeDrawer;
+      $('#dcSave').onclick = async ()=>{
+        const cmd = $('#dcCmd').value.trim(), desc = $('#dcDesc').value.trim();
+        if (!desc) return toast('描述不能为空', true);
+        if (i>=0){ s.desc = desc; } else { if(!cmd) return toast('命令名不能为空', true); DB.slash.push({cmd,desc,icon:''}); }
+        if (await fakeSave('已提交飞书')){ closeDrawer(); render(); }
+      };
+    };
+    $('#scAdd').onclick = ()=>edit();
+    $$('[data-scedit]').forEach(b=> b.onclick = ()=>edit(+b.dataset.scedit));
+    $$('[data-scdel]').forEach(b=> b.onclick = async ()=>{
+      const s = DB.slash[+b.dataset.scdel];
+      if (await confirmDlg({title:'删除命令', msg:`确认删除远端命令 /${s.cmd}？约 5 分钟后从飞书面板消失。`, danger:true, okText:'删除'})){ DB.slash.splice(+b.dataset.scdel,1); await fakeSave('已删除'); render(); }
+    });
+    $('#scReload').onclick = ()=>toast('已刷新（原型演示）');
+    $('#scBuiltins').onclick = ()=>toast('✅ 内置命令已补齐（原型演示）');
+  },
+};
+</script>
