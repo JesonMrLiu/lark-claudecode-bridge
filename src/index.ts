@@ -1676,38 +1676,6 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   for (const f of results) if (f.status === 'rejected') console.error('❌ 应用启动失败：', f.reason);
   if (results.every((r) => r.status === 'rejected')) throw new Error('所有应用均启动失败，请检查 config.yaml 中的 apps 配置');
   console.log(`🚀 lark-claudecode-bridge 已启动（${results.length - results.filter((r) => r.status === 'rejected').length}/${results.length} 个应用，长连接模式，无需公网 IP）`);
-  // 第二步：记忆增强自举。LCB 先起来（机器人可用性优先），记忆随后尽力而为：
-  // 服务没起就自动拉起（embedded 受管），起不来只提示 + 指引手动开启，绝不阻断启动
-  if (config.memory?.enabled) {
-    console.log(`${step('记忆增强 · 启动 OpenViking 服务 …')}`);
-    let report;
-    try {
-      report = await ensureMemoryServiceRunning({
-        endpoint: memoryEndpoint(config.memory),
-        mode: config.memory.mode,
-      });
-    } catch (e) {
-      // 自举自身抛错（理论上 ensureMemoryServiceRunning 全程收敛为 report，这里是最后一道兜底）
-      report = {
-        ready: false, started: false,
-        detail: `自举异常：${e instanceof Error ? e.message : String(e)}`,
-        hint: '请到配置页「记忆增强」点「检查修复」',
-      };
-    }
-    console.log(`      ${report.ready ? '✅' : '⚠️'} ${report.detail}`);
-    if (!report.ready && report.hint) console.log(`      手动开启指引：${report.hint}`);
-    // 第三步：签发各 bot 记忆身份（服务不可达时内部自动退避重试，服务后就绪即补签）
-    console.log(`${step('记忆增强 · 签发各 bot 记忆身份 …')}`);
-    await refreshMemoryKeys();
-    // 客户端接入配置兜底（§6.7 第 4 步）：外部自管域自动 skipped-external；LCB 骨架已存在
-    // kept 零写。失败只 warn——本机直连 claude 的插件启用受影响，LCB 会话有 env 通道不受影响
-    try {
-      const w = ensureClientCliConf(config.memory);
-      if (w === 'written' || w === 'updated') console.log(`      客户端配置 ovcli.conf 已${w === 'written' ? '写入' : '刷新'}（${w}）`);
-    } catch (e) { console.warn('[memory] ovcli.conf 写入失败：', e instanceof Error ? e.message : e); }
-  } else {
-    console.log(`${step('记忆增强 · 未启用（config.yaml 的 memory.enabled=false），跳过')}`);
-  }
   // 页面托管启停的探活依据：进程存活期间持有 PID 文件（崩溃/被硬杀时由读取方清理陈旧文件）
   writePidFile();
   // 优雅关闭：SIGINT/SIGTERM（或页面 stop/restart 经 selfStop 注入）时逐个关闭全部长连接
@@ -1717,13 +1685,17 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     for (const r of runners) r.gateway.close();
     // 常驻 CLI 子进程一并回收（优雅退出，不赖 stdio 断连兜底）
     killAllResidentSessions();
-    // B3 受管 OpenViking 服务一并关停（embedded 模式随 LCB 生命周期；独立手动服务不受影响）
+    // B3 受管 OpenViking 服务一并关停（embedded 模式随 LCB 生命周期；独立手动服务不受影响）。
+    // 自举已后台化：尚未拉起（managed 未定义）时本调用空安全直接返回
     stopManagedServer();
     clearPidFile();
     process.exit(0);
   };
   // Web 配置页（server.enabled 缺省 true）：随 bridge 常驻，浏览器可随时查看/修改配置；
-  // 启动失败只 warn 不阻断机器人服务（端口冲突等场景桥接器本体仍可用）
+  // 启动失败只 warn 不阻断机器人服务（端口冲突等场景桥接器本体仍可用）。
+  // P0 重启超时根治：配置页启动**前移**到记忆自举之前——OpenViking 冷启动动辄 30-60s，
+  // 串行在它后面会让页面重启探活（/api/status）轻易撞上前端 45s 超时，误报「重启失败」；
+  // 现在配置页可用时间只取决于 LCB 本体，与记忆服务快慢彻底解耦
   if (config.server?.enabled !== false) {
     try {
       console.log(`${step('配置页启动 …')}`);
@@ -1752,4 +1724,42 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   process.on('unhandledRejection', (reason) => {
     console.error('[unhandledRejection]（已忽略，进程继续运行）', reason);
   });
+  // 第二步：记忆增强自举（**后台执行**，不阻塞配置页可用与机器人服务）。
+  // 服务没起就自动拉起（embedded 受管），起不来只提示 + 指引手动开启，绝不影响 LCB 本体——
+  // 启动原则「记忆增强失败绝不阻断 LCB」从「不阻断」升级为「不拖慢」
+  const memoryConf = config.memory;
+  if (memoryConf?.enabled) {
+    void (async () => {
+      console.log(`${step('记忆增强 · 启动 OpenViking 服务 …')}`);
+      let report;
+      try {
+        report = await ensureMemoryServiceRunning({
+          endpoint: memoryEndpoint(memoryConf),
+          mode: memoryConf.mode,
+        });
+      } catch (e) {
+        // 自举自身抛错（理论上 ensureMemoryServiceRunning 全程收敛为 report，这里是最后一道兜底）
+        report = {
+          at: new Date().toISOString(), trigger: 'lcb-start', phase: 'failed',
+          ready: false, started: false,
+          detail: `自举异常：${e instanceof Error ? e.message : String(e)}`,
+          hint: '请到配置页「记忆增强」点「检查修复」',
+        };
+      }
+      console.log(`      ${report.ready ? '✅' : '⚠️'} ${report.detail}`);
+      if (!report.ready && report.hint) console.log(`      手动开启指引：${report.hint}`);
+      // 第三步：签发各 bot 记忆身份（服务不可达时内部自动退避重试，服务后就绪即补签）
+      console.log(`${step('记忆增强 · 签发各 bot 记忆身份 …')}`);
+      await refreshMemoryKeys();
+      // 客户端接入配置兜底（§6.7 第 4 步）：外部自管域自动 skipped-external；LCB 骨架已存在
+      // kept 零写。失败只 warn——本机直连 claude 的插件启用受影响，LCB 会话有 env 通道不受影响
+      try {
+        const w = ensureClientCliConf(memoryConf);
+        if (w === 'written' || w === 'updated') console.log(`      客户端配置 ovcli.conf 已${w === 'written' ? '写入' : '刷新'}（${w}）`);
+      } catch (e) { console.warn('[memory] ovcli.conf 写入失败：', e instanceof Error ? e.message : e); }
+      console.log(`${step('记忆增强 · 自举流程结束（后续状态见配置页「记忆增强」）')}`);
+    })();
+  } else {
+    console.log(`${step('记忆增强 · 未启用（config.yaml 的 memory.enabled=false），跳过')}`);
+  }
 }

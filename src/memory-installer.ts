@@ -624,6 +624,13 @@ export interface MemoryAutoStartReport {
   ready: boolean;
   /** 本次是否真的拉起了进程（false=已在跑/远程模式/未安装/失败） */
   started: boolean;
+  /**
+   * 自举阶段（配置页重启弹窗分步展示的判定源）：starting=服务拉起中（含前台等待与慢启动
+   * 后台续等）；ready=已就绪（含「已在运行」幂等跳过与后台续等成功）；failed=失败/未启用
+   * 等终态。历史缺陷：后台续等（waitSlowStart）结果不回写，报告永远停在转后台那一刻的
+   * 「启动中」文案——页面无从得知最终就绪与否，本字段随结果回写一并闭环。
+   */
+  phase: 'starting' | 'ready' | 'failed';
   detail: string;
   hint?: string;
 }
@@ -661,8 +668,14 @@ export async function ensureMemoryServiceRunning(opts: {
 }): Promise<MemoryAutoStartReport> {
   const trigger = opts.trigger ?? 'lcb-start';
   const foregroundMs = opts.foregroundMs ?? 60_000;
-  const finish = (r: Omit<MemoryAutoStartReport, 'at' | 'trigger'>): MemoryAutoStartReport => {
-    autoStartReport = { at: new Date().toISOString(), trigger, ...r };
+  const finish = (
+    r: Omit<MemoryAutoStartReport, 'at' | 'trigger' | 'phase'>,
+    phaseOverride?: MemoryAutoStartReport['phase'],
+  ): MemoryAutoStartReport => {
+    // phase：ready=true 即终态就绪；慢启动转后台续等显式传 'starting'（终态由 waitSlowStart
+    // 回写）；其余（未安装/缺配置/崩溃/远程不可达）为终态 failed——页面据此决定继续轮询还是亮黄警示
+    const phase: MemoryAutoStartReport['phase'] = phaseOverride ?? (r.ready ? 'ready' : 'failed');
+    autoStartReport = { at: new Date().toISOString(), trigger, phase, ...r };
     return autoStartReport;
   };
   // 远程模式：只探活不代管（拉起别人的服务是越权）
@@ -722,13 +735,26 @@ export async function ensureMemoryServiceRunning(opts: {
       hint: '请到配置页「记忆增强」检查模型三件套与 ov.conf，或点「检查修复」查看完整安装流水线',
     });
   }
-  // 慢启动：进程活着只是还没就绪 → 后台续等，不红叉、不杀进程；后续签发由调用方重试兜上
-  void waitSlowStart(r.port, () => { /* 后台续等进度不进控制台（启动已结束），页面轮询 install 状态即可见 */ });
+  // 慢启动：进程活着只是还没就绪 → 后台续等，不红叉、不杀进程；后续签发由调用方重试兜上。
+  // 续等结果回写报告（phase → ready/failed）：否则报告永远停在「启动中」，重启弹窗/状态区
+  // 无从得知最终就绪与否（历史盲区）
+  void waitSlowStart(r.port, () => { /* 后台续等进度不进控制台（启动已结束），页面轮询 install 状态即可见 */ })
+    .then((w) => {
+      if (!autoStartReport) return;
+      autoStartReport = {
+        ...autoStartReport,
+        at: new Date().toISOString(),
+        phase: w.ok ? 'ready' : 'failed',
+        ready: w.ok,
+        detail: w.detail,
+        ...(w.ok ? {} : { hint: '请到配置页「记忆增强」检查模型三件套与 ov.conf，或点「检查修复」查看完整安装流水线' }),
+      };
+    });
   return finish({
     ready: false, started: true,
     detail: `记忆服务正在启动（冷启动超过 ${Math.round(foregroundMs / 1000)} 秒，进程仍在运行，已转入后台等待）`,
     hint: '通常 1-3 分钟内就绪；若长时间未起，请到配置页「记忆增强」查看受管服务输出',
-  });
+  }, 'starting');
 }
 
 function spawnManaged(bin: string, confPath: string, port: number): void {
