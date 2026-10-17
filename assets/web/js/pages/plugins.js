@@ -1,48 +1,58 @@
-// ============ 插件 ============
+// ============ 插件（已装列表 + 管理市场 / 从市场安装 双卡；市场卡在左：先添加市场再安装） ============
 import { $, esc, toast, api } from '../core.js';
 import { confirmDialog } from '../ui.js';
 
 // 点击 combobox 之外收起面板的监听只注册一次（模块级标志，等价原 document.body 标记法）
 let comboHideBound = false;
+let badgeCount = 0; // 有新版本的插件数（导航徽标；进过本页后可见）
 
 async function renderPlugins(el) {
   el.innerHTML = `
-  <div class="card">
-    <h3>Claude Code 插件 <button class="btn sm" id="plCheckUpdate" style="margin-left:8px">检查更新</button></h3>
-    <div class="desc">两处目录的已启用插件都会自动加载（managed 托管目录优先）：本机 <code>~/.claude</code>（来源「本机」，与本机 claude CLI 共用）与 bridge 托管目录 <code id="pluginDir">…</code>。装好后下一条消息自动加载。飞书端同样可用 <code>/plugin install xxx@marketplace</code>（仅管理员）。打开页面在后台自动检查远程市场新版本（不阻塞列表，5 分钟内不重复；只检测不升级，升级点单行「更新」）。</div>
-    <div class="hint" id="plSyncNote" hidden style="margin:6px 0"></div>
-    <table><thead><tr><th>插件</th><th>市场</th><th>来源</th><th>版本</th><th style="width:90px">状态</th><th style="width:250px">操作</th></tr></thead>
-    <tbody id="plBody"><tr><td colspan="6" class="hint">加载中…</td></tr></tbody></table>
+  <div class="panel">
+    <header class="panel-head"><h3>已安装插件</h3>
+      <div class="panel-actions"><button class="btn sm" id="plCheckUpdate">检查更新</button></div></header>
+    <div class="panel-body">
+      <div class="hint" id="plSyncNote" hidden style="margin:0 0 8px"></div>
+      <table><thead><tr><th>插件</th><th style="width:120px">市场</th><th style="width:130px">来源</th><th style="width:170px">版本</th><th style="width:90px">状态</th><th style="width:230px">操作</th></tr></thead>
+      <tbody id="plBody"><tr><td colspan="6" class="hint">加载中…</td></tr></tbody></table>
+    </div>
+    <footer class="panel-foot">两处目录的已启用插件都会自动加载（managed 托管目录优先）：本机 <code>~/.claude</code> 与 bridge 托管目录 <code id="pluginDir">…</code>。启停 / 更新后<b>下一条消息生效</b>，无须重启；飞书端亦可用 <code>/plugin install xxx@marketplace</code>（仅管理员）。</footer>
   </div>
-  <div class="card">
-    <h3>安装 / 市场</h3>
-    <div class="desc">安装来源为已添加的市场：新插件先「添加市场」，再从下拉选择安装。</div>
-    <label>从市场安装插件</label>
-    <div class="row" style="max-width:760px">
-      <div class="combo">
-        <input type="text" id="plInstall" placeholder="（加载中…）" autocomplete="off">
-        <div class="combo-panel" id="plInstallPanel" hidden></div>
+  <div class="grid2" style="gap:16px;align-items:start">
+    <div class="panel" style="margin:0">
+      <header class="panel-head"><h3>管理市场</h3></header>
+      <div class="panel-body">
+        <div class="mini-note" style="margin-bottom:10px">安装来源为已添加的市场：新插件先在这里「添加市场」，再到右侧安装。</div>
+        <label class="fld">添加市场（git 地址或本机路径）</label>
+        <div class="input-btn"><input type="text" id="plMarket" placeholder="https://github.com/…/marketplace"><button class="btn" id="plDoMarketAdd">添加</button></div>
+        <label class="fld" style="margin-top:12px">目标目录</label>
+        <div class="input-btn"><select id="plMarketDir">
+          <option value="user" selected>本机 ~/.claude</option>
+          <option value="bridge">bridge 托管目录</option>
+        </select><button class="btn" id="plDoMarketUpdate">全部更新</button></div>
+        <div class="mini-note" style="margin-top:8px">「全部更新」= 刷新市场索引 + 逐个更新该目录所有已装插件。</div>
       </div>
-      <select id="plDir" style="max-width:170px">
-        <option value="user" selected>装到本机 ~/.claude</option>
-        <option value="bridge">装到 bridge 托管目录</option>
-      </select>
-      <button class="btn primary" id="plDoInstall">安装</button>
     </div>
-    <div class="hint" style="margin:6px 0">默认装本机 ~/.claude：本机 claude CLI 与桥接器两处共用一份，无须安装两次。装好后下一条消息自动加载。</div>
-    <label style="margin-top:14px">管理市场</label>
-    <div class="row" style="max-width:760px">
-      <input type="text" id="plMarket" placeholder="marketplace git 地址或本机路径">
-      <select id="plMarketDir" style="max-width:170px">
-        <option value="user" selected>本机 ~/.claude</option>
-        <option value="bridge">bridge 托管目录</option>
-      </select>
-      <button class="btn" id="plDoMarketAdd">添加市场</button>
-      <button class="btn" id="plDoMarketUpdate">全部更新</button>
+    <div class="panel" style="margin:0">
+      <header class="panel-head"><h3>从市场安装</h3></header>
+      <div class="panel-body">
+        <label class="fld">搜索插件 <span class="tip" data-tip="候选来自已添加市场的全部插件；也可在飞书端 /plugin install xxx@marketplace（仅管理员）">ⓘ</span></label>
+        <div class="input-btn" style="align-items:flex-start">
+          <div class="combo" style="flex:1;min-width:0">
+            <input type="text" id="plInstall" placeholder="（加载中…）" autocomplete="off">
+            <div class="combo-panel" id="plInstallPanel" hidden></div>
+          </div>
+        </div>
+        <label class="fld" style="margin-top:12px">安装到</label>
+        <select id="plDir">
+          <option value="user" selected>本机 ~/.claude（推荐：本机 CLI 与桥接器共用一份）</option>
+          <option value="bridge">bridge 托管目录</option>
+        </select>
+        <div style="margin-top:12px"><button class="btn primary" id="plDoInstall">安装</button></div>
+      </div>
     </div>
-    <div class="hint" style="margin:6px 0">「全部更新」= 刷新市场索引 + 逐个更新该目录所有已装插件。</div>
-    <pre class="report" id="plReport" style="display:none;margin-top:12px"></pre>
-  </div>`;
+  </div>
+  <pre class="report" id="plReport" style="display:none;margin-top:0"></pre>`;
   const report = (title, text) => {
     $('#plReport').style.display = '';
     $('#plReport').textContent = `${title}\n${text}`;
@@ -65,11 +75,12 @@ async function renderPlugins(el) {
   /** 渲染已装插件表（本地秒出与后台刷新完成两条路径共用；入参 /api/plugins 响应） */
   const renderList = (r) => {
     installed = r.plugins || [];
+    badgeCount = installed.filter((p) => p.latestVersion).length;
     $('#pluginDir').textContent = r.configDir;
     const body = $('#plBody');
     if (!body) return; // 页面已切走（后台刷新回调晚于切页）
     if (!installed.length) {
-      body.innerHTML = '<tr><td colspan="6" class="hint">尚未安装任何插件</td></tr>';
+      body.innerHTML = '<tr class="empty"><td colspan="6">尚未安装任何插件</td></tr>';
       return;
     }
     body.innerHTML = installed.map((p) => `
@@ -77,9 +88,9 @@ async function renderPlugins(el) {
         <td><b>${esc(p.name)}</b></td>
         <td>${esc(p.marketplace || '-')}</td>
         <td>${p.source === 'bridge' ? '<span class="tag warn">bridge 托管</span>' : '<span class="tag off">本机 ~/.claude</span>'}</td>
-        <td class="hint">${esc(p.version || '-')}${p.latestVersion ? ` <span class="tag warn">→ ${esc(p.latestVersion)}</span>` : ''}</td>
+        <td><span class="mono">${esc(p.version || '-')}</span>${p.latestVersion ? ` <span class="tag warn">→ ${esc(p.latestVersion)}</span>` : ''}</td>
         <td>${p.enabled ? '<span class="tag ok">已启用</span>' : '<span class="tag off">未启用</span>'}</td>
-        <td>
+        <td class="ops">
           <button class="btn sm" data-op="update" data-arg="${esc(p.key)}" data-dir="${p.source}">更新</button>
           <button class="btn sm" data-op="${p.enabled ? 'disable' : 'enable'}" data-arg="${esc(p.key)}" data-dir="${p.source}">${p.enabled ? '停用' : '启用'}</button>
           <button class="btn sm danger" data-op="uninstall" data-arg="${esc(p.key)}" data-dir="${p.source}">卸载</button>
@@ -263,7 +274,7 @@ async function renderPlugins(el) {
         }
       }
       $('#plDoInstall').disabled = !available.length;
-      input.placeholder = available.length ? '输入关键词搜索插件，从结果中选择' : '（请先在下方添加市场）';
+      input.placeholder = available.length ? '输入关键词搜索插件，从结果中选择' : '（请先在左侧添加市场）';
     } catch (e) {
       available = [];
       $('#plDoInstall').disabled = true;
@@ -360,6 +371,9 @@ async function renderPlugins(el) {
 export const page = {
   id: 'plugins',
   title: '插件',
+  desc: '两处目录的 Claude Code 插件统一管理，改动下一条消息自动生效',
+  legend: false,
+  badge: () => (badgeCount ? `<span class="nav-badge">${badgeCount}</span>` : ''),
   icon: '<path d="M19.439 7.85c-.049.322.059.648.289.878l1.568 1.568c.47.47.706 1.087.706 1.704s-.235 1.233-.706 1.704l-1.611 1.611a.98.98 0 0 1-.837.276c-.47-.07-.802-.48-.968-.925a2.501 2.501 0 1 0-3.214 3.214c.446.166.855.497.925.968a.979.979 0 0 1-.276.837l-1.61 1.61a2.404 2.404 0 0 1-1.705.707 2.402 2.402 0 0 1-1.704-.706l-1.568-1.568a1.026 1.026 0 0 0-.877-.29c-.493.074-.84.504-1.02.968a2.5 2.5 0 1 1-3.237-3.237c.464-.18.894-.527.967-1.02a1.026 1.026 0 0 0-.289-.877l-1.568-1.568A2.402 2.402 0 0 1 1.998 12c0-.617.236-1.234.706-1.704L4.23 8.77c.24-.24.581-.353.917-.303.515.077.877.528 1.073 1.01a2.5 2.5 0 1 0 3.259-3.259c-.482-.196-.933-.558-1.01-1.073-.05-.336.062-.676.303-.917l1.525-1.525A2.402 2.402 0 0 1 12 1.998c.617 0 1.234.236 1.704.706l1.568 1.568c.23.23.556.338.877.29.493-.074.84-.504 1.02-.968a2.5 2.5 0 1 1 3.237 3.237c-.464.18-.894.527-.967 1.02Z"/>',
   render: renderPlugins,
 };

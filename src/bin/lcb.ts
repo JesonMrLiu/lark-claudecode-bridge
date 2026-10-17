@@ -11,6 +11,7 @@ import { startBridge } from '../index.js';
 import { loadConfig, CONFIG_PATH, CONFIG_DIR } from '../config.js';
 import { initManagedClaudeDir } from '../claude-config.js';
 import { startWebServer } from '../web/server.js';
+import { resetPasswordToDefault } from '../web/webauth.js';
 import { AccessControl } from '../access/access-control.js';
 import { VERSION } from '../version.js';
 import { join } from 'node:path';
@@ -82,6 +83,19 @@ async function main(): Promise<void> {
       // 页面写盘后，bridge 的热重载器下一条消息拾取可热字段；需重启字段由页面提示
       await startWebServer({ autoOpen: !args.includes('--no-open') });
       console.log('按 Ctrl+C 退出配置页');
+      break;
+    }
+    case 'reset-password': {
+      // 忘记配置页密码的兜底：恢复初始密码 123456（下次登录会再次引导修改）。
+      // 只有能登上这台机器的人才能执行——内网里隔着浏览器的人做不到，因此是安全的恢复通道
+      const r = resetPasswordToDefault(CONFIG_PATH);
+      if (!r.ok) {
+        console.error(`❌ ${r.error}`);
+        process.exit(1);
+      }
+      console.log('✅ 配置页密码已恢复为初始密码 123456');
+      console.log('注：webauth.json 每次校验现读现验，配置页无需重启，刷新页面输入 123456 即可进入；');
+      console.log('    登录后会再次引导你设置新密码。');
       break;
     }
     case 'pair': {
@@ -215,6 +229,7 @@ async function main(): Promise<void> {
   lcb setup              引导式配置（命令行问答，支持多个机器人应用）
   lcb start              启动桥接器（前台；含 Web 配置页，首次安装自动进入引导）
   lcb ui                 仅启动 Web 配置页（可与运行中的桥接器共存）
+  lcb reset-password     配置页密码忘记时，恢复初始密码 123456
   lcb pair <code>        批准配对码
   lcb app list           列出机器人应用
   lcb app add            添加机器人应用（重启后生效）

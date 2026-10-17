@@ -1,7 +1,8 @@
-// ============ MCP 管理页（#12）============
+// ============ MCP 管理 ============
 // 后端：GET /api/mcp · POST /api/mcp/action（add/update/remove）· POST /api/mcp/check（状态探测）
 // 四来源：bridge 自管（mcp/servers.json，页面管理 + 注入生效）/ 用户级·本机（~/.claude.json，展示+可删）/
-// 项目级（工作区 .mcp.json，只读）/ 已装插件内（<plugin-installPath>/.mcp.json，只读；未启用时标「（未启用）」）。
+// 项目级（工作区 .mcp.json，只读）/ 已装插件内（只读；未启用时标「（未启用）」）。
+// 搜索只匹配「名称」列；过滤只切换行显隐不重建 DOM（兼容中文输入法组合输入）。
 import { $, esc, toast, api } from '../core.js';
 import { openDrawer, closeDrawer, confirmDialog } from '../ui.js';
 
@@ -15,33 +16,45 @@ const sourceTag = (s) => {
   if (s.source === 'plugin') return `插件 · ${esc(s.pluginName || '?')}${s.pluginEnabled ? '' : '（未启用）'}`;
   return SOURCE_TAG[s.source] || s.source;
 };
+const sourceTagClass = (s) => (s.source === 'bridge' ? 'info' : s.source === 'plugin' ? 'off' : 'ghost');
 /** 来源是否可删（project / plugin 只读） */
 const isDeletable = (s) => s.source !== 'project' && s.source !== 'plugin';
 
 function renderMcp(el) {
   el.innerHTML = `
-  <div class="card">
-    <h3>MCP Servers</h3>
-    <div class="desc">stdio 走 command + args（本地进程），http/sse 走 url（远程服务）。页面添加的配置存 bridge 自管目录（见下方路径），运行中的任务即时生效；本机 ~/.claude.json 与工作区 .mcp.json 为只读来源（前者可删）；已装插件内 .mcp.json 或 plugin.json 内 mcpServers 字段只读展示。</div>
-    <div class="list-toolbar">
-      <button class="btn" id="mcpRefresh">刷新</button>
-      <button class="btn primary" id="mcpAdd">+ 添加 MCP</button>
+  <div class="panel">
+    <header class="panel-head"><h3>MCP Servers</h3>
+      <div class="panel-actions">
+        <input type="search" id="mcpSearch" placeholder="过滤：名称…" style="width:190px;padding:4px 10px;font-size:12.5px">
+        <button class="btn sm" id="mcpRefresh">刷新</button>
+        <button class="btn primary sm" id="mcpAdd">＋ 添加 MCP</button>
+      </div></header>
+    <div class="panel-body">
+      <table><thead><tr>
+        <th style="width:150px">名字</th><th>类型 / 连接</th><th style="width:150px">来源</th><th style="width:150px">状态 <span class="tip" data-tip="点击状态格检测该 server">ⓘ</span></th><th style="width:130px">操作</th>
+      </tr></thead>
+        <tbody id="mcpBody"><tr><td colspan="5" class="hint">加载中…</td></tr></tbody>
+      </table>
+      <div class="mini-note" id="mcpBridgePath" style="margin-top:10px"></div>
     </div>
-    <input type="search" class="list-search" id="mcpSearch" placeholder="按名字 / 来源 / 类型 / URL 过滤…">
-    <table><thead><tr>
-      <th style="width:150px">名字</th><th>类型 / 连接</th><th style="width:130px">来源</th><th style="width:130px">状态</th><th style="width:130px"></th>
-    </tr></thead>
-      <tbody id="mcpBody"><tr><td colspan="5" class="desc">加载中…</td></tr></tbody>
-    </table>
-    <div class="desc" id="mcpBridgePath" style="margin-top:10px"></div>
+    <footer class="panel-foot">stdio 走 command + args（本地进程），http/sse 走 url（远程服务）；页面添加落 bridge 自管目录、任务级热生效；本机 / 项目 / 插件来源只读（本机可删）。</footer>
   </div>`;
   $('#mcpRefresh').onclick = () => void loadMcp();
   $('#mcpAdd').onclick = addMcp;
-  $('#mcpSearch').oninput = filterMcpRows;
+  bindSearch();
   void loadMcp();
 }
 
-/** 搜索过滤：遍历 tr.dataset.searchText 切换 hidden */
+/** 搜索过滤：只匹配名称列；只切换 tr 显隐不重建 DOM；组合输入（中文 IME）期间暂停 */
+function bindSearch() {
+  const inp = $('#mcpSearch');
+  let composing = false;
+  inp.addEventListener('compositionstart', () => { composing = true; });
+  inp.addEventListener('compositionend', () => { composing = false; filterMcpRows(); });
+  inp.oninput = () => { if (!composing) filterMcpRows(); };
+}
+
+/** 搜索过滤：遍历 tr.dataset.searchText 切换 hidden（关键词只命中名称） */
 function filterMcpRows() {
   const q = ($('#mcpSearch').value || '').trim().toLowerCase();
   const body = $('#mcpBody');
@@ -63,7 +76,7 @@ async function loadMcp() {
   try {
     data = await api('GET', '/api/mcp');
   } catch (e) {
-    body.innerHTML = `<tr><td colspan="5" class="desc">加载失败：${esc(e.message)}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="5" class="hint">加载失败：${esc(e.message)}</td></tr>`;
     return;
   }
   const bp = $('#mcpBridgePath');
@@ -76,25 +89,26 @@ async function loadMcp() {
   }
   const servers = data.servers || [];
   if (servers.length === 0) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="5" class="desc">暂无 MCP server。可点「+ 添加 MCP」或在终端用 claude mcp add 添加（本机用户级会出现在此列表）。</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="5" class="empty">暂无 MCP server<br><span class="mini-note">可点右上「＋ 添加 MCP」，或在终端用 claude mcp add 添加（本机用户级会出现在此列表）。</span></td></tr>`;
     return;
   }
   body.innerHTML = '';
   for (const s of servers) {
+    // 类型标签分色：stdio=本地进程（蓝）· http/sse=远程服务（橙）
     const conn = s.config.type === 'http' || s.config.type === 'sse'
-      ? `${esc(String(s.config.type))} · ${esc(String(s.config.url ?? ''))}`
-      : `${esc(String(s.config.type ?? 'stdio'))} · ${esc(String(s.config.command ?? ''))}${s.config.args ? ' ' + esc(JSON.stringify(s.config.args)) : ''}`;
-    const tag = sourceTag(s);
+      ? `<span class="tag warn">${esc(String(s.config.type))}</span> <span class="mono" style="font-size:11.5px">${esc(String(s.config.url ?? ''))}</span>`
+      : `<span class="tag info">${esc(String(s.config.type ?? 'stdio'))}</span> <span class="mono" style="font-size:11.5px">${esc(String(s.config.command ?? ''))}${s.config.args ? ' ' + esc(JSON.stringify(s.config.args)) : ''}</span>`;
     const tr = document.createElement('tr');
-    tr.dataset.searchText = `${s.name} ${sourceTag(s)} ${conn} ${s.config.url ?? ''} ${s.config.command ?? ''}`.toLowerCase();
+    // 搜索只匹配名称列
+    tr.dataset.searchText = String(s.name).toLowerCase();
     tr.innerHTML = `
-      <td><strong>${esc(s.name)}</strong></td>
+      <td><b>${esc(s.name)}</b></td>
       <td>${conn}</td>
-      <td><span class="chip">${tag}</span></td>
-      <td class="mcp-status" data-status-for="${esc(s.name)}"><span class="desc">未检测</span></td>
+      <td><span class="tag ${sourceTagClass(s)}">${sourceTag(s)}</span></td>
+      <td class="mcp-status" data-status-for="${esc(s.name)}"><span class="mut">未检测</span></td>
       <td class="ops">
         <button class="btn sm" data-view="${esc(s.name)}">查看</button>
-        ${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删除</button>` : '<span class="desc">只读</span>'}
+        ${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删除</button>` : '<span class="dim" style="font-size:11.5px">只读</span>'}
       </td>`;
     tr.querySelector('[data-view]').onclick = () => viewMcp(s);
     const delBtn = tr.querySelector('[data-del]');
@@ -111,7 +125,7 @@ async function loadMcp() {
 }
 
 async function checkMcp(s, cell) {
-  cell.innerHTML = '<span class="desc">检测中…</span>';
+  cell.innerHTML = '<span class="mut">检测中…</span>';
   try {
     const r = await api('POST', '/api/mcp/check', { name: s.name, source: s.source, workspaceName: s.workspaceName });
     const map = {
@@ -119,7 +133,7 @@ async function checkMcp(s, cell) {
       failed: `<span style="color:var(--err-tx)">✘ 异常</span>`,
       unreachable: `<span style="color:var(--warn-tx)">⚠ 不可达</span>`,
     };
-    cell.innerHTML = `${map[r.status] || esc(r.status)}<div class="desc" style="font-size:11px;white-space:normal">${esc(r.detail || '')}</div>`;
+    cell.innerHTML = `${map[r.status] || esc(r.status)}<div class="mini-note" style="white-space:normal">${esc(r.detail || '')}</div>`;
   } catch (e) {
     cell.innerHTML = `<span style="color:var(--err-tx)">检测失败</span>`;
     toast(e.message, true);
@@ -147,30 +161,30 @@ function viewMcp(s) {
       const missing = (s.missingEnv || []).includes(k) || ((s.resolvedEnv || {})[k] || '').includes('${');
       const raw = String((s.config.env || {})[k] ?? '');
       const cur = (s.resolvedEnv || {})[k] ?? raw;
-      return `<tr><td><code>${esc(k)}</code></td><td><code class="desc">${esc(raw)}</code></td>
+      return `<tr><td><code>${esc(k)}</code></td><td><code>${esc(raw)}</code></td>
         <td>${missing ? `<span style="color:var(--err-tx)">未设置（${esc(cur)}）</span>` : `<code>${esc(cur)}</code>`}</td></tr>`;
     }).join('')
-    : `<tr><td colspan="3" class="desc">（无 env 配置）</td></tr>`;
+    : `<tr><td colspan="3" class="mut">（无 env 配置）</td></tr>`;
   const onlyRead = !isDeletable(s);
   const editable = s.source === 'bridge'; // 后端 op:update 只写 bridge servers.json；machine-user 只能删
   openDrawer({
     title: `MCP · ${s.name}`,
     bodyHtml: `
-      <div class="hint" style="margin:0 0 8px">来源：${sourceTag(s)} · 配置文件：<code class="desc">${esc(s.path)}</code></div>
-      ${onlyRead ? `<div class="hint" style="margin:0 0 8px;color:var(--warn-tx)">只读来源——此 MCP 由 ${s.source === 'plugin' ? '插件' : '项目'}自带，编辑请前往 ${s.source === 'plugin' ? '插件目录' : '对应工作区目录'}手动修改。</div>` : ''}
-      ${!editable && !onlyRead ? `<div class="hint" style="margin:0 0 8px;color:var(--warn-tx)">用户级·本机来源不支持页面编辑（可删除）；如需修改请在 ~/.claude.json 手动改，或删除后到本页重新添加。</div>` : ''}
+      <div class="mini-note" style="margin:0 0 8px">来源：${sourceTag(s)} · 配置文件：<code>${esc(s.path)}</code></div>
+      ${onlyRead ? `<div class="banner warn" style="margin:0 0 8px"><span>只读来源——此 MCP 由 ${s.source === 'plugin' ? '插件' : '项目'}自带，编辑请前往 ${s.source === 'plugin' ? '插件目录' : '对应工作区目录'}手动修改。</span></div>` : ''}
+      ${!editable && !onlyRead ? `<div class="banner warn" style="margin:0 0 8px"><span>用户级·本机来源不支持页面编辑（可删除）；如需修改请在 ~/.claude.json 手动改，或删除后到本页重新添加。</span></div>` : ''}
       <div data-pane="view">
-        <label>配置（JSON 原文）</label>
+        <label class="fld">配置（JSON 原文）</label>
         <textarea readonly rows="10" style="min-height:140px">${esc(JSON.stringify(s.config, null, 2))}</textarea>
       </div>
       <div data-pane="edit" style="display:none">
-        <label>配置（JSON，可编辑——env 也在其中改）</label>
+        <label class="fld">配置（JSON，可编辑——env 也在其中改）</label>
         <textarea id="emJson" rows="12" style="min-height:180px">${esc(JSON.stringify(s.config, null, 2))}</textarea>
         <div class="hint" style="margin-top:6px">保存后立即对新任务生效（bridge 自管 servers.json 每任务现读）。</div>
       </div>
-      <label>环境变量（引用值 → 当前值；当前值已合并 飞书应用 env › Claude 认证 env › settings.json env › 系统环境，支持 \${VAR:-默认值}）</label>
+      <label class="fld" style="margin-top:12px">环境变量 <span class="tip" data-tip="当前值已合并：飞书应用 env › Claude 认证 env › settings.json env › 系统环境，支持 \${VAR:-默认值}">ⓘ</span></label>
       <table><thead><tr><th style="width:130px">变量</th><th>配置值</th><th>当前值</th></tr></thead><tbody>${envRows}</tbody></table>`,
-    footHtml: `${editable ? '<button class="btn" data-act="edit">编辑</button><button class="btn primary" data-act="save" style="display:none">保存</button>' : ''}<button class="btn" data-act="close">关闭</button>`,
+    footHtml: `${editable ? '<button class="btn" data-act="edit">编辑</button><button class="btn primary" data-act="save" style="display:none">保存</button>' : ''}<span class="sp"></span><button class="btn" data-act="close">关闭</button>`,
     onMount({ body, foot }) {
       foot.querySelector('[data-act="close"]').onclick = () => closeDrawer();
       const editBtn = foot.querySelector('[data-act="edit"]');
@@ -208,17 +222,17 @@ function addMcp() {
         <button data-tab="json">JSON 配置</button>
       </div>
       <div data-panel="cmd">
-        <label>粘贴 claude mcp add 命令（自动解析 command / args / env / header / url）</label>
+        <label class="fld">粘贴 claude mcp add 命令（自动解析 command / args / env / header / url）</label>
         <textarea id="amCmd" rows="4" placeholder='claude mcp add my-mcp -e API_KEY=xxx -- npx -y @scope/mcp-server&#10;claude mcp add my-mcp -t http -H "Authorization: Bearer xxx" https://example.com/mcp&#10;claude mcp add-json my-mcp {"type":"http","url":"https://…"}'></textarea>
-        <div class="hint" style="margin-top:8px">名字取命令第 4 个参数；scope（-s）忽略——统一存 bridge 目录。</div>
+        <div class="mini-note" style="margin-top:8px">名字取命令第 4 个参数；scope（-s）忽略——统一存 bridge 目录。</div>
       </div>
       <div data-panel="json" style="display:none">
-        <label>名字</label>
+        <label class="fld">名字</label>
         <input type="text" id="amName" placeholder="my-mcp">
-        <label>配置 JSON</label>
+        <label class="fld">配置 JSON</label>
         <textarea id="amJson" rows="6" placeholder='stdio：{"type":"stdio","command":"npx","args":["-y","mcp-server-foo"],"env":{"KEY":"val"}}&#10;http：{"type":"http","url":"https://example.com/mcp"}'></textarea>
       </div>`,
-    footHtml: `<button class="btn" data-act="cancel">取消</button><button class="btn primary" data-act="save">添加</button>`,
+    footHtml: `<span class="sp"></span><button class="btn" data-act="cancel">取消</button><button class="btn primary" data-act="save">添加</button>`,
     onMount({ body, foot }) {
       body.querySelectorAll('.subtabs [data-tab]').forEach((b) => {
         b.onclick = () => {
@@ -260,6 +274,8 @@ function addMcp() {
 export const page = {
   id: 'mcp',
   title: 'MCP',
+  desc: '四个来源的 MCP server 聚合；bridge 来源页面可管理，任务级热生效',
+  legend: false,
   icon: '<circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4M5 5l2.8 2.8m8.4 8.4L19 19M19 5l-2.8 2.8M7.8 16.2L5 19"/>',
   render: renderMcp,
 };

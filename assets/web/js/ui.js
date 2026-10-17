@@ -90,7 +90,7 @@ const joinPath = (base, name) => {
   return base.replace(/[\\/]+$/, '') + sepCh + name;
 };
 /**
- * 打开目录浏览弹层：盘符/根层 → 逐级进入 → 「选择此目录」确定。
+ * 打开目录浏览弹层（文件管理器风格）：盘符/根层 → 逐级进入 → 「选择此目录」确定。
  * resolve(选中的绝对路径) / resolve(null)（取消）。手输路径可直接跳转，
  * 路径不存在等错误在弹层内联提示（不关层、可改可回退）。
  */
@@ -99,63 +99,96 @@ export function pickDirectory(initialPath) {
     const mask = document.createElement('div');
     mask.className = 'modal-mask';
     mask.innerHTML = `
-    <div class="modal" role="dialog" aria-modal="true">
-      <h3 style="margin:0 0 10px">选择目录</h3>
-      <div class="row">
-        <input type="text" class="pd-jump" placeholder="输入或粘贴路径，回车前往">
-        <button class="btn pd-go" title="跳转到输入的路径">前往</button>
-        <button class="btn pd-up" title="返回上一级">上级目录</button>
+    <div class="modal dp" role="dialog" aria-modal="true" style = "padding:30px;">
+      <div class="dp-head">
+        <b>选择目录</b>
+        <span class="dp-path mono" title=""></span>
       </div>
-      <div class="hint pd-cur" style="margin:8px 0 0;word-break:break-all"></div>
-      <div class="dir-list"><div class="empty">加载中…</div></div>
-      <div class="savebar">
-        <span class="hint pd-note"></span><span style="flex:1"></span>
-        <button class="btn pd-cancel">取消</button>
-        <button class="btn primary pd-ok">选择此目录</button>
+      <div class="dp-toolbar">
+        <input type="text" class="dp-jump" placeholder="输入或粘贴路径，回车前往">
+        <button class="btn sm dp-go" title="跳转到输入的路径">前往</button>
+        <button class="btn sm dp-up" title="返回上一级">上级</button>
+      </div>
+      <div class="dp-grid"><div class="dp-empty">加载中…</div></div>
+      <div class="dp-foot">
+        <span class="hint dp-note"></span>
+        <span style="flex:1"></span>
+        <button class="btn dp-cancel">取消</button>
+        <button class="btn primary dp-ok">选择此目录</button>
       </div>
     </div>`;
     document.body.appendChild(mask);
-    const list = mask.querySelector('.dir-list');
-    const cur = mask.querySelector('.pd-cur');
-    const upBtn = mask.querySelector('.pd-up');
-    const okBtn = mask.querySelector('.pd-ok');
-    const note = mask.querySelector('.pd-note');
-    const jumpInput = mask.querySelector('.pd-jump');
+    const grid = mask.querySelector('.dp-grid');
+    const pathEl = mask.querySelector('.dp-path');
+    const upBtn = mask.querySelector('.dp-up');
+    const okBtn = mask.querySelector('.dp-ok');
+    const note = mask.querySelector('.dp-note');
+    const jumpInput = mask.querySelector('.dp-jump');
+    const FOLDER_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>';
     let current = '';      // '' = 盘符/根层（此层不可作为选择结果）
     let currentParent = null;
     const close = (val) => { mask.remove(); resolveP(val); };
     const render = (r) => {
       current = r.path || '';
       currentParent = r.parent;
-      cur.textContent = r.drives ? '此电脑（选择一个盘符）' : (r.path || '');
+      const curText = r.drives ? '此电脑（选择一个盘符）' : (r.path || '');
+      pathEl.textContent = curText;
+      pathEl.title = curText;
       upBtn.hidden = !r.parent;
       okBtn.disabled = !current;
       note.textContent = r.error || '';
       const items = r.drives
         ? r.drives.map((d) => ({ label: d, next: d }))
         : (r.dirs || []).map((d) => ({ label: d, next: joinPath(current, d) }));
-      list.innerHTML = items.length
-        ? items.map((it) => `<button data-next="${esc(it.next)}">${esc(it.label)}</button>`).join('')
-        : `<div class="empty">${r.error ? '（上述路径无法列出子目录）' : '（没有子目录）'}</div>`;
-      list.querySelectorAll('button[data-next]').forEach((b) => b.onclick = () => go(b.dataset.next));
+      grid.innerHTML = items.length
+        ? items.map((it) => `<button type="button" class="dp-item" data-next="${esc(it.next)}" title="${esc(it.next)}">${FOLDER_SVG}<span>${esc(it.label)}</span></button>`).join('')
+        : `<div class="dp-empty">${r.error ? '（上述路径无法列出子目录）' : '（没有子目录）'}</div>`;
+      grid.querySelectorAll('.dp-item').forEach((b) => b.onclick = () => go(b.dataset.next));
     };
     const go = async (p) => {
-      list.innerHTML = '<div class="empty">加载中…</div>';
+      grid.innerHTML = '<div class="dp-empty">加载中…</div>';
       try { render(await api('GET', `/api/fs/dirs?p=${encodeURIComponent(p)}`)); }
-      catch (e) { list.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+      catch (e) { grid.innerHTML = `<div class="dp-empty">加载失败：${esc(e.message)}</div>`; }
     };
     const jump = () => { const v = jumpInput.value.trim(); if (v) go(v); };
-    mask.querySelector('.pd-go').onclick = jump;
+    mask.querySelector('.dp-go').onclick = jump;
     jumpInput.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); jump(); } };
     upBtn.onclick = () => { if (currentParent) go(currentParent); };
-    okBtn.onclick = () => { if (current) close(current); };
-    mask.querySelector('.pd-cancel').onclick = () => close(null);
-    mask.onclick = (e) => { if (e.target === mask) close(null); };
+    // 关闭统一走 closeWithUnbind：弹层销毁时解绑捕获段按键监听
+    const unbind = bindDialogKeys((k) => { if (k === 'Escape') close(null); });
+    const closeWithUnbind = (val) => { unbind(); close(val); };
+    okBtn.onclick = () => { if (current) closeWithUnbind(current); };
+    mask.querySelector('.dp-cancel').onclick = () => closeWithUnbind(null);
+    mask.onclick = (e) => { if (e.target === mask) closeWithUnbind(null); };
     // 初始位置：现值路径存在则从它开始，否则停在盘符/根层（跳转框预填现值方便改错）
     jumpInput.value = initialPath || '';
     go(initialPath || '');
+    jumpInput.focus();
   });
 }
+
+// ============ 通用居中弹窗（挂壳层 #modalMask；CLI 授权 / 设置 / 改密 / 工作区选目录用） ============
+let modalOnClose = null;
+/** 打开通用居中弹窗。width 例：'min(460px,92vw)'；closeOnMask=false 时点遮罩不关（强制引导类） */
+export function openModal({ title, bodyHtml, footHtml, width = '', onClose = null, closeOnMask = true }) {
+  $('#modalTitle').textContent = title;
+  $('#modalBody').innerHTML = bodyHtml;
+  $('#modalFoot').innerHTML = footHtml || '';
+  $('#modalBox').style.width = width || '';
+  modalOnClose = onClose || null;
+  $('#modalMask').dataset.closeOnMask = closeOnMask ? '1' : '';
+  $('#modalMask').hidden = false;
+  return $('#modalBody');
+}
+export function closeModal() {
+  if ($('#modalMask').hidden) return;
+  $('#modalMask').hidden = true;
+  $('#modalBox').style.width = '';
+  const f = modalOnClose;
+  modalOnClose = null;
+  f?.();
+}
+export const isModalOpen = () => !$('#modalMask').hidden;
 
 // ============ 通用右侧抽屉（应用编辑 / 斜杆命令编辑 / 档案编辑共用） ============
 let drawerOnMount = null;
@@ -233,8 +266,18 @@ function initDrawerResize() {
 export function initDrawer() {
   $('#drawerClose').onclick = dismissDrawer;
   $('#drawerMask').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) dismissDrawer(); });
-  // ESC 有风格化弹窗打开时归弹窗（其自身在捕获阶段拦截并 stopPropagation，此处计数兜底）
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !openDialogs) dismissDrawer(); });
+  // 通用弹窗关闭路径：X / 点遮罩（closeOnMask 才关）/ ESC；层级 = 确认框 > 弹窗 > 抽屉
+  $('#modalClose').onclick = closeModal;
+  $('#modalMask').addEventListener('mousedown', (e) => {
+    if (e.target === e.currentTarget && $('#modalMask').dataset.closeOnMask) closeModal();
+  });
+  // ESC 分层：风格化弹窗（确认/输入/进度）自己在捕获段拦截；其次通用弹窗；最后抽屉
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (openDialogs) return;
+    if (isModalOpen()) { closeModal(); return; }
+    dismissDrawer();
+  });
   initDrawerResize();
 }
 

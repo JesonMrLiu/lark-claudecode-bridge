@@ -733,47 +733,24 @@ function studioGuideCardHtml(rk, endpoint) {
   const srcLabel = rk?.source === 'config' ? 'config.yaml 的 memory.api_key'
     : rk?.source === 'ov-conf' ? '受管 ov.conf 的 server.root_api_key' : '';
   const state = rk?.configured
-    ? `<span style="color:var(--ok-tx);font-weight:600">✓ 已配置</span> <span class="hint">来源：${esc(srcLabel)}</span>`
-    : '<span style="color:var(--danger);font-weight:600">✗ 未配置</span> <span class="hint">请到「服务与配置」点「检查修复」重新生成</span>';
-  const login = (title, badge, key, body, btn) => `
-    <div style="flex:1;min-width:280px;border:1px solid var(--border);border-radius:10px;padding:12px 14px">
-      <div style="font-size:13px;font-weight:700">${esc(title)} ${esc(badge)}</div>
-      <div class="hint" style="margin-top:6px;line-height:1.8">${body}</div>
-      <div style="margin-top:8px">${btn}</div>
-    </div>`;
-  return `<div class="card" style="margin-top:12px;border-left:3px solid var(--accent)">
+    ? `已配置（来源：${srcLabel}），查看行为会留痕`
+    : '未配置——请到「服务与配置」点「检查修复」重新生成';
+  // 精简（主人反馈）：说明性长文案全部收进 ⓘ 悬浮提示，卡内只留地址 + 两个动作
+  const tip = [
+    'Root 密钥 = 管理员钥匙：用于列出用户、复制/重置密钥。用它登录 Studio 后身份固定为 default 且不可切换——这是 Studio 设计，不代表机器人记忆没隔离。',
+    '看某个机器人的记忆：在下方列表点该行「打开记忆空间」，以该机器人自己的用户密钥进入，一机一目录、互相隔离。',
+    '两种登录态不能互相切换：看 A 机器人用 A 的密钥进。更不要把「模型配置」里的模型厂商 API Key 填进 Studio——那是调模型用的，与鉴权无关，填了必 401。',
+    `Root 密钥状态：${state}。`,
+  ].join('\n');
+  return `<div class="card" style="margin-top:12px">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <b style="font-size:13.5px">🌐 连接 OpenViking Studio（${esc((endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, ''))}/studio）</b>
+      <span class="tip" style="align-self:center" data-tip="${esc(tip)}">ⓘ</span>
       <span style="flex:1"></span>
       <button class="btn sm" id="memCopyRoot" title="复制 Root 密钥到剪贴板（查看行为留痕）" ${rk?.configured ? '' : 'disabled style="opacity:.5;cursor:not-allowed"'}>⧉ 复制 Root 密钥</button>
       <button class="btn sm primary" id="memOpenStudio" title="复制 Root 密钥 → 打开 Studio 新标签 → 在「Root 或账号管理员 API 密钥」框 Ctrl+V 即可进入">打开 Studio 并复制</button>
     </div>
-    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:10px">
-      ${login(
-        '登录方式一 · 管理员', 'Root 密钥',
-        'root',
-        `用于<b>管理</b>：列出用户、复制/重置他人密钥、账号设置。<br>
-         用它登录后，Studio 里的身份<b>固定显示为 <code>default</code>，且无法切换</b>——
-         这是 Studio 的设计（管理员凭证不含具体用户身份），<b>不代表机器人记忆没隔离</b>。<br>
-         <span class="hint">密钥即受管 ov.conf 的 <code>server.root_api_key</code>；查看行为会留痕。</span>`,
-        `<button class="btn sm" data-root-copy title="复制 Root 密钥（查看行为留痕）" ${rk?.configured ? '' : 'disabled style="opacity:.5;cursor:not-allowed"'}>⧉ 复制 Root 密钥</button>`,
-      )}
-      ${login(
-        '登录方式二 · 查看某个机器人的记忆', '该机器人的用户密钥',
-        'user',
-        `用于<b>浏览某一个机器人（或网页用户）自己的记忆空间</b>。<br>
-         在下方用户列表点那一行的「打开记忆空间」，密钥自动进剪贴板并跳转，粘贴即以<b>该机器人身份</b>进入。<br>
-         <span class="hint">每个机器人一把独立密钥、一机一目录，数据物理隔离，互不可见。</span>`,
-        '<span class="hint">↓ 在下方「机器人」分组里点对应那一行的「打开记忆空间」</span>',
-      )}
-    </div>
-    <div class="hint" style="margin-top:10px;padding:8px 12px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px;line-height:1.7">
-      ⚠️ 两种登录态<b>不能互相切换</b>：想看 A 机器人的记忆就用 A 的密钥进，看 B 就用 B 的密钥进。
-      用 Root 进去只会看到管理员（default）视角，看不到各机器人的记忆。<br>
-      ⚠️ <b>更不要填</b>「模型配置」里那个模型厂商 API Key（智谱等）——那是调用模型用的，与 OpenViking 鉴权无关。
-    </div>
-    <div class="hint" style="margin-top:8px;line-height:1.7">Root 密钥状态：${state}</div>
-    <div id="memRootStatus" class="hint" style="margin-top:4px;line-height:1.7"></div>
+    <div id="memRootStatus" class="hint" style="margin-top:6px;line-height:1.7"></div>
   </div>`;
 }
 
@@ -826,9 +803,9 @@ function renderUsersTab(el, { st, m }) {
         ${u.authInitNeeded ? '<button class="btn sm primary" id="memUsersInit">⚡ 一键初始化</button>' : '<button class="btn sm" id="memUsersInit">⚡ 一键初始化</button>'}
         <button class="btn sm" id="memUsersRefresh">↻ 刷新</button>
       </div>
-      <div class="desc" style="margin-top:6px">api_key 模式：网页与每个机器人各持一把独立密钥（密钥落盘已加密、页面只脱敏显示，查看行为留痕审计）。「打开记忆空间」= 密钥进剪贴板 + 自动新标签打开文件系统页，粘贴一次即可连接。</div>
-      <div class="hint" style="margin-top:6px">ⓘ 1933 网页右上角的身份切换显示的是技术 ID（OpenViking 暂不支持显示名）——哪个 ID 对应哪台机器人，以本页对照为准。</div>
-      ${u.authInitNeeded ? `<div class="hint" style="margin-top:10px;padding:9px 14px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px">🔑 待初始化鉴权：网页端用户（web）尚未创建——浏览器打开记忆空间会 401。点右上「⚡ 一键初始化」自动创建网页 + 各机器人用户并签发密钥。</div>` : ''}
+      <div class="desc" style="margin-top:6px">网页与每个机器人各持一把独立密钥，页面脱敏显示、查看留痕。「打开记忆空间」= 密钥进剪贴板并自动打开该身份的记忆页。
+        <span class="tip" style="vertical-align:-1px" data-tip="密钥落盘已加密；1933 网页右上角身份显示的是技术 ID（OpenViking 暂不支持显示名），哪个 ID 对应哪台机器人以本页对照为准。">ⓘ</span></div>
+      ${u.authInitNeeded ? `<div class="hint" style="margin-top:10px;padding:9px 14px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px">🔑 待初始化鉴权：网页端用户尚未创建，浏览器打开记忆空间会 401——点右上「⚡ 一键初始化」自动创建并签发密钥。</div>` : ''}
       ${u.users.length === 0 && !u.authInitNeeded ? '<div class="hint" style="margin-top:12px">暂无用户——点「⚡ 一键初始化」创建。</div>' : ''}
       ${studioGuideCardHtml(u.rootKey, m.endpoint)}
       ${group('网页管理', webUsers, '浏览器打开记忆空间用这一把（Studio 里的「用户 API 密钥」也用它）')}
@@ -853,7 +830,8 @@ const granularityCardHtml = (gran) => `
         <label class="switch"><input type="checkbox" id="memGran" ${gran === 'bot-user' ? 'checked' : ''}><span class="track"></span></label>
       </label>
     </div>
-    <div class="hint" style="margin-top:8px;line-height:1.8">升级属<b>增量演进</b>：既有密钥与记忆不受影响、会话不中断，仅为新聊天者追加独立签发。建议触发条件（任一出现即升级）：同一 bot 服务 2 人以上且内容敏感 / 出现「记忆是谁写的」追溯需求 / 部署走向团队共享。</div>
+    <div class="hint" style="margin-top:8px;line-height:1.8">升级属<b>增量演进</b>：不影响既有密钥与记忆、会话不中断，仅为新聊天者追加独立签发。
+      <span class="tip" style="vertical-align:-1px" data-tip="建议触发条件（任一出现即升级）：同一 bot 服务 2 人以上且内容敏感；出现「记忆是谁写的」追溯需求；部署走向团队共享。">ⓘ</span></div>
   </div>`;
 
 function bindUsersTabActions(el, { m }) {
@@ -1005,6 +983,8 @@ function bindUsersTabActions(el, { m }) {
 export const page = {
   id: 'memory',
   title: '记忆增强',
+  desc: 'OpenViking 长期记忆：自动召回历史、归档提炼，按机器人命名空间隔离',
+  legend: false,
   icon: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
   render: renderMemory,
 };

@@ -1,6 +1,10 @@
 // ============ 权限（页内一级 tab：免确认工具 / 危险命令黑名单） ============
+// 改动即时保存并热生效；「全部工具免确认」缺省开启（显式 false 才算关闭），开启时黑名单是唯一安全网。
 import { S, $, esc, toast, saveDoc } from '../core.js';
 import { confirmDialog } from '../ui.js';
+
+const svg = (inner, s = 14) => `<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+const IC_INFO = '<circle cx="12" cy="12" r="9"/><path d="M12 8h.01"/><path d="M12 12v4"/>';
 
 let permTab = 'allow'; // tab 状态：切换 / 重渲染保持
 function renderPermissions(el) {
@@ -10,7 +14,7 @@ function renderPermissions(el) {
   el.innerHTML = `
   <div class="tabs">
     <button data-t="allow" class="${permTab === 'allow' ? 'active' : ''}">免确认工具</button>
-    <button data-t="danger" class="${permTab === 'danger' ? 'active' : ''}">危险命令黑名单</button>
+    <button data-t="danger" class="${permTab === 'danger' ? 'active' : ''}">危险命令黑名单 <span class="tag off" style="margin-left:4px">${p.dangerous_commands.length}</span></button>
   </div>
   <div id="permPanel"></div>`;
   el.querySelectorAll('.tabs button').forEach((b) =>
@@ -26,28 +30,30 @@ function renderAllowTab(panel, p) {
   // 缺省即开（与后端 DEFAULT_ALLOW_ALL_TOOLS 一致）：只有显式 false 才算用户主动关闭
   const allOn = p.allow_all_tools !== false;
   panel.innerHTML = `
-  <div class="card">
-    <h3>免确认工具</h3>
-    <div class="switch-row">
-      <label class="switch">
-        <input type="checkbox" id="allowAll" ${allOn ? 'checked' : ''}>
-        <span class="track"></span>
-      </label>
-      <span class="switch-label">全部工具免确认（除危险命令黑名单外）</span>
-    </div>
-    ${allOn ? '<div style="background:var(--warn-bg);color:var(--warn-tx);border-radius:7px;padding:7px 12px;margin:8px 0">⚠️ 已开启全部放行：除命中危险命令黑名单的 Bash 外，所有工具（含 Write/Edit）都不再弹确认卡，下方名单暂不生效</div>' : ''}
-    <div class="${allOn ? 'block-disabled' : ''}">
-      <div class="desc">名单内工具直接放行不弹确认卡（配置即整体替换内置默认）。Bash 仍受危险命令黑名单约束。</div>
-      <div class="list-toolbar">
-        <input type="text" id="newTool" placeholder="工具名，如 Write" style="max-width:320px">
-        <button class="btn" id="addTool">添加</button>
-        <button class="btn" id="resetTools" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button>
+  <div class="panel">
+    <header class="panel-head"><h3>免确认工具</h3>
+      <div class="panel-actions">
+        ${isDefault ? '<span class="tag off">与内置默认一致</span>' : ''}
+        <span class="tip" data-tip="开启后除命中黑名单的 Bash 外，所有工具（含写入）都不再弹确认卡">${svg(IC_INFO)}</span>
+      </div></header>
+    <div class="panel-body">
+      <div class="switch-row" style="margin-top:0">
+        <label class="switch"><input type="checkbox" id="allowAll" ${allOn ? 'checked' : ''}><span class="track"></span></label>
+        <span class="switch-label">全部工具免确认（除危险命令黑名单外）</span>
       </div>
-      ${p.allow_tools.length === 0 ? '<div style="background:var(--warn-bg);color:var(--warn-tx);border-radius:7px;padding:7px 12px;margin:8px 0">⚠️ 名单为空：所有工具（含 Write/Edit）都会弹确认卡</div>' : ''}
-      ${isDefault ? '<div class="hint" style="margin:8px 0"><span class="tag off">与内置默认一致</span></div>' : ''}
-      <table><tbody id="toolBody"></tbody></table>
+      ${allOn ? '<div class="banner warn" style="margin:8px 0"><span>已开启全部放行——下方名单暂不生效，黑名单是唯一安全网。</span></div>' : ''}
+      <div style="${allOn ? 'opacity:.45;pointer-events:none' : ''}">
+        <div class="desc" style="margin:8px 0 4px">名单内工具直接放行不弹确认卡（配置即整体替换内置默认）。Bash 仍受危险命令黑名单约束。</div>
+        <table><tbody id="toolBody"></tbody></table>
+        ${p.allow_tools.length === 0 ? '<div class="banner warn" style="margin:8px 0"><span>⚠️ 名单为空：所有工具（含 Write/Edit）都会弹确认卡</span></div>' : ''}
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <input type="text" id="newTool" placeholder="工具名，如 Write" style="max-width:300px">
+          <button class="btn" id="addTool">添加</button>
+          <button class="btn" id="resetTools" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button>
+        </div>
+      </div>
     </div>
-    <div class="footer-note">权限改动即时保存并热生效（已有会话的下一个工具调用即用新名单）。plan 模式下写操作仍会经此判定：${allOn ? '全部免确认已开启，除危险命令外一律直通' : '白名单命中直通，未命中弹确认卡'}。</div>
+    <footer class="panel-foot">权限改动即时保存并热生效（已有会话的下一个工具调用即用新名单）。plan 模式下写操作仍会经此判定：${allOn ? '全部免确认已开启，除危险命令外一律直通' : '白名单命中直通，未命中弹确认卡'}。</footer>
   </div>`;
   $('#toolBody').innerHTML = p.allow_tools.map((t, i) =>
     `<tr><td><code>${esc(t)}</code></td><td style="width:80px"><button class="btn sm danger" data-i="${i}">删除</button></td></tr>`).join('')
@@ -112,18 +118,19 @@ function renderDangerTab(panel, p) {
   const defaults = S.status?.permissionDefaults?.dangerousCommands || [];
   const isDefault = defaults.length > 0 && JSON.stringify(p.dangerous_commands) === JSON.stringify(defaults);
   panel.innerHTML = `
-  <div class="card">
-    <h3>危险命令黑名单</h3>
-    <div class="desc">正则源串（不区分大小写），命中即弹确认卡。删除正则 = 放宽对应命令为直通，请谨慎。</div>
-    <div class="list-toolbar">
-      <input type="text" id="newDc" placeholder="正则源串，如 \\bgit\\s+push\\b.*--force" style="max-width:480px">
-      <button class="btn" id="addDc">添加</button>
-      <button class="btn" id="resetDc" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button>
+  <div class="panel">
+    <header class="panel-head"><h3>危险命令黑名单</h3>
+      <div class="panel-actions"><span class="tip" data-tip="正则（不区分大小写），命中的 Bash 命令弹确认卡">${svg(IC_INFO)}</span></div></header>
+    <div class="panel-body">
+      ${p.dangerous_commands.length === 0 ? '<div class="banner err" style="margin-bottom:10px"><span>黑名单为空——所有 Bash 命令（含 rm -rf、sudo）将免确认直通，请确认有意为之。</span></div>' : ''}
+      <table><tbody id="dcBody"></tbody></table>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <input type="text" id="newDc" placeholder="正则源串，如 \\bgit\\s+push\\b.*--force" style="max-width:420px">
+        <button class="btn" id="addDc">添加</button>
+        <button class="btn" id="resetDc" ${defaults.length ? '' : 'disabled title="status 不可用，无法取默认值"'}>恢复默认</button>
+      </div>
     </div>
-    ${p.dangerous_commands.length === 0 ? '<div style="background:var(--err-bg);color:var(--err-tx);border-radius:7px;padding:7px 12px;margin:8px 0">⚠️ 黑名单为空：所有 Bash 命令（含 rm -rf、sudo）将免确认直通，请确认有意为之</div>' : ''}
-    ${isDefault ? '<div class="hint" style="margin:8px 0"><span class="tag off">与内置默认一致</span></div>' : ''}
-    <table><tbody id="dcBody"></tbody></table>
-    <div class="footer-note">权限改动即时保存并热生效（已有会话的下一个工具调用即用新名单）。「全部工具免确认」开启时本黑名单是唯一的安全网——删除正则等于放行对应命令。</div>
+    <footer class="panel-foot">正则源串不区分大小写，命中即弹确认卡；删除正则 = 放宽对应命令为直通，请谨慎。改动即时保存并热生效。「全部工具免确认」开启时本黑名单是唯一的安全网。</footer>
   </div>`;
   $('#dcBody').innerHTML = p.dangerous_commands.map((s, i) =>
     `<tr><td style="width:90%"><code>${esc(s)}</code></td><td><button class="btn sm danger" data-i="${i}">删除</button></td></tr>`).join('')
@@ -165,6 +172,7 @@ function renderDangerTab(panel, p) {
 export const page = {
   id: 'permissions',
   title: '权限',
+  desc: '工具免确认名单与危险命令黑名单，改动即时生效',
   icon: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>',
   render: renderPermissions,
 };

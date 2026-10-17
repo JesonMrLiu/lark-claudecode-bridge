@@ -35,6 +35,12 @@ import { checkUpdate, hasNewerVersion, installMode, runUpdate } from './update.j
 import { memoryStatus, testMemoryConnection } from './memory-api.js';
 import { chatsTree, chatTopics, chatTimeline } from './chats-api.js';
 import {
+  authMeta, authThrottleState, changePassword, clearAuthFailures, clearSessionCookie, createSession,
+  dropOtherSessions, dropSession, readSessionToken, registerAuthFailure, resetPasswordToDefault,
+  sessionCookie, setLockMinutes, touchSession, verifyPassword,
+} from './webauth.js';
+import { listLogFiles, tailLogFile, tailLogRange } from './logs-api.js';
+import {
   deleteMemoryUser, initMemoryUsers, listMemoryUsers, resetUserKey, revealRootKey, revealUserKey,
 } from './memory-users-api.js';
 import { MANAGED_OV_CONF, getInstallState, runInstall, runStartPipeline, stopManagedServer } from '../memory-installer.js';
@@ -162,7 +168,8 @@ function listSubdirs(input: string): {
     const dirs = readdirSync(abs, { withFileTypes: true })
       .filter((e) => e.isDirectory())
       .map((e) => e.name)
-      .sort((a, b) => a.localeCompare(b));
+      // 普通目录在前、点开头隐藏目录殿后（目录选择弹层网格的浏览主路径是普通目录）
+      .sort((a, b) => (a.startsWith('.') ? 1 : 0) - (b.startsWith('.') ? 1 : 0) || a.localeCompare(b));
     return { path: abs, parent: parentOf(abs), dirs };
   } catch (e) {
     return { path: abs, parent: parentOf(abs), dirs: [], error: `无法读取：${e instanceof Error ? e.message : String(e)}` };
@@ -212,11 +219,10 @@ async function friendlyAddrInUse(host: string, port: number): Promise<string> {
   let occupier = '';
   try {
     const res = await fetch(`http://${disp}:${port}/api/status`, { signal: AbortSignal.timeout(2000) });
-    if (res.ok) {
-      const st = await res.json().catch(() => null) as { version?: string } | null;
-      if (st && typeof st.version === 'string') {
-        occupier = `（占用者疑似旧 lcb 配置页进程 v${st.version}——npm 更新后旧进程未退出，需手动结束）`;
-      }
+    // 401 也带 version（鉴权网关对 /api/status 特批附版本）：加锁后的新进程仍可被识别
+    const st = await res.json().catch(() => null) as { version?: string } | null;
+    if (st && typeof st.version === 'string') {
+      occupier = `（占用者疑似旧 lcb 配置页进程 v${st.version}——npm 更新后旧进程未退出，需手动结束）`;
     }
   } catch { /* 探测失败/非 lcb 服务：走通用文案 */ }
   const probe = process.platform === 'win32'
@@ -282,6 +288,7 @@ async function handle(
 ): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const path = url.pathname;
+  const configPath = ctx.configPath; // 短别名：鉴权段大量引用
   // 每请求现查（不能用启动快照）：bootstrap 写盘成功后，后续请求立即按「已有配置」处理
   const firstRun = !existsSync(ctx.configPath);
   // 安全闸：Host / Origin 校验（防 DNS rebinding 拿本机页面读写配置）
@@ -289,6 +296,86 @@ async function handle(
     res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Forbidden');
     return;
+  }
+  // ---- 配置页密码闸：静态资源（html/js/css）公开（页面源码不含秘密）；锁屏本身在前端，
+  // 但数据全部挡在 API 层——所有 /api/*（除登录）必须携带有效会话 cookie，否则 401。
+  // 首装向导 /api/bootstrap 同样被拦：内网他人无法抢在主人之前 bootstrap 配置 ----
+  const sessionToken = readSessionToken(req.headers.cookie);
+  if (path.startsWith('/api/') && path !== '/api/auth/verify') {
+    // 每请求滑动续期：TTL 取当前锁屏设置（改设置即刻约束既有会话；webauth 文件随读随取，
+    // 顺带让 `lcb reset-password` 的改密对运行中的进程即时生效）
+    const okSession = !!sessionToken && touchSession(sessionToken, authMeta(configPath).lockMinutes);
+    if (!okSession) {
+      // /api/status 在 401 里特批附 version：EADDRINUSE 端口占用探测靠它识别运行中的 lcb
+      if (path === '/api/status') return json(res, 401, { error: '配置页已锁定', version: VERSION });
+      return json(res, 401, { error: '配置页已锁定，请先解锁' });
+    }
+  }
+  // ---- 配置页密码：登录 / 登出 / 会话元信息 / 改密 / 恢复初始密码 / 锁屏设置 ----
+  if (path === '/api/auth/verify' && req.method === 'POST') {
+    const ip = req.socket.remoteAddress ?? 'unknown';
+    const th = authThrottleState(ip);
+    if (th.blocked) return json(res, 429, { error: `密码尝试过于频繁，请 ${th.retryAfter} 秒后再试` });
+    const body = await readJsonBody(req).catch(() => ({}) as Record<string, unknown>);
+    if (!verifyPassword(configPath, String(body.password ?? ''))) {
+      registerAuthFailure(ip);
+      return json(res, 401, { error: '密码错误，请重试' });
+    }
+    clearAuthFailures(ip);
+    const meta = authMeta(configPath);
+    const token = createSession(meta.lockMinutes);
+    res.setHeader('Set-Cookie', sessionCookie(token, meta.lockMinutes));
+    // isDefault：仍为默认密码 123456 时前端每次登录都弹「修改默认密码」引导
+    return json(res, 200, { ok: true, isDefault: meta.isDefault, lockMinutes: meta.lockMinutes });
+  }
+  if (path === '/api/auth/meta' && req.method === 'GET') {
+    // 能过鉴权闸才可能走到这里 ⇒ 会话有效；供设置弹窗取锁屏设置与默认密码状态
+    return json(res, 200, { ok: true, ...authMeta(configPath) });
+  }
+  if (path === '/api/auth/logout' && req.method === 'POST') {
+    dropSession(sessionToken);
+    res.setHeader('Set-Cookie', clearSessionCookie());
+    return json(res, 200, { ok: true });
+  }
+  if (path === '/api/auth/change' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const r = changePassword(configPath, String(body.old ?? ''), String(body.next ?? ''));
+    if (!r.ok) return json(res, 400, { error: r.error });
+    dropOtherSessions(sessionToken); // 其他标签页/旧会话全部失效，当前页保持登录
+    return json(res, 200, { ok: true, isDefault: false });
+  }
+  if (path === '/api/auth/reset-default' && req.method === 'POST') {
+    // 恢复初始密码 123456：必须验当前密码（防锁屏状态下被内网他人一键重置）
+    const body = await readJsonBody(req);
+    if (!verifyPassword(configPath, String(body.old ?? ''))) return json(res, 401, { error: '当前密码不正确' });
+    resetPasswordToDefault(configPath);
+    dropOtherSessions(sessionToken);
+    return json(res, 200, { ok: true, isDefault: true });
+  }
+  if (path === '/api/auth/settings' && req.method === 'PUT') {
+    const body = await readJsonBody(req);
+    const r = setLockMinutes(configPath, Number(body.lockMinutes));
+    if (!r.ok) return json(res, 400, { error: r.error });
+    const lockMinutes = Number(body.lockMinutes);
+    if (sessionToken) touchSession(sessionToken, lockMinutes); // 立即按新 TTL 续期
+    return json(res, 200, { ok: true, lockMinutes });
+  }
+  // ---- 运行日志（概览「查看日志」抽屉）：列表 + 尾部 N 行 + 日期范围聚合 ----
+  if (path === '/api/logs' && req.method === 'GET') {
+    return json(res, 200, listLogFiles(configPath));
+  }
+  if (path === '/api/logs/content' && req.method === 'GET') {
+    const from = url.searchParams.get('from');
+    const to = url.searchParams.get('to');
+    if (from || to) {
+      // 日期范围模式（前端主路径）：from~to 每天日志依时间序合并
+      const r = tailLogRange(configPath, from || to || '', to || from || '', Number(url.searchParams.get('lines')) || 2000);
+      if ('error' in r) return json(res, 400, { error: r.error });
+      return json(res, 200, r);
+    }
+    const r = tailLogFile(configPath, url.searchParams.get('file') ?? '', Number(url.searchParams.get('lines')) || 500);
+    if ('error' in r) return json(res, 400, { error: r.error });
+    return json(res, 200, r);
   }
   // 静态页与模块：入口单文件 + js/css 目录服务（防穿越见下）
   if (req.method === 'GET' && (path === '/' || path === '/index.html')) {

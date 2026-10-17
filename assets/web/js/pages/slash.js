@@ -2,21 +2,24 @@
 import { S, $, esc, toast, api } from '../core.js';
 import { openDrawer, closeDrawer, confirmDialog } from '../ui.js';
 
+const IC_INFO = '<circle cx="12" cy="12" r="9"/><path d="M12 8h.01"/><path d="M12 12v4"/>';
+const svg = (inner, s = 13) => `<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+
 function renderSlash(el) {
   el.innerHTML = `
-  <div class="card">
-    <h3>飞书斜杠命令（远端管理）</h3>
-    <div class="desc">直接读写飞书开放平台已注册的斜杠命令；聊天输入 <code>/</code> 弹出指令面板，选中后可继续输入描述再发送。需给应用开通 <code>application:app_slash_command</code> 读写权限并发布版本；改动约 5 分钟后生效（PC 端 7.70+）。<b>本页操作即时提交飞书，与底部「保存」按钮无关。</b></div>
-    <div class="list-toolbar">
-      <div style="max-width:320px;width:100%"><label>目标应用</label><select id="scApp"></select></div>
-      <span class="spacer"></span>
-      <button class="btn" id="scReload">刷新列表</button>
-      <button class="btn" id="scBuiltins">补齐内置命令</button>
-      <button class="btn primary" id="scAdd">+ 新增命令</button>
+  <div class="panel">
+    <header class="panel-head"><h3>已注册命令</h3>
+      <div class="panel-actions">
+        <select id="scApp" style="width:auto;padding:4px 10px;font-size:12.5px"></select>
+        <button class="btn sm" id="scReload">刷新</button>
+        <button class="btn sm" id="scBuiltins">补齐内置</button>
+      </div></header>
+    <div class="panel-body">
+      <table><thead><tr><th style="width:170px">命令</th><th>描述</th><th style="width:130px">图标</th><th style="width:150px">操作</th></tr></thead>
+      <tbody id="scBody"><tr><td colspan="4" style="padding:36px 0"><div class="br-spin-sm"></div><div class="hint" style="text-align:center">正在从飞书拉取斜杆命令…</div></td></tr></tbody></table>
+      <pre class="report" id="scReport" style="display:none;margin-top:12px"></pre>
     </div>
-    <table style="margin-top:12px"><thead><tr><th style="width:170px">命令</th><th>描述</th><th style="width:150px">图标</th><th style="width:130px">操作</th></tr></thead>
-    <tbody id="scBody"><tr><td colspan="4" style="padding:36px 0"><div class="br-spin-sm"></div><div class="hint" style="text-align:center">正在从飞书拉取斜杆命令…</div></td></tr></tbody></table>
-    <pre class="report" id="scReport" style="display:none;margin-top:12px"></pre>
+    <footer class="panel-foot">${svg(IC_INFO)} 直接读写飞书开放平台（需 application:app_slash_command 权限并发布版本），改动约 5 分钟生效（PC 端 7.70+）；<b>本页操作即时提交飞书，与「保存」按钮无关</b>。聊天输入 <code>/</code> 弹出指令面板。</footer>
   </div>`;
   const appSel = $('#scApp');
   (S.status?.apps || []).forEach((a) => {
@@ -39,11 +42,11 @@ function renderSlash(el) {
           <td><code>/${esc(x.command)}</code></td>
           <td>${esc(x.description?.default_value || '')}</td>
           <td class="hint">${esc(x.description?.icon?.icon_key || '—')}</td>
-          <td>
+          <td class="ops">
             <button class="btn sm" data-op="edit">编辑</button>
             <button class="btn sm danger" data-op="del">删除</button>
           </td>
-        </tr>`).join('') || '<tr><td colspan="4" class="hint">远端暂无命令；点「补齐内置命令」一键注册 bridge 内置指令</td></tr>';
+        </tr>`).join('') || '<tr class="empty"><td colspan="4">远端暂无命令；点「补齐内置」一键注册 bridge 内置指令</td></tr>';
       $('#scBody').querySelectorAll('button[data-op]').forEach((b) => b.onclick = () => {
         const tr = b.closest('tr');
         if (b.dataset.op === 'del') return delRemote(tr.dataset.cid, tr.dataset.cmd);
@@ -55,7 +58,7 @@ function renderSlash(el) {
         });
       });
     } catch (e) {
-      $('#scBody').innerHTML = `<tr><td colspan="4" class="hint">加载失败：${esc(e.message)}（确认已开通斜杠命令权限后点「刷新列表」重试）</td></tr>`;
+      $('#scBody').innerHTML = `<tr><td colspan="4" class="hint">加载失败：${esc(e.message)}（确认已开通斜杠命令权限后点「刷新」重试）</td></tr>`;
     }
   };
   const delRemote = async (cid, cmd) => {
@@ -74,17 +77,19 @@ function renderSlash(el) {
   const openSlashDrawer = ({ commandId, command, description, icon }) => {
     const isCreate = !commandId;
     openDrawer({
-      title: isCreate ? '新增斜杠命令' : `编辑 /${command}`,
+      title: isCreate ? '新增命令' : `编辑 /${command}`,
+      narrow: true,
       bodyHtml: `
-        <label>命令（不带 /）</label>
+        <label class="fld">命令（不带 /${isCreate ? '' : '；飞书侧命令名不可修改，如需改名请删除后重建'}）</label>
         <input type="text" id="dcCmd" ${isCreate ? '' : 'disabled title="飞书侧命令名不可修改（如需改名请删除后重建）"'} value="${esc(command || '')}" placeholder="produce">
-        <label>描述（指令面板展示）</label>
+        <label class="fld">描述（指令面板展示）</label>
         <input type="text" id="dcDesc" value="${esc(description || '')}" placeholder="内容生产流程">
-        <label>图标 icon_key（可空，取值见飞书开放平台图标列表）</label>
+        <label class="fld">图标 icon_key（可空，取值见飞书开放平台图标列表）</label>
         <input type="text" id="dcIcon" value="${esc(icon || '')}" placeholder="skill_outlined">`,
-      footHtml: `<button class="btn primary" id="dcSave">${isCreate ? '创建（即时提交飞书）' : '保存（即时提交飞书）'}</button>`,
-      onMount: () => {
-        document.getElementById('dcSave').onclick = async () => {
+      footHtml: `<span class="sp"></span><button class="btn" id="dcCancel">取消</button><button class="btn primary" id="dcSave">${isCreate ? '创建' : '保存'}</button>`,
+      onMount: ({ foot }) => {
+        foot.querySelector('#dcCancel').onclick = closeDrawer;
+        foot.querySelector('#dcSave').onclick = async () => {
           const cmd = document.getElementById('dcCmd').value.trim();
           const desc = document.getElementById('dcDesc').value.trim();
           const ic = document.getElementById('dcIcon').value.trim();
@@ -96,7 +101,7 @@ function renderSlash(el) {
             } else {
               await api('POST', '/api/slash-commands/action', { op: 'update', app: appSel.value, commandId, description: desc, icon: ic });
             }
-            toast(isCreate ? `已创建 /${cmd}` : '已保存');
+            toast(`${isCreate ? `已创建 /${cmd}` : '已保存'}（即时提交飞书，约 5 分钟生效）`);
             closeDrawer();
             loadRemote();
           } catch (e) { toast(e.message, true); }
@@ -106,6 +111,7 @@ function renderSlash(el) {
   };
   appSel.onchange = loadRemote;
   $('#scReload').onclick = loadRemote;
+  $('#pageActions').innerHTML = '<button class="btn primary" id="scAdd">新增命令</button>';
   $('#scAdd').onclick = () => openSlashDrawer({ command: '', description: '', icon: '' });
   $('#scBuiltins').onclick = async () => {
     if (!appSel.value) return;
@@ -129,6 +135,8 @@ function renderSlash(el) {
 export const page = {
   id: 'slash',
   title: '斜杠命令',
+  desc: '注册到飞书开放平台的指令面板，聊天框输入 / 触发',
+  legend: false,
   icon: '<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>',
   render: renderSlash,
 };

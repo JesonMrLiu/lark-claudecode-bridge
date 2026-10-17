@@ -101,6 +101,69 @@ function chatIdTail(chatId: string): string {
   return chatId.length > 6 ? chatId.slice(-6) : chatId;
 }
 
+// ============ 飞书真实用户名（gateway-registry → GET /open-apis/contact/v3/users/batch） ============
+// 会话页发信人显示真名而非 ou_…：access.json 只覆盖配对过的用户，其余经通讯录批量解析。
+// 成功缓存 24h、失败短缓存 10 分钟（同群名模式——contact 权限补开后十分钟内自动恢复真名）。
+// 需要应用开通「获取用户基本信息」（contact:user.base:readonly）；未开通时自动降级 ou 尾号显示。
+interface UserNameMeta { name?: string; at: number }
+const userNameCache = new Map<string, UserNameMeta>(); // key `${appId}/${openId}`
+const USER_OK_TTL_MS = 24 * 60 * 60 * 1000;
+const USER_FAIL_TTL_MS = 10 * 60 * 1000;
+/** contact batch 接口单次 user_ids 上限（官方约定 ≤50） */
+const USER_BATCH_SIZE = 50;
+
+/** 批量解析 open_id → 姓名。整批失败（权限/网络）落短缓存防每轮树接口重打；零结果视为失败态 */
+async function fetchUserNames(appId: string, ids: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const need: string[] = [];
+  for (const id of ids) {
+    const hit = userNameCache.get(`${appId}/${id}`);
+    if (hit && Date.now() - hit.at < (hit.name ? USER_OK_TTL_MS : USER_FAIL_TTL_MS)) {
+      if (hit.name) out.set(id, hit.name);
+      continue;
+    }
+    need.push(id);
+  }
+  if (!need.length) return out;
+  const src = getChatInfoSource(appId);
+  if (!src) return out; // 桥未运行（lcb ui 独立进程）：吃缓存，没有则本轮降级，不报错
+  for (let i = 0; i < need.length; i += USER_BATCH_SIZE) {
+    const batch = need.slice(i, i + USER_BATCH_SIZE);
+    const qs = batch.map((id) => `user_ids=${encodeURIComponent(id)}`).join('&');
+    let okBatch = false;
+    try {
+      const res = await src.request({
+        method: 'GET',
+        url: `/open-apis/contact/v3/users/batch?user_id_type=open_id&${qs}`,
+      });
+      const items = res.code === 0
+        ? (res.data as { items?: unknown } | undefined)?.items
+        : undefined;
+      if (Array.isArray(items)) {
+        const got = new Set<string>();
+        for (const it of items) {
+          const uid = (it as { user_id?: unknown }).user_id;
+          const name = (it as { name?: unknown }).name;
+          if (typeof uid === 'string' && typeof name === 'string' && name) {
+            userNameCache.set(`${appId}/${uid}`, { name, at: Date.now() });
+            out.set(uid, name);
+            got.add(uid);
+          }
+        }
+        okBatch = true;
+        // 本批未被接口返回的 id：落失败短缓存（10 分钟后自动重试，可能后配对）
+        for (const id of batch) {
+          if (!got.has(id)) userNameCache.set(`${appId}/${id}`, { at: Date.now() });
+        }
+      }
+    } catch { /* 机器人无该用户可见范围 / 权限缺失 / 网络失败：降级 */ }
+    if (!okBatch) {
+      for (const id of batch) userNameCache.set(`${appId}/${id}`, { at: Date.now() });
+    }
+  }
+  return out;
+}
+
 /** 显示名三级降级：飞书真名 → access 人名（单用户=p2p）→ 「群聊（N人）/会话 ·尾号」 */
 function buildDisplayName(
   meta: ChatMeta | undefined, users: string[], access: Map<string, string>, chatId: string,
@@ -168,13 +231,16 @@ export async function chatsTree(configPath: string): Promise<{ bots: ChatBotSumm
       }
       const users = usersByChat.get(chatId) ?? [];
       const meta = await fetchChatMeta(appId, chatId);
-      const name = buildDisplayName(meta, users, access, chatId);
+      // 发信人真名：access（配对人名，用户自填优先）+ 飞书通讯录解析兜底，合并后同源展示
+      const feishuNames = await fetchUserNames(appId, users);
+      const nameMap = new Map<string, string>([...feishuNames, ...access]);
+      const name = buildDisplayName(meta, users, nameMap, chatId);
       channels.push({
         chatId,
         displayName: name.displayName,
         chatType: name.chatType,
         nameSource: name.nameSource,
-        users: users.map((userId) => ({ userId, ...(access.get(userId) ? { name: access.get(userId) } : {}) })),
+        users: users.map((userId) => ({ userId, ...(nameMap.get(userId) ? { name: nameMap.get(userId) } : {}) })),
         dates,
         lastActiveAt: lastActiveMs ? new Date(lastActiveMs).toISOString() : '',
         topics: topicCountByChat.get(chatId) ?? 0,

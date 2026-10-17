@@ -1,10 +1,12 @@
-// ============ Skills 管理页（#12）============
+// ============ Skills 管理 ============
 // 后端：GET /api/skills · POST /api/skills/action（create/delete）· POST /api/skills/import（zip）
 // 四来源：用户级·本机（~/.claude/skills）/ 用户级·bridge（managed 生效目录）/ 项目级（工作区 .claude/skills）/
 // 已装插件内（<plugin-installPath>/skills；plugin 只读，未启用时标「（未启用）」）。
-// 远端 CRUD：改动即时落盘，无页内保存条
+// 搜索只匹配「名称 + 说明」两列；过滤只切换行显隐不重建 DOM（兼容中文输入法组合输入）。
+// 远端 CRUD：改动即时落盘，无页内保存条。
 import { $, esc, toast, api } from '../core.js';
 import { openDrawer, closeDrawer, confirmDialog, promptDialog } from '../ui.js';
+import { renderMarkdown } from '../markdown.js';
 
 /** 来源标签（function：plugin 来源需要拼插件名与启用状态） */
 const SOURCE_TAG = {
@@ -17,34 +19,46 @@ const sourceTag = (s) => {
   if (s.source === 'plugin') return `插件 · ${esc(s.pluginName || '?')}${s.pluginEnabled ? '' : '（未启用）'}`;
   return SOURCE_TAG[s.source] || s.source;
 };
+const sourceTagClass = (s) => (s.source === 'bridge' ? 'info' : s.source === 'plugin' ? (s.pluginEnabled ? 'off' : 'warn') : 'ghost');
 /** 来源是否可删（project / plugin 只读；其他用户级可删） */
 const isDeletable = (s) => s.source !== 'project' && s.source !== 'plugin';
 
 function renderSkills(el) {
   el.innerHTML = `
-  <div class="card">
-    <h3>Skills</h3>
-    <div class="desc">Claude Code 技能（每项一个目录，含 SKILL.md）。列表聚合四个来源：本机用户级、bridge 自管用户级、各工作区项目级、已装插件内的 skills（只读展示）。新增（含 zip 导入）统一进用户级生效目录。</div>
-    <div class="list-toolbar">
-      <button class="btn" id="skillImport">导入 zip</button>
-      <button class="btn primary" id="skillAdd">+ 新建</button>
+  <div class="panel">
+    <header class="panel-head"><h3>技能列表</h3>
+      <div class="panel-actions">
+        <input type="search" id="skillSearch" placeholder="过滤：名称 / 说明…" style="width:210px;padding:4px 10px;font-size:12.5px">
+        <button class="btn sm" id="skillImport">导入 zip</button>
+        <button class="btn primary sm" id="skillAdd">＋ 新建</button>
+      </div></header>
+    <div class="panel-body">
+      <input type="file" id="skillZipFile" accept=".zip" style="display:none">
+      <table><thead><tr>
+        <th style="width:220px">名字</th><th>说明</th><th style="width:190px">来源</th><th style="width:130px">操作</th>
+      </tr></thead>
+        <tbody id="skillBody"><tr><td colspan="4" class="hint">加载中…</td></tr></tbody>
+      </table>
+      <div class="mini-note" id="skillEffective" style="margin-top:10px"></div>
     </div>
-    <input type="file" id="skillZipFile" accept=".zip" style="display:none">
-    <input type="search" class="list-search" id="skillSearch" placeholder="按名字 / 来源 / 路径过滤…">
-    <table><thead><tr>
-      <th style="width:170px">名字</th><th>说明</th><th style="width:130px">来源</th><th style="width:240px">路径</th><th style="width:130px"></th>
-    </tr></thead>
-      <tbody id="skillBody"><tr><td colspan="5" class="desc">加载中…</td></tr></tbody>
-    </table>
-    <div class="desc" id="skillEffective" style="margin-top:10px"></div>
+    <footer class="panel-foot">新增 / 导入统一落盘用户级生效目录；项目级与插件内来源只读。改动即时生效。</footer>
   </div>`;
   $('#skillAdd').onclick = addSkill;
-  $('#skillSearch').oninput = filterSkillRows;
+  bindSearch();
   bindZipImport();
   void loadSkills();
 }
 
-/** 搜索过滤：遍历 tr.dataset.searchText 切换 hidden */
+/** 搜索过滤：只匹配名称+说明；只切换 tr 显隐不重建 DOM；组合输入（中文 IME）期间暂停 */
+function bindSearch() {
+  const inp = $('#skillSearch');
+  let composing = false;
+  inp.addEventListener('compositionstart', () => { composing = true; });
+  inp.addEventListener('compositionend', () => { composing = false; filterSkillRows(); });
+  inp.oninput = () => { if (!composing) filterSkillRows(); };
+}
+
+/** 搜索过滤：遍历 tr.dataset.searchText 切换 hidden（关键词只命中名称与说明） */
 function filterSkillRows() {
   const q = ($('#skillSearch').value || '').trim().toLowerCase();
   const body = $('#skillBody');
@@ -70,7 +84,7 @@ async function loadSkills() {
   try {
     data = await api('GET', '/api/skills');
   } catch (e) {
-    body.innerHTML = `<tr><td colspan="5" class="desc">加载失败：${esc(e.message)}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="4" class="hint">加载失败：${esc(e.message)}</td></tr>`;
     return;
   }
   const eff = $('#skillEffective');
@@ -83,22 +97,21 @@ async function loadSkills() {
   }
   const skills = data.skills || [];
   if (skills.length === 0) {
-    body.innerHTML = `<tr class="empty-row"><td colspan="5" class="desc">暂无 skill（四个来源均未发现 SKILL.md）。可点上方「+ 新建」或「导入 zip」。</td></tr>`;
+    body.innerHTML = `<tr class="empty-row"><td colspan="4" class="empty">暂无 skill（四个来源均未发现 SKILL.md）<br><span class="mini-note">可点右上「＋ 新建」或「导入 zip」。</span></td></tr>`;
     return;
   }
   body.innerHTML = '';
   for (const s of skills) {
-    const tag = sourceTag(s);
     const tr = document.createElement('tr');
-    tr.dataset.searchText = `${s.name} ${sourceTag(s)} ${s.path} ${s.description || ''}`.toLowerCase();
+    // 搜索只匹配名称 + 说明两列（路径/来源不参与，避免全字段模糊误命中）
+    tr.dataset.searchText = `${s.name} ${s.description || ''}`.toLowerCase();
     tr.innerHTML = `
-      <td><strong>${esc(s.name)}</strong></td>
-      <td>${esc(s.description) || '<span class="desc">（无说明）</span>'}</td>
-      <td><span class="chip">${tag}</span></td>
-      <td><code class="desc">${esc(s.path)}</code></td>
+      <td><b>${esc(s.name)}</b>${s.path ? `<div class="mini-note" style="margin-top:2px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="完整目录：${esc(s.path)}"><code>${esc(s.path)}</code></div>` : ''}</td>
+      <td>${esc(s.description) || '<span class="mut">（无说明）</span>'}</td>
+      <td><span class="tag ${sourceTagClass(s)}">${sourceTag(s)}</span></td>
       <td class="ops">
         <button class="btn sm" data-browse="${esc(s.name)}">查看</button>
-        ${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删除</button>` : ''}
+        ${isDeletable(s) ? `<button class="btn sm danger" data-del="${esc(s.name)}">删除</button>` : '<span class="dim" style="font-size:11.5px">只读</span>'}
       </td>`;
     tr.querySelector('[data-browse]').onclick = () => browseSkill(s);
     const delBtn = tr.querySelector('[data-del]');
@@ -121,71 +134,31 @@ async function delSkill(s) {
     .catch((e) => toast(e.message, true));
 }
 
-// ---------- skill 文件浏览（#3）：目录树 + 原文/视图/双栏三种查看模式 ----------
-
-/** 极简 markdown → HTML（先整体转义再还原语法，绝无 XSS 面）：标题/代码块/行内代码/粗斜体/列表/引用/链接/分割线 */
-function renderMarkdown(src) {
-  const codeBlocks = [];
-  let text = String(src).replace(/```(\w*)\n?([\s\S]*?)(?:```|$)/g, (_m, lang, code) => {
-    codeBlocks.push(`<pre style="background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:10px;overflow:auto;font-size:12px"><code>${esc(code.replace(/\n$/, ''))}</code></pre>`);
-    return `${codeBlocks.length - 1}`;
-  });
-  const lines = text.split('\n');
-  const out = [];
-  let listOpen = false;
-  const closeList = () => { if (listOpen) { out.push('</ul>'); listOpen = false; } };
-  const inline = (s) => esc(s)
-    .replace(/`([^`]+)`/g, '<code style="background:var(--code-bg);padding:1px 5px;border-radius:4px;font-size:12px">$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--primary)">$1</a>');
-  for (const line of lines) {
-    const block = /^ (\d+) $/.exec(line);
-    if (block) { closeList(); out.push(codeBlocks[Number(block[1])]); continue; }
-    const h = /^(#{1,4})\s+(.*)$/.exec(line);
-    if (h) { closeList(); const lv = h[1].length; out.push(`<h${lv + 1} style="margin:12px 0 6px">${inline(h[2])}</h${lv + 1}>`); continue; }
-    if (/^\s*[-*]\s+/.test(line)) {
-      if (!listOpen) { out.push('<ul style="margin:4px 0;padding-left:22px">'); listOpen = true; }
-      out.push(`<li>${inline(line.replace(/^\s*[-*]\s+/, ''))}</li>`);
-      continue;
-    }
-    if (/^\s*\d+\.\s+/.test(line)) {
-      if (!listOpen) { out.push('<ul style="margin:4px 0;padding-left:22px">'); listOpen = true; }
-      out.push(`<li>${inline(line.replace(/^\s*\d+\.\s+/, ''))}</li>`);
-      continue;
-    }
-    closeList();
-    if (/^---+\s*$/.test(line)) { out.push('<hr style="border:none;border-top:1px solid var(--border);margin:10px 0">'); continue; }
-    if (/^>\s?/.test(line)) { out.push(`<blockquote style="margin:6px 0;padding:4px 12px;border-left:3px solid var(--border);color:var(--muted,#667)">${inline(line.replace(/^>\s?/, ''))}</blockquote>`); continue; }
-    if (line.trim() === '') { out.push(''); continue; }
-    out.push(`<p style="margin:4px 0">${inline(line)}</p>`);
-  }
-  closeList();
-  return out.join('\n');
-}
+// ---------- skill 文件浏览：目录树 + 原文/视图/双栏三种查看模式 ----------
+// markdown 渲染走公共模块 ../markdown.js（与会话页 AI 气泡同源，含表格支持）
 
 /** 浏览抽屉：左侧文件树（目录懒加载展开），右侧查看区（markdown 文件支持 原文/视图/两者 三模式） */
 function browseSkill(s) {
   openDrawer({
     title: `${s.name} · ${sourceTag(s)}`,
     bodyHtml: `
-      <div class="hint" style="margin:0 0 10px"><code class="desc">${esc(s.path)}</code></div>
-      <div style="display:flex;gap:14px;align-items:flex-start">
-        <div id="sbTree" style="width:250px;flex:none;border:1px solid var(--border);border-radius:8px;padding:8px;max-height:62vh;overflow:auto;font-size:13px">
-          <div class="desc">目录加载中…</div>
-        </div>
-        <div style="flex:1;min-width:0">
+      <div class="hint" style="margin:0 0 10px"><code>${esc(s.path)}</code></div>
+      <div class="dw-layout">
+        <nav class="dw-nav" id="sbTree" style="width:250px;border:1px solid var(--border);border-radius:10px;padding:8px;max-height:62vh;overflow:auto;font-size:13px">
+          <span class="hint">目录加载中…</span>
+        </nav>
+        <div class="dw-pane">
           <div id="sbModes" style="display:none;gap:8px;margin-bottom:8px" class="subtabs">
             <button data-mode="both" class="active">两者都看</button>
             <button data-mode="raw">只看原文</button>
             <button data-mode="view">只看视图</button>
           </div>
-          <div id="sbFileName" class="desc" style="margin-bottom:6px">点击左侧文件查看内容</div>
-          <div id="sbView" style="display:none;border:1px solid var(--border);border-radius:8px;padding:12px;max-height:56vh;overflow:auto;font-size:13px;line-height:1.6"></div>
-          <textarea id="sbRaw" readonly style="display:none;width:100%;min-height:56vh;font-family:ui-monospace,Consolas,monospace;font-size:12px"></textarea>
+          <div id="sbFileName" class="mini-note" style="margin-bottom:6px">点击左侧文件查看内容</div>
+          <div id="sbView" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;max-height:56vh;overflow:auto;font-size:13px;line-height:1.6;background:var(--sunk)"></div>
+          <textarea id="sbRaw" readonly style="display:none;width:100%;min-height:56vh;font-family:var(--mono);font-size:12px"></textarea>
         </div>
       </div>`,
-    footHtml: `<button class="btn" data-act="close">关闭</button>`,
+    footHtml: `<span class="sp"></span><button class="btn" data-act="close">关闭</button>`,
     onMount({ body, foot }) {
       foot.querySelector('[data-act="close"]').onclick = () => closeDrawer();
       const tree = body.querySelector('#sbTree');
@@ -207,7 +180,7 @@ function browseSkill(s) {
         fileName.textContent = `加载中：${fp}`;
         try {
           const r = await api('GET', `/api/skills/raw?path=${encodeURIComponent(fp)}`);
-          fileName.innerHTML = `<strong>${esc(r.name)}</strong> <span class="desc">· ${(r.size / 1024).toFixed(1)}KB</span>`;
+          fileName.innerHTML = `<b>${esc(r.name)}</b> <span class="dim">· ${(r.size / 1024).toFixed(1)}KB</span>`;
           rawPane.value = r.content;
           if (isMd(r.name)) {
             viewPane.innerHTML = renderMarkdown(r.content);
@@ -225,25 +198,25 @@ function browseSkill(s) {
         }
       };
       const renderDir = async (dir, container) => {
-        container.innerHTML = '<div class="desc" style="padding:2px 6px">加载中…</div>';
+        container.innerHTML = '<div class="hint" style="padding:2px 6px">加载中…</div>';
         let files;
         try {
           const r = await api('GET', `/api/skills/files?path=${encodeURIComponent(dir)}`);
           files = r.files || [];
         } catch (e) {
-          container.innerHTML = `<div class="desc" style="padding:2px 6px;color:var(--err-tx)">${esc(e.message)}</div>`;
+          container.innerHTML = `<div class="hint" style="padding:2px 6px;color:var(--err-tx)">${esc(e.message)}</div>`;
           return;
         }
         container.innerHTML = '';
         if (files.length === 0) {
-          container.innerHTML = '<div class="desc" style="padding:2px 6px">（空目录）</div>';
+          container.innerHTML = '<div class="hint" style="padding:2px 6px">（空目录）</div>';
           return;
         }
         for (const f of files) {
-          const row = document.createElement('div');
-          row.style.cssText = 'padding:3px 6px;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
-          row.onmouseenter = () => { row.style.background = 'var(--off-bg)'; };
-          row.onmouseleave = () => { row.style.background = ''; };
+          const row = document.createElement('button');
+          row.style.cssText = 'display:block;width:100%;text-align:left;border:0;background:none;font:inherit;cursor:pointer;padding:4px 8px;border-radius:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+          row.onmouseenter = () => { row.style.background = 'var(--pri-w)'; };
+          row.onmouseleave = () => { if (!row.dataset.active) row.style.background = ''; };
           const childPath = `${dir.replace(/[\\/]+$/, '')}/${f.name}`;
           if (f.isDir) {
             row.textContent = `▸ 📁 ${f.name}`;
@@ -267,7 +240,7 @@ function browseSkill(s) {
             row.onclick = () => {
               tree.querySelectorAll('[data-active]').forEach((x) => { delete x.dataset.active; x.style.background = ''; x.style.fontWeight = ''; });
               row.dataset.active = '1';
-              row.style.background = 'var(--primary-weak)';
+              row.style.background = 'var(--pri-w)';
               row.style.fontWeight = '600';
               void openFile(childPath);
             };
@@ -283,13 +256,14 @@ function browseSkill(s) {
 function addSkill() {
   openDrawer({
     title: '新建 skill（用户级）',
+    narrow: true,
     bodyHtml: `
-      <label>名字（字母/数字/下划线/连字符，1-64 位）</label>
+      <label class="fld">名字（字母/数字/下划线/连字符，1-64 位）</label>
       <input type="text" id="nskName" placeholder="my-skill">
-      <label>说明（frontmatter description）</label>
+      <label class="fld">说明（frontmatter description）</label>
       <input type="text" id="nskDesc" placeholder="这个 skill 做什么、什么时候用">
-      <div class="hint" style="margin-top:10px">创建后生成目录与 SKILL.md 模板，请到目录中补充正文与脚本。</div>`,
-    footHtml: `<button class="btn" data-act="cancel">取消</button><button class="btn primary" data-act="save">创建</button>`,
+      <div class="mini-note" style="margin-top:10px">创建后生成目录与 SKILL.md 模板，请到目录中补充正文与脚本。</div>`,
+    footHtml: `<span class="sp"></span><button class="btn" data-act="cancel">取消</button><button class="btn primary" data-act="save">创建</button>`,
     onMount({ foot }) {
       foot.querySelector('[data-act="cancel"]').onclick = () => closeDrawer();
       foot.querySelector('[data-act="save"]').onclick = async () => {
@@ -337,6 +311,8 @@ function bindZipImport() {
 export const page = {
   id: 'skills',
   title: 'Skills',
+  desc: '四个来源的技能聚合：本机 / bridge / 项目 / 插件（只读）',
+  legend: false,
   icon: '<path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>',
   render: renderSkills,
 };

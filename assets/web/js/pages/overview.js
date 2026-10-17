@@ -1,7 +1,9 @@
 // ============ 概览 ============
-// 桥接器启停 / 版本更新（宿主进程管理：embedded 页面随进程生死，独立页面经 PID 跨进程操作）
+// 状态看板：4 张瓦片（桥接器进程 / Claude 认证 / 飞书 CLI / 记忆增强）+ LCB、飞书 CLI
+// 各自独立的版本更新卡 + 机器人与快捷指令 + 日志查看器抽屉。
+// 桥接器启停（宿主进程管理）：embedded 页面随进程生死，独立页面经 PID 跨进程操作。
 import { S, $, esc, toast, api, refresh } from '../core.js';
-import { bindDialogKeys, confirmDialog, mountDialog, progressDialog, stepsDialog } from '../ui.js';
+import { openDrawer, closeDrawer, bindDialogKeys, confirmDialog, mountDialog, progressDialog, stepsDialog } from '../ui.js';
 // larkNotConfigured 与后端 needsLarkCliConfig 同源（detail 含 not_configured 即「未配置应用」），
 // 判定只有一份、放在弹窗模块里，避免两处漂移
 import { larkNotConfigured, openLarkCliDeviceDialog } from './larkcli-device.js';
@@ -9,15 +11,27 @@ import { larkNotConfigured, openLarkCliDeviceDialog } from './larkcli-device.js'
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const UPD = { checkedAt: 0, data: null };
 const LARKCLI = { checkedAt: 0, data: null }; // 飞书官方 CLI 状态缓存（30s 节流，同 UPD）
+const svg = (inner, s = 14) => `<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+const IC = {
+  apps: '<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>',
+  claude: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/>',
+  zap: '<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>',
+  memory: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
+  file: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>',
+  chats: '<path d="M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z"/><path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1"/>',
+  copy: '<rect width="13" height="13" x="9" y="9" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+};
 
 function showMask(inner) {
   let m = $('#brMask');
   if (!m) {
     m = document.createElement('div');
-    m.id = 'brMask'; m.className = 'br-mask';
+    m.id = 'brMask'; m.className = 'modal-mask';
+    m.style.zIndex = '150';
     document.body.appendChild(m);
   }
-  m.innerHTML = `<div class="br-mask-card">${inner}</div>`;
+  m.innerHTML = `<div class="modal dlg" style="text-align:center"><div class="dlg-msg" style="white-space:normal">${inner}</div></div>`;
   m.style.display = 'flex';
 }
 
@@ -163,7 +177,7 @@ function renderUpdateResult() {
   const area = $('#updArea');
   if (!area) return;
   if (r.hasUpdate && r.mode === 'global') {
-    area.innerHTML = '<button class="btn primary" id="btnUpdRun">一键更新</button>';
+    area.innerHTML = `<button class="btn sm primary" id="btnUpdRun">更新到 v${esc(r.latest)}</button>`;
     $('#btnUpdRun').onclick = runUpdateFlow;
   } else if (r.hasUpdate) {
     area.innerHTML = '<span class="hint">当前非 npm 全局安装运行，请手动更新</span>';
@@ -189,7 +203,7 @@ async function runUpdateFlow() {
   const btn = $('#btnUpdRun');
   if (btn) { btn.disabled = true; btn.textContent = '更新中…'; }
   try {
-    // 只更新桥接器自身：飞书 CLI 的更新在它自己那一行点「更新」，两条更新各自独立
+    // 只更新桥接器自身：飞书 CLI 的更新在它自己那张卡点「更新」，两条更新各自独立
     await api('POST', '/api/update/run');
     UPD.checkedAt = 0; LARKCLI.checkedAt = 0;
     if (running) await restartFlow();
@@ -201,7 +215,7 @@ async function runUpdateFlow() {
   }
 }
 
-/** 纯函数（可测）：概览表格行里「飞书 CLI」的状态 HTML（不含操作按钮，按钮由 render 按需挂） */
+/** 纯函数（可测）：飞书 CLI 状态 HTML（不含操作按钮，按钮由 renderLarkCliResult 按需挂） */
 export function larkCliStatHtml(r) {
   if (!r) return '<span class="hint">未检查</span>';
   if (!r.installed) return '<span class="tag off">未安装</span>';
@@ -223,7 +237,7 @@ export function larkCliStatHtml(r) {
 }
 
 /**
- * 纯函数（可测）：概览行主入口按钮的文案——按「点开后会先走哪一步」命名，
+ * 纯函数（可测）：飞书 CLI 主入口按钮的文案——按「点开后会先走哪一步」命名，
  * 不出现「按钮写扫码授权、点开弹窗却是配置二维码」的错位。
  * 未配置应用时弹窗从 config 阶段起步（见 openDeviceDialog 与 larkcli-device.js），故叫「配置应用」。
  * 探测不出（unknown）**不**算未配置：误判会把已配好应用的用户反复推去重配，按「扫码授权」处理。
@@ -249,11 +263,12 @@ function openDeviceDialog() {
   });
 }
 
+/** 飞书 CLI 卡内的动作按钮区（安装 / 更新 / 授权 / SKILL） */
 function renderLarkCliResult() {
   const el = $('#larkCliStat');
   const r = LARKCLI.data;
   if (!el) return;
-  el.innerHTML = `${larkCliStatHtml(r)} <span id="larkCliArea"></span>`;
+  el.innerHTML = `${larkCliStatHtml(r)} <span id="larkCliArea" style="display:inline-flex;gap:6px;margin-left:6px;vertical-align:1px"></span>`;
   const area = $('#larkCliArea');
   if (!area || !r) return;
   const add = (label, op) => {
@@ -262,29 +277,49 @@ function renderLarkCliResult() {
     b.textContent = label;
     b.onclick = () => (op === 'auth-device' ? openDeviceDialog() : larkCliActionFlow(op));
     area.appendChild(b);
-    area.appendChild(document.createTextNode(' '));
   };
   if (!r.installed) { add('安装', 'install'); return; }
   if (r.hasUpdate) add('更新', 'update');
   // 入口常驻，且已授权也给（token 会过期，随时可重走一遍 device flow 刷新）。
   // 走**页面内二维码**（主路径，无桌面环境同样可用）；终端窗口降级为弹窗里的备选。
-  // 文案跟着「弹窗会先走哪一步」走（见 larkCliPrimaryLabel）：未配置应用时弹窗从配置阶段
-  // 起步、先出配置二维码，按钮就叫「配置应用」；已配置才是「扫码授权」。
-  // **入口数量不变**——三种状态都是同一个弹窗（op 一律 auth-device），只是弹窗按前置条件
-  // 决定先出哪种二维码（见 openDeviceDialog 与 larkcli-device.js）。
   add(larkCliPrimaryLabel(r), 'auth-device');
   if (r.skill && !r.skill.installed) add('装 SKILL', 'skill');
+  paintCliTile(r); // 30s 缓存路径（render 时直接重放）同样回填瓦片
+}
+
+/** 飞书 CLI 瓦片回填：检测结果同时刷新上方瓦片（此前只回填更新卡，瓦片永远停在「检测中」） */
+function paintCliTile(r, failed = false) {
+  const top = $('#tileCliTop');
+  if (!top) return; // 页面已切走
+  let dot = 'off';
+  let dstate = '未安装';
+  let subText = '未安装——点「安装」一键装好并引导授权';
+  if (failed) {
+    dot = 'err';
+    dstate = '检测失败';
+    subText = 'CLI 状态探测异常，点「检查更新」重试';
+  } else if (r?.installed) {
+    dot = r.auth?.state === 'authorized' ? 'ok' : 'warn';
+    dstate = r.auth?.state === 'authorized' ? '已授权' : r.auth?.state === 'expired' ? '授权已过期' : '未授权';
+    subText = `v${r.version || '?'} · SKILL ${r.skill?.installed ? '已装' : '未装'}${r.hasUpdate ? ' · 可更新' : ''}`;
+  }
+  top.innerHTML = `<span class="dot ${dot}"></span><span class="tile-state" style="color:var(--${dot}-tx)">${dstate}</span><span class="tile-ico">${svg(IC.zap, 16)}</span>`;
+  const sub = $('#tileCliSub');
+  if (sub) { sub.textContent = subText; sub.title = subText; }
+  const btn = $('#tileCliAuth');
+  if (btn) btn.textContent = r?.installed ? (r.auth?.state === 'authorized' ? '重新授权' : '去授权') : '安装';
 }
 
 async function doCheckLarkCli() {
   const el = $('#larkCliStat'); if (!el) return;
-  el.innerHTML = '<span class="hint">检测中…</span>';
   try {
     LARKCLI.data = await api('GET', '/api/lark-cli?check=1');
     LARKCLI.checkedAt = Date.now();
     renderLarkCliResult();
+    paintCliTile(LARKCLI.data);
   } catch (e) {
     el.innerHTML = `<span class="hint">检测失败：${esc(e.message)}</span>`;
+    paintCliTile(null, true);
   }
 }
 
@@ -408,7 +443,7 @@ async function larkCliActionFlow(op = 'install') {
     },
     config: {
       what: '配置应用',
-      // 这是**备选**路径：主路径已改成弹窗里的配置二维码（见 larkcli-device.js 的 config 阶段），
+      // 这是**备选**路径：主路径是弹窗里的配置二维码（见 larkcli-device.js 的 config 阶段），
       // 只有用户在弹窗里显式点「改用终端窗口」才会走到这里
       msg: '将打开一个终端窗口执行 <code>lark-cli config init --new</code>：按窗口打印的链接在浏览器完成飞书应用创建，'
         + '完成后会自动进入授权登录。'
@@ -466,9 +501,9 @@ function paintAutostart(el, r) {
   const tags = r.enabled
     ? '<span class="tag ok">已开启</span>'
     : '<span class="tag off">未开启</span>';
+  // 只留开关 + 状态 tag + 过期警示；各平台的「登录启动管理方式」说明文案一律不显示（主人拍板）
   const stale = r.stale ? ' <span class="tag warn">启动命令已过期，关闭再开启可更新</span>' : '';
-  const hint = r.detail ? ` <span class="hint">${esc(r.detail)}</span>` : '';
-  el.innerHTML = `<span class="switch-row tight"><label class="switch"><input type="checkbox" id="asToggle" ${r.enabled ? 'checked' : ''}><span class="track"></span></label>${tags}${stale}${hint}</span>`;
+  el.innerHTML = `<span class="switch-row" style="margin:0"><label class="switch"><input type="checkbox" id="asToggle" ${r.enabled ? 'checked' : ''}><span class="track"></span></label>${tags}${stale}</span>`;
   $('#asToggle').onchange = async (e) => {
     const on = e.target.checked;
     try {
@@ -482,7 +517,7 @@ function paintAutostart(el, r) {
   };
 }
 
-/** 概览页「开机自启」行：首次渲染拉状态；开关点击即生效（低风险，与权限页即时保存一致） */
+/** LCB 更新卡内「开机自启」行：首次渲染拉状态；开关点击即生效（低风险，即时保存） */
 async function renderAutostart() {
   const el = $('#asStat');
   if (!el) return;
@@ -500,86 +535,241 @@ async function renderAutostart() {
   paintAutostart(el, r);
 }
 
+// ============ 运行日志查看器（日期范围查询；后端按天聚合 ~/.lark-claudecode-bridge/logs/ 落盘日志） ============
+async function logViewer() {
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const dateStr = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  const today = new Date();
+  const weekAgo = new Date(today.getTime() - 6 * 86_400_000);
+  openDrawer({
+    title: '运行日志',
+    bodyHtml: `
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <input type="date" id="lgFrom" value="${dateStr(weekAgo)}" style="width:145px;padding:5px 10px;font-size:12.5px">
+        <span class="mut" style="font-size:12.5px">至</span>
+        <input type="date" id="lgTo" value="${dateStr(today)}" style="width:145px;padding:5px 10px;font-size:12.5px">
+        <button class="btn sm primary" id="lgQuery">查询</button>
+        <select id="lgLevel" style="width:auto;padding:5px 10px;font-size:12.5px">
+          <option value="all">全部级别</option>
+          <option value="INFO">Info</option>
+          <option value="WARN">Warn</option>
+          <option value="ERROR">Error</option>
+        </select>
+        <input type="search" id="lgQ" placeholder="关键字过滤…" style="width:170px;padding:5px 10px;font-size:12.5px">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px"><input type="checkbox" id="lgAuto" checked> 自动滚动</label>
+        <span style="flex:1"></span>
+        <button class="btn sm" id="lgRefresh">↻ 刷新</button>
+        <button class="btn sm" id="lgCopy">复制</button>
+        <button class="btn sm" id="lgDownload">下载</button>
+      </div>
+      <pre id="lgView" style="background:#0d1117;color:#c9d4e6;border:1px solid var(--border);border-radius:10px;padding:14px 16px;font-family:var(--mono);font-size:12px;line-height:1.8;overflow:auto;max-height:calc(100vh - 320px);white-space:pre-wrap;word-break:break-all;margin:0">加载中…</pre>
+      <div class="mini-note" style="margin-top:8px" id="lgNote">日志按天落盘于 <code>~/.lark-claudecode-bridge/logs/</code>（14 天前自动清理）；默认展示最近 7 天，级别与关键字过滤仅影响当前视图。</div>`,
+    footHtml: `<span class="sp"></span><button class="btn" id="lgClose">关闭</button>`,
+  });
+  $('#lgClose').onclick = closeDrawer;
+  const lvlColor = (l) => (l === 'ERROR' ? '#ff8f94' : l === 'WARN' ? '#ffb45e' : '#7d8aa5');
+  let lines = [];
+
+  const paintView = () => {
+    const lv = $('#lgLevel').value;
+    const q = $('#lgQ').value.trim().toLowerCase();
+    const rows = lines.filter((t) => {
+      const m = t.match(/\b(ERROR|WARN|INFO|DEBUG)\b/);
+      const level = m ? m[1] : 'INFO';
+      return (lv === 'all' || level === lv) && (!q || t.toLowerCase().includes(q));
+    });
+    $('#lgView').innerHTML = (rows.length ? rows : ['（无匹配日志行）']).map((t) => {
+      const m = t.match(/\b(ERROR|WARN|INFO|DEBUG)\b/);
+      const level = m ? m[1] : 'INFO';
+      const i = m ? t.indexOf(m[1]) : -1;
+      if (i < 0) return esc(t);
+      return `<span style="color:${lvlColor(level)};font-weight:600">${esc(t.slice(0, i + level.length))}</span><span>${esc(t.slice(i + level.length))}</span>`;
+    }).join('\n');
+    if ($('#lgAuto').checked) { const v = $('#lgView'); v.scrollTop = v.scrollHeight; }
+  };
+  const loadRange = async () => {
+    const from = $('#lgFrom').value;
+    const to = $('#lgTo').value;
+    if (!from || !to) { $('#lgView').textContent = '请选择开始与结束日期'; return; }
+    $('#lgView').textContent = '加载中…';
+    try {
+      const r = await api('GET', `/api/logs/content?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&lines=2000`);
+      lines = r.lines || [];
+      $('#lgNote').innerHTML = `已并入 ${r.files.length} 天日志（${esc(r.files[0] || '')}${r.files.length > 1 ? ` ~ ${esc(r.files[r.files.length - 1] || '')}` : ''}）${r.truncated ? '，日志量大仅显示末尾部分' : ''}；级别与关键字过滤仅影响当前视图。`;
+      paintView();
+    } catch (e) {
+      lines = [];
+      $('#lgView').textContent = `加载失败：${e.message}`;
+    }
+  };
+  $('#lgLevel').onchange = paintView;
+  $('#lgQ').oninput = paintView;
+  $('#lgAuto').onchange = paintView;
+  $('#lgQuery').onclick = () => void loadRange();
+  $('#lgRefresh').onclick = () => void loadRange();
+  $('#lgFrom').onchange = () => void loadRange();
+  $('#lgTo').onchange = () => void loadRange();
+  $('#lgCopy').onclick = async () => {
+    try { await navigator.clipboard.writeText(lines.join('\n')); toast('日志已复制到剪贴板'); }
+    catch { toast('复制失败（浏览器剪贴板权限）', true); }
+  };
+  $('#lgDownload').onclick = () => {
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `lcb-logs-${$('#lgFrom').value || 'start'}-${$('#lgTo').value || 'end'}.log`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  await loadRange();
+}
+
+// ============ 页面 ============
 export const page = {
   id: 'overview',
   title: '概览',
+  desc: '桥接器运行状态、版本与快捷入口',
   icon: '<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
   async render(el) {
     const st = S.status || {};
-    const claudeTag = st.claude?.hasAuth === null ? '<span class="tag off">未知</span>'
-      : st.claude?.hasAuth ? '<span class="tag ok">已就绪</span>' : '<span class="tag err">未认证</span>';
     const stale = !st.bridge; // 旧版本进程（API 无 bridge 字段）：进程托管功能整体不可用
     const br = stale ? { running: st.embedded === true, pid: null, spawnable: false } : st.bridge;
-    const ctl = stale
-      ? '<div class="hint" style="margin-top:10px">⚠️ 配置页服务进程为旧版本，页面启停 / 重启 / 更新不可用：请重启桥接器（lcb start）后刷新本页。</div>'
+    const claudeReady = st.claude?.hasAuth !== false && st.claude?.hasAuth !== null;
+    const tile = ({ dot, dstate, name, sub, icon, actions = '', id = '' }) => `
+      <div class="tile"${id ? ` id="${id}"` : ''}>
+        <div class="tile-top"${id ? ` id="${id}Top"` : ''}><span class="dot ${dot}"></span><span class="tile-state" style="color:var(--${dot}-tx)">${dstate}</span><span class="tile-ico">${svg(icon, 16)}</span></div>
+        <div class="tile-name">${name}</div>
+        <div class="tile-sub"${id ? ` id="${id}Sub"` : ''} title="${esc(sub)}">${sub}</div>
+        <div class="tile-actions">${actions}</div>
+      </div>`;
+    const brCtl = stale
+      ? '<span class="hint">进程为旧版本，启停不可用</span>'
       : br.spawnable === false
-      ? '<div class="hint" style="margin-top:10px">当前运行方式不支持页面托管启停（如源码运行），请在服务器上手动运行 lcb start。</div>'
-      : `<div style="display:flex; gap:10px; margin-top:12px">${
-          br.running
-            ? '<button class="btn" id="btnBrRestart">重启</button><button class="btn danger" id="btnBrStop">停止</button>'
-            : '<button class="btn primary" id="btnBrStart">启动</button>'
-        }</div>
-        <div class="hint" style="margin-top:8px">${st.embedded
-          ? '本页随桥接器进程运行：停止后页面将离线（可运行 lcb ui 重开）；重启会短暂失联后自动恢复。'
-          : '本页独立运行（lcb ui）：在此启动的桥接器为后台进程，运行日志见 ~/.lark-claudecode-bridge/bridge.log。'}</div>`;
+        ? '<span class="hint">当前运行方式不支持页面托管启停</span>'
+        : br.running
+          ? '<button class="btn" id="btnBrRestart">重启</button><button class="btn danger" id="btnBrStop">停止</button>'
+          : '<button class="btn primary" id="btnBrStart">启动</button>';
     el.innerHTML = `
-    <div class="card">
-      <h3>运行状态</h3>
-      <table>
-        <tr><td>版本</td><td>v${esc(st.version)}</td></tr>
-        <tr><td>模式</td><td>${st.embedded ? '随 lcb start 常驻' : 'lcb ui 独立（桥接器未随本页启动）'}</td></tr>
-        <tr><td>桥接器进程</td><td>${stale
-          ? (st.embedded ? '<span class="tag warn">运行中（旧版本进程）</span>' : '<span class="tag off">状态未知（旧版本进程）</span>')
-          : br.running
-            ? `<span class="tag ok">运行中</span> <span class="hint">PID ${esc(br.pid)}</span>`
-            : '<span class="tag off">未运行</span>'}</td></tr>
-        <tr><td>配置文件</td><td><code>${esc(st.configPath)}</code></td></tr>
-        <tr><td>配置页</td><td><code>${esc(location.host)}</code></td></tr>
-        <tr><td>Claude 认证</td><td>${claudeTag}（模式：${esc(st.claude?.mode || 'inherit')}）</td></tr>
-        <tr><td>开机自启</td><td id="asStat"><span class="hint">检测中…</span></td></tr>
-      </table>
-      ${ctl}
-      <div class="desc" style="margin-top:10px">${st.claude?.hasAuth === false ? '⚠️ 未检测到认证：到「Claude 认证」页填写，或在配置页所在机器执行 claude login。' : ''}</div>
+    <div class="tiles">
+      ${tile({
+        dot: br.running ? 'ok' : 'off',
+        dstate: br.running ? '运行中' : (stale && st.embedded ? '运行中（旧版本）' : '未运行'),
+        name: '桥接器进程',
+        sub: br.running ? `PID ${br.pid ?? '?'} · ${st.embedded ? '随 lcb start 常驻' : '独立页面托管'}` : (st.embedded ? '随 lcb start 常驻' : '独立页面托管'),
+        icon: IC.apps,
+        actions: brCtl,
+      })}
+      ${tile({
+        dot: claudeReady ? 'ok' : 'err',
+        dstate: st.claude?.hasAuth === null ? '未知' : claudeReady ? '已就绪' : '未认证',
+        name: 'Claude 认证',
+        sub: `${st.claude?.mode === 'managed' ? 'bridge 托管' : '继承本机'} · ${esc(st.claude?.current?.model || 'CLI 默认')}`,
+        icon: IC.claude,
+        actions: '<button class="btn" data-go="claude">管理</button>',
+      })}
+      ${tile({
+        dot: 'off',
+        dstate: '检测中',
+        name: '飞书 CLI',
+        sub: '安装 / 授权状态检测中…',
+        icon: IC.zap,
+        actions: '<button class="btn" id="tileCliAuth">授权</button>',
+        id: 'tileCli',
+      })}
+      ${tile({
+        dot: 'off',
+        dstate: '检测中',
+        name: '记忆增强',
+        sub: 'OpenViking 记忆服务检测中…',
+        icon: IC.memory,
+        actions: '<button class="btn" data-go="memory">管理</button>',
+      })}
     </div>
-    <div class="card">
-      <h3>版本与更新</h3>
-      <div class="card-sub">
-        <h4 class="card-sub-title">▍LCB 桥接器</h4>
-        <table>
-          <tr><td>当前版本</td><td><span class="chip">v${esc(st.version)}</span></td></tr>
-          <tr><td>最新版本</td><td id="updLatest"><span class="hint">未检查</span></td></tr>
-        </table>
-        <div style="display:flex; gap:10px; margin-top:12px; align-items:center">
-          <button class="btn" id="btnUpdCheck">检查更新</button>
-          <span id="updArea"></span>
+
+    <div class="grid2" style="gap:16px;align-items:stretch">
+      <div class="panel" style="margin:0">
+        <header class="panel-head"><h3>LCB 桥接器 · 版本与更新</h3>
+          <div class="panel-actions" id="updLatest"><span class="hint">未检查</span></div>
+        </header>
+        <div class="panel-body">
+          <table class="kv">
+            <tr><td>当前版本</td><td><span class="chip">v${esc(st.version)}</span></td></tr>
+            <tr><td>运行模式</td><td>${st.embedded ? '随 lcb start 常驻' : 'lcb ui 独立页面'}</td></tr>
+            <tr><td>配置文件</td><td><code>${esc(st.configPath)}</code></td></tr>
+            <tr><td>开机自启</td><td id="asStat"><span class="hint">检测中…</span></td></tr>
+          </table>
+          <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+            <button class="btn sm" id="btnUpdCheck">检查更新</button>
+            <span id="updArea"></span>
+          </div>
         </div>
       </div>
-      <div class="card-sub">
-        <h4 class="card-sub-title">▍飞书 CLI（lark-cli）</h4>
-        <table>
-          <tr><td>状态</td><td id="larkCliStat"><span class="hint">检测中…</span></td></tr>
-        </table>
+      <div class="panel" style="margin:0">
+        <header class="panel-head"><h3>飞书 CLI · 版本与更新</h3>
+          <div class="panel-actions"><button class="btn sm" id="btnCliCheck">检查更新</button></div>
+        </header>
+        <div class="panel-body">
+          <table class="kv">
+            <tr><td>当前状态</td><td id="larkCliStat"><span class="hint">检测中…</span></td></tr>
+          </table>
+          <div class="mini-note" style="margin-top:10px">飞书官方 CLI（@larksuite/cli）负责设备授权与应用配置；与 LCB 桥接器的更新相互独立、各走各的按钮。</div>
+        </div>
       </div>
     </div>
-    <div class="card">
-      <h3>常用命令</h3>
-      <div class="desc">在飞书聊天框输入 <code>/</code> 触发；其它 / 开头消息原文透传给 Claude Code。斜杠面板需先到「斜杠命令」页注册（补齐内置命令）。</div>
-      <table><thead><tr><th style="width:150px">命令</th><th>说明</th></tr></thead><tbody>
-      ${(st.commands || []).map((c) => `<tr><td><code>/${esc(c.command)}</code></td><td>${esc(c.description)}</td></tr>`).join('') || '<tr><td colspan="2" class="hint">无</td></tr>'}
-      </tbody></table>
+
+    <div class="panel" style="margin-top:16px">
+      <header class="panel-head"><h3>飞书快捷指令</h3>
+        <div class="panel-actions"><button class="btn sm" data-go="slash">管理命令 →</button></div>
+      </header>
+      <div class="panel-body" style="padding-top:8px">
+        <div style="display:flex;flex-wrap:wrap;gap:8px">
+          ${(st.commands || []).map((c) => `<span class="chip src" style="font-size:12.5px;padding:4px 12px">/${esc(c.command)}<span class="mut" style="margin-left:4px">${esc(c.description)}</span></span>`).join('')}
+        </div>
+        <div class="mini-note" style="margin-top:10px">在飞书聊天框输入 / 触发；其它 / 开头的消息原文透传给 Claude Code。</div>
+      </div>
     </div>
-    <div class="card">
-      <h3>常用指引</h3>
-      <div class="desc">飞书端与机器人对话即可使用；<code>/help</code> 查看全部命令。配置修改后：<b>应用 / 认证 / server 段需重启 lcb start</b>，工作区 / 权限 / 触发词下一条消息自动生效。</div>
+
+    <div class="panel">
+      <header class="panel-head"><h3>常用指引</h3></header>
+      <div class="panel-body">
+        <div class="mini-note">飞书端与机器人对话即可使用；<code>/help</code> 查看全部命令。配置修改后：<b>应用 / 认证 / server 段需重启 lcb start</b>，工作区 / 权限 / 触发词下一条消息自动生效。${st.claude?.hasAuth === false ? '<br>⚠️ 未检测到 Claude 认证：到「Claude 认证」页配置，或在配置页所在机器执行 claude login。' : ''}</div>
+      </div>
     </div>`;
-    // 启停按钮 + 版本更新 + 飞书 CLI 状态；自动检查 30s 节流（切回概览 tab 不重复打 npm）
+    $('#pageActions').innerHTML = `<button class="btn primary" id="btnOpenLog">${svg(IC.file, 14)} 查看日志</button>`;
+    // 页头按钮在 #view 之外，需单独绑定（绑在 #view 委托上会因不在容器内而永远收不到事件）
+    $('#btnOpenLog').onclick = () => void logViewer();
+
+    // ---- 瓦片与跳转 ----
+    el.querySelectorAll('[data-go]').forEach((b) => b.onclick = () => { location.hash = b.dataset.go; });
     const bind = (id, fn) => { const b = $(id); if (b) b.onclick = fn; };
     bind('#btnBrStart', startFlow); bind('#btnBrStop', stopFlow); bind('#btnBrRestart', restartFlow);
     bind('#btnUpdCheck', doCheckUpdate);
+    bind('#btnCliCheck', () => void doCheckLarkCli());
+    $('#tileCliAuth').onclick = () => (
+      LARKCLI.data && !LARKCLI.data.installed ? void larkCliActionFlow('install') : openDeviceDialog()
+    );
+    // 自动检查 30s 节流（切回概览 tab 不重复打 npm）
     if (UPD.data && Date.now() - UPD.checkedAt < 30000) renderUpdateResult();
     else doCheckUpdate();
     if (LARKCLI.data && Date.now() - LARKCLI.checkedAt < 30000) renderLarkCliResult();
-    else doCheckLarkCli();
+    else void doCheckLarkCli();
     void renderAutostart();
+
+    // ---- 记忆增强瓦片：异步补状态（失败静默保留「检测中」） ----
+    void (async () => {
+      let ms = null;
+      try { ms = await api('GET', '/api/memory/status'); } catch { /* 首装/服务未装：瓦片保持未就绪 */ }
+      const tileEl = [...el.querySelectorAll('.tile')].find((t) => t.querySelector('.tile-name')?.textContent === '记忆增强');
+      if (!tileEl) return;
+      const m = ms?.memory || {};
+      const healthy = !!ms?.health?.healthy;
+      const dot = m.enabled === false ? 'off' : healthy ? 'ok' : 'warn';
+      const dstate = m.enabled === false ? '已停用' : healthy ? '运行中' : '服务异常';
+      const sub = healthy ? `OpenViking · ${m.endpoint || ''}` : (m.enabled === false ? '未启用（可在记忆增强页开启）' : '未就绪——到记忆增强页检查或启动');
+      tileEl.querySelector('.tile-top').innerHTML = `<span class="dot ${dot}"></span><span class="tile-state" style="color:var(--${dot}-tx)">${dstate}</span><span class="tile-ico">${svg(IC.memory, 16)}</span>`;
+      const subEl = tileEl.querySelector('.tile-sub');
+      subEl.textContent = sub;
+      subEl.title = sub;
+    })();
   },
 };

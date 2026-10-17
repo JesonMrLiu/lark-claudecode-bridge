@@ -58,16 +58,17 @@ export async function refresh() {
   try {
     S.doc = await api('GET', '/api/config');
     S.firstRun = false;
-    $('#hFirstRun').textContent = '';
   } catch (e) {
     if (String(e.message).includes('bootstrap')) {
       S.firstRun = true;
       S.doc = null;
-      $('#hFirstRun').textContent = '首次安装向导';
     } else { throw e; }
   }
   const st = S.status || {};
-  $('#hMeta').textContent = `v${st.version || '?'} · ${location.host}`;
+  const hv = $('#hVer');
+  const hh = $('#hHost');
+  if (hv) { hv.textContent = `v${st.version || '?'}`; hv.hidden = false; }
+  if (hh) { hh.textContent = S.firstRun ? `${location.host} · 首次安装向导` : location.host; hh.hidden = false; }
   // 版本错位检测：静态页每次现读磁盘（新），API 属于运行中进程（旧）——status 无 bridge
   // 字段说明进程早于「页面托管启停」功能，提示重启而非让用户撞「未知端点」
   $('#staleBar').hidden = !(S.status && S.status.bridge === undefined);
