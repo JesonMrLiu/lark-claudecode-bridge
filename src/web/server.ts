@@ -29,11 +29,12 @@ import { ensureRuntimeDirs } from '../util/runtime-dirs.js';
 import { builtinCommands, createSlashApiClient, ensureBuiltins, expectedCommands, syncSlashCommands } from '../feishu/slash-commands.js';
 import { refreshMarketplaceIndex, removeMarketplaceIfUnused, resolvePluginMarketplace, runPluginCli, updateAllPlugins } from '../executor/plugin-manager.js';
 import { invalidatePluginCache, listAvailablePlugins, listInstalledPlugins, loadEnabledPlugins } from '../executor/plugin-discovery.js';
-import { bridgeStatus, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDetached, stopBridgeByPid } from './lifecycle.js';
+import { bridgeStatus, probePortOccupier, resolveLcbEntry, restartBridgeWithHelper, spawnBridgeDetached, stopBridgeByPid } from './lifecycle.js';
 import { getAutostartStatus, setAutostartEnabled } from './autostart.js';
 import { checkUpdate, hasNewerVersion, installMode, runUpdate } from './update.js';
 import { memoryStatus, testMemoryConnection } from './memory-api.js';
-import { chatsTree, chatTopics, chatTimeline } from './chats-api.js';
+import { chatsTree, chatTopics, chatTimeline, fetchUserNames } from './chats-api.js';
+import { AccessControl } from '../access/access-control.js';
 import {
   authMeta, authThrottleState, changePassword, clearAuthFailures, clearSessionCookie, createSession,
   dropOtherSessions, dropSession, readSessionToken, registerAuthFailure, resetPasswordToDefault,
@@ -212,19 +213,17 @@ export function shouldShowTunnelHint(host: string): boolean {
   return process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
 }
 
-/** EADDRINUSE 报错文案：探测占用者身份（是否旧 lcb 配置页进程）+ 按平台给排查命令。
+/** EADDRINUSE 报错文案：探测占用者身份（是否旧 lcb 进程 + PID）+ 按平台给排查命令。
  * 裸 Node 错误（listen EADDRINUSE :::17317）对首装用户完全不可操作 */
 async function friendlyAddrInUse(host: string, port: number): Promise<string> {
-  const disp = host === '::1' ? '[::1]' : host;
+  void host; // 占用者探测固定走回环（probePortOccupier 内部 127.0.0.1），host 仅保留签名兼容
   let occupier = '';
-  try {
-    const res = await fetch(`http://${disp}:${port}/api/status`, { signal: AbortSignal.timeout(2000) });
-    // 401 也带 version（鉴权网关对 /api/status 特批附版本）：加锁后的新进程仍可被识别
-    const st = await res.json().catch(() => null) as { version?: string } | null;
-    if (st && typeof st.version === 'string') {
-      occupier = `（占用者疑似旧 lcb 配置页进程 v${st.version}——npm 更新后旧进程未退出，需手动结束）`;
-    }
-  } catch { /* 探测失败/非 lcb 服务：走通用文案 */ }
+  const occ = await probePortOccupier(port).catch(() => null);
+  if (occ?.isLcb) {
+    // 401 也带 version（鉴权网关对 /api/status 特批附版本）：加锁后的旧进程仍可被识别；
+    // PID 直取占用者自报（顶层 pid），lcb start 的启动清场（freeLcbOccupiedPort）据此自动接管
+    occupier = `（占用者疑似旧 lcb 进程 v${occ.version}${occ.pid ? `，PID ${occ.pid}` : ''}——npm 更新后旧进程未退出，需手动结束）`;
+  }
   const probe = process.platform === 'win32'
     ? `netstat -ano | findstr :${port} 查 PID、taskkill /F /PID <pid> 停止`
     : process.platform === 'darwin'
@@ -306,8 +305,9 @@ async function handle(
     // 顺带让 `lcb reset-password` 的改密对运行中的进程即时生效）
     const okSession = !!sessionToken && touchSession(sessionToken, authMeta(configPath).lockMinutes);
     if (!okSession) {
-      // /api/status 在 401 里特批附 version：EADDRINUSE 端口占用探测靠它识别运行中的 lcb
-      if (path === '/api/status') return json(res, 401, { error: '配置页已锁定', version: VERSION });
+      // /api/status 在 401 里特批附 version+pid：EADDRINUSE 端口占用探测靠它们识别运行中的
+      // lcb 并定位 PID（freeLcbOccupiedPort 自动清场、friendlyAddrInUse 报文案）
+      if (path === '/api/status') return json(res, 401, { error: '配置页已锁定', version: VERSION, pid: process.pid });
       return json(res, 401, { error: '配置页已锁定，请先解锁' });
     }
   }
@@ -438,6 +438,9 @@ async function handle(
     }
     return json(res, 200, {
       version: VERSION, uptimeMs: Date.now() - startedAt, configPath: ctx.configPath,
+      // 顶层 pid=应答进程自身：前端重启判定/端口占用探测（freeLcbOccupiedPort）直接取用，
+      // 不必回退 netstat 反查。与 bridge.pid（PID 文件内容）区分：独立模式下两者可能不同
+      pid: process.pid,
       firstRun, embedded: ctx.embedded,
       bridge: { ...bridgeStatus(), spawnable: resolveLcbEntry().ok },
       server: { host: ctx.host, port: ctx.port },
@@ -1226,6 +1229,60 @@ async function handle(
     });
     killTree();
     return json(res, 200, result);
+  }
+  // ---- 接入申请（配对授权）：配置页「权限 → 接入申请」。数据层直读/直写 access.json——
+  // 桥内 AccessControl 每条消息前 reload，此处批准/拒绝后用户下一条消息即放行；
+  // 终端 lcb pair 双通道并存。申请人真名按 appId 借网关通讯录解析（失败降级原始 id） ----
+  if (path === '/api/access/pending' && req.method === 'GET') {
+    const items = AccessControl.load(join(CONFIG_DIR, 'access.json')).listPendingDetailed();
+    const byApp = new Map<string, string[]>();
+    for (const it of items) {
+      if (!it.appId) continue;
+      byApp.set(it.appId, [...(byApp.get(it.appId) ?? []), it.userId]);
+    }
+    const names = new Map<string, string>();
+    for (const [appId, ids] of byApp) {
+      try {
+        for (const [uid, n] of await fetchUserNames(appId, ids)) names.set(uid, n);
+      } catch { /* 解析失败降级原始 id 展示 */ }
+    }
+    let appNames = new Map<string, string>();
+    try {
+      appNames = new Map((loadConfig(ctx.configPath)?.apps ?? []).map((a) => [a.appId, a.name || a.appId]));
+    } catch { /* 配置损坏降级 appId */ }
+    return json(res, 200, {
+      pending: items.map((it) => {
+        const n = names.get(it.userId);
+        return {
+          userId: it.userId,
+          name: it.name,
+          code: it.code,
+          appId: it.appId,
+          appName: it.appId ? appNames.get(it.appId) : undefined,
+          displayName: n && n !== it.userId ? n : undefined,
+          expiresAt: it.expiresAt,
+          expiresInSec: Math.max(0, Math.round((it.expiresAt - Date.now()) / 1000)),
+        };
+      }),
+    });
+  }
+  if (path === '/api/access/pending/approve' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const code = String(body.code ?? '').trim();
+    if (!/^\d{6}$/.test(code)) return json(res, 400, { error: '配对码格式不正确（6 位数字）' });
+    const r = AccessControl.load(join(CONFIG_DIR, 'access.json')).approvePairing(code);
+    if (!r.ok) return json(res, 404, { error: r.error ?? '配对码无效或已过期' });
+    console.log(`[配对] 配置页批准配对码 ${code}（用户 ${r.userId}${r.isFirstAdmin ? '，成为 admin' : '，member'}）`);
+    return json(res, 200, { ok: true, userId: r.userId, isFirstAdmin: r.isFirstAdmin });
+  }
+  if (path === '/api/access/pending/reject' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const code = String(body.code ?? '').trim();
+    if (!/^\d{6}$/.test(code)) return json(res, 400, { error: '配对码格式不正确（6 位数字）' });
+    const ok = AccessControl.load(join(CONFIG_DIR, 'access.json')).rejectPairing(code);
+    if (!ok) return json(res, 404, { error: '配对码无效或已过期' });
+    console.log(`[配对] 配置页拒绝配对码 ${code}`);
+    return json(res, 200, { ok: true });
   }
   // ---- 桥接器进程启停（页面托管）。embedded 与 lcb ui 独立模式语义不同：embedded 停止/重启
   // 会连带本页所在进程，先回响应再走 selfStop 优雅关闭；独立模式经 PID 文件跨进程操作 ----

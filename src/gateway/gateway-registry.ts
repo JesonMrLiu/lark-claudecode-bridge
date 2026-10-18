@@ -20,3 +20,8 @@ export function registerChatInfoSource(appId: string, requester: FeishuRequester
 export function getChatInfoSource(appId: string): FeishuRequester | undefined {
   return sources.get(appId);
 }
+
+/** 全部已注册请求口（appId → requester）：兄弟应用桥遍历其他应用解析通讯录范围外用户真名用 */
+export function listChatInfoSources(): Array<[string, FeishuRequester]> {
+  return [...sources.entries()];
+}

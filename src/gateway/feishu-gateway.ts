@@ -4,6 +4,8 @@ import { basename, join } from 'node:path';
 import type { CardDecision, FeishuAppConfig, GatewayHandlers, IncomingMessage, RejectedMessage } from '../types.js';
 import { INBOX_DIR } from '../config.js';
 import { buildImageCard, buildTextCard } from './card-builder.js';
+import { getCachedUserName, getCachedUserUnion, putCachedUserName, putCachedUserUnion } from '../feishu/name-cache.js';
+import { resolveNamesByUnionViaSiblings } from '../feishu/sibling-names.js';
 import { isImageFile } from '../util/file-types.js';
 import type { Redactor } from '../security/redact.js';
 import { CANARY_ALERT_TEXT, type SecurityEvent } from '../security/audit.js';
@@ -98,7 +100,7 @@ interface RawMessagePayload {
     parent_id?: string;
     mentions?: Array<{ key?: string; id?: { open_id?: string } }>;
   };
-  sender?: { sender_id?: { open_id?: string } };
+  sender?: { sender_id?: { open_id?: string; union_id?: string } };
 }
 
 /** post 富文本节点（拍平时只取关心的 tag，其余跳过） */
@@ -233,12 +235,14 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
     }
     const userId = payload?.sender?.sender_id?.open_id;
     if (!userId) return null;
+    const unionId = payload?.sender?.sender_id?.union_id;
     return {
       chatId: m.chat_id,
       chatType: isGroup ? 'group' : 'p2p',
       userId,
       text: stripMention(text),
       messageId: m.message_id,
+      ...(unionId ? { unionId } : {}),
       ...(m.parent_id ? { parentId: m.parent_id } : {}),
       ...(imageKeys.length > 0 ? { imageKeys } : {}),
       ...(files.length > 0 ? { files } : {}),
@@ -567,6 +571,13 @@ export class FeishuGateway {
           return;
         }
         const parsed = parseIncomingMessage(data, botOpenId, { strictGroupMention: this.strictGroupMention });
+        // 发送者 union_id 落盘索引（幂等零重写）：兄弟应用桥解析通讯录范围外用户真名的桥接键；
+        // 新 union 到手时清该 id 的失败短缓存——下一条消息/下一次树渲染立即可重试解析
+        if (parsed && !('rejected' in parsed) && parsed.unionId
+          && getCachedUserUnion(this.cfg.appId, parsed.userId) !== parsed.unionId) {
+          putCachedUserUnion(this.cfg.appId, parsed.userId, parsed.unionId);
+          this.userNameCache.delete(parsed.userId);
+        }
         if (parsed && 'rejected' in parsed) {
           // 不支持的消息类型（p2p）：明确反馈而非静默蒸发；提示发送失败不影响主流程
           if (parsed.rejected.chatType === 'p2p') {
@@ -652,6 +663,108 @@ export class FeishuGateway {
   /** 以卡片形态发送 markdown 文本（宽度跟随 cardWidth getter） */
   async sendText(chatId: string, markdown: string): Promise<string> {
     return this.sendCard(chatId, buildTextCard(markdown, this.cardWidth()));
+  }
+
+  /**
+   * 按 open_id 主动私聊发文本卡（配对码私发管理员等「机器人发起单聊」场景）。
+   * 与 sendText 同一凭证同一接口，仅 receive_id_type 换 open_id——需要机器人与该用户
+   * 存在可见关系（同租户即可，无需先成为好友）；失败由调用方捕获降级（日志留码）
+   */
+  async sendTextToUser(openId: string, markdown: string): Promise<string> {
+    const safe = this.sanitizeCard(openId, buildTextCard(markdown, this.cardWidth()));
+    // 走原始 request：SDK 的 im.message.create 类型把 receive_id_type 锁死为 'chat_id'，
+    // open_id 形态与 cardkit 实体模式（sendCardEntity）同款绕行
+    const res = await this.client.request({
+      method: 'POST',
+      url: '/open-apis/im/v1/messages?receive_id_type=open_id',
+      data: { receive_id: openId, msg_type: 'interactive', content: JSON.stringify(stripMessageChannelUnsupportedProps(safe)) },
+    });
+    const messageId = (res.data as { message_id?: string } | undefined)?.message_id;
+    if (res.code !== 0 || !messageId) throw new Error(`私聊发送失败: ${JSON.stringify(res)}`);
+    return messageId;
+  }
+
+  /**
+   * 批量解析 open_id → 飞书姓名（contact batch，需 contact:user.base:readonly）。
+   * 成功缓存 24h、失败短缓存 10 分钟（权限补开后十分钟自动恢复真名）；未返回的 id 同样落
+   * 失败缓存防重打。与 web 层 chats-api 的同名解析相互独立（各自缓存，只读低频不叠加压力）
+   */
+  private readonly userNameCache = new Map<string, { name?: string; at: number }>();
+
+  async resolveUserNames(openIds: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    const need: string[] = [];
+    for (const id of openIds) {
+      const diskName = getCachedUserName(this.cfg.appId, id);
+      if (diskName) { out.set(id, diskName); continue; } // 磁盘持久缓存（与 chats-api 同库共用）
+      const hit = this.userNameCache.get(id);
+      if (hit && Date.now() - hit.at < 600_000) continue; // 失败短缓存：10 分钟后自动重试
+      need.push(id);
+    }
+    if (!need.length) return out;
+    const attempted = [...need]; // 本轮已尝试 contact 的 id 快照：兄弟桥的候选（失败缓存是 contact 阶段才打的，不能反过来堵同轮的兄弟桥）
+    /** 飞书 v3 user 对象标识字段是 open_id（无 user_id 字段，同 chats-api 修复口径） */
+    const absorb = (items: unknown, batch: string[]): boolean => {
+      if (!Array.isArray(items)) return false;
+      const got = new Set<string>();
+      for (const it of items as Array<{ user_id?: unknown; open_id?: unknown; name?: unknown }>) {
+        const uid = typeof it.open_id === 'string' && it.open_id ? it.open_id : it.user_id;
+        const name = it.name;
+        if (typeof uid === 'string' && typeof name === 'string' && name) {
+          putCachedUserName(this.cfg.appId, uid, name); // 成功态落磁盘持久缓存
+          out.set(uid, name);
+          got.add(uid);
+        }
+      }
+      for (const id of batch) if (!got.has(id)) this.userNameCache.set(id, { at: Date.now() });
+      return true;
+    };
+    const query = async (batch: string[]): Promise<void> => {
+      const qs = batch.map((id) => `user_ids=${encodeURIComponent(id)}`).join('&');
+      let ok = false;
+      try {
+        const res = await this.client.request({
+          method: 'GET',
+          url: `/open-apis/contact/v3/users/batch?user_id_type=open_id&${qs}`,
+        });
+        const items = res.code === 0 ? (res.data as { items?: unknown } | undefined)?.items : undefined;
+        ok = absorb(items, batch);
+      } catch { /* open_id 跨应用(99992361) 整批被拒：走下方逐个回退 */ }
+      if (!ok && batch.length > 1) {
+        for (const id of batch) await query([id]); // 逐个回退隔离坏 id
+      } else if (!ok) {
+        for (const id of batch) this.userNameCache.set(id, { at: Date.now() });
+      }
+    };
+    for (let i = 0; i < need.length; i += 50) {
+      await query(need.slice(i, i + 50));
+    }
+    // 兄弟应用桥兜底：通讯录权限范围外用户（接入申请人常态），直查拿不到的缺口 id
+    // 用已落盘的 union_id 借兄弟应用凭证解析（实测分身应用可查到主应用范围外用户）。
+    // ⚠️ 候选只看「本轮 contact 已尝试仍缺名」的 id——不能查失败缓存（absorb 刚在 contact
+    // 阶段打过，查了会把同轮兄弟桥完全堵死，2026-10-18 实测复现过）；跨轮节流由失败缓存
+    // 天然承担（下轮 need 直接跳过，到不了这里）。兄弟也查不到 → 失败缓存已在 absorb 落好；
+    // 无 union 索引的不动失败缓存（后续消息事件带来 union 时即清缓存立即可重试）
+    const missing = attempted.filter((id) => !out.has(id));
+    if (missing.length) {
+      const unions = new Map<string, string>();
+      for (const id of missing) {
+        const u = getCachedUserUnion(this.cfg.appId, id);
+        if (u) unions.set(id, u);
+      }
+      if (unions.size) {
+        try {
+          const got = await resolveNamesByUnionViaSiblings(this.cfg.appId, unions);
+          for (const [id, name] of got) {
+            putCachedUserName(this.cfg.appId, id, name);
+            out.set(id, name);
+            this.userNameCache.delete(id);
+          }
+          for (const id of unions.keys()) if (!got.has(id)) this.userNameCache.set(id, { at: Date.now() });
+        } catch { /* 桥失败不影响已解析结果 */ }
+      }
+    }
+    return out;
   }
 
   /** 更新已发送卡片（流式进度刷新；消息卡通道：入口剥离 cardkit 专属属性）。

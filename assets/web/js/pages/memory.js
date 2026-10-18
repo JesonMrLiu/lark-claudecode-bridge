@@ -833,14 +833,15 @@ function renderUsersTab(el, { st, m }) {
 
 /** 粒度向导卡（方案 §六：默认 bot 级；「升级到 bot×人」开关 = 增量升级意向，不动既有 key 与记忆） */
 const granularityCardHtml = (gran) => `
-  <div class="card" style="margin-top:14px">
+  <div class="card" style="margin-top:14px;">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       <b style="font-size:13.5px">记忆粒度</b>
       <span class="hint">${gran === 'bot-user' ? '已选择：bot × 人（每位聊天者独立空间）' : '当前：每 bot 一把密钥（默认，单机自用零损失）'}</span>
       <span style="flex:1"></span>
       <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
-        <span class="hint">升级到 bot×人</span>
-        <label class="switch"><input type="checkbox" id="memGran" ${gran === 'bot-user' ? 'checked' : ''}><span class="track"></span></label>
+        <span class="hint">升级到 bot×人（暂不支持升级）</span>
+        <!-- 我暂时把这个开关关掉，暂时不开放开启 -->
+        <!--<label class="switch"><input type="checkbox" id="memGran" ${gran === 'bot-user' ? 'checked' : ''}><span class="track"></span></label>-->
       </label>
     </div>
     <div class="hint" style="margin-top:8px;line-height:1.8">升级属<b>增量演进</b>：不影响既有密钥与记忆、会话不中断，仅为新聊天者追加独立签发。

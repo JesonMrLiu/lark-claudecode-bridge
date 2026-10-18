@@ -1,6 +1,6 @@
-// ============ 权限（页内一级 tab：免确认工具 / 危险命令黑名单） ============
+// ============ 权限（页内一级 tab：免确认工具 / 危险命令黑名单 / 接入申请） ============
 // 改动即时保存并热生效；「全部工具免确认」缺省开启（显式 false 才算关闭），开启时黑名单是唯一安全网。
-import { S, $, esc, toast, saveDoc } from '../core.js';
+import { S, $, esc, toast, saveDoc, api } from '../core.js';
 import { confirmDialog } from '../ui.js';
 
 const svg = (inner, s = 14) => `<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
@@ -15,13 +15,92 @@ function renderPermissions(el) {
   <div class="tabs">
     <button data-t="allow" class="${permTab === 'allow' ? 'active' : ''}">免确认工具</button>
     <button data-t="danger" class="${permTab === 'danger' ? 'active' : ''}">危险命令黑名单 <span class="tag off" style="margin-left:4px">${p.dangerous_commands.length}</span></button>
+    <button data-t="pair" class="${permTab === 'pair' ? 'active' : ''}">接入申请 <span class="tag off" style="margin-left:4px" id="pairCount">…</span></button>
   </div>
   <div id="permPanel"></div>`;
   el.querySelectorAll('.tabs button').forEach((b) =>
     b.onclick = () => { permTab = b.dataset.t; renderPermissions(el); });
   const panel = $('#permPanel');
   if (permTab === 'danger') renderDangerTab(panel, p);
+  else if (permTab === 'pair') renderPairTab(panel);
   else renderAllowTab(panel, p);
+  if (permTab !== 'pair') void refreshPairCount(); // 徽标数量任何 tab 下都保持新鲜
+}
+
+/** 接入申请徽标数量（tab 头）；面板不存在时静默退出（页面已切换） */
+async function refreshPairCount() {
+  let n = 0;
+  try { n = (await api('GET', '/api/access/pending')).pending.length; } catch { /* 失联：保持原样 */ }
+  const el = $('#pairCount');
+  if (el) { el.textContent = String(n); el.className = `tag ${n > 0 ? 'warn' : 'off'}`; }
+  return n;
+}
+
+// ============ 接入申请 tab：配对授权（码不再发到来话群，私发管理员 + 此处审批） ============
+let pairPollTimer = null;
+function renderPairTab(panel) {
+  if (pairPollTimer) { clearInterval(pairPollTimer); pairPollTimer = null; }
+  panel.innerHTML = `
+  <div class="panel">
+    <header class="panel-head"><h3>接入申请</h3>
+      <div class="panel-actions">
+        <span class="tip" data-tip="未知用户私聊/群里艾特机器人时，配对码私聊发给管理员并出现在这里；批准后立即生效，也可忽略（15 分钟自动过期）">${svg(IC_INFO)}</span>
+        <button class="btn sm" id="pairRefresh">↻ 刷新</button>
+      </div></header>
+    <div class="panel-body">
+      <div id="pairList"><span class="hint">加载中…</span></div>
+    </div>
+    <footer class="panel-foot">批准 = 该用户获得使用权限（member）；不批准可忽略，申请 15 分钟后自动过期。终端 <code>lcb pair &lt;码&gt;</code> 双通道并存。配对码私聊发给当前配置的管理员（该机器人最早的使用者），不再发到来话群。</footer>
+  </div>`;
+  $('#pairRefresh').onclick = () => void loadPairList();
+  void loadPairList();
+  pairPollTimer = setInterval(() => { if (panel.isConnected) void loadPairList(true); else { clearInterval(pairPollTimer); pairPollTimer = null; } }, 30_000);
+}
+
+async function loadPairList(silent = false) {
+  const box = $('#pairList');
+  if (!box) return;
+  try {
+    const { pending } = await api('GET', '/api/access/pending');
+    await refreshPairCount();
+    if (!box.isConnected) return;
+    if (!pending.length) {
+      box.innerHTML = '<div class="banner ok" style="margin:6px 0"><span>暂无接入申请。未知用户联系机器人时会自动出现在这里（配对码同时私聊发给管理员）。</span></div>';
+      return;
+    }
+    box.innerHTML = `<table><thead><tr><th>申请人</th><th>机器人</th><th>配对码</th><th>剩余有效期</th><th style="width:170px">操作</th></tr></thead>
+      <tbody>${pending.map((it) => `
+        <tr>
+          <td><b>${esc(it.displayName || it.name)}</b>${it.displayName && it.displayName !== it.name ? ` <span class="hint" style="font-size:11px">${esc(it.name)}</span>` : ''}</td>
+          <td>${esc(it.appName || it.appId || '—')}</td>
+          <td><code>${esc(it.code)}</code></td>
+          <td>${it.expiresInSec > 60 ? `${Math.floor(it.expiresInSec / 60)} 分钟` : '<span class="tag warn">即将过期</span>'}</td>
+          <td style="display:flex;gap:6px">
+            <button class="btn sm primary" data-act="approve" data-code="${esc(it.code)}" data-name="${esc(it.displayName || it.name)}">授权</button>
+            <button class="btn sm danger" data-act="reject" data-code="${esc(it.code)}" data-name="${esc(it.displayName || it.name)}">拒绝</button>
+          </td>
+        </tr>`).join('')}</tbody></table>`;
+    box.querySelectorAll('button[data-act]').forEach((b) => {
+      b.onclick = async () => {
+        const approve = b.dataset.act === 'approve';
+        if (!(await confirmDialog({
+          title: approve ? '批准接入申请' : '拒绝接入申请',
+          message: approve
+            ? `确定批准 <b>${esc(b.dataset.name)}</b> 使用机器人？批准后对方即可开始对话。`
+            : `确定拒绝 <b>${esc(b.dataset.name)}</b> 的申请？对方再次发消息可重新发起申请。`,
+          confirmText: approve ? '批准' : '拒绝',
+          danger: !approve,
+        }))) return;
+        try {
+          await api('POST', `/api/access/pending/${approve ? 'approve' : 'reject'}`, { code: b.dataset.code });
+          toast(approve ? `✅ 已批准 ${b.dataset.name}` : '已拒绝该申请');
+        } catch (e) { toast(e.message, true); }
+        void loadPairList();
+      };
+    });
+  } catch (e) {
+    if (!silent) box.innerHTML = `<div class="banner err" style="margin:6px 0"><span>加载失败：${esc(e.message)}</span></div>`;
+  }
 }
 
 function renderAllowTab(panel, p) {
@@ -172,7 +251,7 @@ function renderDangerTab(panel, p) {
 export const page = {
   id: 'permissions',
   title: '权限',
-  desc: '工具免确认名单与危险命令黑名单，改动即时生效',
+  desc: '工具免确认名单、危险命令黑名单与接入申请审批，改动即时生效',
   icon: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1 1 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>',
   render: renderPermissions,
 };

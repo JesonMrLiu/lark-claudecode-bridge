@@ -6,11 +6,13 @@
 // 群名/会话类型经运行中网关的飞书 REST 现拉（gateway-registry；成功缓存 24h、失败短缓存 10 分钟
 // ——权限补开后十分钟内自动恢复真名，不必重启）。lcb ui 独立进程无网关来源 → 走降级显示名。
 // 设计基调：查看器不能因数据缺失报错——目录/文件缺失按空处理、坏行跳过、ID 白名单防路径穿越。
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CONFIG_DIR, loadConfig } from '../config.js';
 import type { BridgeConfig } from '../types.js';
 import { getChatInfoSource } from '../gateway/gateway-registry.js';
+import { getCachedChatMeta, getCachedUserName, getCachedUserUnion, putCachedChatMeta, putCachedUserName } from '../feishu/name-cache.js';
+import { resolveNamesByUnionViaSiblings } from '../feishu/sibling-names.js';
 import type { TranscriptEvent } from '../transcript/transcript-writer.js';
 
 const TRANSCRIPTS_DIR = join(CONFIG_DIR, 'transcripts');
@@ -67,34 +69,39 @@ function readSessionStore(appId: string): SessionStoreShape {
 // ============ 飞书真群名（gateway-registry → GET /open-apis/im/v1/chats/:chat_id） ============
 
 interface ChatMeta { name?: string; chatType?: string; at: number }
+/** 成功态走磁盘持久缓存（name-cache，重启不丢）；本 Map 只留「拉取失败」短缓存（10 分钟自愈） */
 const chatMetaCache = new Map<string, ChatMeta>(); // key `${appId}/${chatId}`
-const META_OK_TTL_MS = 24 * 60 * 60 * 1000;   // 群名成功缓存 24h（群改名次日自动刷新）
 const META_FAIL_TTL_MS = 10 * 60 * 1000;      // 拉取失败短缓存：im:chat 权限补开后十分钟内自动恢复真名
 
 async function fetchChatMeta(appId: string, chatId: string): Promise<ChatMeta | undefined> {
   const key = `${appId}/${chatId}`;
+  const disk = getCachedChatMeta(appId, chatId);
+  if (disk?.name) return { ...disk, at: 0 }; // 磁盘命中：零 API 调用（30 天/3 天 TTL 由缓存层管）
   const hit = chatMetaCache.get(key);
-  // 失败态（无 name）用短 TTL 重试；成功态 24h
-  if (hit && Date.now() - hit.at < (hit.name ? META_OK_TTL_MS : META_FAIL_TTL_MS)) return hit;
+  if (hit && Date.now() - hit.at < META_FAIL_TTL_MS) return hit; // 失败短缓存：别反复打飞书
   const src = getChatInfoSource(appId);
-  if (!src) return hit; // 桥未运行（lcb ui 独立进程）：吃旧缓存，没有则降级
+  if (!src) return hit ?? (disk ? { ...disk, at: 0 } : undefined); // 桥未运行：失败态或磁盘旧值
   try {
     const res = await src.request({ method: 'GET', url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}` });
-    const data = res.data as { name?: unknown; chat_type?: unknown } | undefined;
+    const data = res.data as { name?: unknown; chat_type?: unknown; chat_mode?: unknown } | undefined;
     if (res.code === 0 && typeof data?.name === 'string' && data.name) {
       const meta: ChatMeta = {
         name: data.name,
-        chatType: typeof data.chat_type === 'string' ? data.chat_type : '',
+        // 飞书字段不统一：详情接口部分会话给 chat_type（取值 private/group）、部分只有
+        // chat_mode（p2p/group）——实测同一应用两种形态都出现，两个都读
+        chatType: typeof data.chat_type === 'string' && data.chat_type
+          ? data.chat_type
+          : typeof data.chat_mode === 'string' ? data.chat_mode : '',
         at: Date.now(),
       };
-      chatMetaCache.set(key, meta);
+      putCachedChatMeta(appId, chatId, { name: meta.name, chatType: meta.chatType });
       return meta;
     }
   } catch { /* 机器人不在群 / 权限缺失 / 网络失败：降级显示名 */ }
   const failed: ChatMeta = { at: Date.now() };
   chatMetaCache.set(key, failed);
-  // 曾拉到过真名（缓存过期后的重拉失败）→ 继续用旧真名，好过降级串
-  return hit?.name ? hit : failed;
+  // 曾拉到过真名（磁盘旧值未过期）→ 继续用旧真名，好过降级串
+  return disk?.name ? { ...disk, at: 0 } : failed;
 }
 
 function chatIdTail(chatId: string): string {
@@ -106,31 +113,51 @@ function chatIdTail(chatId: string): string {
 // 成功缓存 24h、失败短缓存 10 分钟（同群名模式——contact 权限补开后十分钟内自动恢复真名）。
 // 需要应用开通「获取用户基本信息」（contact:user.base:readonly）；未开通时自动降级 ou 尾号显示。
 interface UserNameMeta { name?: string; at: number }
+/** 成功态走磁盘持久缓存（name-cache，30 天、重启不丢）；本 Map 只留「解析失败」短缓存（10 分钟自愈） */
 const userNameCache = new Map<string, UserNameMeta>(); // key `${appId}/${openId}`
-const USER_OK_TTL_MS = 24 * 60 * 60 * 1000;
 const USER_FAIL_TTL_MS = 10 * 60 * 1000;
 /** contact batch 接口单次 user_ids 上限（官方约定 ≤50） */
 const USER_BATCH_SIZE = 50;
 
-/** 批量解析 open_id → 姓名。整批失败（权限/网络）落短缓存防每轮树接口重打；零结果视为失败态 */
-async function fetchUserNames(appId: string, ids: string[]): Promise<Map<string, string>> {
+/** 批量解析 open_id → 姓名（配对授权 API 同源复用）。整批失败（权限/网络）落短缓存防每轮树接口重打；零结果视为失败态 */
+export async function fetchUserNames(appId: string, ids: string[]): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   const need: string[] = [];
   for (const id of ids) {
+    const diskName = getCachedUserName(appId, id);
+    if (diskName) { out.set(id, diskName); continue; } // 磁盘命中：零 API 调用
     const hit = userNameCache.get(`${appId}/${id}`);
-    if (hit && Date.now() - hit.at < (hit.name ? USER_OK_TTL_MS : USER_FAIL_TTL_MS)) {
-      if (hit.name) out.set(id, hit.name);
-      continue;
-    }
+    if (hit && Date.now() - hit.at < USER_FAIL_TTL_MS) continue; // 失败短缓存：10 分钟后自动重试
     need.push(id);
   }
   if (!need.length) return out;
+  const attempted = [...need]; // 本轮已尝试 contact 的 id 快照：兄弟桥候选（失败缓存是 contact 阶段才打的，不能堵同轮兄弟桥）
   const src = getChatInfoSource(appId);
   if (!src) return out; // 桥未运行（lcb ui 独立进程）：吃缓存，没有则本轮降级，不报错
-  for (let i = 0; i < need.length; i += USER_BATCH_SIZE) {
-    const batch = need.slice(i, i + USER_BATCH_SIZE);
+  /** 吸收一批结果。⚠️ 飞书 v3 user 对象的标识字段是 open_id（user_id_type=open_id 时实测响应
+   *  只有 open_id/union_id，无 user_id 字段）——10-15 起误取 it.user_id 恒为 undefined，
+   *  真名解析从未生效、会话页全员 ou_（2026-10-18 主人反馈 + 插桩实锤后修复） */
+  const absorb = (items: unknown, batch: string[]): boolean => {
+    if (!Array.isArray(items)) return false;
+    const got = new Set<string>();
+    for (const it of items as Array<{ user_id?: unknown; open_id?: unknown; name?: unknown }>) {
+      const uid = typeof it.open_id === 'string' && it.open_id ? it.open_id : it.user_id;
+      const name = it.name;
+      if (typeof uid === 'string' && typeof name === 'string' && name) {
+        putCachedUserName(appId, uid, name); // 成功态落磁盘持久缓存（跨重启/跨场景共用）
+        out.set(uid, name);
+        got.add(uid);
+      }
+    }
+    // 本批未被接口返回的 id：落失败短缓存（10 分钟后自动重试，可能后配对）
+    for (const id of batch) {
+      if (!got.has(id)) userNameCache.set(`${appId}/${id}`, { at: Date.now() });
+    }
+    return true;
+  };
+  const query = async (batch: string[]): Promise<void> => {
     const qs = batch.map((id) => `user_ids=${encodeURIComponent(id)}`).join('&');
-    let okBatch = false;
+    let ok = false;
     try {
       const res = await src.request({
         method: 'GET',
@@ -139,42 +166,87 @@ async function fetchUserNames(appId: string, ids: string[]): Promise<Map<string,
       const items = res.code === 0
         ? (res.data as { items?: unknown } | undefined)?.items
         : undefined;
-      if (Array.isArray(items)) {
-        const got = new Set<string>();
-        for (const it of items) {
-          const uid = (it as { user_id?: unknown }).user_id;
-          const name = (it as { name?: unknown }).name;
-          if (typeof uid === 'string' && typeof name === 'string' && name) {
-            userNameCache.set(`${appId}/${uid}`, { name, at: Date.now() });
-            out.set(uid, name);
-            got.add(uid);
-          }
-        }
-        okBatch = true;
-        // 本批未被接口返回的 id：落失败短缓存（10 分钟后自动重试，可能后配对）
-        for (const id of batch) {
-          if (!got.has(id)) userNameCache.set(`${appId}/${id}`, { at: Date.now() });
-        }
-      }
-    } catch { /* 机器人无该用户可见范围 / 权限缺失 / 网络失败：降级 */ }
-    if (!okBatch) {
+      ok = absorb(items, batch);
+    } catch { /* 权限缺失 / 网络失败 / open_id 跨应用(99992361) 整批被拒：走下方逐个回退 */ }
+    if (!ok && batch.length > 1) {
+      // 整批失败 → 逐个回退：跨应用的坏 id 单查时被隔离（该 id 落失败缓存），好 id 照样拿到真名
+      for (const id of batch) await query([id]);
+    } else if (!ok) {
       for (const id of batch) userNameCache.set(`${appId}/${id}`, { at: Date.now() });
+    }
+  };
+  for (let i = 0; i < need.length; i += USER_BATCH_SIZE) {
+    await query(need.slice(i, i + USER_BATCH_SIZE));
+  }
+  // 兄弟应用桥兜底（与网关 resolveUserNames 同款）：通讯录权限范围外用户的缺口 id，
+  // 用磁盘 union 索引借兄弟应用凭证解析；命中写共享磁盘缓存并清失败短缓存；兄弟也查不到
+  // → 失败缓存已在 absorb 落好（跨轮节流，防配置页 30s 轮询重打）；无 union 索引的不动
+  // 失败缓存（后续事件带来 union 时即清缓存立即可重试）
+  const missing = attempted.filter((id) => !out.has(id));
+  if (missing.length) {
+    const unions = new Map<string, string>();
+    for (const id of missing) {
+      const u = getCachedUserUnion(appId, id);
+      if (u) unions.set(id, u);
+    }
+    if (unions.size) {
+      try {
+        const got = await resolveNamesByUnionViaSiblings(appId, unions);
+        for (const [id, name] of got) {
+          putCachedUserName(appId, id, name);
+          out.set(id, name);
+          userNameCache.delete(`${appId}/${id}`);
+        }
+        for (const id of unions.keys()) if (!got.has(id)) userNameCache.set(`${appId}/${id}`, { at: Date.now() });
+      } catch { /* 桥失败不影响已解析结果 */ }
     }
   }
   return out;
 }
 
-/** 显示名三级降级：飞书真名 → access 人名（单用户=p2p）→ 「群聊（N人）/会话 ·尾号」 */
+/**
+ * 真名回写 access.json（自愈）：配对时拿不到真名、name 落的是原始 open_id 的记录，
+ * 一旦通讯录解析成功就补正——配对展示/群内管理员名/会话页全线受益。只修「缺失或自指」项，
+ * 用户自填的真名永不被覆盖；确有修改才写盘（读-改-写，与运行中 AccessControl 实例的整盘
+ * 覆写存在竞态窗口，但本写入低频 + 下轮树接口自愈，可接受）
+ */
+function backfillAccessNames(names: Array<[string, string]>): void {
+  if (!names.length) return;
+  const path = join(CONFIG_DIR, 'access.json');
+  let raw: { users?: Record<string, { name?: string }> };
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8')) as { users?: Record<string, { name?: string }> };
+  } catch { return; } // 无准入数据/损坏：不造文件
+  let changed = false;
+  for (const [uid, name] of names) {
+    const u = raw.users?.[uid];
+    if (u && (!u.name || u.name === uid) && name !== uid) {
+      u.name = name;
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  try {
+    const tmp = `${path}.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(raw, null, 2), 'utf8');
+    renameSync(tmp, path);
+  } catch { /* 回写失败不影响展示（内存缓存已生效） */ }
+}
+
+/** 显示名三级降级：飞书真名 → access 人名（单用户=p2p）→ 「群聊（N人）/会话 ·尾号」。
+ *  chatType 独立透出：群信息拉到但群名为空（如 p2p 无名）时类型不再被丢弃——
+ *  此前丢弃导致前端把群聊误标「私聊」（2026-10-17 主人反馈） */
 function buildDisplayName(
   meta: ChatMeta | undefined, users: string[], access: Map<string, string>, chatId: string,
 ): { displayName: string; chatType: string; nameSource: 'feishu' | 'access' | 'fallback' } {
-  if (meta?.name) return { displayName: meta.name, chatType: meta.chatType || '', nameSource: 'feishu' };
+  const chatType = meta?.chatType || (users.length > 1 ? 'group' : '');
+  if (meta?.name) return { displayName: meta.name, chatType, nameSource: 'feishu' };
   if (users.length === 1) {
     const n = access.get(users[0]);
-    if (n) return { displayName: n, chatType: 'p2p', nameSource: 'access' };
+    if (n) return { displayName: n, chatType: chatType || 'p2p', nameSource: 'access' };
   }
   const label = users.length > 1 ? `群聊（${users.length}人）` : '会话';
-  return { displayName: `${label} ·${chatIdTail(chatId)}`, chatType: users.length > 1 ? 'group' : '', nameSource: 'fallback' };
+  return { displayName: `${label} ·${chatIdTail(chatId)}`, chatType, nameSource: 'fallback' };
 }
 
 // ============ ① 树：GET /api/chats/tree ============
@@ -231,9 +303,16 @@ export async function chatsTree(configPath: string): Promise<{ bots: ChatBotSumm
       }
       const users = usersByChat.get(chatId) ?? [];
       const meta = await fetchChatMeta(appId, chatId);
-      // 发信人真名：access（配对人名，用户自填优先）+ 飞书通讯录解析兜底，合并后同源展示
+      // 发信人真名：飞书通讯录解析为权威，access 仅兜底——合并顺序 feishu 在后（同 key 胜出），
+      // 且 access 里 name===userId 的自指记录（配对时拿不到真名落了原始 id）不参与兜底，
+      // 否则会把飞书真名顶回 ou_ 串（2026-10-17 主人反馈会话页 ou_ 满屏的根因之一）
       const feishuNames = await fetchUserNames(appId, users);
-      const nameMap = new Map<string, string>([...feishuNames, ...access]);
+      const accessNames = new Map<string, string>();
+      for (const [uid, n] of access) {
+        if (n && n !== uid) accessNames.set(uid, n);
+      }
+      const nameMap = new Map<string, string>([...accessNames, ...feishuNames]);
+      backfillAccessNames([...feishuNames]);
       const name = buildDisplayName(meta, users, nameMap, chatId);
       channels.push({
         chatId,

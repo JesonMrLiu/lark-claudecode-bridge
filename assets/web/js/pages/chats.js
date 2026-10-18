@@ -34,6 +34,11 @@ const RESULT_BADGE = {
   error: '<span class="tag err">出错</span>',
 };
 
+/** 整页加载层（仅初始进页存在）：盖住列表+详情区，初始链路（树→话题→时间线）走完/出错即移除。
+ *  层移除后以下调用自动变 no-op——页内后续「查询/切通道」仍走时间线区行内「加载中…」，不重复盖罩 */
+const bootStage = (t) => { const n = $('#chBootTxt'); if (n) n.textContent = t; };
+const hideBoot = () => $('#chBoot')?.remove();
+
 export const page = {
   id: 'chats',
   title: '会话',
@@ -63,11 +68,15 @@ export const page = {
         <div class="chat-list-panel" id="chList" style="border-top:1px solid var(--border)"></div>
       </div>
       <div class="panel" style="margin:0;min-height:440px" id="chDetail"></div>
+      <div class="chats-boot" id="chBoot" role="status" aria-live="polite">
+        <div class="chats-boot-box"><span class="br-spin-sm" aria-hidden="true"></span><span id="chBootTxt">正在加载会话目录…</span></div>
+      </div>
     </div>`;
     try {
       const r = await api('GET', '/api/chats/tree');
       ST.bots = r.bots ?? [];
     } catch (e) {
+      hideBoot();
       $('#chDetail').innerHTML = `<div class="empty" style="margin-top:60px">会话树加载失败：${esc(e.message)}</div>`;
       return;
     }
@@ -79,6 +88,7 @@ export const page = {
     const botSel = $('#chBot');
     botSel.innerHTML = ST.bots.map((b) => `<option value="${esc(b.appId)}">${esc(b.name)}（${esc(b.appId)}）</option>`).join('');
     if (!ST.bots.length) {
+      hideBoot();
       $('#chList').innerHTML = '<div class="empty">暂无会话记录<br><span class="mini-note">还没有任何对话落盘。在飞书里和机器人聊几句后回来看。</span></div>';
       $('#chCnt').textContent = '0 条会话';
       $('#chGo').disabled = true;
@@ -90,8 +100,14 @@ export const page = {
     const firstBot = ST.bots.find((b) => b.channels.length);
     if (firstBot) {
       botSel.value = firstBot.appId;
-      await selectChannel(firstBot.appId, firstBot.channels[0].chatId);
+      bootStage('正在加载会话详情…');
+      try {
+        await selectChannel(firstBot.appId, firstBot.channels[0].chatId);
+      } finally {
+        hideBoot(); // 成功/空态/报错任何出口都撤层，加载层绝不残留
+      }
     } else {
+      hideBoot();
       renderList();
       renderDetailEmpty();
     }
@@ -108,6 +124,17 @@ function chanOf(app, chat) {
   return null;
 }
 
+/** 会话类型徽标三态：group=群聊 / p2p|private=私聊 / 空（群信息拉不到且无法推断）=未知——
+ *  空类型不再误标「私聊」（主人反馈：群聊被艾特却挂着私聊标签）；飞书详情接口对 p2p
+ *  可能回 chat_mode=p2p 也可能回 chat_type=private，两口径都归私聊 */
+const typeTag = (t) => t === 'group' ? '<span class="tag info">群聊</span>'
+  : (t === 'p2p' || t === 'private') ? '<span class="tag off">私聊</span>'
+    : '<span class="tag off" title="暂无法识别会话类型（飞书群信息拉取失败）">未知</span>';
+/** 成员名串（= 在此通道艾特过机器人的用户）：真名优先，无真名退 ou 尾号 */
+const membersOf = (c) => (c?.users || [])
+  .map((u) => (u.name && u.name !== u.userId ? u.name : short(u.userId, 8)))
+  .join('、');
+
 function renderList() {
   const el = $('#chList');
   const bot = ST.bots.find((b) => b.appId === ST.app);
@@ -118,7 +145,7 @@ function renderList() {
       <div class="c-main">
         <div class="c-top"><span class="c-name">${esc(c.displayName)}</span><span class="c-time">${c.dates.length} 天</span></div>
         <div class="c-prev">${c.topics} 话题 · ${fmtSize(c.sizeBytes)}</div>
-        <div class="c-badges">${c.chatType === 'group' ? '<span class="tag info">群聊</span>' : '<span class="tag off">私聊</span>'}</div>
+        <div class="c-badges">${typeTag(c.chatType)}${c.chatType === 'group' && c.users?.length ? `<span class="hint" style="margin-left:6px">${esc(membersOf(c))}</span>` : ''}</div>
       </div>
     </div>`).join('') || '<div class="empty">无记录通道</div>';
   $('#chCnt').textContent = `${bot.channels.length} 条会话`;
@@ -157,7 +184,8 @@ async function selectChannel(app, chat) {
   ST.date = ST.dates[0] ?? '';
   ST.users = hit?.chan.users ?? [];
   ST.nameByUser = {};
-  for (const u of ST.users) ST.nameByUser[u.userId] = u.name || `${u.userId.slice(0, 10)}…`;
+  // 自指记录（配对早期落了原始 id）按无真名处理，退 ou 尾号展示（后端同理过滤）
+  for (const u of ST.users) ST.nameByUser[u.userId] = u.name && u.name !== u.userId ? u.name : `${u.userId.slice(0, 10)}…`;
   renderList();
   renderDetailSkeleton();
   try {
@@ -201,8 +229,10 @@ function renderDetailSkeleton() {
       </div>
       <div id="chatTl" class="chats-scroll"></div>
     </div>`;
-  $('#chDName').innerHTML = `${esc(c?.displayName || ST.chat)} ${c?.chatType === 'group' ? '<span class="tag info">群聊</span>' : '<span class="tag off">私聊</span>'}`;
-  $('#chDSub').textContent = `${hit?.bot.name || ''}${ST.topic ? '' : ''} · ${c?.topics ?? 0} 话题 · ${fmtSize(c?.sizeBytes ?? 0)}`;
+  $('#chDName').innerHTML = `${esc(c?.displayName || ST.chat)} ${typeTag(c?.chatType)}`;
+  // 群聊把「艾特过机器人的成员」亮在标题副行（主人要求：只显示群名看不出是谁在聊）
+  const memberLine = c?.chatType === 'group' && c?.users?.length ? ` · 成员：${esc(membersOf(c))}` : '';
+  $('#chDSub').innerHTML = `${esc(hit?.bot.name || '')} · ${c?.topics ?? 0} 话题 · ${fmtSize(c?.sizeBytes ?? 0)}${memberLine}`;
   $('#chCopyId').onclick = async () => {
     try { await navigator.clipboard.writeText(ST.chat); toast(`会话 ID ${ST.chat} 已复制`); }
     catch { toast('复制失败（浏览器剪贴板权限）', true); }
@@ -293,6 +323,7 @@ async function loadTimeline() {
     tl.innerHTML = `<div class="empty">时间线加载失败：${esc(e.message)}</div>`;
     return;
   }
+  bootStage('正在渲染消息…'); // 仅初始进页有加载层时生效；页内查询时层已移除，自动 no-op
   renderTimeline();
 }
 

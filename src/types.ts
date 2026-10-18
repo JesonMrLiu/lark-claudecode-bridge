@@ -243,6 +243,8 @@ export interface SessionConfig {
 }
 export interface IncomingMessage {
   chatId: string; chatType: 'p2p' | 'group'; userId: string; text: string; messageId: string;
+  /** 发送者 union_id（消息事件自带，同一开发商全部应用通用）：解析通讯录范围外用户真名的桥接键 */
+  unionId?: string;
   /** image 消息 / post 内嵌图片的 image_key（gateway 下载后把本地路径注记拼进 text，下游不再消费此字段） */
   imageKeys?: string[];
   /** file 消息 / post 混发（顶层 files 数组或 media 节点）的文件标识与原始文件名

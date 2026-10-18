@@ -3,17 +3,20 @@
 //   用户密码必须是密文」；盐随机生成，防彩虹表反查默认密码。
 // - 默认密码 123456；isDefault 现场判定（hash === md5(salt+'123456')），不落布尔位免得漂移。
 // - 文件随读随校验（不缓存）：lcb reset-password 改完盘，运行中的配置页下次校验立即生效。
-// - 会话令牌：随机 32 字节 hex，进程内存表；滑动过期 = 锁屏时长（0=永不，按 30 天兜底），
-//   进程重启即全体失效（与「每次进页都要输密码」的产品语义一致）。
+// - 会话令牌：随机 32 字节 hex；滑动过期 = 锁屏时长（0=永不，按 30 天兜底）。会话表落盘
+//   webauth.sessions.json（与 webauth.json 同目录）：桥接器重启后会话延续——embedded 重启的
+//   前端轮询与刷新不再被 401 锁屏拦截（2026-10-17 重启 120s 假失败根因）。登出/改密吊销
+//   即时落盘，跨重启不复活。token 明文本机落盘与 HttpOnly cookie 同机同权，风险等价。
 // - 登录限速：同 IP 连续错 5 次锁 30 秒，拖慢内网暴力试密码。
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { CONFIG_DIR } from '../config.js';
 
 /** 默认密码（恢复初始密码即回到它；登录后引导修改） */
 export const DEFAULT_PASSWORD = '123456';
-/** 无操作自动锁屏时长（分钟）：默认 30 小时；0 = 永不锁屏 */
-export const LOCK_MINUTES_DEFAULT = 1800;
+/** 无操作自动锁屏时长（分钟）：默认 30 分钟（主人拍板 2026-10-17，原 30 小时）；0 = 永不锁屏 */
+export const LOCK_MINUTES_DEFAULT = 30;
 /** 设置弹窗提供的档位（前端下拉同源） */
 export const LOCK_MINUTES_OPTIONS = [30, 60, 240, 1440, 1800, 0] as const;
 /** 「永不锁屏」时会话过期兜底：30 天（绝对上限，防令牌永久有效） */
@@ -50,9 +53,11 @@ function writeAtomic(path: string, text: string): void {
   renameSync(tmp, path);
 }
 
-/** 读认证文件；缺失/损坏时按默认密码重建（默认密码场景重建即修复，属预期自愈） */
+/** 读认证文件；缺失/损坏时按默认密码重建（默认密码场景重建即修复，属预期自愈）。
+ * 顺带把会话落盘目录对齐到 webauth.json 所在目录（目录变化时重载会话表——多实例/测试隔离） */
 function loadAuthFile(configPath: string): WebAuthFile {
   const p = webAuthPathFor(configPath);
+  ensureSessionStore(dirname(p));
   if (existsSync(p)) {
     try {
       const raw = JSON.parse(readFileSync(p, 'utf8')) as Partial<WebAuthFile>;
@@ -129,12 +134,45 @@ export function sessionTtlMs(lockMinutes: number): number {
   return lockMinutes > 0 ? lockMinutes * 60_000 : SESSION_MAX_MS;
 }
 
-// ---- 会话表（进程内存）：token → 过期时刻 ----
-const sessions = new Map<string, number>();
+// ---- 会话表：内存 Map + 落盘（跨重启延续）。落盘路径随 webauth.json 所在目录（首读时对齐），
+// 生产默认 CONFIG_DIR。写盘节流：滑动续期每请求都发生，60s 内的重复续期不重复写盘；
+// 创建/吊销强制即时落盘——吊销跨重启生效是安全底线（登出后 token 不得复活）。 ----
+interface SessionFile { v: 1; sessions: Record<string, number> }
+
+let sessions = new Map<string, number>();
+let sessionsPath = join(CONFIG_DIR, 'webauth.sessions.json');
+let sessionsDirSeen = ''; // 已对齐的落盘目录（同目录重复调用零开销）
+let lastPersistAt = 0;
+
+/** 对齐会话落盘目录（= webauth.json 所在目录）；目录变化时重载会话表 */
+function ensureSessionStore(dir: string): void {
+  if (sessionsDirSeen === dir) return;
+  sessionsDirSeen = dir;
+  sessionsPath = join(dir, 'webauth.sessions.json');
+  sessions = new Map();
+  try {
+    const raw = JSON.parse(readFileSync(sessionsPath, 'utf8')) as Partial<SessionFile>;
+    const now = Date.now();
+    for (const [t, exp] of Object.entries(raw.sessions ?? {})) {
+      if (typeof exp === 'number' && Number.isFinite(exp) && exp > now) sessions.set(t, exp);
+    }
+  } catch { /* 首次无文件/损坏：空表起步，首次写盘自愈 */ }
+}
+
+function persistSessions(force = false): void {
+  const now = Date.now();
+  if (!force && now - lastPersistAt < 60_000) return; // 续期节流；创建/吊销走 force
+  lastPersistAt = now;
+  try {
+    const obj: SessionFile = { v: 1, sessions: Object.fromEntries(sessions) };
+    writeAtomic(sessionsPath, JSON.stringify(obj, null, 2));
+  } catch { /* 落盘失败不阻断鉴权：降级为进程内会话（重启后需重新解锁） */ }
+}
 
 export function createSession(lockMinutes: number): string {
   const token = randomBytes(32).toString('hex');
   sessions.set(token, Date.now() + sessionTtlMs(lockMinutes));
+  persistSessions(true);
   return token;
 }
 
@@ -144,21 +182,26 @@ export function touchSession(token: string, lockMinutes: number): boolean {
   if (exp === undefined) return false;
   if (Date.now() > exp) {
     sessions.delete(token);
+    persistSessions(true);
     return false;
   }
   sessions.set(token, Date.now() + sessionTtlMs(lockMinutes));
+  persistSessions(); // 节流：60s 内高频续期不重复写盘
   return true;
 }
 
 export function dropSession(token: string): void {
-  if (token) sessions.delete(token);
+  if (!token || !sessions.delete(token)) return;
+  persistSessions(true); // 吊销即时落盘（安全底线）
 }
 
 /** 改密/恢复初始后吊销其余会话（其他标签页需重新输密码；当前会话保留） */
 export function dropOtherSessions(keepToken: string): void {
-  for (const token of sessions.keys()) {
-    if (token !== keepToken) sessions.delete(token);
+  let changed = false;
+  for (const token of [...sessions.keys()]) {
+    if (token !== keepToken) { sessions.delete(token); changed = true; }
   }
+  if (changed) persistSessions(true);
 }
 
 export function sessionCookie(token: string, lockMinutes: number): string {

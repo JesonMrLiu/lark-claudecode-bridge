@@ -12,7 +12,7 @@ import { buildTaskEnv } from './task-env.js';
 import { warnIfNoClaudeAuth } from './auth-precheck.js';
 import { serverUrl } from './util/server-url.js';
 import { startWebServer } from './web/server.js';
-import { clearPidFile, writePidFile, stopExistingBridgeAndWait } from './web/lifecycle.js';
+import { clearPidFile, freeLcbOccupiedPort, writePidFile, stopExistingBridgeAndWait } from './web/lifecycle.js';
 import { AccessControl } from './access/access-control.js';
 import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { registerChatInfoSource } from './gateway/gateway-registry.js';
@@ -141,6 +141,10 @@ export interface BridgeDeps { // 全部可注入，测试用 mock；生产用真
     partialUpdateCardElements?(cardId: string, sequence: number, actions: unknown[]): Promise<void>;
     /** 卡片实体全量替换；可选 */
     replaceCardEntity?(cardId: string, sequence: number, card: unknown): Promise<void>;
+    /** 按 open_id 主动私聊发文本卡（配对码私发管理员）；可选——缺省时配对通知仅留日志 */
+    sendTextToUser?(openId: string, markdown: string): Promise<string>;
+    /** 批量解析 open_id → 飞书姓名（配对流程展示真名）；可选——缺省时降级显示原始 id */
+    resolveUserNames?(openIds: string[]): Promise<Map<string, string>>;
   };
   access: AccessControl;
   store: SessionStore;
@@ -289,6 +293,8 @@ export function createBridge(
   // 配置热重载失败提示的去重标记：失败状态只在「成功 → 失败」跳变时向当前聊天提示一次，
   // 避免配置持续损坏期间每条消息都刷屏；恢复成功后静默复位（不发恢复消息）
   let reloadFailNotified = false;
+  /** 配对码私发管理员的节流表（appId:userId → 上次通知时刻）：申请码 15 分钟复用，通知 5 分钟一次 */
+  const pairNotifyAt = new Map<string, number>();
 
   function workspacePath(name: string): string {
     return config.workspaces.find((w) => w.name === name)?.path ?? config.workspaces[0].path;
@@ -394,26 +400,51 @@ export function createBridge(
       reloadFailNotified = false;
     }
     if (!deps.access.isAllowed(msg.userId)) {
+      // 真名解析先行（contact 直查 + 兄弟应用桥，命中落共享磁盘缓存）：access.json 一律落
+      // 真名而非 ou_ 串——接入申请列表/私聊通知/会话页才能处处显示真名（主人拍板 2026-10-18）
+      const resolved = deps.gateway.resolveUserNames
+        ? await deps.gateway.resolveUserNames([msg.userId]).catch(() => new Map<string, string>())
+        : new Map<string, string>();
+      const resolvedName = resolved.get(msg.userId) || msg.userId;
       if (app.role === 'deputy') {
         // 分身机器人艾特即用（用户决策）：不走配对——首条消息自动补录 member（access.json
         // 保留审计记录，isAllowed 后续校验天然兼容）；无 admin 权限，
         // 管理命令与工作区切换在各自入口被拒，能力范围由分身配置限定
-        deps.access.addUser(msg.userId, msg.userId, 'member', app.appId);
-        console.log(`${tag}[接入] 分身应用 ${app.appId} 新用户 ${msg.userId} 已自动加入（member，能力按分身配置限定）`);
+        deps.access.addUser(msg.userId, resolvedName, 'member', app.appId);
+        console.log(`${tag}[接入] 分身应用 ${app.appId} 新用户 ${msg.userId}（${resolvedName}）已自动加入（member，能力按分身配置限定）`);
         // 不 return：本条消息照常进入命令/任务处理
       } else if (!deps.access.hasUsers(app.appId)) {
         // 首个使用者免配对直接成为 admin——按应用判定：多应用部署下 open_id 按应用隔离，
         // 新应用的第一个使用者同样是「首个」，不应因别的应用已有用户而被配对码拦住
-        deps.access.addUser(msg.userId, msg.userId, 'admin', app.appId);
-        deps.access.addUser(msg.userId, msg.userId, 'admin', app.appId);
-        console.log(`${tag}[接入] 应用 ${app.appId} 首位用户 ${msg.userId} 已自动成为 admin（后续用户需配对）`);
+        deps.access.addUser(msg.userId, resolvedName, 'admin', app.appId);
+        console.log(`${tag}[接入] 应用 ${app.appId} 首位用户 ${msg.userId}（${resolvedName}）已自动成为 admin（后续用户需配对）`);
         await deps.gateway.sendTextTo(msg.chatId,
           `🎉 欢迎！你是本机器人的首位用户，已自动成为 **admin**。\n\n后续其他同事首次使用时需由你在桥接器终端批准配对（\`lcb pair <配对码>\`）。`);
         // 不 return：欢迎语之外，本条消息照常进入命令/任务处理
       } else {
-        const code = deps.access.beginPairing(msg.userId, msg.userId, app.appId);
-        console.log(`${tag}[配对] 未知用户 ${msg.userId} 请求接入，配对码：${code}（在终端输入 lcb pair ${code} 批准）`);
-        await deps.gateway.sendTextTo(msg.chatId, `🔐 首次使用需配对。\n\n请管理员在桥接器终端确认配对码：**${code}**（15 分钟内有效）`);
+        // 配对流程（主人拍板 2026-10-17）：申请码不再发到来话群/私聊，群里只提示联系管理员；
+        // 码私聊发给当前配置的管理员（该应用最早成为 admin 的用户=首个使用者），由他在配置页
+        // 「权限 → 接入申请」授权（也可不授权），终端 lcb pair 双通道保留
+        const admin = deps.access.primaryAdmin(app.appId);
+        const adminName = admin ? (resolved.get(admin.userId) || (admin.name && !admin.name.startsWith('ou_') ? admin.name : '管理员')) : '管理员';
+        const code = deps.access.beginPairing(msg.userId, resolvedName, app.appId);
+        console.log(`${tag}[配对] 未知用户 ${msg.userId}（${resolvedName}）请求接入，配对码：${code}（管理员 ${admin ? admin.userId : '无'} 终端 lcb pair ${code} 或配置页授权）`);
+        // 群/私聊来话只提示联系管理员，不出现配对码（防群里围观者拿码扰局）
+        await deps.gateway.sendTextTo(msg.chatId,
+          `🚫 你暂无权使用本机器人，需管理员「${adminName}」授权。\n请通过飞书联系他，由管理员在配置页「权限 → 接入申请」为你授权后即可使用。`)
+          .catch(() => { /* 提示发送失败不阻断 */ });
+        // 码私发管理员；同一申请 5 分钟内不重复骚扰（beginPairing 复用码，通知侧节流）
+        if (admin) {
+          const last = pairNotifyAt.get(`${app.appId}:${msg.userId}`) ?? 0;
+          if (Date.now() - last > 5 * 60_000) {
+            pairNotifyAt.set(`${app.appId}:${msg.userId}`, Date.now());
+            if (deps.gateway.sendTextToUser) {
+              await deps.gateway.sendTextToUser(admin.userId,
+                `🔐 收到新的接入申请\n\n申请人：${resolvedName}\n机器人：${app.name}\n配对码：**${code}**（15 分钟内有效）\n\n请到配置页「权限 → 接入申请」点击授权（不同意可忽略，申请 15 分钟后自动过期）；也可在桥接器终端执行 \`lcb pair ${code}\` 批准。`)
+                .catch((e) => console.warn(`${tag}[配对] 私聊通知管理员失败（码已留日志与配置页）：`, e));
+            }
+          }
+        }
         return;
       }
     } else {
@@ -1538,6 +1569,17 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
   if (oldBridge.pid) console.log(oldBridge.stopped
     ? `🔁 检测到旧桥接器实例（PID ${oldBridge.pid}），已停止，继续启动…`
     : `⚠️ 旧桥接器实例（PID ${oldBridge.pid}）停止超时/失败，继续启动（配置页端口可能仍被其占用）`);
+  // 双实例治理第二道：端口实占清场。PID 文件是「登记制」——旧进程异常退出留陈旧记录、外部
+  // 旧版本进程不登记，只认 PID 文件杀不到真正的端口占用者（2026-10-17 升级期事故根因）。
+  // 这里直接探测配置页端口：占用者是 LCB 自己人（/api/status 带 version）→ 强制结束并等端口
+  // 释放；非 LCB 占用者不动，交给配置页 EADDRINUSE 的友好提示换端口。探测失败/端口空闲均零开销
+  if (config.server?.enabled !== false) {
+    const freed = await freeLcbOccupiedPort(config.server?.port ?? 17317);
+    if (freed.pid !== null) {
+      if (freed.freed) console.log(`🔁 ${freed.detail}，继续启动…`);
+      else console.warn(`⚠️ 配置页端口清场未完成：${freed.detail}；本进程配置页可能无法启动（桥接器不受影响）`);
+    }
+  }
   let webHandle: { close(): void } | null = null;
   // access 全局共享：个人场景同一人对所有机器人，N 个 bridge 注入同一实例（单进程无竞态）
   const access = AccessControl.load(join(CONFIG_DIR, 'access.json'));
@@ -1655,6 +1697,8 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
         sendCardEntityTo: (chatId, card) => gateway.sendCardEntity(chatId, card),
         partialUpdateCardElements: (cardId, seq, actions) => gateway.partialUpdateCardElements(cardId, seq, actions),
         replaceCardEntity: (cardId, seq, card) => gateway.replaceCardEntity(cardId, seq, card),
+        sendTextToUser: (openId, md) => gateway.sendTextToUser(openId, md),
+        resolveUserNames: (ids) => gateway.resolveUserNames(ids),
       },
       access,
       store: SessionStore.load(join(CONFIG_DIR, `sessions.${app.appId}.json`)),

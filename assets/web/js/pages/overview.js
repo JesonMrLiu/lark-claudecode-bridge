@@ -35,13 +35,35 @@ function showMask(inner) {
   m.style.display = 'flex';
 }
 
-/** 启停请求的容错：embedded 停止/重启时进程退出可能先于响应到达，网络断开视为已受理 */
+/** 启停请求的容错：embedded 停止/重启时进程退出可能先于响应到达，网络断开视为已受理。
+ * delivered 区分「服务确认受理」与「网络断开推定受理」——后者有两种截然相反的可能：
+ * ①旧进程退出先于响应（正常）②服务根本不在、请求无人受理（2026-10-17 120s 空等根因），
+ * 调用方（restartFlow）须用 probeBridgeAlive 二次分流 */
 async function bridgeActionSafe(op) {
-  try { return await api('POST', '/api/bridge/action', { op }); }
+  try { return { ...await api('POST', '/api/bridge/action', { op }), delivered: true }; }
   catch (e) {
-    if (/fetch|network|load failed/i.test(e.message)) return { ok: true, message: '已提交（连接关闭属预期）' };
+    if (/fetch|network|load failed/i.test(e.message)) return { ok: true, message: '已提交（连接关闭属预期）', delivered: false };
     throw e;
   }
+}
+
+/** 桥接器状态探测：裸 fetch /api/status，任何 HTTP 应答（含 401 锁屏/503）都算「在」；
+ * 不用 api()：它对非 2xx 会抛错，而锁屏 401 时服务明明活着。本地回环毫秒级应答，3s 兜底防悬挂。
+ * 返回结构化信息：401 特批响应自带顶层 pid/version（重启判定用它识别新进程，无需 200 会话）*/
+async function probeStatus() {
+  try {
+    const res = await Promise.race([
+      fetch('/api/status', { cache: 'no-store' }),
+      sleep(3000).then(() => { throw new Error('probe-timeout'); }),
+    ]);
+    const body = await res.json().catch(() => ({}));
+    return {
+      alive: true,
+      locked: res.status === 401,
+      pid: typeof body.pid === 'number' ? body.pid : null,
+      version: typeof body.version === 'string' ? body.version : null,
+    };
+  } catch { return { alive: false, locked: false, pid: null, version: null }; }
 }
 
 /**
@@ -64,8 +86,20 @@ async function restartFlow() {
   dlg.onClose(() => { stopped = true; setTimeout(() => void refresh(), 3000); });
   const paint = (i, patch) => { Object.assign(st[i], patch); dlg.setSteps(st.map((s) => ({ ...s }))); };
 
-  try { await bridgeActionSafe('restart'); }
+  let delivered = true;
+  try { delivered = (await bridgeActionSafe('restart')).delivered !== false; }
   catch (e) { paint(0, { status: 'failed', detail: e.message }); toast(e.message, true); return; }
+  if (!delivered) {
+    // 推定受理（网络断开）二次分流：服务确实不在 = 重启请求无人受理，立即明示，不空等 120s
+    //（embedded 正常重启也会推定受理，但那时服务很快失联/被新进程接管，探测通过继续走轮询）
+    if (!(await probeStatus()).alive) {
+      paint(0, { status: 'failed', detail: '桥接器服务未在运行，重启请求未送达。请在终端运行 lcb start 拉起后重试' });
+      paint(1, { status: 'skipped', detail: '配置页不可达，无法检测记忆增强（记忆增强不会导致重启失败）' });
+      dlg.setHint('<button class="btn sm" id="sdReload">手动刷新页面</button>');
+      document.querySelector('#sdReload').onclick = () => location.reload();
+      return;
+    }
+  }
 
   // ---- 步骤①：等 LCB 回归。embedded：本页随进程失联，连续两次 /api/status 成功才算新进程
   //（排除旧进程残影）；独立：本页不失联，等 PID 文件换新（bridge.running 且 pid 变化）。
@@ -74,25 +108,61 @@ async function restartFlow() {
   await sleep(2500); // 留给旧进程退场：立刻探测可能命中尚未退出的旧 server
   let streak = false;
   let back = false;
+  /** 200 轮询拿不到时的 401 兜底：新进程已上线但页面会话失效（重启清空/改密吊销/锁屏过期）
+   *  → 重启本身成功，转为「重新解锁」引导而非空等 120s（401 特批响应自带顶层 pid 可判新旧） */
+  const finishWithRelock = (waitedSec) => {
+    paint(0, { status: 'done', detail: `LCB 已重启（用时 ${waitedSec} 秒）` });
+    paint(1, { status: 'warn', detail: '配置页会话已随重启失效（安全设计），请重新解锁后查看记忆增强状态' });
+    dlg.setHint('<button class="btn primary sm" id="sdReload">重新解锁页面</button>');
+    document.querySelector('#sdReload').onclick = () => location.reload();
+    toast('✅ LCB 已重启，请重新解锁页面');
+  };
   while (!stopped && Date.now() - t0 < 120_000) {
     const sec = Math.round((Date.now() - t0) / 1000);
     let s = null;
-    try { s = await api('GET', '/api/status'); } catch { /* 失联窗口属预期 */ }
+    try { s = await api('GET', '/api/status'); } catch { /* 失联窗口 / 401 锁屏属预期 */ }
+    if (!s) {
+      const probe = await probeStatus();
+      if (probe.pid != null && oldPid != null && probe.pid !== oldPid) {
+        finishWithRelock(sec);
+        return;
+      }
+    }
     if (s) {
       if (embedded) {
-        if (streak) { back = true; break; }
-        streak = true;
-        await sleep(1000); // 快速二次确认（旧实现同口径）
-        continue;
-      }
-      if (s.bridge?.running && (oldPid == null || s.bridge?.pid !== oldPid)) { back = true; break; }
+        // 新进程识别：应答者顶层 pid ≠ 重启前 PID（pid 双方齐备时），否则看 uptimeMs 是否小于
+        // 已等待时长（新进程必然更年轻；旧版 LCB 无顶层 pid、或别的进程占着端口应答时兜底）。
+        // 识别不过 = 旧进程残影/冒充应答：不算回归，继续等（避免端口被旧进程接管时误报「已重启」）
+        const waitedMs = Date.now() - t0;
+        const fresh = (s.pid != null && oldPid != null)
+          ? s.pid !== oldPid
+          : (s.uptimeMs != null ? s.uptimeMs < waitedMs : true);
+        if (fresh) {
+          if (streak) { back = true; break; }
+          streak = true;
+          await sleep(1000); // 快速二次确认（旧实现同口径）
+          continue;
+        }
+        streak = false; // 残影应答：重置连击，继续等
+      } else if (s.bridge?.running && (oldPid == null || s.bridge?.pid !== oldPid)) { back = true; break; }
     } else if (embedded) streak = false;
     paint(0, { detail: `已等 ${sec} 秒…（新进程上线即自动恢复）` });
     await sleep(1500);
   }
   if (stopped) return;
   if (!back) {
-    paint(0, { status: 'failed', detail: '超过 120 秒未见新进程上线——可能端口占用等启动异常，请查看日志' });
+    // 超时三分：①新进程其实已上线但会话失效（轮询内兜底漏网的最后时机，如 oldPid 迟到才解析）
+    // ②端口有应答但 PID 与重启前相同（旧进程仍占端口）③彻底无人应答（启动失败）
+    const probe = await probeStatus();
+    if (probe.pid != null && oldPid != null && probe.pid !== oldPid) {
+      finishWithRelock(Math.round((Date.now() - t0) / 1000));
+      return;
+    }
+    paint(0, { status: 'failed', detail: probe.alive
+      ? '超过 120 秒未见新进程上线：端口上有服务应答但 PID 未变化（疑似重启前旧进程仍占用端口）——请结束占用进程（lcb start 也会自动清场）后重试'
+      : '超过 120 秒未见新进程上线——可能端口占用等启动异常，请查看日志' });
+    // 步骤①失败不再静默跳过步骤②：给出灰态说明，避免「记忆增强根本没显示启动」的误解
+    paint(1, { status: 'skipped', detail: 'LCB 未恢复，无法检测记忆增强（记忆增强不会导致重启失败）' });
     dlg.setHint('<button class="btn sm" id="sdReload">手动刷新页面</button>');
     document.querySelector('#sdReload').onclick = () => location.reload();
     return;

@@ -1,8 +1,9 @@
 // ============ 配置页密码锁屏（原型设置/锁屏模块的服务端真实现） ============
 // 行为约定：
-// - 进页即锁：每次进入配置页（刷新/新开标签）都要输入密码，服务端会话只在内存中放行 API
+// - 进页即锁：每次进入配置页（刷新/新开标签）都要输入密码，服务端会话放行 API（会话已持久化，
+//   桥接器重启后会话延续，重启轮询/刷新不再被 401 拦截；手动锁屏/登出仍即时吊销）
 // - 默认密码 123456；解锁响应带 isDefault，仍为默认密码时每次登录弹「修改默认密码」引导
-// - 无操作自动锁屏：lockMinutes 分钟（服务端 webauth.json，默认 30 小时；0=永不），双端同步过期
+// - 无操作自动锁屏：lockMinutes 分钟（服务端 webauth.json，默认 30 分钟；0=永不），双端同步过期
 // - 恢复初始密码两条路：本弹窗（验当前密码）/ 本机终端 `lcb reset-password`（忘记密码兜底）
 // - 密文落盘在服务端（webauth.json 只存 salt+md5），前端全程不接触哈希
 import { $, api, toast } from './core.js';
@@ -12,7 +13,7 @@ export const AUTH = {
   unlocked: false,
   everUnlocked: false, // 本次页面生命周期内是否解锁过：锁屏时才需要吊销服务端会话
   isDefault: true,
-  lockMinutes: 1800,
+  lockMinutes: 30,
   lastActive: Date.now(),
   enteredPwd: '', // 本次解锁所输密码（仅内存）：引导改密时作为「当前密码」提交，免重复输入
 };

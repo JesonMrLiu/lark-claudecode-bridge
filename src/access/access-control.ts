@@ -73,12 +73,44 @@ export class AccessControl {
       this.save();
     }
   }
+  /** 待审列表（配置页「接入申请」用）：带过期时刻与来源应用，供前端算剩余有效期/按机器人分组 */
+  listPendingDetailed(): Array<{ userId: string; name: string; code: string; expiresAt: number; appId?: string }> {
+    this.evict();
+    return Object.values(this.data.pending).map(({ userId, name, code, expiresAt, appId }) => (
+      { userId, name, code, expiresAt, ...(appId ? { appId } : {}) }
+    ));
+  }
   listPending(): Array<{ userId: string; name: string; code: string }> {
     this.evict();
     return Object.values(this.data.pending).map(({ userId, name, code }) => ({ userId, name, code }));
   }
+  /**
+   * 当前配置的管理员（配对码私发对象）：该应用**最早**成为 admin 的用户——
+   * 即首个使用者（产品语义=应用创建人）。按 appId 过滤为空（老数据缺 appId）时
+   * 回退全部 admin 中最早者。只发这一个人，不群发所有 admin（主人拍板 2026-10-17）
+   */
+  primaryAdmin(appId?: string): { userId: string; name: string } | null {
+    type UserRec = AccessStoreData['users'][string];
+    const byOldest = (list: Array<[string, UserRec]>): Array<[string, UserRec]> =>
+      list.sort((a, b) => (a[1].pairedAt || '').localeCompare(b[1].pairedAt || ''));
+    const adminsOf = (pred: (u: UserRec) => boolean) =>
+      byOldest(Object.entries(this.data.users).filter(([, u]) => u.role === 'admin' && pred(u)));
+    const pick = adminsOf((u) => appId === undefined || u.appId === appId)[0]
+      ?? adminsOf(() => true)[0];
+    return pick ? { userId: pick[0], name: pick[1].name } : null;
+  }
+  /** 发起配对：已有未过期申请则复用原码（用户连发消息不换码，管理员侧通知可节流） */
   beginPairing(userId: string, name: string, appId?: string): string {
     this.evict();
+    const existing = this.data.pending[userId];
+    if (existing && existing.expiresAt > Date.now()) {
+      if (appId && !existing.appId) existing.appId = appId;
+      // 真名升级：早期记录曾把 open_id 当 name 落库（解析失败降级）——后续解析出真名即覆盖，
+      // 配置页/通知随之显示真名；已存真名（用户自填或先到先解析）永不被 ou_ 串回写
+      if (name && !name.startsWith('ou_') && existing.name.startsWith('ou_')) existing.name = name;
+      this.save();
+      return existing.code;
+    }
     const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
     this.data.pending[userId] = { userId, name, code, expiresAt: Date.now() + TTL_MS, ...(appId ? { appId } : {}) };
     this.save();
