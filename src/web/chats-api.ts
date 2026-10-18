@@ -251,6 +251,15 @@ function buildDisplayName(
 
 // ============ ① 树：GET /api/chats/tree ============
 
+/** 「用户+/new」会话条目（一次 /new = 一个 sessionId）：列表页的列表项即此粒度 */
+export interface ChatSessionSummary {
+  sessionId: string;
+  /** 首条消息摘要（session-store 口径，取 updatedAt 最新一条）；空则退 sessionId 前 8 位 */
+  title: string;
+  updatedAt: string;
+  /** 参与用户（channelKey 拆出；同 sessionId 跨用户合并，常态 1 人） */
+  users: Array<{ userId: string; name?: string }>;
+}
 export interface ChatChannelSummary {
   chatId: string;
   displayName: string;
@@ -264,6 +273,8 @@ export interface ChatChannelSummary {
   /** 话题数（session-store 口径 = 该通道全部 CC 会话） */
   topics: number;
   sizeBytes: number;
+  /** 会话条目（updatedAt 降序）。数据源 = sessions.<appId>.json，树接口本就在读，零新增 IO */
+  sessions: ChatSessionSummary[];
 }
 export interface ChatBotSummary { appId: string; name: string; channels: ChatChannelSummary[] }
 
@@ -275,9 +286,11 @@ export async function chatsTree(configPath: string): Promise<{ bots: ChatBotSumm
   const bots: ChatBotSummary[] = [];
   for (const appId of listDirs(TRANSCRIPTS_DIR)) {
     const store = readSessionStore(appId);
-    // channelKey = `${chatId}:${userId}`（session/channel.ts 口径）→ 按 chatId 聚合用户与话题数
+    // channelKey = `${chatId}:${userId}`（session/channel.ts 口径）→ 按 chatId 聚合用户、话题数与会话条目
     const usersByChat = new Map<string, string[]>();
     const topicCountByChat = new Map<string, number>();
+    /** (chatId, sessionId) 聚合：跨 userId 合并、updatedAt 取最新、标题同步取最新一条的摘要（与 chatTopics 同口径） */
+    const sessionsByChat = new Map<string, Map<string, { title: string; updatedAt: string; users: Set<string> }>>();
     for (const [key, st] of Object.entries(store)) {
       const i = key.lastIndexOf(':');
       if (i <= 0) continue;
@@ -287,6 +300,21 @@ export async function chatsTree(configPath: string): Promise<{ bots: ChatBotSumm
       if (!arr) usersByChat.set(chatId, arr = []);
       if (!arr.includes(userId)) arr.push(userId);
       topicCountByChat.set(chatId, (topicCountByChat.get(chatId) ?? 0) + (st.sessions?.length ?? 0));
+      let bySid = sessionsByChat.get(chatId);
+      if (!bySid) sessionsByChat.set(chatId, bySid = new Map());
+      for (const t of st.sessions ?? []) {
+        if (!t?.sessionId) continue;
+        const cur = bySid.get(t.sessionId);
+        if (cur) {
+          cur.users.add(userId);
+          if ((t.updatedAt ?? '') > cur.updatedAt) {
+            cur.updatedAt = t.updatedAt ?? '';
+            cur.title = t.summary ?? '';
+          }
+        } else {
+          bySid.set(t.sessionId, { title: t.summary ?? '', updatedAt: t.updatedAt ?? '', users: new Set([userId]) });
+        }
+      }
     }
     const channels: ChatChannelSummary[] = [];
     for (const chatId of listDirs(join(TRANSCRIPTS_DIR, appId))) {
@@ -314,6 +342,17 @@ export async function chatsTree(configPath: string): Promise<{ bots: ChatBotSumm
       const nameMap = new Map<string, string>([...accessNames, ...feishuNames]);
       backfillAccessNames([...feishuNames]);
       const name = buildDisplayName(meta, users, nameMap, chatId);
+      // 会话条目（列表页列表项）：名字复用本通道已解析的 nameMap，无额外飞书调用
+      const sessions: ChatSessionSummary[] = [];
+      for (const [sessionId, v] of sessionsByChat.get(chatId) ?? []) {
+        sessions.push({
+          sessionId,
+          title: v.title || sessionId.slice(0, 8), // 无摘要的历史数据退化为短 id
+          updatedAt: v.updatedAt,
+          users: [...v.users].map((userId) => ({ userId, ...(nameMap.get(userId) ? { name: nameMap.get(userId) } : {}) })),
+        });
+      }
+      sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
       channels.push({
         chatId,
         displayName: name.displayName,
@@ -324,6 +363,7 @@ export async function chatsTree(configPath: string): Promise<{ bots: ChatBotSumm
         lastActiveAt: lastActiveMs ? new Date(lastActiveMs).toISOString() : '',
         topics: topicCountByChat.get(chatId) ?? 0,
         sizeBytes,
+        sessions,
       });
     }
     channels.sort((a, b) => b.lastActiveAt.localeCompare(a.lastActiveAt));
