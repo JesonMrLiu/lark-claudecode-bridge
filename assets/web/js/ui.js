@@ -293,16 +293,20 @@ export function initDrawer() {
  *   要展示成片清单（如 SKILL 名单）的调用方传更大的值。
  */
 export function progressDialog({ title = '执行中', note = '请稍候…', reportMaxHeight = 220 } = {}) {
+  // 三段式结构（.modal 本体无 padding，内边距由 modal-head/body/foot 提供；
+  // 关闭按钮放 .modal-foot——savebar 是 fixed 悬浮条，弹窗内复用会脱离文档流漂到屏幕底部）
   const { mask, unmount } = mountDialog(`
     <div class="modal" role="dialog" aria-modal="true" style="width:min(640px,94vw)">
-      <div style="display:flex;align-items:center;gap:10px">
-        <div class="br-spin" style="margin:0"></div>
-        <b class="pd-title">${esc(title)}</b>
+      <div class="modal-head">
+        <div class="br-spin" style="margin:0;flex:0 0 auto"></div>
+        <b class="pd-title" style="font-size:14.5px">${esc(title)}</b>
       </div>
-      <div class="prog"><div class="prog-bar"></div></div>
-      <pre class="report" style="margin-top:12px;max-height:${Number(reportMaxHeight) || 220}px"></pre>
-      <div class="savebar" style="justify-content:flex-end">
-        <button class="btn primary" hidden>关闭</button>
+      <div class="modal-body">
+        <div class="prog" style="margin-top:0"><div class="prog-bar"></div></div>
+        <pre class="report" style="margin-top:12px;max-height:${Number(reportMaxHeight) || 220}px"></pre>
+      </div>
+      <div class="modal-foot" data-pd="foot" hidden>
+        <button class="btn primary">关闭</button>
       </div>
     </div>`);
   const bar = mask.querySelector('.prog-bar');
@@ -310,6 +314,7 @@ export function progressDialog({ title = '执行中', note = '请稍候…', rep
   const spin = mask.querySelector('.br-spin');
   const titleEl = mask.querySelector('.pd-title');
   const closeBtn = mask.querySelector('button');
+  const footEl = mask.querySelector('[data-pd="foot"]');
   log.textContent = note;
   let done = false;
   let onCloseFn = null;
@@ -340,7 +345,7 @@ export function progressDialog({ title = '执行中', note = '请稍候…', rep
       if (ok) bar.classList.add('done');
       spin.style.display = 'none';
       titleEl.textContent = text || (ok ? `✅ ${title}` : `❌ ${title}`);
-      closeBtn.hidden = false;
+      footEl.hidden = false;
       closeBtn.focus();
     },
     onClose(fn) { onCloseFn = fn; },

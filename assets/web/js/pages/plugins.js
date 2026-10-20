@@ -192,16 +192,20 @@ async function renderPlugins(el) {
     // 弹框 DOM（遮罩不可点击关闭；关闭按钮完成前不存在）
     const mask = document.createElement('div');
     mask.className = 'modal-mask';
+    // 三段式结构（.modal 本体无 padding，内边距由 modal-head/body/foot 提供；
+    // 关闭按钮放 .modal-foot——savebar 是 fixed 悬浮条，弹窗内复用会脱离文档流漂到屏幕底部）
     mask.innerHTML = `
     <div class="modal" role="dialog" aria-modal="true" style="width:min(640px,94vw)">
-      <div style="display:flex;align-items:center;gap:10px">
-        <div class="br-spin" style="margin:0"></div>
-        <b id="podTitle">${esc(title)}</b>
+      <div class="modal-head">
+        <div class="br-spin" style="margin:0;flex:0 0 auto"></div>
+        <b id="podTitle" style="font-size:14.5px">${esc(title)}</b>
       </div>
-      <div class="prog"><div class="prog-bar" id="podBar"></div></div>
-      <pre class="report" id="podLog" style="margin-top:12px;max-height:220px">正在执行 claude plugin …（安装/更新可能需要拉取仓库，请稍候）</pre>
-      <div class="savebar" style="justify-content:flex-end">
-        <button class="btn primary" id="podClose" hidden>关闭</button>
+      <div class="modal-body">
+        <div class="prog" style="margin-top:0"><div class="prog-bar" id="podBar"></div></div>
+        <pre class="report" id="podLog" style="margin-top:12px;max-height:220px">正在执行 claude plugin …（安装/更新可能需要拉取仓库，请稍候）</pre>
+      </div>
+      <div class="modal-foot" id="podFoot" hidden>
+        <button class="btn primary" id="podClose">关闭</button>
       </div>
     </div>`;
     document.body.appendChild(mask);
@@ -210,6 +214,7 @@ async function renderPlugins(el) {
     const spin = mask.querySelector('.br-spin');
     const titleEl = mask.querySelector('#podTitle');
     const closeBtn = mask.querySelector('#podClose');
+    const footEl = mask.querySelector('#podFoot');
     const setBar = (pct) => { bar.style.width = `${pct}%`; };
     const appendLog = (line) => { log.textContent += `\n${line}`; log.scrollTop = log.scrollHeight; };
     // 单请求无内部进度：缓动模拟；update-all 用真实 i/N 不走此定时器
@@ -245,7 +250,7 @@ async function renderPlugins(el) {
       spin.style.display = 'none';
       titleEl.textContent = `${allOk ? '✅' : '❌'} ${title} · ${allOk ? '完成' : '部分失败（详见日志与底部全文）'}`;
       report(allOk ? `✅ ${op} 完成` : `❌ ${op} 部分失败`, lines.join('\n'));
-      closeBtn.hidden = false;
+      footEl.hidden = false;
       closeBtn.onclick = () => void close();
     } catch (e) {
       if (timer) clearInterval(timer);
@@ -254,7 +259,7 @@ async function renderPlugins(el) {
       titleEl.textContent = `❌ ${title} · 失败`;
       appendLog(`❌ 请求失败：${e.message}`);
       report(`❌ ${op} 失败`, e.message);
-      closeBtn.hidden = false;
+      footEl.hidden = false;
       closeBtn.onclick = () => void close();
     } finally {
       pageBtns.forEach((b) => { b.disabled = false; });

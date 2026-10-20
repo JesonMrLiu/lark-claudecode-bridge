@@ -415,6 +415,8 @@ body.drawer-resizing{cursor:ew-resize;user-select:none}
 @keyframes pop{from{transform:scale(.96);opacity:.5}}
 .dlg-title{font-size:15px;display:flex;align-items:center;gap:8px;margin-bottom:10px}
 .dlg-title.danger{color:var(--err)}
+/* danger 确认框标题前的圆形警示徽标（confirmDialog 用的 .dlg-ico 此前无定义，"!" 裸文本） */
+.dlg-ico{width:18px;height:18px;border-radius:50%;background:var(--err);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;flex:0 0 auto}
 .dlg-msg{font-size:13px;line-height:1.75;white-space:pre-line;word-break:break-word;color:var(--ink)}
 .dlg-input{width:100%;padding:7px 11px;border:1px solid var(--border2);border-radius:var(--r-s);font:inherit;font-size:13px;background:var(--field);color:var(--ink)}
 .dlg-foot{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
