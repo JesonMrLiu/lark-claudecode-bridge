@@ -20,6 +20,9 @@ export async function api(method, path, body) {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  // 401 联动：服务端说会话无效（静默过期/手动锁屏吊销/重启吊销）→ 通知 auth 层盖锁屏遮罩，
+  // 由 onAuthExpired 自行判重（锁屏上的「密码错误」401 不会走到这里之外的误触发）
+  if (res.status === 401) hooks.onAuthExpired?.(path);
   // 把响应体一并挂到 Error 上（message 不变，向后兼容）：调用方常需要 error 之外的结构化字段，
   // 如扫码授权的 hint:'install'|'config'——丢了它前端就只能干瞪眼
   if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), data);
@@ -50,8 +53,10 @@ export async function saveDoc() {
   } catch (e) { toast(`保存失败：${e.message}`, true); return false; }
 }
 
-/** 视图刷新回调：main.js 启动时注入 render（core 不感知页面注册表，破 core→pages 依赖环） */
-export const hooks = { rerender: () => {} };
+/** 视图刷新回调：main.js 启动时注入 render（core 不感知页面注册表，破 core→pages 依赖环）。
+ * onAuthExpired：api() 收到 401（会话过期/被吊销）时触发，auth.js 注入——把页面拉回锁屏遮罩，
+ * 避免停留在「看似正常但数据全空」的僵尸态 */
+export const hooks = { rerender: () => {}, onAuthExpired: () => {} };
 
 export async function refresh() {
   S.status = await api('GET', '/api/status').catch(() => null);

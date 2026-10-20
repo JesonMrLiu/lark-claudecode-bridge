@@ -6,7 +6,7 @@
 // - 无操作自动锁屏：lockMinutes 分钟（服务端 webauth.json，默认 30 分钟；0=永不），双端同步过期
 // - 恢复初始密码两条路：本弹窗（验当前密码）/ 本机终端 `lcb reset-password`（忘记密码兜底）
 // - 密文落盘在服务端（webauth.json 只存 salt+md5），前端全程不接触哈希
-import { $, api, toast } from './core.js';
+import { $, api, toast, hooks } from './core.js';
 import { openModal, closeModal, confirmDialog } from './ui.js';
 
 export const AUTH = {
@@ -39,6 +39,18 @@ export function lockPage() {
   $('#settingsBtn').hidden = true;
   if (hadSession) api('POST', '/api/auth/logout').catch(() => { /* 离线：无所谓 */ });
   setTimeout(() => $('#lockPwd').focus(), 60);
+}
+
+/** 无操作超时判定 + 锁屏：供活跃事件/看门狗 tick/页面回前台共用。
+ * 返回是否已触发锁屏。核心修复：判定必须在「刷新 lastActive」之前做——
+ * 否则后台标签页/睡眠唤醒后回来的第一个交互会先把 lastActive 刷成「刚刚」，
+ * 看门狗永远判不超时 → 遮罩不出现，而服务端会话早已过期 → 僵尸态（页面正常但数据全 401） */
+function checkIdle() {
+  if (!AUTH.unlocked || !AUTH.lockMinutes) return false;
+  if (Date.now() - AUTH.lastActive <= AUTH.lockMinutes * 60000) return false;
+  lockPage();
+  toast('已因长时间无操作自动锁屏，请重新输入密码', true);
+  return true;
 }
 
 /** 解锁成功后的统一入口：via='password'（输密码登录，仍默认密码时弹引导）| 'session'（会话恢复免密） */
@@ -196,16 +208,22 @@ export function initAuth({ onUnlock }) {
   $('#lockBtn').innerHTML = svg(IC_LOCK, 14);
   $('#settingsBtn').onclick = () => void openSettingsModal();
   $('#lockBtn').onclick = () => { lockPage(); toast('已锁定，输入密码可重新进入'); };
-  // 无操作看门狗：任意交互刷新 lastActive；每 30s 检查一次（与服务端会话 TTL 同步过期）
+  // 无操作看门狗：任意交互先判超时（超时即锁屏，且本次不记活跃），否则刷新 lastActive。
+  // 「先判后记」是关键：睡眠/后台标签页节流期间 tick 停摆，回来第一个交互必须先补一次判定
   ['mousemove', 'keydown', 'click', 'wheel', 'touchstart'].forEach((ev) =>
-    document.addEventListener(ev, () => { AUTH.lastActive = Date.now(); }, { passive: true }));
-  setInterval(() => {
-    if (!AUTH.unlocked || !AUTH.lockMinutes) return;
-    if (Date.now() - AUTH.lastActive > AUTH.lockMinutes * 60000) {
-      lockPage();
-      toast('已因长时间无操作自动锁屏，请重新输入密码', true);
-    }
-  }, 30000);
+    document.addEventListener(ev, () => { if (!checkIdle()) AUTH.lastActive = Date.now(); }, { passive: true }));
+  // 切回标签页 / 窗口聚焦时立即判定：不等被浏览器节流的 tick（后台页定时器可迟至 1 次/分钟）
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkIdle(); });
+  window.addEventListener('focus', checkIdle);
+  // 兜底联动：解锁状态下任何 API 401（会话已过期/被吊销）→ 立即拉回锁屏遮罩，
+  // 杜绝「页面正常显示但点菜单/切 tab 全部 401 无数据」的僵尸态。
+  // 锁屏上「密码错误」的 401 因 AUTH.unlocked=false 天然跳过，互不干扰
+  hooks.onAuthExpired = () => {
+    if (!AUTH.unlocked) return;
+    lockPage();
+    toast('会话已过期，请重新输入密码', true);
+  };
+  setInterval(checkIdle, 30000); // 兜底轮询（与服务端会话 TTL 同步过期）；主判定已前置到交互/回前台时刻
   // 先盖锁屏（防内容闪烁），再静默恢复会话：服务端会话有效（未超时/未锁屏吊销）→ 直接进入免密；
   // 无效（首次 / 自动锁屏后 / 手动锁屏后）→ 留在锁屏等输入。锁屏遮罩先出后撤，闪屏可忽略
   lockPage();
