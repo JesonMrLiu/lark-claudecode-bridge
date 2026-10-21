@@ -6,6 +6,7 @@ import type {
   BridgeConfig, CardConfig, ClaudeAuthMode, ClaudeConfig, ClaudeProfile, FeishuAppConfig, MemoryConfig, MemoryModelConfig,
   PermissionsConfig, PluginRef, SecurityConfig, ServerConfig, SessionConfig, SlashCommandDef, SlashCommandsConfig, TriggerRule, Workspace,
 } from './types.js';
+import { isValidUserId } from './memory.js';
 
 /** LCB_CONFIG_DIR 环境变量可覆盖配置根目录（多租户分进程场景用；正常用户无须设置） */
 export const CONFIG_DIR = join(process.env.LCB_CONFIG_DIR ?? homedir(), '.lark-claudecode-bridge');
@@ -343,13 +344,14 @@ function normalizeAutostart(doc: Record<string, unknown>): { enabled?: boolean }
  * 会让探活/env 透传指向错误目标。缺省 enabled=false 时其余字段仍解析保存（用户先填表单后开启，
  * B2 配置页 [测试连接] 双绿门禁的前置形态）。
  */
-function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | undefined {
+export function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | undefined {
   const raw = doc.memory;
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== 'object') throw new Error('memory 必须为对象（含 enabled / mode / endpoint），请检查 config.yaml');
   const m = raw as {
     enabled?: unknown; mode?: unknown; version?: unknown; endpoint?: unknown;
     account?: unknown; api_key?: unknown; model?: unknown; granularity?: unknown;
+    identityMap?: unknown; displayNames?: unknown;
   };
   let enabled = false;
   if (m.enabled !== undefined && m.enabled !== null) {
@@ -411,6 +413,36 @@ function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | undefined
     };
     if (Object.keys(model).length === 0) model = undefined;
   }
+  // 身份映射两字段（多机器人 → 共享 OpenViking 用户；配置页 saveDoc 以 camelCase 原样写 YAML）：
+  // identityMap = appId → OpenViking user_id；displayNames = uid → 中文显示名。运行时的
+  // resolveMemoryUid / memoryEnvFor / ensureMemoryUserKeys 全经 config.memory.identityMap
+  // 解析身份——此处不透传等于「页面保存成功、运行时永远回退 appId 专属身份」，机器人会话
+  // 沉淀到不了共享用户（映射重构后的断点即在此：本函数曾漏读这两个字段，配置加载即静默丢弃）。
+  // 非法条目 warn 跳过不硬抛：normalizeMemory 抛错会让 section() 把整个 memory 段当缺失，
+  // 一条写坏拖垮全部记忆配置语义过重
+  const parseUidRecord = (v: unknown, key: string, mode: 'uidValue' | 'uidKey'): Record<string, string> | undefined => {
+    if (v === undefined || v === null) return undefined;
+    if (typeof v !== 'object' || Array.isArray(v)) {
+      console.warn(`[配置] memory.${key} 必须为对象（键值映射），已忽略该字段`);
+      return undefined;
+    }
+    const out: Record<string, string> = {};
+    for (const [rawKey, rawVal] of Object.entries(v as Record<string, unknown>)) {
+      const k = rawKey.trim();
+      const val = typeof rawVal === 'string' ? rawVal.trim() : '';
+      if (!k || !val) continue; // 空键/空值：编辑中间态，静默跳过
+      const uidOk = mode === 'uidValue' ? isValidUserId(val) : isValidUserId(k);
+      if (!uidOk) {
+        const bad = mode === 'uidValue' ? val : k;
+        console.warn(`[配置] memory.${key} 中「${bad.slice(0, 32)}」不是合法 OpenViking 用户 ID（仅字母/数字/_/-，≤128），该条目已跳过`);
+        continue;
+      }
+      out[k] = val;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  };
+  const identityMap = parseUidRecord(m.identityMap, 'identityMap', 'uidValue');
+  const displayNames = parseUidRecord(m.displayNames, 'displayNames', 'uidKey');
   return {
     enabled,
     mode,
@@ -420,6 +452,8 @@ function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | undefined
     ...(apiKey ? { apiKey } : {}),
     ...(model ? { model } : {}),
     ...(granularity ? { granularity } : {}),
+    ...(identityMap ? { identityMap } : {}),
+    ...(displayNames ? { displayNames } : {}),
   };
 }
 

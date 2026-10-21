@@ -51,6 +51,14 @@ export function resolveMemoryUid(memory: Pick<MemoryConfig, 'identityMap'>, appI
   return mapped || appId;
 }
 
+/** OpenViking user_id 合法性（路径安全 + uid 口径）：字母数字下划线连字符，≤128。
+ *  单源在 memory.ts：config.ts（加载层校验 identityMap 条目）与 memory-users-api.ts
+ *  （管理面建用户/重置/删除）共用——放 web 层会引入 config → web 的模块环
+ *  （web/config-api.ts 反向依赖 config.ts）。re-export 见 memory-users-api.ts */
+export function isValidUserId(uid: string): boolean {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(uid);
+}
+
 /**
  * memory.enabled 时的 ns env 下发（§6.4/§6.6）——返回值由调用方以「保留既有值」方式并入
  * taskEnv（apps[].env 手配 OPENVIKING_* = 专家覆盖口，优先级最高）。键语义：

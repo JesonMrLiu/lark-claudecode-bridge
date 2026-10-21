@@ -41,7 +41,7 @@ import { ensureProfileSettingsFile, resolveAppProfile, resolveAppProfileModel } 
 import {
   MEMORY_PLUGIN_NAME, createMemoryProvider, ensureMemoryUserKeys, memoryEndpoint, memoryEnvFor, type MemoryProvider,
 } from './memory.js';
-import { WEB_USER_ID } from './web/memory-users-api.js';
+import { WEB_USER_ID, vaultStore } from './web/memory-users-api.js';
 import { cleanupClientCliConf, ensureClientCliConf, ensureMemoryServiceRunning, stopManagedServer } from './memory-installer.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
@@ -1648,6 +1648,12 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     for (const o of outcomes.values()) {
       if (o.userKey) {
         memoryUserKeys.set(o.appId, o.userKey);
+        // 重签即换新 key（服务端旧 key 立即失效）：按 uid 同步刷进密钥保险库，配置页复制/
+        // OpenViking Studio / 本机插件拿到的始终是可用 key。不刷则保险库留旧 key，要等
+        // 「用户与密钥」Tab 打开触发列表自愈，期间复制出去的 key 必 401（共享映射 uid 被
+        // 每次 LCB 重启重签，窗口高频出现）。共享身份多 appId 携同一把 key，vaultStore
+        // 按 uid 键合 + 明文缓存去重，重复调用零额外 DPAPI 开销
+        if (o.uid) void vaultStore(o.uid, o.userKey).catch(() => { /* 保险库写失败不阻断签发链路 */ });
         unreachable = false;
         const label = o.appId === WEB_USER_ID ? 'web 用户（网页端）'
           : o.uid && o.uid !== o.appId ? `bot ${o.appId} → ${o.uid}（共享/映射身份）`

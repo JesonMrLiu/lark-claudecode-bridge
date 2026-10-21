@@ -21,7 +21,7 @@ import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import type { BridgeConfig, MemoryConfig } from '../types.js';
 import { MANAGED_OV_CONF, MEMORY_MANAGED_DIR } from '../memory-installer.js';
-import { DEFAULT_MEMORY_ACCOUNT, memoryAccount, memoryEndpoint, ensureRemoteAccount, probeMemoryHealth } from '../memory.js';
+import { DEFAULT_MEMORY_ACCOUNT, isValidUserId, memoryAccount, memoryEndpoint, ensureRemoteAccount, probeMemoryHealth } from '../memory.js';
 import { maskSecret } from './config-api.js';
 
 /** 网页管理端用户约定 uid（方案 §四 阶段 3：{"user_id":"web"}） */
@@ -33,10 +33,9 @@ export const MEMORY_AUDIT_LOG = join(MEMORY_MANAGED_DIR, 'audit.log');
 /** 删除前备份目录（先备份后删除，方案 §六/§七「清理动作必须二次确认 + 先备份」） */
 export const MEMORY_BACKUP_DIR = join(MEMORY_MANAGED_DIR, 'backups');
 
-/** user_id 合法性（路径安全 + OpenViking uid 口径）：字母数字下划线连字符，≤128 */
-export function isValidUserId(uid: string): boolean {
-  return /^[A-Za-z0-9_-]{1,128}$/.test(uid);
-}
+/** user_id 合法性（路径安全 + OpenViking uid 口径）：单源在 ../memory.js（config.ts 加载层
+ *  校验 identityMap 同口径），此处 re-export 保持既有引用路径不变 */
+export { isValidUserId };
 
 // ============ 审计留痕 ============
 
@@ -155,7 +154,10 @@ function dpapi(mode: 'protect' | 'unprotect', b64: string): Promise<string | nul
  *  明文进程内缓存：列表每次聚合都会回带 api_key——值未变时跳过 DPAPI 重加密（省一次 PowerShell 进程） */
 const vaultSeenPlain = new Map<string, string>();
 
-async function vaultStore(uid: string, plain: string): Promise<void> {
+/** 密钥入保险库（exported）：index.ts 启动/热重载签发链路（refreshMemoryKeys）重签成功后
+ *  按 uid 同步刷新，消灭「重签换 key 后保险库留旧 key → 配置页/Studio 复制即 401、
+ *  须等「用户与密钥」Tab 列表自愈」的窗口 */
+export async function vaultStore(uid: string, plain: string): Promise<void> {
   if (vaultSeenPlain.get(uid) === plain && loadVault()[uid]) return;
   const v = loadVault();
   if (process.platform === 'win32') {
