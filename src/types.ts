@@ -169,6 +169,14 @@ export interface MemoryConfig {
    *  'bot-user' = 升级 bot×人（触发信号出现后的增量升级——已有 bot key 不作废、不动会话，
    *  仅追加新聊天者签发逻辑）。仅记录意向与页面展示，鉴权实际形态随 auth_mode 演进 */
   granularity?: 'bot' | 'bot-user';
+  /** 机器人 → OpenViking 用户 关联表（记忆身份映射，「用户与密钥」Tab 可视化管理）：
+   *  键 = 飞书 appId，值 = OpenViking user_id（ASCII，见 memory-users-api isValidUserId）。
+   *  每台机器人关联且仅关联一个用户；缺省（无条目）= 专属用户（uid 即 appId，历史口径零迁移）。
+   *  多台机器人映射同一 uid = 共享同一份记忆。变更经 saveDoc 落盘后由 memory 热重载链路重签生效 */
+  identityMap?: Record<string, string>;
+  /** OpenViking user_id → 中文显示名（仅 LCB 侧存储与配置页展示——服务端 user_id 仅 ASCII 且
+   *  无显示名字段，人可读对照以本映射为准；user_id 本身保持 ASCII 稳定标识） */
+  displayNames?: Record<string, string>;
 }
 /** 飞书斜杠命令注册定义（同步到开放平台 app_slash_commands；command 不含 / 前缀） */
 export interface SlashCommandDef { command: string; description: string; icon?: string }
@@ -263,7 +271,8 @@ export interface RejectedMessage {
 export type CardDecision = 'allow' | 'deny' | 'allow-session'
   | 'plan-approve' | 'plan-revise' | 'plan-reject' | 'plan-view-file'
   | 'qa-pick' | 'qa-submit'
-  | 'ws-switch';
+  | 'ws-switch'
+  | 'progress-tools-expand' | 'progress-tools-fold';
 export interface CardActionValue {
   requestId: string; decision: CardDecision; feedback?: string;
   /** qa-pick：问题下标与选项 label */
@@ -273,6 +282,8 @@ export interface CardActionValue {
   formValue?: Record<string, string>;
   /** ws-switch：目标工作区名（/ws 工作区卡片的切换按钮） */
   ws?: string;
+  /** progress-tools-expand/fold：工作动态展开/收起按钮定位进度卡用（channelKey 定位） */
+  channelKey?: string;
 }
 export interface CardActionEvent { value: CardActionValue; operatorId: string; openMessageId: string }
 /**
@@ -300,10 +311,21 @@ export type PermissionDecision = 'allow' | 'deny' | 'allow-session';
  * - first-delta：首个流式 text 增量（模型开始吐字）——提前把启动阶段文案切为「正在执行」
  * - agent-start/agent-settle：子代理与后台任务生命周期（进度卡子代理清单的数据源）
  */
+/** TodoWrite 待办项状态（CLI 原生枚举透传） */
+export type TodoItemStatus = 'pending' | 'in_progress' | 'completed';
+
 export type ProgressEvent =
-  | { kind: 'text' | 'tool-start' | 'status'; content: string }
+  | { kind: 'text' | 'status'; content: string }
+  /** 模型思考期（CLI status=requesting 心跳）：进度卡显示「💭 处理中…」于执行栈顶，
+   *  首个步骤/工具/文本事件到达即焚（v5：替代旧「等待模型响应…」笼罩性状态行） */
+  | { kind: 'thinking' }
   | { kind: 'first-delta' }
-  | { kind: 'tool-result'; content: string; ok: boolean; note?: string }
+  /** 工具调用开始：tool/summary 拆字段（旧版拼在 content 里按 ': ' 反解，命令含 ': ' 会解析错位）；
+   *  sub=true 表示该调用发生在子代理内（parent_tool_use_id 非空），进度卡归组到对应子代理步骤 */
+  | { kind: 'tool-start'; tool: string; summary: string; sub?: boolean }
+  | { kind: 'tool-result'; tool: string; ok: boolean; note?: string; sub?: boolean }
+  /** TodoWrite 待办清单（步骤式进度卡的步骤来源）：每次调用全量替换清单与状态 */
+  | { kind: 'todos'; todos: Array<{ content: string; activeForm?: string; status: TodoItemStatus }> }
   | { kind: 'agent-start'; agent: { id: string; description: string; type: string } }
   | { kind: 'agent-settle'; id: string; status: 'done' | 'failed' | 'stopped'; summary?: string };
 

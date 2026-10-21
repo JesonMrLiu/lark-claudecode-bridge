@@ -1,4 +1,8 @@
-import { buildProgressCard, buildSinkNoticeCard, buildPartialUpdateActions, buildQaButtonActions, type ProgressState } from './card-builder.js';
+import {
+  buildProgressCard, buildProgressParts, buildSinkNoticeCard, buildPartialUpdateActions, buildQaButtonActions,
+  toolLabel, STEP_TOOLS_MAX, LOOSE_TOOLS_MAX,
+  type ProgressState, type TaskPhase, type TaskStep, type SubagentTask, type ToolStep, type TodoItem,
+} from './card-builder.js';
 import type { ConfirmationRequest } from '../types.js';
 
 export interface CardSender {
@@ -17,10 +21,10 @@ export interface CardSender {
 }
 
 /** 进度卡初始文案：markStarted 据此识别「尚未进入执行阶段」——首个执行事件到达时切为执行中 */
-const INITIAL_STATUS = '🚀 已接收，启动中…';
+const INITIAL_STATUS = '已接收，启动中…';
 /** init 到达后的启动阶段文案（CLI 进程已起、会话已建，仍在加载上下文/工具）：markSessionReady
  *  切入此态，markStarted 同样允许从此态接管——冷启动大头发生在 init 之前，先让用户看到进程已建立 */
-const BOOT_STATUS = '🔌 会话已建立，加载上下文与工具中…';
+const BOOT_STATUS = '会话已建立，加载上下文与工具中…';
 /** 单次卡片更新请求超时：飞书 SDK 的 axios 无超时（timeout=0），请求被网络黑洞时
  *  flush 串行链会无限期挂起（生产实测单次挂 7.4 分钟）——挂起期间计时/交互区全停，
  *  与任务卡死无从区分。到点按失败处理（seq 不推进）下轮重试；若超时请求实际已在
@@ -82,6 +86,11 @@ export class ProgressCard {
   private heartbeatTimer?: NodeJS.Timeout;
   private lastActivityAt = Date.now();
   private done = false;
+  /** 工具折叠面板模式（仅实体卡/cardkit 通道）：消息卡通道对新组件兼容面未验证，降级不含面板 */
+  private panelMode = false;
+  /** 局部更新内容缓存（element_id → 上次下发 content）：内容未变的组件跳过，
+   *  心跳每秒只刷真正变化的行（默认仅计时行），避免步骤多时触碰 batch_update 频控 */
+  private partialCache = new Map<string, string>();
   // C1 修复：flush 单飞串行化——同一时刻最多一个 updateCard in-flight，
   // 期间的新 flush 请求标记 dirty，落地后补刷一次；保证任何时刻后发起的
   // 更新（尤其 finish 终态）永远晚于先前挂起的更新落地。
@@ -92,26 +101,32 @@ export class ProgressCard {
   constructor(
     private sender: CardSender,
     title: string,
-    private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number; cardWidthMode?: 'default' | 'fill'; updateTimeoutMs?: number } = {},
+    private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number; cardWidthMode?: 'default' | 'fill'; updateTimeoutMs?: number; channelKey?: string } = {},
   ) {
-    this.state = { title, status: INITIAL_STATUS, toolLine: '', startedAt: Date.now(), agents: [] };
+    this.state = {
+      title, status: INITIAL_STATUS, startedAt: Date.now(),
+      phase: 'boot', steps: [], agents: [], looseTools: [],
+      channelKey: opts.channelKey,
+    };
   }
 
   async start(): Promise<void> {
-    const initial = buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default');
-    // 优先卡片实体模式（支持局部更新 → plan 表单输入不被心跳刷掉）；
-    // 创建失败（cardkit:card:write 权限缺失/接口异常）降级为普通卡片 + 整卡 PATCH，功能不退化
+    // 优先卡片实体模式（支持局部更新 → plan 表单输入不被心跳刷掉，且为工具折叠面板的
+    // 唯一渲染通道）；创建失败（cardkit:card:write 权限缺失/接口异常）降级为普通卡片 +
+    // 整卡 PATCH，功能不退化（面板随之取消，步骤行内联工具计数）
     if (this.sender.sendCardEntity) {
       try {
-        const { messageId, cardId } = await this.sender.sendCardEntity(initial);
+        const { messageId, cardId } = await this.sender.sendCardEntity(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', true));
         this.messageId = messageId;
         this.cardId = cardId;
+        this.panelMode = true;
       } catch (e) {
-        console.warn('[进度卡] 卡片实体模式不可用，降级为整卡更新（挂起期间状态/计时停更，输入冻结保护仍生效）。如已开通 cardkit:card:write，需在飞书开发者后台创建新版本并发布、并重启 bridge 后生效。原因：', e instanceof Error ? e.message : e);
+        console.warn('[进度卡] 卡片实体模式不可用，降级为整卡更新（挂起期间状态/计时停更，输入冻结保护仍生效，工具明细不展示折叠面板）。如已开通 cardkit:card:write，需在飞书开发者后台创建新版本并发布、并重启 bridge 后生效。原因：', e instanceof Error ? e.message : e);
       }
     }
     if (!this.messageId) {
-      this.messageId = await this.sender.sendCard(initial);
+      this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', false));
+      this.panelMode = false;
     }
     this.lastStructure = this.structureKey();
     this.qaButtonsDirty = false;
@@ -129,73 +144,224 @@ export class ProgressCard {
   }
 
   /** 流式文本块到达（活动信号）：产品决策——运行中与终态都不在主卡渲染过程文本/回复正文，
-   *  完整回复由 index.ts 收尾逻辑独立多卡直接展示；此方法仅刷新空闲计时（配合 wiring 侧
-   *  的 markStarted 切阶段文案），不再积累 buffer */
+   *  完整回复由 index.ts 收尾逻辑独立多卡直接展示；此方法清执行瞬态（💭 处理中即焚——
+   *  模型已开始吐字）并刷新空闲计时，不再积累 buffer */
   appendText(_delta: string): void {
     if (this.done) return;
-    this.lastActivityAt = Date.now();
-  }
-
-  toolStart(name: string, summary: string): void {
-    if (this.done) return;
-    this.state.toolLine = `${name}: ${summary.slice(0, 120)}`;
-    this.lastActivityAt = Date.now();
-    void this.flush();
-  }
-
-  toolResult(name: string, ok: boolean, note?: string): void {
-    if (this.done) return;
-    // 失败时带首行原因（权限被拒/命令出错一眼可辨），不再让 ✘ 被误读成「工具没权限」
-    this.state.toolLine = note ? `${ok ? '✔' : '✘'} ${name} — ${note}` : `${ok ? '✔' : '✘'} ${name}`;
+    this.clearTransient();
     this.lastActivityAt = Date.now();
   }
 
   /**
-   * 首个执行事件（流式增量/工具调用）到达：启动阶段文案（已接收/会话已建立）切为「正在执行…」。
-   * 幂等且仅在状态行仍处于启动阶段（INITIAL/BOOT）时改写——CLI status 心跳（🌐 等待模型响应等）
-   * 若先到则不覆盖；解决长任务期间状态行一直停留在"启动中"与实际执行进度不符的问题
+   * 工具调用开始：sub=true 表示发生在子代理内，归组到最后一个运行中的子代理；
+   * 主代理调用归组到当前 active 步骤（TodoWrite 驱动），无步骤时入未归属池。
+   * 「正在使用 X」行归属到所属条目下方（v5 执行栈），历史明细仅进折叠面板（实体卡模式）。
+   */
+  toolStart(name: string, summary: string, sub = false): void {
+    if (this.done) return;
+    const label = toolLabel(name);
+    const trimmed = summary.slice(0, 80);
+    this.clearTransient(); // 执行证据到达：💭 处理中即焚、心跳小字清空
+    if (sub) {
+      const agent = [...this.state.agents].reverse().find((a) => a.status === 'running');
+      if (agent) {
+        if (agent.tools.length < STEP_TOOLS_MAX) {
+          // 同工具连续 start（上次未 result）：覆写上一条 running，避免出现两条 running
+          const last = agent.tools[agent.tools.length - 1];
+          if (last && last.ok === 'running') { last.label = label; last.summary = trimmed; }
+          else agent.tools.push({ name, label, summary: trimmed, ok: 'running' });
+        }
+        this.state.runningTool = { label, summary: trimmed, state: 'running' };
+        this.lastActivityAt = Date.now();
+        void this.flush();
+        return;
+      }
+      // 无运行中子代理（task_started 竞态/旧 CLI）：落主代理池兜底
+    }
+    const active = this.state.steps.find((s) => s.status === 'active');
+    const pool = active ? active.tools : this.state.looseTools;
+    const cap = active ? STEP_TOOLS_MAX : LOOSE_TOOLS_MAX;
+    if (pool.length < cap) {
+      const last = pool[pool.length - 1];
+      if (last && last.ok === 'running') { last.label = label; last.summary = trimmed; }
+      else pool.push({ name, label, summary: trimmed, ok: 'running' });
+    }
+    this.state.runningTool = { label, summary: trimmed, state: 'running' };
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /** 定位在途工具所在集合及其归属条目（toolResult 回写「刚完成」行用）：
+   *  优先匹配 sub 标记的池，找不到回退主池；未归属池无 owner */
+  private locateRunningOwner(sub: boolean): { pool: Array<ToolStep>; owner?: TaskStep | SubagentTask } | undefined {
+    if (sub) {
+      for (let i = this.state.agents.length - 1; i >= 0; i--) {
+        const a = this.state.agents[i];
+        if (a.tools.some((t) => t.ok === 'running')) return { pool: a.tools, owner: a };
+      }
+    }
+    for (let i = this.state.steps.length - 1; i >= 0; i--) {
+      const s = this.state.steps[i];
+      if (s.tools.some((t) => t.ok === 'running')) return { pool: s.tools, owner: s };
+    }
+    if (this.state.looseTools.some((t) => t.ok === 'running')) return { pool: this.state.looseTools };
+    return undefined;
+  }
+
+  /**
+   * 工具调用落定：按工具名匹配最后一条 running（找不到回退池内最后一条 running），失败时
+   * 带首行原因（权限被拒/命令出错一眼可辨）。落定后 ↳ 行不消失——转「刚完成」灰态保持
+   * 显示（归属到工具所在条目下方），直到该条目下一条 toolStart 覆盖或条目完成。
+   */
+  toolResult(name: string, ok: boolean, note?: string, sub = false): void {
+    if (this.done) return;
+    this.state.thinking = false; // 有执行结果即非思考期（随后的 requesting 心跳会重新点亮）
+    const found = this.locateRunningOwner(sub) ?? this.locateRunningOwner(false);
+    let settled: ToolStep | undefined;
+    if (found) {
+      const { pool, owner } = found;
+      for (let i = pool.length - 1; i >= 0; i--) {
+        const s = pool[i];
+        // 按工具名匹配最后一条 running；名字对不上时回退池内最后一条 running
+        if (s.ok === 'running' && (s.name === name || pool.slice(i + 1).every((x) => x.ok !== 'running'))) {
+          s.ok = ok;
+          if (!ok && note) s.summary = note.slice(0, 60);
+          settled = s;
+          break;
+        }
+      }
+      // 「刚完成」行归属到工具所在条目（v5：每个条目自己的 ↳ 行）
+      if (settled && owner) owner.recent = { label: settled.label, summary: settled.summary };
+    }
+    const stillRunning = this.state.steps.some((s) => s.tools.some((t) => t.ok === 'running'))
+      || this.state.agents.some((a) => a.tools.some((t) => t.ok === 'running'))
+      || this.state.looseTools.some((t) => t.ok === 'running');
+    if (!stillRunning) {
+      this.state.runningTool = settled
+        ? { label: settled.label, summary: settled.summary, state: 'done' }
+        : undefined;
+    }
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /**
+   * TodoWrite 待办清单（步骤来源）：每次调用全量替换清单与状态，以 content 为键保留已归组
+   * 的工具明细、激活时刻（倒序执行栈排序键）与「刚完成」行（步骤完成即收起）。
+   * 无待办的小任务 steps 为空 → 降级视图（💭 处理中 + ↳ 当前动作行）
+   */
+  setTodos(todos: TodoItem[]): void {
+    if (this.done) return;
+    const prev = new Map(this.state.steps.map((s) => [s.title, s]));
+    this.state.steps = todos.map((t) => {
+      const old = prev.get(t.content);
+      const status = t.status === 'completed' ? 'done' as const : t.status === 'in_progress' ? 'active' as const : 'pending' as const;
+      const activatedAt = old?.activatedAt ?? (status === 'active' ? Date.now() : undefined);
+      return {
+        title: t.content,
+        ...(t.activeForm ? { activeLabel: t.activeForm } : {}),
+        status,
+        tools: old?.tools ?? [],
+        ...(activatedAt !== undefined ? { activatedAt } : {}),
+        ...(status !== 'done' && old?.recent ? { recent: old.recent } : {}),
+      };
+    });
+    this.clearTransient();
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /**
+   * 首个执行事件（流式增量/工具调用）到达：清掉 💭 处理中与心跳小字；启动阶段文案
+   * （已接收/会话已建立）一并清除——v5 执行期不再有笼罩性状态行，版面主体=倒序执行栈。
+   * 幂等：状态行已非启动文案时仅清瞬态
    */
   markStarted(): void {
-    if (this.done || (this.state.status !== INITIAL_STATUS && this.state.status !== BOOT_STATUS)) return;
-    this.setStatus('🔄 正在执行…');
+    if (this.done) return;
+    this.clearTransient();
+    if (this.state.status === INITIAL_STATUS || this.state.status === BOOT_STATUS) {
+      this.state.status = '';
+    }
+    if (this.state.phase === 'boot') this.state.phase = 'running';
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /**
+   * 模型思考期（CLI status=requesting 心跳）：状态行置「💭 处理中…」（执行栈顶唯一状态行），
+   * 首个步骤/工具/文本事件到达即焚（markStarted/toolStart/appendText/setTodos 均 clearTransient）。
+   * v5 替代旧「等待模型响应…」——思考不再整程笼罩工具列表，只在真正等待模型时出现
+   */
+  markThinking(): void {
+    if (this.done) return;
+    this.state.thinking = true;
+    this.state.heartbeat = undefined;
+    if (this.state.phase === 'boot') this.state.phase = 'running';
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /** 清执行瞬态：💭 处理中即焚 + 心跳小字清空（执行证据到达时调用） */
+  private clearTransient(): void {
+    this.state.thinking = false;
+    this.state.heartbeat = undefined;
   }
 
   /**
    * system/init 到达（CLI 进程已起、会话已建立）：「已接收，启动中…」切为「会话已建立」，
    * 冷启动期间（加载配置/插件/MCP server、resume 回放，常见数十秒）不再黑盒。幂等且仅在
-   * 初始文案时生效——CLI status 心跳若先到则不倒退
+   * 初始文案时生效——首个执行事件（markStarted）会一并清掉
    */
   markSessionReady(): void {
     if (this.done || this.state.status !== INITIAL_STATUS) return;
-    this.setStatus(BOOT_STATUS);
-  }
-
-  setStatus(status: string): void {
-    if (this.done) return;
-    this.state.status = status;
+    this.state.status = BOOT_STATUS;
     this.lastActivityAt = Date.now();
     void this.flush();
   }
 
   /**
-   * 挂起/清除内嵌工具确认：非 undefined 时卡片底部渲染确认按钮区并收敛正文，
+   * 运行心跳（v5 降级为灰色小字行，渲染在执行栈与计时行之间）：上下文压缩/等待后台任务/
+   * 决策结果等有信息量的状态文案；空串 = 清空。执行事件（工具/文本/待办）到达时经
+   * clearTransient 清空——心跳只描述「当前没在执行时的等待原因」
+   */
+  setStatus(status: string): void {
+    if (this.done) return;
+    const s = status.trim();
+    this.state.heartbeat = s || undefined;
+    this.state.thinking = false; // CLI 显式状态心跳取代思考态（requesting 另走 markThinking）
+    this.lastActivityAt = Date.now();
+    void this.flush();
+  }
+
+  /** 挂起/解除用户输入区时同步阶段色点：挂起 → waiting（橙），解除且未终态 → 恢复 running */
+  private setWaiting(active: boolean): void {
+    if (this.done) return;
+    if (active) this.state.phase = 'waiting';
+    else if (this.state.phase === 'waiting') this.state.phase = 'running';
+  }
+
+  /**
+   * 挂起/清除内嵌工具确认：非 undefined 时卡片顶部渲染确认按钮区并收敛正文，
    * 决策（含超时）后置回 undefined 恢复正文展示。appendText 期间照常积累 buffer，
    * 清除后 flush 一次性带出。
    */
   setConfirm(req: ConfirmationRequest | undefined): void {
     if (this.done) return;
     this.state.confirm = req;
+    this.setWaiting(!!req);
     this.lastActivityAt = Date.now();
     void this.flush();
   }
 
   /**
-   * 挂起/清除内嵌计划确认（#3+#6）：plan 正文由 wiring 侧两段式多卡直发（sendPlanContentCards），
-   * 本卡仅渲染就绪提示 + 审批表单。决策后 clearPlan() 收回区域
+   * 挂起/清除计划审批（#3+#6）：v5 计划正文与审批表单都在独立卡片上（index 侧
+   * sendPlanContentCards + buildPlanConfirmCard），本卡不再渲染 plan 区块——此状态仅维持
+   * 等待阶段（header 变橙 + 计时行「计划确认后恢复」+ 维持性刷新冻结）。决策后置回 undefined
    */
   setPlan(req: import('./card-builder.js').EmbeddedPlanState | undefined): void {
     if (this.done) return;
     this.state.plan = req;
+    this.setWaiting(!!req);
     this.lastActivityAt = Date.now();
     void this.flush();
   }
@@ -207,6 +373,7 @@ export class ProgressCard {
   setQuestion(req: import('./card-builder.js').EmbeddedQuestionState | undefined): void {
     if (this.done) return;
     this.state.question = req;
+    this.setWaiting(!!req);
     // 提问区收回时同步清选中态脏标记（按钮已随全量替换消失，qa-only 空批次无意义）
     if (!req) this.qaButtonsDirty = false;
     this.lastActivityAt = Date.now();
@@ -250,17 +417,20 @@ export class ProgressCard {
     void this.flush();
   }
 
-  /** 子代理/后台任务启动：加入清单（同 id 重复启动幂等跳过） */
+  /** 子代理/后台任务启动：加入清单（同 id 重复启动幂等跳过）。v5 与步骤同级独立成行，
+   *  按启动时间插入倒序执行栈 */
   agentStart(agent: { id: string; description: string; type: string }): void {
     if (this.done) return;
     if (this.state.agents.some((t) => t.id === agent.id)) return;
-    this.state.agents.push({ ...agent, startedAt: Date.now(), status: 'running' });
+    this.clearTransient();
+    this.state.agents.push({ ...agent, startedAt: Date.now(), status: 'running', tools: [] });
     this.lastActivityAt = Date.now();
     void this.flush();
   }
 
   /**
-   * 子代理/后台任务落定：标记完成/失败/停止（条目保留至任务结束供回看）。
+   * 子代理/后台任务落定：标记完成/失败/停止（条目保留至任务结束供回看）；
+   * 落定即收起「刚完成」行（结论摘要随 ✅/❌ 行展示）。
    * 找不到条目时补建（resume 续跑场景：上轮启动的后台任务本轮才收到通知）。
    */
   agentSettle(id: string, status: 'done' | 'failed' | 'stopped', summary?: string): void {
@@ -268,9 +438,10 @@ export class ProgressCard {
     const t = this.state.agents.find((x) => x.id === id);
     if (t) {
       t.status = status;
+      t.recent = undefined;
       if (summary) t.summary = summary;
     } else {
-      this.state.agents.push({ id, description: summary?.slice(0, 80) ?? id, type: 'task', startedAt: Date.now(), status, ...(summary ? { summary } : {}) });
+      this.state.agents.push({ id, description: summary?.slice(0, 80) ?? id, type: 'task', startedAt: Date.now(), status, tools: [], ...(summary ? { summary } : {}) });
     }
     this.lastActivityAt = Date.now();
     void this.flush();
@@ -279,15 +450,20 @@ export class ProgressCard {
   /**
    * 终态收敛。resultChars：完整回复字数（有回复时传入）——终态不渲染回复正文，仅在该值
    * 非空时显示一行「完整回复已单独发送」指引（正文由 index.ts 收尾独立多卡直接展示）。
+   * phase：终态阶段（done 绿 / stopped 灰 / error 红），驱动结论行 emoji 与 header 色；缺省 done。
+   * 工具动态与子代理清单保留到终态（呼应原型：终态卡可回看本次做了哪些动作）。
    */
-  async finish(summary: string, resultChars?: number): Promise<void> {
+  async finish(summary: string, resultChars?: number, phase: TaskPhase = 'done'): Promise<void> {
     this.done = true;
     this.state.done = true;
+    this.state.phase = phase;
     clearInterval(this.flushTimer);
     clearInterval(this.heartbeatTimer);
     this.sinkNoticeRetry = undefined; // 心跳已停，补打失去驱动；终态后旧卡提示已无意义
     this.state.status = summary;
-    this.state.toolLine = '';
+    this.state.runningTool = undefined;
+    this.state.thinking = false;
+    this.state.heartbeat = undefined;
     this.state.resultChars = resultChars;
     // 终态不再带交互区（决策未落的最极端兜底；正常路径 plan/question/confirm 先于 finish settle）
     this.state.confirm = undefined;
@@ -348,16 +524,19 @@ export class ProgressCard {
     }
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const fresh = buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default');
-        // 沉底重发沿用当前模式：原先是实体模式则新建实体（旧实体已随消息撤回弃用）
+        // 沉底重发沿用当前模式：原先是实体模式则新建实体（旧实体已随消息撤回弃用），
+        // 工具折叠面板随通道走（实体卡有、消息卡降级无）
         if (this.sender.sendCardEntity && oldCardId) {
-          const { messageId, cardId } = await this.sender.sendCardEntity(fresh);
+          const { messageId, cardId } = await this.sender.sendCardEntity(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', true));
           this.messageId = messageId;
           this.cardId = cardId;
+          this.panelMode = true;
           this.seq = 0; // sequence 按实体计数：新实体从 1 重新递增
         } else {
-          this.messageId = await this.sender.sendCard(fresh);
+          this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', false));
+          this.panelMode = false;
         }
+        this.partialCache.clear();
         this.lastStructure = this.structureKey();
         this.qaButtonsDirty = false; // 重发卡片已含最新选中态
         void this.flush();
@@ -433,20 +612,36 @@ export class ProgressCard {
               if (this.hasInputPending() && !this.qaButtonsDirty) break;
               withQaButtons = this.qaButtonsDirty;
               this.qaButtonsDirty = false; // 先清后发：失败恢复见 catch
-              const actions = this.hasInputPending()
+              // 内容未变化的组件跳过（partialCache 记上次成功下发的 content）：心跳每秒
+              // 通常只有计时行变化，步骤多时不至于整批全量触达 batch_update 频控
+              const allActions = this.hasInputPending()
                 ? buildQaButtonActions(this.state)
-                : buildPartialUpdateActions(this.state, withQaButtons);
+                : buildPartialUpdateActions(this.state, this.panelMode, withQaButtons);
+              const actions = this.hasInputPending()
+                ? allActions
+                : allActions.filter((a) => {
+                  const content = (a.params.partial_element as { content?: string }).content;
+                  if (typeof content !== 'string') return true; // qa 按钮类（text/type）不过滤
+                  return this.partialCache.get(a.params.element_id) !== content;
+                });
               // 挂起中无 qa 按钮可发（question 刚被清等边界）：视同冻结跳过；脏标记不恢复
-              // （空批次重试只会无限刷日志，选中态由下次全量渲染/点击补齐）
+              // （空批次重试只会无限刷日志，选中态由下次全量渲染/点击补齐）。
+              // 正常路径内容全无变化（纯心跳无事件）同样空批直接跳过
               if (actions.length === 0) break;
               await withTimeout(this.sender.partialUpdateCard(this.cardId, expectedSeq, actions), timeoutMs);
+              // 成功才落缓存：失败路径不落，下轮原样重发
+              for (const a of actions) {
+                const content = (a.params.partial_element as { content?: string }).content;
+                if (typeof content === 'string') this.partialCache.set(a.params.element_id, content);
+              }
             } else {
               // 结构变化：全量替换实体（form 输入会重置，但这些时刻用户尚未输入或已提交；
               // 全量渲染已含最新选中态）。replace 前同样先清 qa 脏标记（先清后发）：await
               // 期间新点击重新置位的 dirty 由下一轮 partial（qa 例外通道）自动补发
               withQaButtons = this.qaButtonsDirty;
               this.qaButtonsDirty = false;
-              await withTimeout(this.sender.replaceCard(this.cardId, expectedSeq, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
+              await withTimeout(this.sender.replaceCard(this.cardId, expectedSeq, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', this.panelMode)), timeoutMs);
+              this.partialCache.clear();
               this.lastStructure = structure;
             }
           } else {
@@ -456,7 +651,7 @@ export class ProgressCard {
             // 否则确认按钮根本不上屏。计时/状态行在挂起期间停更可接受（任务实际在等用户）
             const structure = this.structureKey();
             if (this.hasInputPending() && structure === this.lastStructure) break;
-            await withTimeout(this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default')), timeoutMs);
+            await withTimeout(this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', this.panelMode)), timeoutMs);
             this.lastStructure = structure;
           }
           this.seq = expectedSeq; // 仅成功后提交推进
@@ -532,12 +727,21 @@ export class ProgressCard {
     return !!(this.state.plan || this.state.question);
   }
 
-  /** 结构签名：交互区存在性 + 终态——任一变化都需要全量重渲染才能上屏。
+  /** 结构签名：阶段（header 模板色）、交互区存在性、终态、面板模式（通道切换）、
+   *  执行栈条目（v5 倒序混排后的渲染序：kind + 标题 + 状态 + 面板工具数）、未归属池有无
+   *  ——任一变化都需要全量重渲染才能上屏（条目增删/换序、面板出现/消失都是元素级结构变化）。
+   *  行内易变内容（子代理运行秒数、↳ 正在使用/刚完成、状态行处理中）不进签名——那些走
+   *  element 级局部更新（partialCache 内容 diff 过滤后发送）。
    *  0.20.0 起不含 qa 选中态：选中态变化只走按钮 element_id 级局部更新，全量替换会
    *  清空 form 内未提交的自定义输入（用户点选项时输入框里可能已打了字） */
   private structureKey(): string {
     const s = this.state;
-    return JSON.stringify([!!s.confirm, !!s.plan, !!s.question, !!s.done]);
+    const parts = buildProgressParts(s, this.panelMode);
+    return JSON.stringify([
+      s.phase, !!s.confirm, !!s.plan, !!s.question, !!s.done, this.panelMode,
+      parts.items.map((x) => x.sig),
+      s.looseTools.length > 0,
+    ]);
   }
 }
 

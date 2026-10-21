@@ -18,8 +18,9 @@ import { FeishuGateway } from './gateway/feishu-gateway.js';
 import { registerChatInfoSource } from './gateway/gateway-registry.js';
 import { ProgressCard, feishuErrorBody } from './gateway/progress-card.js';
 import {
-  DECISION_TEXT,
-  buildPlanTailCard, buildResultTailCard, buildWorkspaceSwitchedCard, planChunkHeader, resultChunkHeader,
+  DECISION_TEXT, TOOLS_TOGGLE_REQUEST_ID,
+  buildPlanConfirmCard, buildPlanSettledCard, buildPlanTailCard, buildResultTailCard, buildWorkspaceSwitchedCard,
+  planChunkHeader, resultChunkHeader,
   type PlanCardRequest, type ResultCardRequest,
   type QuestionCardRequest, type QuestionCardAnswers,
 } from './gateway/card-builder.js';
@@ -40,6 +41,7 @@ import { ensureProfileSettingsFile, resolveAppProfile, resolveAppProfileModel } 
 import {
   MEMORY_PLUGIN_NAME, createMemoryProvider, ensureMemoryUserKeys, memoryEndpoint, memoryEnvFor, type MemoryProvider,
 } from './memory.js';
+import { WEB_USER_ID } from './web/memory-users-api.js';
 import { cleanupClientCliConf, ensureClientCliConf, ensureMemoryServiceRunning, stopManagedServer } from './memory-installer.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
@@ -82,9 +84,9 @@ function raceFallback<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
 
 /** plan 卡片按钮文案（toast 用） */
 const PLAN_DECISION_TEXT: Record<Extract<CardDecision, `plan-${string}`>, string> = {
-  'plan-approve': '✅ 计划已批准，开始执行（后续写操作免确认）',
-  'plan-revise': '📝 修改意见已提交',
-  'plan-reject': '❌ 计划已放弃',
+  'plan-approve': '计划已批准，开始执行（后续写操作免确认）',
+  'plan-revise': '修改意见已提交',
+  'plan-reject': '计划已放弃',
   // plan-view-file 不消费挂起项，仅 toast「正在重新发送计划内容卡片…」——文案不在此出现，留口供编译期完整性
   'plan-view-file': '',
 };
@@ -219,7 +221,7 @@ export function createBridge(
     onSettled: (d: PermissionDecision) => void;
   }>();
   // plan 确认挂起项：requestId → 等待中的计划决策（plan-approve/revise/reject）。
-  // 嵌入主卡片后回调侧无 cardId（主卡 messageId 由 ProgressCard 内部管理），改带 channelKey 定位活跃进度卡
+  // v5 审批表单在独立确认卡上（buildPlanConfirmCard，紧跟方案正文直发），回调按 requestId 定位挂起项
   const planPending = new Map<string, {
     resolve: (r: PlanAskResult) => void;
     req: PlanCardRequest;
@@ -227,6 +229,16 @@ export function createBridge(
     channelKey: string;
     chatId: string;
   }>();
+  // 独立计划确认卡（requestId → messageId）：决策/超时后整卡收口为灰色终态卡（按钮消失防重复点击）
+  const planConfirmCards = new Map<string, string>();
+  /** 收口独立计划确认卡（best effort：更新失败仅落日志，不影响流程） */
+  function settlePlanConfirmCard(requestId: string, text: string): void {
+    const mid = planConfirmCards.get(requestId);
+    if (!mid) return;
+    planConfirmCards.delete(requestId);
+    void deps.gateway.updateCard(mid, buildPlanSettledCard(text, config.card?.width ?? 'default'))
+      .catch((e) => console.warn(tag, '[计划确认卡收口失败]（不影响流程）:', e instanceof Error ? e.message : e));
+  }
   // 计划正文两段式多卡直发（与下方「结果回传两段式」完全同构）：~3000 字/块，非尾卡走文本
   // 消息、尾卡走卡片，连发间隔 300ms 防飞书限流。planAsk 与 plan-view-file 回调（存量卡片
   // 残留按钮，重发即「再看一遍」）共用
@@ -317,7 +329,7 @@ export function createBridge(
     runtimes.set(key, rt);
     rt.queuedCount = (rt.queuedCount ?? 0) + 1;
     if (rt.busy) {
-      void deps.gateway.sendTextTo(msg.chatId, `⏳ 当前有任务在运行，本条消息已排队（第 ${rt.queuedCount} 位），完成后自动开始`)
+      void deps.gateway.sendTextTo(msg.chatId, `当前有任务在运行，本条消息已排队（第 ${rt.queuedCount} 位），完成后自动开始`)
         .catch(() => {}); // 提示失败静默：不影响任务本身入队
     }
     const myEpoch = rt.epoch; // 闭包捕获本条消息入队时的代际；executeTask 据此判断是否被 /new 作废
@@ -349,7 +361,7 @@ export function createBridge(
     const n = Number(t);
     const ws = fileTracker.getWorkspace(key);
     if (!(n >= 1 && n <= files.length) || !ws) {
-      await deps.gateway.sendTextTo(msg.chatId, `🔢 编号超出范围（1-${files.length}），请对应上方文件清单回复`);
+      await deps.gateway.sendTextTo(msg.chatId, `编号超出范围（1-${files.length}），请对应上方文件清单回复`);
       return true;
     }
     const file = files[n - 1];
@@ -357,7 +369,7 @@ export function createBridge(
     const displayName = rel.startsWith('..') ? basename(file) : rel;
     const diff = await collectFileDiff(ws, file).catch(() => null);
     if (diff === null || !diff.trim()) {
-      await deps.gateway.sendTextTo(msg.chatId, `📊 ${displayName} 本次无可展示的改动（非 git 仓库 / 未改动 / 二进制）`);
+      await deps.gateway.sendTextTo(msg.chatId, `${displayName} 本次无可展示的改动（非 git 仓库 / 未改动 / 二进制）`);
       return true;
     }
     // 全面卡片化（用户决策）：不论多长一律多卡展示（~2800 字/块），不再落盘 .md 发文件附件；
@@ -365,7 +377,7 @@ export function createBridge(
     const widthMode = config.card?.width ?? 'default';
     const cards = buildFileDiffCards(diff, { fileName: displayName }, widthMode);
     if (diff.length > 100_000) {
-      await deps.gateway.sendTextTo(msg.chatId, `📊 ${displayName} 的 diff 极长（约 ${diff.length.toLocaleString()} 字符），将分 ${cards.length} 张卡片陆续发送，请稍候`);
+      await deps.gateway.sendTextTo(msg.chatId, `${displayName} 的 diff 极长（约 ${diff.length.toLocaleString()} 字符），将分 ${cards.length} 张卡片陆续发送，请稍候`);
     }
     for (let i = 0; i < cards.length; i++) {
       if (i > 0) await new Promise((r) => setTimeout(r, 300));
@@ -393,7 +405,7 @@ export function createBridge(
       if (!reloadFailNotified) {
         reloadFailNotified = true;
         await deps.gateway.sendTextTo(msg.chatId,
-          `⚠️ 配置热重载失败，本次沿用上次配置（修复 config.yaml 后下一条消息自动恢复）：${reloadErr}`)
+          `配置热重载失败，本次沿用上次配置（修复 config.yaml 后下一条消息自动恢复）：${reloadErr}`)
           .catch(() => { /* 提示发送失败不阻断消息循环，错误已留日志 */ });
       }
     } else {
@@ -483,7 +495,7 @@ export function createBridge(
       // 合并的核心增量，改写结果里没有就显式拼到末尾，绝不把用户刚给的链接/要求吞掉
       const finalPrompt = rewriteByTrigger(combined, [pendingSup.rule]) ?? combined;
       const merged = finalPrompt.includes(trimmedText) ? finalPrompt : `${finalPrompt} ${trimmedText}`;
-      await deps.gateway.sendTextTo(msg.chatId, '✅ 已收到补充，任务开始');
+      await deps.gateway.sendTextTo(msg.chatId, '已收到补充，任务开始');
       enqueue(key, msg, merged, currentWorkspace);
       return;
     }
@@ -565,7 +577,7 @@ export function createBridge(
           await deps.gateway.sendTextTo(
             msg.chatId,
             `**工作区列表**（当前：**${currentWorkspace}**）\n${workspaceListMarkdown(config.workspaces, currentWorkspace)}`
-              + '\n\n⚠️ 工作区卡片发送失败（详见桥接器日志），已降级为文本。切换：`/ws use <名字>`',
+              + '\n\n工作区卡片发送失败（详见桥接器日志），已降级为文本。切换：`/ws use <名字>`',
           ).catch(() => { /* 文本也失败（连接断开等）：原错误已留日志，不再冒泡打断消息循环 */ });
         }
       } else if (cmd.reply) {
@@ -614,7 +626,7 @@ export function createBridge(
         }
         gates.get(key)?.reset();
         if (cancelled > 0) {
-          await deps.gateway.sendTextTo(msg.chatId, `🗑️ 已因新建会话取消 ${cancelled} 条排队消息`);
+          await deps.gateway.sendTextTo(msg.chatId, `已因新建会话取消 ${cancelled} 条排队消息`);
         }
       }
       return;
@@ -628,10 +640,10 @@ export function createBridge(
       if (hit.rule.askDetail && !isLocalCommandRewrite(hit.rule.rewrite)) {
         supplementPending.set(key, { rule: hit.rule, originalText: trimmedText, userId: msg.userId, at: Date.now() });
         await deps.gateway.sendTextTo(msg.chatId,
-          `⚡ 已命中触发词「${hit.rule.match}」，请直接回复补充内容（如目标链接、具体要求），我会合并后开始任务（10 分钟内有效；发 /stop 取消）`);
+          `已命中触发词「${hit.rule.match}」，请直接回复补充内容（如目标链接、具体要求），我会合并后开始任务（10 分钟内有效；发 /stop 取消）`);
         return;
       }
-      await deps.gateway.sendTextTo(msg.chatId, '⚡ 已按触发词转入对应技能流程');
+      await deps.gateway.sendTextTo(msg.chatId, '已按触发词转入对应技能流程');
     }
     enqueue(key, msg, cmd.taskText ?? msg.text, currentWorkspace);
   }
@@ -663,8 +675,9 @@ export function createBridge(
           : undefined,
       },
       `任务 · ${wsName}`,
-      // card.width 热生效：每任务现读 config（与同款「同对象 mutate 即生效」语义一致）
-      { cardWidthMode: config.card?.width ?? 'default' },
+      // card.width 热生效：每任务现读 config（与同款「同对象 mutate 即生效」语义一致）；
+      // channelKey 供工作动态展开/收起按钮回调定位本卡（回调 value 携带）
+      { cardWidthMode: config.card?.width ?? 'default', channelKey: key },
     );
     const confirmTimeoutMs = opts.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
     const cardSendTimeoutMs = opts.cardSendTimeoutMs ?? CARD_SEND_TIMEOUT_MS;
@@ -719,7 +732,7 @@ export function createBridge(
             const gc = setTimeout(() => {
               confirmPending.delete(req.requestId);
               progress.setConfirm(undefined);
-              progress.setStatus(`⏰ 确认超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未确认），已自动拒绝 \`${req.toolName}\`；模型重试时会再次请求`);
+              progress.setStatus(`确认超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未确认），已自动拒绝 \`${req.toolName}\`；模型重试时会再次请求`);
               resolve('deny');
             }, confirmTimeoutMs);
             gc.unref();
@@ -739,10 +752,11 @@ export function createBridge(
             });
           });
         },
-        // plan 确认（#3+#6）：计划正文与完整回复同款两段式多卡直发（sendPlanContentCards），
-        // 不搞「点按钮收文件」特例；原文另落盘 claude/plans/ 归档（slug + 时间戳，方便 review
-        // 与 SOP 要求的本地归档，不再有回调消费）。批准/放弃/按意见修改三按钮与意见输入框仍在
-        // 主卡片的内嵌 form 内。超时由本闭包自管：到点 clearPlan + resolve reject
+        // plan 确认（#3+#6，v5 动线：先方案、后确认）：计划正文两段式多卡直发（sendPlanContentCards）
+        // → 独立橙色确认卡（buildPlanConfirmCard：方案要点摘要在上、审批表单在下）紧跟着发送——
+        // 顺序即动线，不再依赖主卡内嵌表单 + 强制沉底保证顺序；主进度卡只维持等待阶段（header 变橙）。
+        // 原文另落盘 claude/plans/ 归档（slug + 时间戳，方便 review 与 SOP 要求的本地归档）。
+        // 超时由本闭包自管：到点收口确认卡 + clearPlan + resolve reject
         planAsk: async (req) => {
           const planReq: PlanCardRequest = { requestId: randomUUID(), plan: req.plan, workspaceName: req.workspaceName };
           // 落盘归档：文件名加时间戳避免并发冲突；失败仅影响归档，不影响直发与审批
@@ -756,21 +770,21 @@ export function createBridge(
           const progress = activeProgress.get(key);
           if (!progress) return { action: 'reject' }; // 进度卡不在 = 任务已结束/被 abort，按放弃处理
           progress.setPlan({ requestId: planReq.requestId, plan: req.plan, workspaceName: req.workspaceName });
-          // 正文直发放挂起开始前：raceFallback 兜底 WS 偶发挂起（此刻超时定时器尚未 arm，裸 await
+          // 发卡放挂起开始前：raceFallback 兜底 WS 偶发挂起（此刻超时定时器尚未 arm，裸 await
           // 挂起即永不超时——同 ask 发卡约束）；raceFallback 永不 reject，失败/超时仅内部落日志，
-          // 审批表单照常可用
+          // 确认卡缺失时审批动线退化为「回复消息表态」，任务不卡死
           await raceFallback(sendPlanContentCards(msg.chatId, planReq), CARD_SEND_TIMEOUT_MS, undefined);
-          // 方案正文卡已全部落地：把带审批表单的主进度卡沉底到正文下方——读完方案就近点按钮，
-          // 批准后执行过程也在正文下方刷新，不用往上滚。force 旁路挂起输入延迟（此刻意见框刚
-          // 上屏、用户连方案都未读完，不可能已打字）；void 不 await：沉底内部 API 无超时包裹，
-          // await 挂起会推迟 planPending 注册，期间旧卡按钮点击查不到挂起项失效。沉底自带兜底：
-          // 撤不掉打迁移标记、重发失败不抛错——上方 setPlan 已让旧卡亮出审批表单，失败也照常可用
-          void progress.sinkToBottom({ force: true });
+          const confirmCardId = await raceFallback(
+            deps.gateway.sendCardTo(msg.chatId, buildPlanConfirmCard(planReq, config.card?.width ?? 'default')),
+            CARD_SEND_TIMEOUT_MS, undefined,
+          );
+          if (confirmCardId) planConfirmCards.set(planReq.requestId, confirmCardId);
           return new Promise<PlanAskResult>((resolve) => {
             const gc = setTimeout(() => {
               planPending.delete(planReq.requestId);
+              settlePlanConfirmCard(planReq.requestId, '已超时，自动放弃');
               progress.setPlan(undefined);
-              progress.setStatus(`⏰ 计划确认超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未确认），已自动放弃；模型重新提交计划时会再次弹出`);
+              progress.setStatus(`计划确认超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未确认），已自动放弃；模型重新提交计划时会再次弹出`);
               resolve({ action: 'reject' });
             }, confirmTimeoutMs);
             gc.unref();
@@ -798,12 +812,12 @@ export function createBridge(
           const progress = activeProgress.get(key);
           if (!progress) return {}; // 进度卡不在 = 任务已结束/被 abort，按未作答处理
           progress.setQuestion({ requestId: qaReq.requestId, questions: req.questions, workspaceName: req.workspaceName, answers });
-          // 不再 sinkToBottom：提问区嵌入主进度卡后，flush 自然 PATCH（理由同 planAsk 上方注释）
+          // 不再 sinkToBottom：提问区嵌入主进度卡后，flush 自然 PATCH（v5 计划审批亦已改为独立确认卡，无需沉底配合）
           return new Promise<AskQuestionResult>((resolve) => {
             const gc = setTimeout(() => {
               qaPending.delete(qaReq.requestId);
               progress.setQuestion(undefined);
-              progress.setStatus(`⏰ 提问超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未作答），已按未作答处理；模型自行决策或停下等待你的回复`);
+              progress.setStatus(`提问超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未作答），已按未作答处理；模型自行决策或停下等待你的回复`);
               resolve({});
             }, confirmTimeoutMs);
             gc.unref();
@@ -901,7 +915,7 @@ export function createBridge(
           rolled = true;
           console.log(tag, `[滚动] ${idleHit ? `空闲超 ${idleHours}h` : `轮次满 ${maxTurns}`}，群聊自动开启新话题：${key}`);
           if (dropped > 0) {
-            await deps.gateway.sendTextTo(msg.chatId, `🗑️ 已开启新话题，${dropped} 条排队消息按旧话题取消（/resume 可找回此前讨论）`)
+            await deps.gateway.sendTextTo(msg.chatId, `已开启新话题，${dropped} 条排队消息按旧话题取消（/resume 可找回此前讨论）`)
               .catch(() => { /* 提示失败不阻断任务 */ });
           }
         }
@@ -1068,8 +1082,11 @@ export function createBridge(
         },
         onProgress: (e: ProgressEvent) => {
           if (e.kind === 'status') {
-            // CLI 状态心跳（等待模型响应/上下文压缩）：刷新进度卡状态行，避免静默期黑盒感
+            // CLI 状态心跳（上下文压缩/等待后台任务等）：降级为执行栈下方灰色小字行，避免静默期黑盒感
             progress.setStatus(e.content);
+          } else if (e.kind === 'thinking') {
+            // 模型思考期（status=requesting）：执行栈顶「💭 处理中…」，首个执行事件即焚
+            progress.markThinking();
           } else if (e.kind === 'first-delta') {
             // 首个流式增量（模型开始吐字）：提前点亮「正在执行」，不等首个完整块
             progress.markStarted();
@@ -1089,21 +1106,32 @@ export function createBridge(
               chatId: msg.chatId, userId: msg.userId, text: streamRedaction.text,
             });
           } else if (e.kind === 'tool-start') {
-            const [n, ...rest] = e.content.split(': ');
             progress.markStarted();
             // 摘要（命令串/路径）同样过脱敏再落盘——命令回显可能带出先前输出中的秘密
-            const summaryRedaction = getRedactor(config.security).text(rest.join(': '));
-            progress.toolStart(n, summaryRedaction.text);
+            const summaryRedaction = getRedactor(config.security).text(e.summary);
+            progress.toolStart(e.tool, summaryRedaction.text, e.sub ?? false);
             deps.transcript?.tool({
               v: 1, ts: now(), kind: 'tool', app: app.appId,
-              chatId: msg.chatId, userId: msg.userId, phase: 'start', tool: n, summary: summaryRedaction.text, ok: true,
+              chatId: msg.chatId, userId: msg.userId, phase: 'start', tool: e.tool, summary: summaryRedaction.text, ok: true,
             });
           } else if (e.kind === 'tool-result') {
-            progress.toolResult(e.content, e.ok ?? true, e.note);
+            progress.toolResult(e.tool, e.ok ?? true, e.note, e.sub ?? false);
             deps.transcript?.tool({
               v: 1, ts: now(), kind: 'tool', app: app.appId,
-              chatId: msg.chatId, userId: msg.userId, phase: 'result', tool: e.content, summary: '', ok: e.ok ?? true,
+              chatId: msg.chatId, userId: msg.userId, phase: 'result', tool: e.tool, summary: '', ok: e.ok ?? true,
             });
+          } else if (e.kind === 'todos') {
+            // TodoWrite 步骤清单：文案由模型生成，与工具摘要同级暴露面——同样过脱敏再上卡
+            const redactTodo = (text: string): string => {
+              const r = getRedactor(config.security).text(text);
+              if (r.hits.length) deps.audit?.write(app.appId, { kind: 'redact', ruleIds: [...new Set(r.hits)], source: 'stream' });
+              return r.text;
+            };
+            progress.setTodos(e.todos.map((t) => ({
+              content: redactTodo(t.content),
+              ...(t.activeForm ? { activeForm: redactTodo(t.activeForm) } : {}),
+              status: t.status,
+            })));
           } else if (e.kind === 'agent-start') {
             // 子代理/后台任务启动：进度卡子代理清单（独立区块，对齐 CLI 的 agent 进度显示）
             progress.agentStart(e.agent);
@@ -1115,7 +1143,7 @@ export function createBridge(
       if (abort.signal.aborted) {
         // /stop（或硬超时）中止后 SDK 流仍会正常收尾走成功分支——按停止处理，不误报「完成」。
         // 会话归档保留（中断任务的会话上下文仍有价值），但跳过结果与产出文件回传
-        await progress.finish('🛑 已停止');
+        await progress.finish('已停止', undefined, 'stopped');
         archive(outcome.sessionId);
         deps.transcript?.result({
           v: 1, ts: now(), kind: 'result', app: app.appId,
@@ -1136,12 +1164,12 @@ export function createBridge(
       // 消息（群聊里机器人自言自语就是噪音），失忆困惑由注记 + /resume 兜底；记忆层上线后
       // 此注记可弱化/去除。注记只进回传文本，不进 transcript（传输层装饰，非模型产出）
       const rollNote = rolled && config.session?.groupRollNotify !== false
-        ? '🍃 已开启新话题（此前讨论 /resume 可找回）'
+        ? '已开启新话题（此前讨论 /resume 可找回）'
         : '';
       const replyText = finalText
         ? (rollNote ? `${finalText}\n\n---\n${rollNote}` : finalText)
         : rollNote;
-      await progress.finish('✅ 完成', finalText.length || undefined);
+      await progress.finish('已完成', finalText.length || undefined);
       archive(outcome.sessionId);
       deps.transcript?.result({
         v: 1, ts: now(), kind: 'result', app: app.appId,
@@ -1160,7 +1188,7 @@ export function createBridge(
         const scale = outcome.usage ? `（当前约 ${(ctxTokens / 10000).toFixed(1)} 万 tokens）` : '';
         await deps.gateway.sendTextTo(
           msg.chatId,
-          `💡 本会话上下文已较大${scale}，建议发送 /new 开启新会话（/resume 可随时切回）。阈值可在 config.yaml 的 session.context_remind_tokens 调整，设为 0 关闭`,
+          `本会话上下文已较大${scale}，建议发送 /new 开启新会话（/resume 可随时切回）。阈值可在 config.yaml 的 session.context_remind_tokens 调整，设为 0 关闭`,
         );
       }
       // 结果回传两段式：finalText 非空即独立多卡直接展示（~3000 字/块，连发间隔 300ms 防飞书
@@ -1207,7 +1235,7 @@ export function createBridge(
           return `${i + 1}. ${rel.startsWith('..') ? f : rel}`; // 工作区外（理论不出现）回退绝对路径
         }).join('\n');
         await deps.gateway.sendTextTo(msg.chatId,
-          `📁 本次修改/新增的文件（共 ${nonImageFiles.length} 个）：\n${list}\n\n💡 回复数字可查看对应文件的本次改动`);
+          `本次修改/新增的文件（共 ${nonImageFiles.length} 个）：\n${list}\n\n回复数字可查看对应文件的本次改动`);
       }
       await uploadProducedImages();
       // 「改动汇总」卡已移除（用户反馈）：改动详情改为按需查看——用户对文件清单回复数字
@@ -1217,7 +1245,7 @@ export function createBridge(
       // 而非正常收尾——按停止处理不误报「出错」，与上方 executor 正常 return 后的 aborted 判断二选一命中
       if (abort.signal.aborted) {
         const hardTimedOut = abort.signal.reason instanceof Error && abort.signal.reason.message === 'hard-timeout';
-        await progress.finish(hardTimedOut ? '🛑 已停止（超过 4 小时上限自动停止）' : '🛑 已停止');
+        await progress.finish(hardTimedOut ? '已停止（超过 4 小时上限自动停止）' : '已停止', undefined, 'stopped');
         const stoppedSessionId = (e as { sessionId?: string })?.sessionId;
         archive(stoppedSessionId);
         deps.transcript?.result({
@@ -1234,16 +1262,16 @@ export function createBridge(
       const uiUrl = serverUrl(config);
       const hint = errText.includes('Not logged in')
         ? config.claude?.mode === 'managed'
-          ? `\n\n💡 没有可用的 Claude Code 认证：当前为 managed 模式${uiUrl ? `，打开 ${uiUrl} 在「Claude 认证」区填写 auth_token / api_key` : ''}（中转站另配 base_url），保存后重启 bridge。`
-          : '\n\n💡 没有可用的 Claude Code 认证：在本机终端跑一次 claude login 登录（登录态存于 ~/.claude，所有机器人共享）；或在本机 ~/.claude/settings.json 的 env 配 ANTHROPIC_AUTH_TOKEN（第三方端点另配 ANTHROPIC_BASE_URL），改完重启 bridge。'
+          ? `\n\n没有可用的 Claude Code 认证：当前为 managed 模式${uiUrl ? `，打开 ${uiUrl} 在「Claude 认证」区填写 auth_token / api_key` : ''}（中转站另配 base_url），保存后重启 bridge。`
+          : '\n\n没有可用的 Claude Code 认证：在本机终端跑一次 claude login 登录（登录态存于 ~/.claude，所有机器人共享）；或在本机 ~/.claude/settings.json 的 env 配 ANTHROPIC_AUTH_TOKEN（第三方端点另配 ANTHROPIC_BASE_URL），改完重启 bridge。'
         : /No conversation found|session not found/i.test(errText)
-          ? '\n\n💡 该会话可能已失效（或属于旧版独立配置目录）：发 /new 开启新会话即可。'
+          ? '\n\n该会话可能已失效（或属于旧版独立配置目录）：发 /new 开启新会话即可。'
           : /429|rate.?limit|usage.?limit|已达到.*上限|quota/i.test(errText)
             // 限额/限流：CLI 内部带指数退避自动重试数分钟，期间计时持续走属正常——
             // 错误到达飞书时已是重试耗尽后的终态，并非桥接器卡死（提示重置时间以 CLI 返回为准）
-            ? '\n\n💡 模型额度受限（Claude Code 已自动重试数分钟仍失败，等待期间计时持续属正常）。等额度恢复后重发任务即可；频繁出现请检查套餐限额或改用 /model 切换模型。'
+            ? '\n\n模型额度受限（Claude Code 已自动重试数分钟仍失败，等待期间计时持续属正常）。等额度恢复后重发任务即可；频繁出现请检查套餐限额或改用 /model 切换模型。'
             : '';
-      await progress.finish(`❌ 出错：${errText.slice(0, 300)}${hint}`);
+      await progress.finish(`出错：${errText.slice(0, 300)}${hint}`, undefined, 'error');
       // 出错任务的会话同样归档：错误轮的上下文对追问「刚才为什么错」有价值，
       // 也让 /resume 历史随真实使用持续积累（executor 抛错时携带 sessionId）
       const errSessionId = (e as { sessionId?: string })?.sessionId;
@@ -1274,6 +1302,11 @@ export function createBridge(
    */
   async function handleCardAction(action: CardActionEvent): Promise<CardActionResponse | undefined> {
     try {
+      // 工作动态展开/收起（存量旧卡按钮回调）：新版卡片已改原生折叠面板（客户端本地展开，
+      // 无回调），此分支仅为升级前发出的旧卡兜底——点击不再报「操作异常」，也不改服务端状态
+      if (action.value.requestId === TOOLS_TOGGLE_REQUEST_ID) {
+        return { toast: { type: 'info', content: '工具明细已内嵌在各步骤的折叠面板里，点 ⌄ 即可展开' } };
+      }
       // plan 确认回调分流（requestId 唯一，planPending 与 confirmPending 不会同时命中）
       const plan = planPending.get(action.value.requestId);
       if (plan) {
@@ -1301,7 +1334,9 @@ export function createBridge(
         plan.resolve(decision === 'plan-approve' ? { action: 'approve' }
           : decision === 'plan-revise' ? { action: 'revise', feedback }
           : { action: 'reject' });
-        // 清除主进度卡的内嵌计划区（按钮随 setPlan(undefined) 的 flush 消失）
+        // 独立确认卡整卡收口为灰色终态（按钮消失防重复点击）
+        settlePlanConfirmCard(action.value.requestId, PLAN_DECISION_TEXT[decision]);
+        // 清除主进度卡的等待阶段（header 随 setPlan(undefined) 恢复蓝色继续执行）
         const prog = activeProgress.get(plan.channelKey);
         if (prog) {
           prog.setPlan(undefined);
@@ -1365,9 +1400,9 @@ export function createBridge(
           const prog = activeProgress.get(qa.channelKey);
           if (prog) {
             prog.setQuestion(undefined);
-            prog.setStatus('✅ 答案已提交，继续执行…');
+            prog.setStatus('答案已提交，继续执行…');
           }
-          return { toast: { type: 'success', content: '✅ 答案已提交' } };
+          return { toast: { type: 'success', content: '答案已提交' } };
         }
         return { toast: { type: 'info', content: '该提问已被处理或已过期' } };
       }
@@ -1378,14 +1413,14 @@ export function createBridge(
       const wsc = wsPending.get(action.value.requestId);
       if (wsc) {
         if (app.role === 'deputy') {
-          return { toast: { type: 'info', content: '⛔ 分身机器人已锁定工作区，不可切换' } };
+          return { toast: { type: 'info', content: '分身机器人已锁定工作区，不可切换' } };
         }
         if (wsc.stale) {
           return { toast: { type: 'info', content: '该列表已过期，请以最新 /ws 卡片为准' } };
         }
         if (!deps.access.isAdmin(action.operatorId)) {
           console.log(tag, `[卡片回调] 非 admin ${action.operatorId} 点击工作区卡 ${action.value.requestId}，已忽略`);
-          return { toast: { type: 'info', content: '⛔ 切换工作区仅管理员可用' } };
+          return { toast: { type: 'info', content: '切换工作区仅管理员可用' } };
         }
         const target = wsc.workspaces.find((w) => w.name === action.value.ws);
         if (!target) {
@@ -1412,7 +1447,7 @@ export function createBridge(
         // 一次性选择语义：本卡随即终态化（移除挂起项，迟到点击按孤儿卡 toast 提示），再切重发 /ws
         wsPending.delete(action.value.requestId);
         return {
-          toast: { type: 'success', content: `✅ 已切换工作区：${target.name}（已开启新会话，/resume 可切回历史）` },
+          toast: { type: 'success', content: `已切换工作区：${target.name}（已开启新会话，/resume 可切回历史）` },
           // 回调响应内联换卡：整卡替换为终态提示（纯 markdown 无按钮），不能再点
           card: { type: 'raw', data: buildWorkspaceSwitchedCard(target.name, target.path, config.card?.width ?? 'default') },
         };
@@ -1604,20 +1639,26 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
       memoryUserKeys.clear();
       return;
     }
-    const outcomes = await ensureMemoryUserKeys(config.memory, config.apps.map((a) => a.appId));
+    // 签发集合 = web（网页端身份；配置页移除「一键初始化」后由此自愈）+ 各 bot 关联身份
+    //（ensureMemoryUserKeys 内部按 distinct uid 去重签发，共享身份只签一次、结果按 appId 展开）
+    const desired = [WEB_USER_ID, ...config.apps.map((a) => a.appId)];
+    const outcomes = await ensureMemoryUserKeys(config.memory, desired);
     memoryUserKeys.clear();
     let unreachable = outcomes.size > 0;
     for (const o of outcomes.values()) {
       if (o.userKey) {
         memoryUserKeys.set(o.appId, o.userKey);
         unreachable = false;
-        console.log(`[memory] bot ${o.appId}：user key 已签发（api_key 模式）`);
+        const label = o.appId === WEB_USER_ID ? 'web 用户（网页端）'
+          : o.uid && o.uid !== o.appId ? `bot ${o.appId} → ${o.uid}（共享/映射身份）`
+            : `bot ${o.appId}`;
+        console.log(`[memory] ${label}：user key 已签发（api_key 模式）`);
       } else if (o.error) {
         unreachable = false;
-        console.warn(`[memory] bot ${o.appId}：user key ${o.error}`);
+        console.warn(`[memory] ${o.appId === WEB_USER_ID ? 'web 用户' : `bot ${o.appId}`}：user key ${o.error}`);
       } else {
         if (o.skipped && !o.skipped.startsWith('服务不可达')) unreachable = false;
-        console.log(`[memory] bot ${o.appId}：${o.skipped}`);
+        console.log(`[memory] ${o.appId === WEB_USER_ID ? 'web 用户' : `bot ${o.appId}`}：${o.skipped}`);
       }
     }
     // 全员因服务不可达被跳过 → 退避重试；服务起来后自动补签，无需重启 LCB

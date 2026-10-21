@@ -16,7 +16,7 @@
 import { createHash } from 'node:crypto';
 import { query, type McpServerConfig, type McpServerStatus, type Options, type Query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { OutputCollector } from './output-collector.js';
-import type { ProgressEvent, SessionInventory, TaskOutcome, TaskUsage } from '../types.js';
+import type { ProgressEvent, SessionInventory, TaskOutcome, TodoItemStatus, TaskUsage } from '../types.js';
 
 export interface ExecutorCallbacks {
   onProgress(event: ProgressEvent): Promise<void> | void;
@@ -103,11 +103,19 @@ const DEFAULT_RESIDENT_IDLE_MS = 60 * 60 * 1000;
  *  正常路径无须走到——后台任务完成会唤醒主循环产生新事件，最终由 result/idle 信号收尾 */
 const BG_WAIT_SILENCE_TIMEOUT_MS = 15 * 60 * 1000;
 
+/** 工具摘要的主字段优先级：命中即直接展示人类可读值，不再贴原始 JSON */
+const SUMMARY_INPUT_KEYS = ['command', 'file_path', 'url', 'query', 'pattern', 'path', 'skill'] as const;
+
 function summarizeToolInput(input: Record<string, unknown>): string {
-  if (typeof input.command === 'string') return input.command;
-  if (typeof input.file_path === 'string') return input.file_path;
-  if (typeof input.pattern === 'string') return input.pattern;
-  return JSON.stringify(input).slice(0, 100);
+  for (const k of SUMMARY_INPUT_KEYS) {
+    if (typeof input[k] === 'string' && (input[k] as string).trim()) return input[k] as string;
+  }
+  // 结构化入参通常有一个主字符串字段：取第一个非空字符串值兜底，仍未命中才落 JSON
+  for (const v of Object.values(input)) {
+    if (typeof v === 'string' && v.trim()) return v;
+  }
+  const json = JSON.stringify(input);
+  return json === '{}' ? '' : json.slice(0, 80);
 }
 
 /** tool_result 失败内容的首行文本（兼容 string / blocks 数组形态）：进度卡 ✘ 行的失败原因 */
@@ -121,6 +129,26 @@ function firstErrorLine(content: unknown): string | undefined {
   }
   const line = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
   return line ? line.slice(0, 80) : undefined;
+}
+
+/** TodoWrite 入参 → 步骤清单：宽松校验（非法项过滤），空/畸形清单返回 undefined 不发布 */
+function extractTodos(input: Record<string, unknown>): Array<{ content: string; activeForm?: string; status: TodoItemStatus }> | undefined {
+  const raw = input.todos;
+  if (!Array.isArray(raw)) return undefined;
+  const allowed = new Set<string>(['pending', 'in_progress', 'completed']);
+  const todos: Array<{ content: string; activeForm?: string; status: TodoItemStatus }> = [];
+  for (const item of raw) {
+    if (item === null || typeof item !== 'object') continue;
+    const t = item as Record<string, unknown>;
+    if (typeof t.content !== 'string' || !t.content.trim()) continue;
+    if (typeof t.status !== 'string' || !allowed.has(t.status)) continue;
+    todos.push({
+      content: t.content,
+      ...(typeof t.activeForm === 'string' && t.activeForm.trim() ? { activeForm: t.activeForm } : {}),
+      status: t.status as TodoItemStatus,
+    });
+  }
+  return todos.length > 0 ? todos : undefined;
 }
 
 /** MCP server 配置的可序列化投影（指纹用）：只取影响子进程行为的配置字段。
@@ -270,8 +298,16 @@ interface TurnContext {
   waitingBg: boolean;
   lastEventAt: number;
   toolNames: Map<string, string>;
+  /** tool_use_id → 是否发生在子代理内（parent_tool_use_id 快照）：tool_result 归组用 */
+  toolParents: Map<string, boolean>;
   silenceWatch: NodeJS.Timeout;
 }
+
+/**
+ * 不进工具明细行的工具：TodoWrite 驱动步骤列表本身、Task 的调用行与子代理步骤重复——
+ * 两者的 tool_use/tool_result 都不再产生「已使用工具」行，避免步骤区出现自指噪音
+ */
+const HEADERLESS_TOOLS: ReadonlySet<string> = new Set(['TodoWrite', 'Task']);
 
 /**
  * 会话进程：一个 CLI 子进程（query）+ 常驻消息循环。
@@ -426,14 +462,19 @@ class SessionProcess {
               };
               turn.cb.onInit?.(this.inventory);
             } else if (message.subtype === 'status') {
-              // CLI 状态心跳（requesting=等模型响应 / compacting=上下文压缩 / null=空闲）：刷新进度卡
-              // 状态行——includePartialMessages=false 下长 API 轮次没有任何其他事件，避免「只有计时在走」的黑盒感
-              await turn.cb.onProgress({
-                kind: 'status',
-                content: message.status === 'requesting' ? '🌐 等待模型响应…'
-                  : message.status === 'compacting' ? '🗜️ 上下文压缩中…'
-                  : '🔄 运行中',
-              });
+              // CLI 状态心跳（requesting=等模型响应 / compacting=上下文压缩 / null=空闲）。
+              // v5：requesting 不再渲染「等待模型响应…」笼罩性状态行，改发 thinking 事件——
+              // 进度卡在执行栈顶显示「💭 处理中…」，首个步骤/工具/文本事件到达即焚；
+              // compacting 与后台任务等待等有信息量的心跳降级为计时行上方的灰色小字（heartbeat），
+              // null（空闲/开始吐字）清空心跳——避免长 API 轮次「只有计时在走」的黑盒感
+              if (message.status === 'requesting') {
+                await turn.cb.onProgress({ kind: 'thinking' });
+              } else {
+                await turn.cb.onProgress({
+                  kind: 'status',
+                  content: message.status === 'compacting' ? '上下文压缩中…' : '',
+                });
+              }
             } else if (message.subtype === 'background_tasks_changed') {
               // 后台任务在途清单（level 信号）：整组替换语义。ambient=true 的杂务任务
               //（live-update watcher 等）不算用户可见工作，不计数避免状态行虚高
@@ -442,7 +483,7 @@ class SessionProcess {
                 if (!t.ambient) turn.bgTasks.set(t.task_id, { taskType: t.task_type, description: t.description });
               }
               if (turn.waitingBg && turn.bgTasks.size > 0) {
-                await turn.cb.onProgress({ kind: 'status', content: `⏳ 等待 ${turn.bgTasks.size} 个后台任务完成…` });
+                await turn.cb.onProgress({ kind: 'status', content: `等待 ${turn.bgTasks.size} 个后台任务完成…` });
               }
             } else if (message.subtype === 'session_state_changed' && message.state === 'idle') {
               // 权威 turn-over 信号：idle 在 heldBackResult flush 且后台任务续跑循环退出后触发。
@@ -455,7 +496,7 @@ class SessionProcess {
               const tag = message.subagent_type ? ` [${message.subagent_type}]` : '';
               await turn.cb.onProgress({
                 kind: 'status',
-                content: `${message.is_backgrounded ? '🤖 后台子代理启动' : '🤖 子代理启动'}${tag}: ${message.description}`,
+                content: `${message.is_backgrounded ? '后台子代理启动' : '子代理启动'}${tag}: ${message.description}`,
               });
               // 子代理清单：进度卡独立区块展示每个子代理的运行状态（对齐 CLI 的 agent 进度显示）
               await turn.cb.onProgress({
@@ -466,7 +507,7 @@ class SessionProcess {
               // 后台任务落定（completed/failed/stopped）：summary 为任务自述结论。
               // status 会原文渲染进进度卡正文并随每次卡片更新发送——子代理完整报告可达
               // 上万字符，截断保留结论摘要（全文另有 agent 清单与 transcript 承载）
-              const label = message.status === 'completed' ? '✅ 后台任务完成' : message.status === 'failed' ? '❌ 后台任务失败' : '🛑 后台任务已停止';
+              const label = message.status === 'completed' ? '后台任务完成' : message.status === 'failed' ? '后台任务失败' : '后台任务已停止';
               await turn.cb.onProgress({ kind: 'status', content: `${label}: ${(message.summary ?? '').slice(0, 300)}` });
               await turn.cb.onProgress({
                 kind: 'agent-settle',
@@ -499,13 +540,29 @@ class SessionProcess {
             for (const block of message.message.content) {
               if (block.type === 'text') {
                 // 子代理文本加标识前缀（forwardSubagentText 转发），与主 Agent 输出在进度卡上区分
-                const prefix = message.parent_tool_use_id ? '🤖 ' : '';
+                const prefix = message.parent_tool_use_id ? '【子代理】' : '';
                 await turn.cb.onProgress({ kind: 'text', content: `${prefix}${block.text}` });
               } else if (block.type === 'tool_use') {
                 const input = (block.input ?? {}) as Record<string, unknown>;
                 turn.toolNames.set(block.id, block.name);
                 turn.collector.track(block.name, input);
-                await turn.cb.onProgress({ kind: 'tool-start', content: `${block.name}: ${summarizeToolInput(input)}` });
+                const isSub = !!message.parent_tool_use_id;
+                turn.toolParents.set(block.id, isSub);
+                // TodoWrite 驱动步骤列表本身、Task 调用行与子代理步骤重复：两类不进工具明细，
+                // 只发语义事件（todos 事件在此发布；子代理启动已由 task_started 覆盖）
+                if (HEADERLESS_TOOLS.has(block.name)) {
+                  if (block.name === 'TodoWrite') {
+                    const todos = extractTodos(input);
+                    if (todos) await turn.cb.onProgress({ kind: 'todos', todos });
+                  }
+                  continue;
+                }
+                await turn.cb.onProgress({
+                  kind: 'tool-start',
+                  tool: block.name,
+                  summary: summarizeToolInput(input),
+                  ...(isSub ? { sub: true } : {}),
+                });
               }
             }
             break;
@@ -516,8 +573,16 @@ class SessionProcess {
             for (const block of content) {
               if (block.type === 'tool_result') {
                 const name = turn.toolNames.get(block.tool_use_id) ?? '';
+                if (HEADERLESS_TOOLS.has(name)) continue;
                 const note = block.is_error ? firstErrorLine(block.content) : undefined;
-                await turn.cb.onProgress({ kind: 'tool-result', content: name, ok: !block.is_error, ...(note ? { note } : {}) });
+                const sub = turn.toolParents.get(block.tool_use_id) ?? false;
+                await turn.cb.onProgress({
+                  kind: 'tool-result',
+                  tool: name,
+                  ok: !block.is_error,
+                  ...(note ? { note } : {}),
+                  ...(sub ? { sub: true } : {}),
+                });
               }
             }
             break;
@@ -550,7 +615,7 @@ class SessionProcess {
             if (message.subtype === 'success' || message.subtype.startsWith('error')) {
               if (turn.bgTasks.size > 0) {
                 turn.waitingBg = true;
-                await turn.cb.onProgress({ kind: 'status', content: `⏳ 主线回复完成，等待 ${turn.bgTasks.size} 个后台任务…` });
+                await turn.cb.onProgress({ kind: 'status', content: `主线回复完成，等待 ${turn.bgTasks.size} 个后台任务…` });
                 break;
               }
               await this.finalizeTurn(turn);
@@ -689,6 +754,7 @@ class SessionProcess {
       waitingBg: false,
       lastEventAt: Date.now(),
       toolNames: new Map(),
+      toolParents: new Map(),
       // 等待后台任务期间的静默看门狗：pending 期间长时间无任何事件则按已有信息收尾
       //（并把进程一并回收——15 分钟静默属异常态，进程可信度存疑，冷启重建更稳）
       silenceWatch: setInterval(() => {
