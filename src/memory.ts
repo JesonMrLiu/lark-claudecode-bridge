@@ -40,13 +40,29 @@ export function memoryEndpoint(memory: Pick<MemoryConfig, 'endpoint'>): string {
 }
 
 /**
+ * 机器人生效的记忆身份（OpenViking user_id，identityMap 解析的唯一真相）：
+ * - identityMap 显式条目（非空白）→ 映射 uid（共享记忆 = 多台机器人映射同一 uid）
+ * - 无条目 → 专属用户（uid 即 appId，历史口径，现有部署零迁移零行为变化）
+ * 纯函数：memoryEnvFor / ensureMemoryUserKeys / namespacesFor / 配置页关联卡共用同一解析，
+ * 保证「签发谁、下发谁的 key、env 身份轴、页面展示」四处口径永远一致。
+ */
+export function resolveMemoryUid(memory: Pick<MemoryConfig, 'identityMap'>, appId: string): string {
+  const mapped = memory.identityMap?.[appId]?.trim();
+  return mapped || appId;
+}
+
+/**
  * memory.enabled 时的 ns env 下发（§6.4/§6.6）——返回值由调用方以「保留既有值」方式并入
  * taskEnv（apps[].env 手配 OPENVIKING_* = 专家覆盖口，优先级最高）。键语义：
  * - OPENVIKING_ACCOUNT：账号轴（全局），缺省 lcb
- * - OPENVIKING_USER：用户轴 = {appId}-{userId}，**每条消息拼装**（群聊按人隔离；
- *   deputy 的 appId 天然不同于主 bot——「分身有自己的记忆、永不读主人记忆」的实现点）
- * - OPENVIKING_API_KEY：连接 key。api_key 模式 = 该 bot 的独立 user key（userKeys 缓存，
- *   root key 永不下发子进程）；dev 模式无 key（身份经 header 隔离）
+ * - OPENVIKING_USER：用户轴**每条消息拼装**，按 identityMap 分两态：
+ *   ① 无显式映射（uid = appId，历史缺省）→ {appId}-{userId}，群聊按人隔离（deputy 的 appId
+ *      天然不同于主 bot——「分身有自己的记忆、永不读主人记忆」的实现点，行为与历史版本一致）
+ *   ② 显式映射（共享/指定身份）→ 固定为映射 uid，**不带 userId 后缀**：共享身份必须是稳定
+ *      单一身份（多台机器人读写同一 ns），与 api_key 模式下 key 自带的身份严格一致
+ * - OPENVIKING_API_KEY：连接 key。api_key 模式 = 该 bot 关联身份的 user key（userKeys 缓存
+ *   按 appId 索引、值为映射 uid 的 key，共享者值重复；root key 永不下发子进程）；
+ *   dev 模式无 key（身份经 header 隔离）
  * - OPENVIKING_MEMORY_ENABLED：'1' 强制启用通道——插件 isPluginEnabled() 的第 1 优先级判据
  *   （插件 scripts/config.mjs），使启用不依赖 ~/.openviking/ 下任何文件（全新机器零手工的关键；
  *   与 ACCOUNT 同级、不依赖 userId）。实测教训：LCB 原先只下发身份三键，插件启用判定根本不看，
@@ -69,7 +85,8 @@ export function memoryEnvFor(
     OPENVIKING_MEMORY_ENABLED: '1',
     OPENVIKING_URL: memoryEndpoint(memory),
   };
-  if (userId) env.OPENVIKING_USER = `${appId}-${userId}`;
+  const uid = resolveMemoryUid(memory, appId);
+  if (userId) env.OPENVIKING_USER = uid === appId ? `${appId}-${userId}` : uid;
   const key = userKeys?.get(appId);
   if (key) env.OPENVIKING_API_KEY = key;
   return env;
@@ -169,7 +186,11 @@ export function createMemoryProvider(config: BridgeConfigLike, userKeys: Readonl
       : Promise.resolve({ healthy: false, detail: 'memory 段未开启' })),
     namespacesFor: (appId: string) => ({
       account: config.memory ? memoryAccount(config.memory) : DEFAULT_MEMORY_ACCOUNT,
-      userPrefix: `${appId}-`,
+      // 缺省（uid=appId）沿用历史「appId-」前缀口径（ns 矩阵还展示 per-chat 后缀拼法）；
+      // 显式映射 → 身份轴即映射 uid（无 per-chat 维度，与 env 下发严格一致）
+      userPrefix: config.memory && resolveMemoryUid(config.memory, appId) !== appId
+        ? resolveMemoryUid(config.memory, appId)
+        : `${appId}-`,
     }),
     userKeys: () => userKeys,
   };
@@ -180,19 +201,26 @@ interface BridgeConfigLike { memory?: MemoryConfig }
 /** 单个 bot 的 user key 签发/跳过结果 */
 export interface MemoryKeyOutcome {
   appId: string;
-  /** 签发成功（api_key 模式）；dev 模式为 undefined（skipped 带原因） */
+  /** 生效记忆身份（resolveMemoryUid 解析值；与 appId 不同 = 显式映射/共享身份，日志据此标注） */
+  uid?: string;
+  /** 签发成功（api_key 模式）；dev 模式为 undefined（skipped 带原因）。共享身份下多个 appId
+   *  携同一把 key（值按 appId 重复展开，env 下发按 appId 查取零改动） */
   userKey?: string;
   skipped?: string;
   error?: string;
 }
 
 /**
- * 为每个 bot 签发独立 user key（§6.7 第 5 步；api_key 模式）。
+ * 为每个 bot 签发其关联身份的 user key（§6.7 第 5 步；api_key 模式）。
  * - dev 模式：整体跳过——身份隔离由 OPENVIKING_USER → X-OpenViking-User header 承担，
  *   Admin API 在 dev 模式被服务端禁用（403），跳过是唯一正解而非降级
  * - api_key 模式：X-API-Key 携带 root key（memory.api_key，只在本函数与配置盘间流转），
  *   POST /api/v1/admin/accounts/{account}/users 签发
- * - 失败不抛出（逐 bot 记 error）：记忆不可用不应阻断机器人服务，与插件发现的容错基调一致
+ * - **按 distinct 映射后 uid 签发**（resolveMemoryUid）：共享身份只签/重签一次，结果按 appId
+ *   展开回填（值重复）——index.ts 的 userKeys 缓存口径（Map<appId, key>）保持不变
+ * - 缺失用户自动创建：signOneUserKey 的首路径就是 POST 创建（409 才走重签），故 identityMap
+ *   指向的新共享 uid / 新增 bot 的专属用户在签发时即自动建成，无须单独初始化
+ * - 失败不抛出（逐 uid 记 error）：记忆不可用不应阻断机器人服务，与插件发现的容错基调一致
  *
  * OpenViking 0.5.0 实弹实测（探针：创建→重复→重签→列表→删除，全绿）修正了三条旧假设：
  *  ① key **非确定性**——seed 参数被服务端忽略，同一 user 每次重签都换新 key。因此「同 seed
@@ -211,37 +239,46 @@ export async function ensureMemoryUserKeys(
   const out = new Map<string, MemoryKeyOutcome>();
   const base = memoryEndpoint(memory).replace(/\/+$/, '');
   const health = await probeMemoryHealth(memoryEndpoint(memory), timeoutMs);
+  // 输入 id（appId 或 web 等非 bot 身份）→ 生效 uid；共享映射在此收敛，同一 uid 只签一次
+  const resolved = appIds.map((id) => ({ id, uid: resolveMemoryUid(memory, id) }));
+  const distinctUids = [...new Set(resolved.map((r) => r.uid))];
   if (!health.healthy) {
-    for (const appId of appIds) {
-      out.set(appId, { appId, skipped: `服务不可达（${health.detail ?? '未知原因'}），身份隔离依赖 OPENVIKING_USER header` });
+    for (const { id } of resolved) {
+      out.set(id, { appId: id, uid: resolveMemoryUid(memory, id), skipped: `服务不可达（${health.detail ?? '未知原因'}），身份隔离依赖 OPENVIKING_USER header` });
     }
     return out;
   }
   if (health.authMode !== 'api_key') {
-    for (const appId of appIds) {
-      out.set(appId, { appId, skipped: `服务为 ${health.authMode ?? 'unknown'} 模式：身份经 X-OpenViking-User header 隔离，无需 user key（多租户部署请在 ov.conf 配 root_api_key 启用 api_key 模式）` });
+    for (const { id } of resolved) {
+      out.set(id, { appId: id, uid: resolveMemoryUid(memory, id), skipped: `服务为 ${health.authMode ?? 'unknown'} 模式：身份经 X-OpenViking-User header 隔离，无需 user key（多租户部署请在 ov.conf 配 root_api_key 启用 api_key 模式）` });
     }
     return out;
   }
   const account = memoryAccount(memory);
   const rootKey = memory.apiKey;
   if (!rootKey) {
-    for (const appId of appIds) {
-      out.set(appId, { appId, error: '服务为 api_key 模式但 memory.api_key（root key）未配置：无法签发 user key，请先在 memory 段配置 root key' });
+    for (const { id } of resolved) {
+      out.set(id, { appId: id, uid: resolveMemoryUid(memory, id), error: '服务为 api_key 模式但 memory.api_key（root key）未配置：无法签发 user key，请先在 memory 段配置 root key' });
     }
     return out;
   }
   // 账号兜底：账号不存在时后续全部 404（这是「一键初始化全 404」的最常见真因）。先查再建，
-  // 建失败只记 error 不用异常中断——签发逐 bot 继续，文案给出可操作指引
+  // 建失败只记 error 不用异常中断——签发逐 uid 继续，文案给出可操作指引
   const accountReady = await ensureRemoteAccount(base, account, rootKey, timeoutMs);
-  for (const appId of appIds) {
+  // 逐 distinct uid 签发：uid → 结果
+  const byUid = new Map<string, { userKey?: string; error?: string }>();
+  for (const uid of distinctUids) {
     if (!accountReady.ok) {
-      out.set(appId, { appId, error: `记忆账号「${account}」不可用：${accountReady.detail}` });
+      byUid.set(uid, { error: `记忆账号「${account}」不可用：${accountReady.detail}` });
       continue;
     }
-    const r = await signOneUserKey(base, account, appId, rootKey, timeoutMs);
-    if (r.userKey) out.set(appId, { appId, userKey: r.userKey });
-    else out.set(appId, { appId, error: r.error ?? '签发失败' });
+    byUid.set(uid, await signOneUserKey(base, account, uid, rootKey, timeoutMs));
+  }
+  // 按输入 id 展开回填（共享者携带同一把 key）
+  for (const { id, uid } of resolved) {
+    const r = byUid.get(uid) ?? {};
+    if (r.userKey) out.set(id, { appId: id, uid, userKey: r.userKey });
+    else out.set(id, { appId: id, uid, error: r.error ?? '签发失败' });
   }
   return out;
 }

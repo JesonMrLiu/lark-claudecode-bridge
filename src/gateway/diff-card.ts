@@ -28,11 +28,11 @@ export function buildFileDiffCards(diffText: string, meta: { fileName: string },
   const src = diffText.trim();
   if (!src) return [];
   const { additions, deletions } = diffStats(src);
-  const title = `**📊 改动详情**　\`${meta.fileName}\`　**+${additions} / -${deletions}** 行\n`;
+  const title = `**改动详情**　\`${meta.fileName}\`　**+${additions} / -${deletions}** 行\n`;
   const chunks = chunkText(src, DIFF_CHUNK_MAX_CHARS);
   return chunks.map((chunk, i) => {
     const counter = chunks.length > 1 ? `（${i + 1}/${chunks.length}）` : '';
-    const content = i === 0 ? `${title}\`\`\`diff\n${chunk}\n\`\`\`` : `**📊 改动详情${counter} · ${meta.fileName}**\n\n\`\`\`diff\n${chunk}\n\`\`\``;
+    const content = i === 0 ? `${title}\`\`\`diff\n${chunk}\n\`\`\`` : `**改动详情${counter} · ${meta.fileName}**\n\n\`\`\`diff\n${chunk}\n\`\`\``;
     return {
       schema: '2.0',
       config: { update_multi: true, ...(widthMode === 'fill' ? { width_mode: 'fill' } : {}) },

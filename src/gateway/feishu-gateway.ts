@@ -254,7 +254,7 @@ export function parseIncomingMessage(event: unknown, botOpenId?: string, opts: {
 
 interface RawCardActionPayload {
   action?: {
-    value?: { requestId?: string; decision?: string; feedback?: string; qIndex?: number; option?: string; ws?: string };
+    value?: { requestId?: string; decision?: string; feedback?: string; qIndex?: number; option?: string; ws?: string; channelKey?: string };
     // 卡片 form 容器提交时回传的全部输入项（name → 值）：plan 表单的 feedback、
     // qa 表单的 custom_N；不同飞书客户端/版本落点可能是 form_value 或并入 value，两处兜底
     form_value?: Record<string, unknown>;
@@ -270,13 +270,15 @@ const VALID_DECISIONS: ReadonlySet<string> = new Set([
   'plan-approve', 'plan-revise', 'plan-reject', 'plan-view-file',
   'qa-pick', 'qa-submit',
   'ws-switch',
+  // 工作动态展开/收起（存量旧卡按钮：新版卡片已改原生折叠面板，回调仅作幂等兜底不报异常）
+  'progress-tools-expand', 'progress-tools-fold',
   // legacy：结论尾卡（1.3.0 起）已无「确认方案/按意见修改」按钮，仅为升级前发出的旧卡
   // 迟到点击能落到孤儿卡 toast（而非静默无响应）保留解析，勿在新卡使用
   'output-confirm', 'output-revise',
 ]);
 
 /** 解析 card.action.trigger 回调；不完整或 decision 不在合法枚举内返回 null */
-function parseCardAction(data: unknown): { value: { requestId: string; decision: CardDecision; feedback?: string; qIndex?: number; option?: string; formValue?: Record<string, string> }; operatorId: string; openMessageId: string } | null {
+function parseCardAction(data: unknown): { value: { requestId: string; decision: CardDecision; feedback?: string; qIndex?: number; option?: string; formValue?: Record<string, string>; channelKey?: string }; operatorId: string; openMessageId: string } | null {
   try {
     if (data === null || typeof data !== 'object') return null;
     const d = data as RawCardActionPayload;
@@ -297,6 +299,8 @@ function parseCardAction(data: unknown): { value: { requestId: string; decision:
     const option = typeof value.option === 'string' ? value.option : undefined;
     // /ws 工作区卡切换按钮透传的目标工作区名
     const ws = typeof value.ws === 'string' && value.ws ? value.ws : undefined;
+    // 工作动态展开/收起按钮透传的进度卡定位通道（存量旧卡兼容分支用）
+    const channelKey = typeof value.channelKey === 'string' && value.channelKey ? value.channelKey : undefined;
     return {
       value: {
         requestId: value.requestId,
@@ -306,6 +310,7 @@ function parseCardAction(data: unknown): { value: { requestId: string; decision:
         ...(option ? { option } : {}),
         ...(formValue && Object.keys(formValue).length > 0 ? { formValue } : {}),
         ...(ws ? { ws } : {}),
+        ...(channelKey ? { channelKey } : {}),
       },
       operatorId: d.operator.open_id,
       openMessageId: d.context?.open_message_id ?? d.open_message_id ?? '',
@@ -581,7 +586,7 @@ export class FeishuGateway {
         if (parsed && 'rejected' in parsed) {
           // 不支持的消息类型（p2p）：明确反馈而非静默蒸发；提示发送失败不影响主流程
           if (parsed.rejected.chatType === 'p2p') {
-            await this.sendText(parsed.rejected.chatId, `🤖 暂不支持该消息类型（${parsed.rejected.messageType}），当前支持：文字、富文本（多行/粘贴）、图片、文件`)
+            await this.sendText(parsed.rejected.chatId, `暂不支持该消息类型（${parsed.rejected.messageType}），当前支持：文字、富文本（多行/粘贴）、图片、文件`)
               .catch((e) => this.log.warn('[类型提示] 发送失败：', e));
           }
           return;

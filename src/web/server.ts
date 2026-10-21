@@ -42,7 +42,7 @@ import {
 } from './webauth.js';
 import { listLogFiles, tailLogFile, tailLogRange } from './logs-api.js';
 import {
-  deleteMemoryUser, initMemoryUsers, listMemoryUsers, resetUserKey, revealRootKey, revealUserKey,
+  createMemoryUser, deleteMemoryUser, initMemoryUsers, listMemoryUsers, resetUserKey, revealRootKey, revealUserKey,
 } from './memory-users-api.js';
 import { MANAGED_OV_CONF, getInstallState, runInstall, runStartPipeline, stopManagedServer } from '../memory-installer.js';
 import {
@@ -607,6 +607,17 @@ async function handle(
       return json(res, 200, await initMemoryUsers(loadConfig(ctx.configPath)));
     } catch (e) {
       return json(res, 500, { error: `一键初始化失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+  // 新建用户（「用户与密钥」弹窗）：Admin API 创建 + 密钥入保险库；显示名称走配置 doc 管道（前端 saveDoc）
+  if (path === '/api/memory/users/create' && req.method === 'POST') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先提交 bootstrap 向导' });
+    const body = await readJsonBody(req);
+    const uid = typeof body.user_id === 'string' ? body.user_id : '';
+    try {
+      return json(res, 200, await createMemoryUser(loadConfig(ctx.configPath), uid));
+    } catch (e) {
+      return json(res, 500, { error: e instanceof Error ? e.message : String(e) });
     }
   }
   if (path === '/api/memory/users/reveal' && req.method === 'POST') {

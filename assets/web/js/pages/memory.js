@@ -5,6 +5,8 @@
 //   P1 保存即生效：模型变更保存后弹「立即生效」确认 → /api/memory/apply 重渲染 ov.conf + 重启服务。
 // - Tab2 用户与密钥：一键初始化 / 用户列表（web / 机器人） / 打开记忆空间（密钥进剪贴板 + 自动
 //   新标签开 1933，Ctrl+V 一次连接） / 复制·重置·删除（重置删除均二次确认，删除先备份）。
+//   显示名称（✏️）：中文对照映射走 doc.memory.displayNames（LCB 侧，服务端无显示名字段）；
+//   用户 ID 只读——OpenViking 无 rename 接口且 user_id 硬编码进密钥与数据目录，禁止修改。
 //   api_key 模式但 web 用户未建时 Tab 亮红点「待初始化鉴权」（前置化浏览器 401 重定向类问题）。
 // 配置读写走标准 doc 管道（saveDoc → PUT /api/config，secret 自动回填）；测试连接走
 // /api/memory/test-connection（表单现值，不落盘）；安装/启停走 /api/memory/install|start|stop。
@@ -82,7 +84,8 @@ const infoCell = (icon, label, valueHtml, span = 1) =>
 
 /** 页头说明行（卡片外，双 Tab 共用）：一句话定位 + 文档外链 */
 const pageIntro = `<div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:0 0 14px">
-  <span class="hint" style="font-size:12.5px">OpenViking 长期记忆：每条消息自动召回相关历史、会话归档自动提炼，按 <code>{appId}-{userId}</code> 命名空间隔离（机器人之间互不可见）。</span>
+<!--  <span class="hint" style="font-size:12.5px">OpenViking 长期记忆：每条消息自动召回相关历史、会话归档自动提炼，按「记忆身份（OpenViking 用户）」隔离存储——每台机器人关联且仅关联一个身份，多台机器人关联同一身份即共享记忆（在「用户与密钥」Tab 管理）。</span>-->
+  <span class="hint" style="font-size:12.5px">OpenViking 长期记忆：每条消息自动召回相关历史、会话归档自动提炼，按「记忆身份（OpenViking 用户）」隔离存储——每台机器人关联且仅关联一个身份。</span>
   <!--<a href="${DOC_URL}" target="_blank" rel="noreferrer" style="font-size:12.5px;flex:0 0 auto;margin-left:auto">查看文档 ↗</a>-->
 </div>`;
 
@@ -684,30 +687,86 @@ const fmtActive = (iso) => {
   return new Date(t).toLocaleDateString();
 };
 
-/** 用户行（网页管理 / 机器人 / 其他；升级 bot×人 后机器人组可展开聊天者维度） */
-function userRowHtml(u) {
-  const displayName = u.appName || (u.kind === 'web' ? '网页管理' : u.userId);
+// ============ 记忆身份关联（identityMap：机器人 → OpenViking 用户） ============
+
+/** doc.memory 兜底取段（granularity 同款口径）；identityMap / displayNames 均为可选 Record */
+const memSeg = () => (S.doc.memory && typeof S.doc.memory === 'object') ? S.doc.memory : {};
+/** 机器人生效记忆身份（与后端 resolveMemoryUid 同口径：显式映射优先，缺省 = 专属用户 uid=appId） */
+const resolvedUid = (appId) => {
+  const map = memSeg().identityMap;
+  return (map && typeof map === 'object' ? (map[appId] || '').trim() : '') || appId;
+};
+/** uid 的中文显示名（doc.displayNames 显式条目；服务端 user_id 仅 ASCII，人可读对照以本映射为准） */
+const uidDisplayName = (uid) => {
+  const dn = memSeg().displayNames;
+  return (dn && typeof dn === 'object' ? (dn[uid] || '').trim() : '') || '';
+};
+/** 关联到某 uid 的机器人（前端按 doc.identityMap 现算，与后端签发/下发同口径） */
+const membersOf = (bots, uid) => bots.filter((b) => resolvedUid(b.appId) === uid);
+/** 用户 ID 合法性（与后端 isValidUserId / OpenViking identifiers 同口径：仅 ASCII） */
+const UID_RE = /^[A-Za-z0-9_.@-]{1,128}$/;
+/** 列表排序：网页管理 → 共享（多成员）→ 机器人专属 → 其余（历史/未关联） */
+const identityOrder = (r) => r.u.userId === 'web' ? 0 : r.members.length > 1 ? 1 : r.members.length === 1 ? 2 : 3;
+
+/**
+ * 用户行（按记忆身份渲染）：显示名优先（displayNames > 唯一成员机器人名 > 推导名 > uid），
+ * 技术 ID 缩为 code；类型徽标与成员 chips 由前端按 identityMap + bots 现算（后端 kind 仅兜底）。
+ * members = 关联到该 uid 的机器人列表（{appId, name}）
+ */
+function userRowHtml(u, members, bots) {
+  const isWeb = u.userId === 'web';
+  const disp = uidDisplayName(u.userId);
+  const ownBot = bots.find((b) => b.appId === u.userId);
+  // 历史聊天者：复合 ID（{appId}-{ou_xxx}）且无成员关联、无显示名（旧口径遗留身份）
+  const isLegacyChat = !isWeb && members.length === 0 && !disp && !ownBot
+    && bots.some((b) => u.userId.startsWith(`${b.appId}-`));
+  const displayName = disp
+    || (members.length === 1 ? (members[0].name || members[0].appId)
+      : members.length > 1 ? '共享身份'
+      : isWeb ? '网页管理'
+      : ownBot ? (ownBot.name || ownBot.appId)
+      : u.userId);
+  let kindTag;
+  if (isWeb) kindTag = '<span class="tag ok">网页管理</span>';
+  else if (members.length > 1) kindTag = `<span class="tag warn">共享身份 × ${members.length}</span>`;
+  else if (members.length === 1) kindTag = '<span class="tag info">机器人专属</span>';
+  else if (isLegacyChat) kindTag = '<span class="tag off">历史聊天者</span>';
+  else if (ownBot) kindTag = '<span class="tag ghost">历史身份</span>';
+  else kindTag = '<span class="tag ghost">未关联</span>';
+  const sharedWarning = members.length > 1
+    ? `<span class="tag warn" title="重置密钥会使这 ${members.length} 台机器人的会话记忆暂不可用（下一条消息自动恢复）；删除前需先解除全部关联">⚠ 联动</span>`
+    : '';
   const keyState = u.keyAvailable
     ? `密钥 <span title="脱敏显示，完整密钥经「复制 key / 打开记忆空间」按需放行">${esc(u.keyHint || '••••')}</span>`
     : '<span style="color:var(--warn-tx)">密钥未在库</span>';
   const meta = [fmtSize(u.sizeBytes), u.lastActive ? `活跃于 ${fmtActive(u.lastActive)}` : '暂无记忆数据'].filter(Boolean).join(' · ');
+  const memberChips = members.length
+    ? `<div class="chips">${members.map((b) => `<span class="chip" title="${esc(b.appId)}">🤖 ${esc(b.name || b.appId)}</span>`).join('')}</div>`
+    : isWeb ? '' : `<div class="chips"><span class="chip src">${ownBot ? '未关联 · 历史记忆保留' : '暂无机器人关联 · 历史数据保留'}</span></div>`;
+  const purpose = isWeb
+    ? '用途：网页端（Studio 记忆空间 / 文件系统页）用它这把'
+    : members.length > 1
+      ? '用途：成员机器人共用这份记忆，互相可见、互相沉淀'
+      : members.length === 1
+        ? '用途：该机器人的专属记忆（会话由 LCB 自动注入，无须手填）'
+        : ownBot
+          ? '用途：该机器人的历史记忆保留于此；在下方关联区重新关联即可继续使用'
+          : isLegacyChat ? '历史聊天者身份（{appId}-{ou_xxx} 旧口径）' : '';
   return `<div style="display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">
     <span style="width:8px;height:8px;border-radius:50%;background:var(--ok-tx);flex:0 0 auto"></span>
-    <div style="min-width:180px;flex:1">
+    <div style="min-width:220px;flex:1">
       <div style="font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap">${esc(displayName)}
-        <span class="hint"><code style="font-size:11px">${esc(u.userId)}</code></span>
+        <span class="hint"><code style="font-size:11px" title="用户 ID 由 OpenViking 绑定在密钥与数据目录中（服务端无改名接口），不支持修改；中文对照请点「编辑」修改显示名称">${esc(u.userId)}</code></span>
+        ${kindTag}${sharedWarning}
         <span class="hint">${keyState}</span>
       </div>
-      <div class="hint" style="margin-top:3px">${meta}</div>
-      <div class="hint" style="margin-top:2px">${u.kind === 'web'
-        ? '用途：网页端（Studio 记忆空间 / 文件系统页）用它这把'
-        : u.kind === 'bot'
-          ? `用途：飞书会话由 LCB 自动注入（无须手填）；想在本页看它的记忆，点右侧「打开记忆空间」以 <code>${esc(u.userId)}</code> 身份进入——与其他机器人的记忆完全隔离`
-          : '用途：历史聊天者身份'}</div>
+      ${memberChips}
+      <div class="hint" style="margin-top:3px">${meta}${purpose ? ` · ${esc(purpose)}` : ''}</div>
     </div>
-    <button class="btn sm primary" data-open="${esc(u.userId)}" title="以「${esc(displayName)}」的身份进入记忆空间：该密钥进剪贴板并自动打开 Studio 文件系统页，粘贴一次即连接。打开的是这一个身份自己的记忆，与其他机器人完全隔离">打开记忆空间</button>
+    <button class="btn sm primary" data-open="${esc(u.userId)}" title="以「${esc(displayName)}」的身份进入记忆空间：该密钥进剪贴板并自动打开 Studio 文件系统页，粘贴一次即连接${members.length > 1 ? `（共享身份：打开的是这 ${members.length} 台机器人共用的记忆）` : ''}">打开记忆空间</button>
     <button class="btn sm" data-copy="${esc(u.userId)}" title="复制密钥（脱敏显示，此操作会留痕）">⧉ 复制key</button>
-    <button class="btn sm" data-reset="${esc(u.userId)}" title="重签密钥：旧密钥立即失效，所有使用方需同步更新">重置</button>
+    <button class="btn sm" data-rename="${esc(u.userId)}" title="编辑中文显示名称（仅本页展示；用户 ID 不支持修改）">编辑</button>
+    <button class="btn sm" data-reset="${esc(u.userId)}" title="重签密钥：旧密钥立即失效${members.length > 1 ? `，影响全部 ${members.length} 台关联机器人` : ''}">重置</button>
     <button class="btn sm danger" data-del="${esc(u.userId)}" title="删除用户与记忆（先自动备份本地数据）">删除</button>
   </div>`;
 }
@@ -788,47 +847,36 @@ function renderUsersTab(el, { st, m }) {
     bodyHtml = `<div class="card">
       <div style="background:var(--off-bg);border-radius:10px;padding:14px 16px">
         <b>当前为 ${esc(u.authMode || 'dev')} 模式：无须用户密钥</b>
-        <div class="hint" style="margin-top:4px;line-height:1.7">本机回环免鉴权，机器人身份经命名空间（<code>{appId}-{userId}</code>）隔离——浏览器打开记忆空间可直接访问。部署走向多人共享 / 出现敏感内容隔离需求时，配置 root_api_key 切换到 api_key 模式后，回本页一键初始化网页与机器人密钥。</div>
+        <div class="hint" style="margin-top:4px;line-height:1.7">本机回环免鉴权，机器人身份经命名空间隔离（显式关联的身份固定为映射 uid）——浏览器打开记忆空间可直接访问。部署走向多人共享 / 出现敏感内容隔离需求时，配置 root_api_key 切换到 api_key 模式后，回本页即可管理用户与密钥。</div>
       </div>
+      ${bindingCardHtml(st.bots || [])}
       ${granularityCardHtml(gran)}</div>`;
   } else {
-    const webUsers = u.users.filter((x) => x.kind === 'web');
-    const botUsers = u.users.filter((x) => x.kind === 'bot');
-    const otherUsers = u.users.filter((x) => x.kind === 'other');
-    // 聊天者归属映射（前端兜底，与后端同口径）：历史复合 ID（{appId}-{ou_xxx}）按前缀归属到
-    // 对应飞书应用——后端未重启（旧构建无映射）时本层照样生效，刷新即见
     const bots = st.bots || [];
-    otherUsers.forEach((x) => {
-      if (x.appName) return;
-      const hit = bots.find((b) => x.userId.startsWith(`${b.appId}-`));
-      if (hit) x.appName = `${hit.name} · 聊天者`;
-    });
-    const group = (title, rows, hint) => rows.length === 0 ? '' : `
-      <div style="margin-top:14px">
-        <div style="font-size:12.5px;font-weight:700;color:var(--muted);letter-spacing:.4px">${esc(title)} <span class="hint" style="font-weight:400">${hint || ''}</span></div>
-        <div>${rows.map(userRowHtml).join('')}</div>
-      </div>`;
+    // 记忆身份单列表（v4 原型形态）：按 成员数 排序（网页管理 → 共享 → 专属 → 历史/未关联）
+    const rows = u.users
+      .map((x) => ({ u: x, members: membersOf(bots, x.userId) }))
+      .sort((a, b) => identityOrder(a) - identityOrder(b));
     bodyHtml = `<div class="card">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <h3 style="margin:0">用户与密钥</h3>
         <span class="hint">${esc(String(u.users.length))} 个用户 · 合计 ${fmtSize(u.totalBytes)} 记忆数据</span>
         <span style="flex:1"></span>
-        ${u.authInitNeeded ? '<button class="btn sm primary" id="memUsersInit">⚡ 一键初始化</button>' : '<button class="btn sm" id="memUsersInit">⚡ 一键初始化</button>'}
+        <button class="btn sm primary" id="memUserCreate" title="新建 OpenViking 用户（可填中文显示名称，仅本页展示）">＋ 新建用户</button>
         <button class="btn sm" id="memUsersRefresh">↻ 刷新</button>
       </div>
-      <div class="desc" style="margin-top:6px">网页与每个机器人各持一把独立密钥，页面脱敏显示、查看留痕。「打开记忆空间」= 密钥进剪贴板并自动打开该身份的记忆页。
-        <span class="tip" style="vertical-align:-1px" data-tip="密钥落盘已加密；1933 网页右上角身份显示的是技术 ID（OpenViking 暂不支持显示名），哪个 ID 对应哪台机器人以本页对照为准。">ⓘ</span></div>
-      ${u.authInitNeeded ? `<div class="hint" style="margin-top:10px;padding:9px 14px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px">🔑 待初始化鉴权：网页端用户尚未创建，浏览器打开记忆空间会 401——点右上「⚡ 一键初始化」自动创建并签发密钥。</div>` : ''}
-      ${u.users.length === 0 && !u.authInitNeeded ? '<div class="hint" style="margin-top:12px">暂无用户——点「⚡ 一键初始化」创建。</div>' : ''}
+      <div class="desc" style="margin-top:6px">记忆身份 = OpenViking 用户（账号 <code>${esc(m.account || 'default')}</code> 下）。每台机器人<b>关联且仅关联一个</b>身份，会话记忆读写该身份——多台机器人关联同一身份即共享记忆。
+        <span class="tip" style="vertical-align:-1px" data-tip="密钥落盘已加密；1933 网页右上角身份显示的是技术 ID（服务端仅支持 ASCII、无显示名字段），中文对照以本页「显示名称」为准——点用户行「编辑」可修改。用户 ID 由 OpenViking 绑定在密钥与数据目录中，不支持修改。">ⓘ</span></div>
+      ${u.authInitNeeded ? `<div class="hint" style="margin-top:10px;padding:9px 14px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px">🔑 待初始化鉴权：网页端用户尚未创建，浏览器打开记忆空间会 401——LCB 启动已包含 web 用户自动签发，稍候点「↻ 刷新」；持续缺失请检查服务与 root key。</div>` : ''}
+      ${u.users.length === 0 && !u.authInitNeeded ? '<div class="hint" style="margin-top:12px">暂无用户——点「＋ 新建用户」创建，或由 LCB 启动时自动补签。</div>' : ''}
       ${studioGuideCardHtml(u.rootKey, m.endpoint)}
-      ${group('网页管理', webUsers, '浏览器打开记忆空间用这一把（Studio 里的「用户 API 密钥」也用它）')}
-      ${group('机器人', botUsers, '每个 bot 一把独立密钥；机器人会话由 LCB 自动注入，你不需要手填到任何地方')}
-      ${group('聊天者与其他', otherUsers, '历史身份（{appId}-{ou_xxx}）已自动归属到对应机器人')}
+      <div style="margin-top:6px">${rows.map((r) => userRowHtml(r.u, r.members, bots)).join('')}</div>
+      ${bindingCardHtml(bots)}
       ${granularityCardHtml(gran)}
     </div>`;
   }
   el.innerHTML = bodyHtml;
-  bindUsersTabActions(el, { m });
+  bindUsersTabActions(el, { m, st });
 }
 
 /** 粒度向导卡（方案 §六：默认 bot 级；「升级到 bot×人」开关 = 增量升级意向，不动既有 key 与记忆） */
@@ -848,7 +896,189 @@ const granularityCardHtml = (gran) => `
       <span class="tip" style="vertical-align:-1px" data-tip="建议触发条件（任一出现即升级）：同一 bot 服务 2 人以上且内容敏感；出现「记忆是谁写的」追溯需求；部署走向团队共享。">ⓘ</span></div>
   </div>`;
 
-function bindUsersTabActions(el, { m }) {
+/**
+ * 「飞书机器人 → 记忆身份」关联卡：每台机器人一个下拉（关联且仅关联一个用户；多台关联同一
+ * 用户 = 共享记忆）。选择只暂存（行内亮「保存」），保存经确认弹窗写 doc.identityMap → saveDoc
+ * 落盘 → memory 热重载自动重签（新 uid 由签发路径自动建户）→ 下一条消息生效。
+ * 选项：我的专属用户（不存在也保留，标「待创建」）→ 其他可用用户 → ➕ 新建共享身份并绑定（弹窗）。
+ * web / 历史聊天者身份不可作为关联目标（前者网页专用，后者是旧口径遗留）。
+ */
+function bindingCardHtml(bots) {
+  if (!bots.length) return '';
+  const users = usersSnapshot?.users ?? [];
+  const isLegacyChat = (uid) => bots.some((b) => uid.startsWith(`${b.appId}-`) && uid !== b.appId);
+  const eligible = users.filter((x) => x.userId !== 'web' && !isLegacyChat(x.userId));
+  const rowsHtml = bots.map((b) => {
+    const cur = resolvedUid(b.appId);
+    const opts = [];
+    const hasOwn = users.some((x) => x.userId === b.appId);
+    opts.push(`<option value="${esc(b.appId)}" ${cur === b.appId ? 'selected' : ''}>${esc(b.appId)}（我的专属用户${hasOwn ? '' : ' · 待创建'}）</option>`);
+    for (const x of eligible) {
+      if (x.userId === b.appId) continue;
+      const n = membersOf(bots, x.userId).length;
+      const disp = uidDisplayName(x.userId);
+      const label = `${disp || x.userId}（${[disp ? x.userId : null, n ? `${n} 台关联` : '未关联'].filter(Boolean).join(' · ')}）`;
+      opts.push(`<option value="${esc(x.userId)}" ${cur === x.userId ? 'selected' : ''}>${esc(label)}</option>`);
+    }
+    opts.push('<option value="__new__">➕ 新建共享身份并绑定…</option>');
+    const mates = membersOf(bots, cur).filter((x) => x.appId !== b.appId);
+    const curDisp = uidDisplayName(cur);
+    const curDesc = cur === b.appId
+      ? `当前：关联专属用户 <code>${esc(cur)}</code>（独立记忆，互不可见）`
+      : `当前：关联${curDisp ? `「${esc(curDisp)}」` : ''} <code>${esc(cur)}</code>${mates.length ? `（与 ${esc(mates.map((x) => x.name || x.appId).join('、'))} 共用）` : '（暂无同伴）'}`;
+    return `<div data-bindrow="${esc(b.appId)}" style="display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">
+      <div style="min-width:200px;flex:1">
+        <div style="font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap">${esc(b.name || b.appId)}
+          <span class="hint"><code style="font-size:11px">${esc(b.appId)}</code></span>
+        </div>
+        <div class="hint" style="margin-top:2px">${curDesc}</div>
+      </div>
+      <select data-bindsel="${esc(b.appId)}" style="width:260px" title="每台机器人只能关联一个 OpenViking 用户；多台关联同一用户即共享记忆">${opts.join('')}</select>
+      <button class="btn sm primary" data-savebind="${esc(b.appId)}" hidden>保存</button>
+    </div>`;
+  }).join('');
+  return `<div style="margin-top:16px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <b style="font-size:13.5px">飞书机器人 → 记忆身份</b>
+      <button class="btn sm ghost" id="memBindInfo" title="关联规则、共享记忆语义、生效与迁移">ⓘ 分配说明</button>
+    </div>
+    <div class="desc" style="margin-top:4px">为每台机器人选择要<b>关联</b>的 OpenViking 用户：一台机器人只能关联一个用户；多台关联同一用户即共享记忆（互相可见、互相沉淀）。保存后下一条消息生效，运行中的会话自动重建。</div>
+    <div style="margin-top:4px">${rowsHtml}</div>
+  </div>`;
+}
+
+/**
+ * 新建用户弹窗（v4 原型形态；bindTo 传 appId = 创建并关联到该机器人）。
+ * 创建走 POST /api/memory/users/create（Admin API 建户 + 密钥入保险库）；显示名称写
+ * doc.displayNames、关联写 doc.identityMap，一并 saveDoc 落盘（memory 热重载自动重签生效）。
+ * 校验失败红字留在弹窗内；Enter 提交 / Esc 关闭。
+ */
+function openCreateModal(bindTo, bindToName) {
+  openModal({
+    title: '新建 OpenViking 用户',
+    width: 'min(520px,92vw)',
+    bodyHtml: `
+      ${bindTo ? `<div class="banner info" style="margin-bottom:8px"><span>创建后将关联到机器人：<b>${esc(bindToName || bindTo)}</b>（下一条消息生效）</span></div>` : ''}
+      <label class="fld" style="margin-top:0">用户 ID（记忆身份标识 · 仅字母/数字/_ . @ -）</label>
+      <input type="text" id="muDlgUid" placeholder="如 shared-work" autocomplete="off">
+      <div id="muDlgErr" style="display:none;color:var(--err-tx);font-size:12px;margin-top:5px"></div>
+      <label class="fld">显示名称（可空 · 中文友好名，仅本页展示）</label>
+      <input type="text" id="muDlgDisp" placeholder="如：日常共享记忆" autocomplete="off">
+      <div class="hint" style="margin-top:12px">创建后自动签发密钥；密钥仅在「复制 key / 打开记忆空间」时放行并留痕。OpenViking 的用户 ID 仅支持 ASCII——中文请填「显示名称」。</div>`,
+    footHtml: `<span class="sp"></span><button class="btn" id="muDlgCancel">取消</button><button class="btn primary" id="muDlgOk">${bindTo ? '创建并关联' : '创建并签发密钥'}</button>`,
+  });
+  const uidEl = $('#muDlgUid');
+  const dispEl = $('#muDlgDisp');
+  const errEl = $('#muDlgErr');
+  const okBtn = $('#muDlgOk');
+  const close = () => closeModal();
+  const submit = async () => {
+    const uid = uidEl.value.trim();
+    const fail = (msg) => { errEl.textContent = msg; errEl.style.display = 'block'; };
+    if (!UID_RE.test(uid)) return fail('仅允许字母、数字、下划线、点、@、连字符，长度 1–128（如 shared-work）');
+    if ((usersSnapshot?.users ?? []).some((x) => x.userId === uid)) return fail(`用户 ${uid} 已存在`);
+    okBtn.disabled = true;
+    okBtn.textContent = '创建中…';
+    try {
+      const r = await api('POST', '/api/memory/users/create', { user_id: uid });
+      if (!r.ok) {
+        okBtn.disabled = false;
+        okBtn.textContent = bindTo ? '创建并关联' : '创建并签发密钥';
+        return fail(r.error || '创建失败');
+      }
+    } catch (e) {
+      okBtn.disabled = false;
+      okBtn.textContent = bindTo ? '创建并关联' : '创建并签发密钥';
+      return fail(e.message);
+    }
+    // 显示名称与关联走配置 doc 管道落盘（一次 saveDoc 同时持久化；memory 热重载自动重签）
+    if (!S.doc.memory || typeof S.doc.memory !== 'object') S.doc.memory = {};
+    const dispName = dispEl.value.trim();
+    if (dispName) {
+      if (!S.doc.memory.displayNames || typeof S.doc.memory.displayNames !== 'object') S.doc.memory.displayNames = {};
+      S.doc.memory.displayNames[uid] = dispName;
+    }
+    if (bindTo) {
+      if (!S.doc.memory.identityMap || typeof S.doc.memory.identityMap !== 'object') S.doc.memory.identityMap = {};
+      S.doc.memory.identityMap[bindTo] = uid;
+    }
+    close();
+    if (dispName || bindTo) await saveDoc();
+    else toast(`已创建用户 ${uid} 并签发密钥（密钥在库加密存储）`);
+    usersSnapshot = await api('GET', '/api/memory/users').catch(() => null);
+    hooks.rerender();
+  };
+  okBtn.onclick = submit;
+  $('#muDlgCancel').onclick = close;
+  uidEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+  dispEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+  uidEl.focus();
+}
+
+/**
+ * 修改显示名弹窗（用户行「编辑」按钮入口）：displayNames 是 LCB 侧中文对照映射（doc.memory.displayNames，
+ * 仅本页与列表展示）。用户 ID 锁定只读——OpenViking 0.5.0 无 rename 接口，且 user_id 硬编码在
+ * 每把密钥（base64url(account).user.secret）与数据目录（data/viking/<账号>/user/<uid>/）里，
+ * 改 ID 即全部密钥失效、历史记忆失联，故只放开显示名。清空保存 = 删除映射条目（列表回落为
+ * 机器人名/技术 ID）；落盘走 saveDoc（与新建弹窗同管道），成功后重拉用户快照重渲染。
+ */
+function openRenameModal(uid) {
+  const cur = uidDisplayName(uid);
+  openModal({
+    title: '修改显示名称',
+    width: 'min(520px,92vw)',
+    bodyHtml: `
+      <label class="fld" style="margin-top:0">用户 ID（只读 · OpenViking 身份标识）</label>
+      <div style="display:flex;align-items:center;gap:8px">
+        <code style="font-size:12.5px;padding:9px 12px;background:rgba(127,127,127,.08);border-radius:8px;flex:1;user-select:text;overflow-wrap:anywhere">${esc(uid)}</code>
+        <span class="tip" data-tip="用户 ID 由 OpenViking 硬编码进每把用户密钥（base64url(账号).用户.密钥）与数据目录（data/viking/账号/user/ID），服务端无改名接口——修改即密钥全部失效、历史记忆失联。因此锁定只读，中文对照请改下方显示名称。">ⓘ</span>
+      </div>
+      <label class="fld">显示名称（可空 · 中文友好名，仅本页展示）</label>
+      <input type="text" id="muRenDisp" placeholder="如：日常共享记忆" value="${esc(cur)}" maxlength="64" autocomplete="off">
+      <div class="hint" style="margin-top:12px">清空并保存 = 删除显示名称，列表回落为机器人名 / 技术 ID。改名不影响密钥、记忆数据与机器人关联。</div>`,
+    footHtml: `<span class="sp"></span><button class="btn" id="muRenCancel">取消</button><button class="btn primary" id="muRenOk">保存</button>`,
+  });
+  const dispEl = $('#muRenDisp');
+  const okBtn = $('#muRenOk');
+  const close = () => closeModal();
+  const submit = async () => {
+    const next = dispEl.value.trim();
+    if (next === cur) return close(); // 无变更：直接关（不空转落盘）
+    if (!S.doc.memory || typeof S.doc.memory !== 'object') S.doc.memory = {};
+    if (!S.doc.memory.displayNames || typeof S.doc.memory.displayNames !== 'object') S.doc.memory.displayNames = {};
+    if (next) S.doc.memory.displayNames[uid] = next;
+    else delete S.doc.memory.displayNames[uid];
+    close();
+    await saveDoc(); // 失败已有 toast（displayNames 改动留在内存编辑态，可再次保存）
+    try { usersSnapshot = await api('GET', '/api/memory/users'); } catch { /* 保持旧快照 */ }
+    hooks.rerender();
+  };
+  okBtn.onclick = submit;
+  $('#muRenCancel').onclick = close;
+  dispEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+  dispEl.focus();
+  dispEl.select();
+}
+
+/** 「分配说明」弹窗（关联卡 ⓘ）：关联规则 / 共享语义 / 生效与迁移 / 联动风险 */
+function openBindInfoModal() {
+  openModal({
+    title: '机器人 → 记忆身份 · 分配说明',
+    width: 'min(560px,92vw)',
+    bodyHtml: `
+      <div class="sub-title">关联规则</div>
+      <div class="desc" style="margin:0">每台飞书机器人<b>只能关联一个</b> OpenViking 用户；缺省关联自己的专属用户（uid = appId）。</div>
+      <div class="sub-title" style="margin-top:14px">共享记忆</div>
+      <div class="desc" style="margin:0">多台机器人关联<b>同一个</b>用户即共享记忆：互相可见、互相沉淀（A 机器人记住的事，B 机器人也能召回）。</div>
+      <div class="sub-title" style="margin-top:14px">生效与迁移</div>
+      <div class="desc" style="margin:0">· 保存后<b>下一条消息生效</b>，运行中的会话自动重建，无须重启桥接器<br>· <b>历史记忆不迁移</b>：改关联只影响之后的新记忆，原用户的记忆原地保留</div>
+      <div class="banner warn" style="margin-top:12px"><span>⚠️ 共享用户被多台机器人关联时，重置 / 删除会影响<b>所有</b>关联它的机器人：重置密钥后成员会话记忆暂不可用（自动恢复）；删除前需先解除全部关联。</span></div>`,
+    footHtml: `<span class="sp"></span><button class="btn primary" id="muBindOk">知道了</button>`,
+  });
+  $('#muBindOk').onclick = closeModal;
+}
+
+function bindUsersTabActions(el, { m, st }) {
   const endpoint = (m.endpoint || DEFAULT_ENDPOINT).replace(/\/+$/, '');
 
   const reload = async () => {
@@ -862,17 +1092,55 @@ function bindUsersTabActions(el, { m }) {
   const refreshBtn = $('#memUsersRefresh');
   if (refreshBtn) refreshBtn.onclick = reload;
 
-  const initBtn = $('#memUsersInit');
-  if (initBtn) initBtn.onclick = async () => {
-    initBtn.disabled = true;
-    initBtn.textContent = '初始化中…';
-    try {
-      const r = await api('POST', '/api/memory/users/init', {});
-      if (r.ok) toast(r.detail || '初始化完成');
-      else toast((r.errors && r.errors[0]) || r.detail || '初始化失败', true);
-    } catch (e) { toast(e.message, true); }
-    await reload();
-  };
+  // —— 新建用户弹窗入口（卡片头「＋ 新建用户」） ——
+  const createBtn = $('#memUserCreate');
+  if (createBtn) createBtn.onclick = () => openCreateModal();
+
+  // —— 关联卡：选择只暂存（行内亮「保存」）→ 确认 → identityMap 落盘（热重载自动重签生效） ——
+  const bots = st.bots || [];
+  const bindInfoBtn = $('#memBindInfo');
+  if (bindInfoBtn) bindInfoBtn.onclick = openBindInfoModal;
+  el.querySelectorAll('select[data-bindsel]').forEach((sel) => {
+    sel.addEventListener('change', () => {
+      const appId = sel.dataset.bindsel;
+      const row = el.querySelector(`[data-bindrow="${CSS.escape(appId)}"]`);
+      const saveBtn = row?.querySelector('[data-savebind]');
+      if (!saveBtn) return;
+      if (sel.value === '__new__') {
+        // 弹窗创建：先把下拉回退到当前关联，创建成功后统一刷新
+        sel.value = resolvedUid(appId);
+        openCreateModal(appId, bots.find((b) => b.appId === appId)?.name);
+      } else {
+        saveBtn.hidden = sel.value === resolvedUid(appId);
+      }
+    });
+  });
+  el.querySelectorAll('[data-savebind]').forEach((btn) => {
+    btn.onclick = async () => {
+      const appId = btn.dataset.savebind;
+      const sel = el.querySelector(`select[data-bindsel="${CSS.escape(appId)}"]`);
+      if (!sel) return;
+      const from = resolvedUid(appId);
+      const target = sel.value;
+      if (!target || target === from || target === '__new__') return;
+      const botName = bots.find((b) => b.appId === appId)?.name || appId;
+      const dispOf = (uid) => uidDisplayName(uid) || (usersSnapshot?.users ?? []).find((x) => x.userId === uid)?.userId || uid;
+      const others = (uid) => membersOf(bots, uid).filter((b) => b.appId !== appId);
+      const uidDesc = (uid) => uid === appId
+        ? `专属用户 <b>${esc(uid)}</b>（独立记忆）`
+        : `用户 <b>${esc(dispOf(uid))}</b>（当前关联：${esc(others(uid).map((b) => b.name || b.appId).join('、')) || '无'}）`;
+      if (!(await confirmDialog({
+        title: '确认更改关联的用户',
+        message: `${esc(botName)}：<code>${esc(from)}</code> → ${uidDesc(target)}<br><br>· 一台机器人只能关联一个用户，保存后即改为关联新用户<br>· 下一条消息生效，运行中的会话自动重建<br>· <b>历史记忆不迁移</b>：原用户的既有记忆原地保留，随时可用「打开记忆空间」查看`,
+        confirmText: '保存',
+      }))) { sel.value = from; return; }
+      if (!S.doc.memory || typeof S.doc.memory !== 'object') S.doc.memory = {};
+      if (!S.doc.memory.identityMap || typeof S.doc.memory.identityMap !== 'object') S.doc.memory.identityMap = {};
+      S.doc.memory.identityMap[appId] = target;
+      if (await saveDoc()) await reload();
+      else sel.value = from;
+    };
+  });
 
   // Root 密钥放行 → 剪贴板 →（可选）打开 Studio。后端顺带做了「拿这把 key 实打服务端」的校验，
   // 结果直接回显在卡片里：拷贝即用，不必等 Studio 报 401 才回头猜是哪把钥匙不对
@@ -945,9 +1213,14 @@ function bindUsersTabActions(el, { m }) {
   };
 
   const resetKey = async (uid) => {
+    // 共享身份联动提示：被多台机器人关联时，重置会影响全部成员的会话记忆（自动恢复）
+    const linked = membersOf(st.bots || [], uid);
+    const linkedNote = linked.length > 1
+      ? `<br><br>⚠ 该身份被 <b>${esc(linked.map((b) => b.name || b.appId).join('、'))}</b> 共 ${linked.length} 台机器人关联：重置后它们的会话记忆将暂不可用（下一条消息自动恢复）。`
+      : '';
     if (!(await confirmDialog({
       title: '重置密钥', danger: true,
-      message: `确定重置 <b>${esc(uid)}</b> 的密钥？<br><br>旧密钥将<b>立即失效</b>——所有使用此密钥的一方（浏览器连接、已打开的记忆空间、机器人会话）需同步更新并重启会话。`,
+      message: `确定重置 <b>${esc(uid)}</b> 的密钥？<br><br>旧密钥将<b>立即失效</b>——所有使用此密钥的一方（浏览器连接、已打开的记忆空间、机器人会话）需同步更新并重启会话。${linkedNote}`,
       confirmText: '重置',
     }))) return;
     try {
@@ -959,6 +1232,11 @@ function bindUsersTabActions(el, { m }) {
   };
 
   const delUser = async (uid) => {
+    // 关联防呆：仍有机器人关联该身份时禁止删除（先改关联，防止成员机器人集体失忆）
+    const linked = membersOf(st.bots || [], uid);
+    if (linked.length > 0) {
+      return toast(`无法删除：${esc(linked.map((b) => b.name || b.appId).join('、'))} 仍关联着该用户，请先在下方改关联到其他用户`, true);
+    }
     if (!(await confirmDialog({
       title: '删除用户', danger: true,
       message: `确定删除 <b>${esc(uid)}</b>？<br><br>该用户的服务端数据将被异步清理；删除前会自动把本地记忆目录打包备份到 <code>openviking/backups/</code>（备份失败会中止删除）。`,
@@ -967,17 +1245,26 @@ function bindUsersTabActions(el, { m }) {
     try {
       const r = await api('POST', '/api/memory/users/delete', { user_id: uid });
       toast(r.ok ? (r.detail || '已删除') : (r.error || r.detail || '删除失败'), !r.ok);
+      // 顺手清理中文对照映射（displayNames 是 LCB 侧条目，用户已删则映射无主，残留会在列表
+      // 「显示名优先」链路里变成幽灵名字；清理失败不回滚删除本身——残留无害，仅展示层冗余）
+      if (r.ok && S.doc?.memory && typeof S.doc.memory === 'object'
+        && S.doc.memory.displayNames && typeof S.doc.memory.displayNames === 'object'
+        && uid in S.doc.memory.displayNames) {
+        delete S.doc.memory.displayNames[uid];
+        await saveDoc();
+      }
     } catch (e) { toast(e.message, true); }
     await reload();
   };
 
   el.addEventListener('click', (e) => {
-    const t = e.target.closest('[data-open],[data-copy],[data-reset],[data-del]');
+    const t = e.target.closest('[data-open],[data-copy],[data-reset],[data-del],[data-rename]');
     if (!t) return;
     if (t.dataset.open) return void openSpace(t.dataset.open);
     if (t.dataset.copy) return void copyKey(t.dataset.copy);
     if (t.dataset.reset) return void resetKey(t.dataset.reset);
     if (t.dataset.del) return void delUser(t.dataset.del);
+    if (t.dataset.rename) return void openRenameModal(t.dataset.rename);
   });
 
   const granEl = $('#memGran');
@@ -1000,7 +1287,8 @@ function bindUsersTabActions(el, { m }) {
 export const page = {
   id: 'memory',
   title: '记忆增强',
-  desc: 'OpenViking 长期记忆：自动召回历史、归档提炼，按机器人命名空间隔离',
+  // desc: 'OpenViking 长期记忆：自动召回历史、归档提炼，按机器人命名空间隔离',
+  desc: '',
   legend: false,
   icon: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
   render: renderMemory,

@@ -51,9 +51,9 @@ export class SecurityAudit implements SecurityAuditWriter {
 
 /** 安全拦截统一话术（R1/R2/R4 拒绝模板）：不解释保护对象、不确认目标是否存在——
  *  模型回复「没有权限」时这是真话（能力缺失，非服从），杜绝侧信道试探 */
-export const DENY_REDLINE_MESSAGE = '⛔ 没有权限访问该路径（安全红线，不可越界）。请改用已分配工作区内的文件继续任务';
-export const DENY_WRITE_MESSAGE = '⛔ 没有权限写入该位置（写入仅限已分配的工作区）';
-export const DENY_BASH_MESSAGE = '⛔ 没有权限使用命令行工具';
+export const DENY_REDLINE_MESSAGE = '没有权限访问该路径（安全红线，不可越界）。请改用已分配工作区内的文件继续任务';
+export const DENY_WRITE_MESSAGE = '没有权限写入该位置（写入仅限已分配的工作区）';
+export const DENY_BASH_MESSAGE = '没有权限使用命令行工具';
 
 /** 金丝雀命中告警模板（gateway 与 gate 侧共用；文本不含任何敏感内容，自身出站无递归风险） */
 export const CANARY_ALERT_TEXT =

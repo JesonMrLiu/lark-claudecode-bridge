@@ -467,6 +467,10 @@ body.drawer-resizing{cursor:ew-resize;user-select:none}
 /* 卡片头部的 ⓘ 向下弹：贴近视口顶部时向上弹会被裁掉（主人反馈 #9） */
 .panel-actions .tip::after{bottom:auto;top:calc(100% + 7px);transform:translateX(-50%) translateY(-4px)}
 .panel-actions .tip:hover::after{transform:translateX(-50%) translateY(0)}
+/* 弹窗内的 ⓘ 向下弹 + 右对齐：modal-body overflow-y:auto 会把向上弹和横向居中的 tooltip 一起裁掉
+   （主人反馈 #10：改名弹窗 ⓘ 长提示被弹窗边缘裁剪）；行尾位置改为右缘对齐才不出右边界 */
+.modal-body .tip::after{bottom:auto;top:calc(100% + 7px);left:auto;right:0;transform:translateY(-4px)}
+.modal-body .tip:hover::after{transform:translateY(0)}
 
 /* ═══ Savebar（未保存条；页内卡级保存行复用同类名） ═══ */
 .savebar{

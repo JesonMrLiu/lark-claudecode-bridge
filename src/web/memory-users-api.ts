@@ -389,6 +389,46 @@ export async function initMemoryUsers(config: BridgeConfig): Promise<InitOutcome
   return out;
 }
 
+// ============ 新建用户（配置页弹窗：Admin API 创建 + 密钥入保险库） ============
+
+export interface CreateUserOutcome { ok: boolean; error?: string; uid?: string }
+
+/**
+ * 新建 OpenViking 用户（「用户与密钥」Tab 弹窗；配合 identityMap 关联即形成共享记忆身份）。
+ * - dev 模式：Admin API 被服务端禁用且本机回环免鉴权——无须用户密钥，直接说明而非报错
+ * - 保留名：web（LCB 启动自动签发，删后重启自愈）与 default（管理员）不接受手工创建
+ * - 创建成功后把响应里的 user_key 刷入保险库（与 init 同款；响应未带 key 时由列表自愈回读兜底）
+ * - 显示名称不在此持久化：displayNames 走配置 doc 管道（前端 saveDoc），与本接口解耦
+ */
+export async function createMemoryUser(config: BridgeConfig, userId: string): Promise<CreateUserOutcome> {
+  const uid = userId.trim();
+  if (!isValidUserId(uid)) return { ok: false, error: '用户 ID 非法：仅字母/数字/_ . @ -，长度 1–128' };
+  if (uid === WEB_USER_ID || uid === DEFAULT_MEMORY_ACCOUNT) return { ok: false, error: `${uid} 为保留名（LCB 自动管理/管理员），请换一个 ID` };
+  const memory = config.memory;
+  if (!memory) return { ok: false, error: 'memory 段未配置' };
+  const health = await probeMemoryHealth(memoryEndpoint(memory));
+  if (!health.healthy) return { ok: false, error: `服务不可达（${health.detail ?? '未知原因'}）——请先在「服务与配置」拉起服务` };
+  if (health.authMode !== 'api_key') {
+    return { ok: false, error: `服务为 ${health.authMode ?? '未知'} 模式：本机回环免鉴权、身份经命名空间隔离，无须创建用户密钥` };
+  }
+  const rootKey = resolveRootKey(memory);
+  if (!rootKey) return { ok: false, error: 'root key 未配置——请先「检查修复」对齐鉴权' };
+  const account = memoryAccount(memory);
+  const accountReady = await ensureRemoteAccount(memoryEndpoint(memory).replace(/\/+$/, ''), account, rootKey);
+  if (!accountReady.ok) return { ok: false, error: `记忆账号「${account}」不可用：${accountReady.detail}` };
+  const r = await adminCall(memory, rootKey, 'POST', adminPath(memory, '/users'), { user_id: uid, role: 'user' });
+  if (!r.ok) {
+    auditMemory('create-fail', { user_id: uid, status: r.status });
+    const hint = r.status === 409 ? '（用户已存在）'
+      : r.status === 404 ? '——服务端不存在该账号，请核对 memory.account（缺省 default）' : '';
+    return { ok: false, error: `创建失败：HTTP ${r.status}${r.message ? `（${r.message}）` : ''}${hint}` };
+  }
+  const result = (r.json.result ?? {}) as { user_key?: string };
+  if (typeof result.user_key === 'string' && result.user_key) await vaultStore(uid, result.user_key);
+  auditMemory('create', { user_id: uid });
+  return { ok: true, uid };
+}
+
 // ============ 密钥明文放行（reveal / 复制 / 打开记忆空间共用） ============
 
 // ============ Root 密钥放行（OpenViking Studio 登录用） ============
