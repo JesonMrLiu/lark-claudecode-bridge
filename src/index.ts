@@ -39,9 +39,10 @@ import { BRIDGE_MCP_JSON, readMcpServersFromJsonFile } from './web/skills-mcp-ap
 import { FEISHU_NOTIFY_SOP_PROMPT, TOOL_HINT_PROMPT } from './notify-sop.js';
 import { ensureProfileSettingsFile, resolveAppProfile, resolveAppProfileModel } from './app-profile.js';
 import {
-  MEMORY_PLUGIN_NAME, createMemoryProvider, ensureMemoryUserKeys, memoryEndpoint, memoryEnvFor, type MemoryProvider,
+  MEMORY_PLUGIN_NAME, createMemoryProvider, ensureMemoryUserKeys, memoryEndpoint, memoryEnvFor, resolveMemoryUid,
+  type MemoryProvider,
 } from './memory.js';
-import { WEB_USER_ID, vaultStore } from './web/memory-users-api.js';
+import { WEB_USER_ID, onUserKeyRotated, vaultStore } from './web/memory-users-api.js';
 import { cleanupClientCliConf, ensureClientCliConf, ensureMemoryServiceRunning, stopManagedServer } from './memory-installer.js';
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
@@ -938,8 +939,12 @@ export function createBridge(
       // 长期记忆 ns env（§6.4/§6.6）：memory.enabled 时每条消息拼装下发——OPENVIKING_USER 按
       // 消息级 userId 隔离（群聊同事话语不混入主人记忆；deputy 的 appId 天然不同即分身永不读
       // 主人记忆）。?? 保留既有值：apps[].env 手配 OPENVIKING_* = 专家覆盖口。关段 = 零注入，
-      // 行为与无此段完全一致（可插拔验收）；常驻进程经配置指纹回收（env 变 → 指纹变 → 重建）
+      // 行为与无此段完全一致（可插拔验收）；常驻进程经配置指纹回收（env 变 → 指纹变 → 重建）。
+      // 构 env 前先做身份新鲜度保障：identityMap 换绑/密钥重置后的第一条消息，必须等签发刷新
+      // 落定、拿到与新映射一致的 key——否则 api_key 模式身份由 key 决定，会拿旧用户 key 把
+      // 记忆静默写回旧 ns（快照一致时此调用零开销直返）
       if (config.memory?.enabled) {
+        await deps.memory?.ensureFreshKeys();
         for (const [k, v] of Object.entries(memoryEnvFor(config.memory, app.appId, msg.userId, deps.memory?.userKeys()))) {
           taskEnv[k] ??= v;
         }
@@ -1634,7 +1639,7 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
    *  且有 flag 防并发叠加（热重载与启动重试可能同时触发） */
   const MEMORY_KEY_RETRY = { intervalMs: 15_000, rounds: 6 };
   let memoryKeyRetrying = false;
-  const refreshMemoryKeys = async (): Promise<void> => {
+  const refreshMemoryKeysInner = async (): Promise<void> => {
     if (!config.memory?.enabled) {
       memoryUserKeys.clear();
       return;
@@ -1648,12 +1653,6 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
     for (const o of outcomes.values()) {
       if (o.userKey) {
         memoryUserKeys.set(o.appId, o.userKey);
-        // 重签即换新 key（服务端旧 key 立即失效）：按 uid 同步刷进密钥保险库，配置页复制/
-        // OpenViking Studio / 本机插件拿到的始终是可用 key。不刷则保险库留旧 key，要等
-        // 「用户与密钥」Tab 打开触发列表自愈，期间复制出去的 key 必 401（共享映射 uid 被
-        // 每次 LCB 重启重签，窗口高频出现）。共享身份多 appId 携同一把 key，vaultStore
-        // 按 uid 键合 + 明文缓存去重，重复调用零额外 DPAPI 开销
-        if (o.uid) void vaultStore(o.uid, o.userKey).catch(() => { /* 保险库写失败不阻断签发链路 */ });
         unreachable = false;
         const label = o.appId === WEB_USER_ID ? 'web 用户（网页端）'
           : o.uid && o.uid !== o.appId ? `bot ${o.appId} → ${o.uid}（共享/映射身份）`
@@ -1666,6 +1665,19 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
         if (o.skipped && !o.skipped.startsWith('服务不可达')) unreachable = false;
         console.log(`[memory] ${o.appId === WEB_USER_ID ? 'web 用户' : `bot ${o.appId}`}：${o.skipped}`);
       }
+    }
+    // 保险库同步（2026-10-22 事故修复）：签发链路拿到的最新 key 立即入保险库，配置页
+    // 「查看密钥」/OpenViking Studio 复制的始终是可用 key——否则留旧 key 等列表自愈，
+    // 期间复制出去的必 401。按 uid 去重后**顺序 await**（vaultStore 内部已串行化 + 写前
+    // 重读，这里不再 fire-and-forget：DPAPI 每次 1-2s、4 用户约 5s，运行在启动/热重载
+    // 后台链路不阻塞消息；写失败落日志，不影响会话 env 下发）
+    const vaultedUids = new Set<string>();
+    for (const o of outcomes.values()) {
+      if (!o.userKey || !o.uid || vaultedUids.has(o.uid)) continue;
+      vaultedUids.add(o.uid);
+      await vaultStore(o.uid, o.userKey).catch((e) => {
+        console.warn(`[memory] ${o.uid} 保险库同步失败（不影响会话 env）：`, e instanceof Error ? e.message : e);
+      });
     }
     // 全员因服务不可达被跳过 → 退避重试；服务起来后自动补签，无需重启 LCB
     if (unreachable && !memoryKeyRetrying) {
@@ -1686,7 +1698,45 @@ export async function startBridge(configPath: string = CONFIG_PATH): Promise<voi
       })();
     }
   };
+  // 单飞包装 + 快照门槛：所有签发触发源（启动自举 / 热重载 onMemoryChanged / 不可达重试 /
+  // 消息路径 ensureFreshKeys）共用同一条在途 Promise，不并发重签；完成时记录「已签发配置
+  // 快照」（memory 段 JSON）——identityMap 换绑、密钥重置等任何段变化都会使其失配
+  let lastSignedSnapshot: string | undefined;
+  let refreshInFlight: Promise<void> | undefined;
+  const memorySnapshot = (): string => JSON.stringify(config.memory ?? null);
+  const refreshMemoryKeys = (): Promise<void> => {
+    if (refreshInFlight) return refreshInFlight;
+    refreshInFlight = (async () => {
+      try {
+        await refreshMemoryKeysInner();
+        lastSignedSnapshot = memorySnapshot();
+      } finally {
+        refreshInFlight = undefined;
+      }
+    })();
+    return refreshInFlight;
+  };
   const memoryProvider = createMemoryProvider(config, memoryUserKeys);
+  // 消息路径的新鲜度保障（机器人换绑用户场景的关键一环）：identityMap 从用户一切到 R 后，
+  // 热重载 onMemoryChanged 是后台异步，第一条消息可能抢在重签完成前构建 taskEnv——拿着
+  // 旧用户的 key + OPENVIKING_USER=R（api_key 模式服务端剥声明头、身份由 key 决定），记忆
+  // 会静默写回旧 ns。executeTask 构建 env 前调 ensureFreshKeys：快照一致零开销直返，不一致
+  // 则单飞等待刷新完成，保证首条消息的 key 与当前映射严格一致
+  memoryProvider.bindEnsureFreshKeys(async () => {
+    if (!config.memory?.enabled) return;
+    if (memorySnapshot() === lastSignedSnapshot) return;
+    await refreshMemoryKeys();
+  });
+  // 配置页「重置密钥」→ 同步刷新进程内缓存：按 uid 反查全部映射机器人 + web 身份逐一更新，
+  // 下一条消息的 taskEnv 即用新 key（否则 LCB 继续下发已作废旧 key 直到重启——2026-10-22
+  // 真机事故：用户重置自救反而加重 401 的根因）
+  onUserKeyRotated((uid, newKey) => {
+    if (!config.memory?.enabled) return;
+    for (const a of config.apps) {
+      if (resolveMemoryUid(config.memory, a.appId) === uid) memoryUserKeys.set(a.appId, newKey);
+    }
+    if (uid === WEB_USER_ID) memoryUserKeys.set(WEB_USER_ID, newKey);
+  });
   // reloader 共享：所有 bridge 持有同一 config 对象引用，mutate 一处全员可见
   const reloadConfig = createConfigReloader(config, configPath, {
     onMemoryChanged: (memory) => {

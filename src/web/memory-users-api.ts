@@ -98,9 +98,9 @@ const adminPath = (memory: MemoryConfig, suffix: string): string =>
 
 type VaultDoc = Record<string, string>;
 
-function loadVault(): VaultDoc {
+function loadVault(path: string = VAULT_FILE): VaultDoc {
   try {
-    const doc = JSON.parse(readFileSync(VAULT_FILE, 'utf8')) as unknown;
+    const doc = JSON.parse(readFileSync(path, 'utf8')) as unknown;
     return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc as VaultDoc : {};
   } catch { return {}; }
 }
@@ -113,8 +113,8 @@ function writeAtomic(path: string, text: string): void {
   renameSync(tmp, path);
 }
 
-function saveVault(v: VaultDoc): void {
-  writeAtomic(VAULT_FILE, JSON.stringify(v, null, 2));
+function saveVault(v: VaultDoc, path: string = VAULT_FILE): void {
+  writeAtomic(path, JSON.stringify(v, null, 2));
 }
 
 function removeVaultEntry(uid: string): void {
@@ -154,23 +154,38 @@ function dpapi(mode: 'protect' | 'unprotect', b64: string): Promise<string | nul
  *  明文进程内缓存：列表每次聚合都会回带 api_key——值未变时跳过 DPAPI 重加密（省一次 PowerShell 进程） */
 const vaultSeenPlain = new Map<string, string>();
 
-/** 密钥入保险库（exported）：index.ts 启动/热重载签发链路（refreshMemoryKeys）重签成功后
- *  按 uid 同步刷新，消灭「重签换 key 后保险库留旧 key → 配置页/Studio 复制即 401、
- *  须等「用户与密钥」Tab 列表自愈」的窗口 */
-export async function vaultStore(uid: string, plain: string): Promise<void> {
-  if (vaultSeenPlain.get(uid) === plain && loadVault()[uid]) return;
-  const v = loadVault();
-  if (process.platform === 'win32') {
-    const b64 = Buffer.from(plain, 'utf8').toString('base64');
-    const sealed = await dpapi('protect', b64);
-    if (sealed) { v[uid] = sealed; saveVault(v); vaultSeenPlain.set(uid, plain); return; }
-    console.warn('[memory-users] DPAPI 保护失败，降级 base64 混淆存储（建议检查 PowerShell 可用性）');
-    v[uid] = `plain:${b64}`;
-  } else {
-    v[uid] = `plain:${Buffer.from(plain, 'utf8').toString('base64')}`;
-  }
-  saveVault(v);
-  vaultSeenPlain.set(uid, plain);
+/** 保险库写队列：所有写入全局串行——并发 vaultStore（启动签发多 uid 同时刷新）各自先读
+ *  快照、DPAPI 加密（秒级 await）后整份写回，会互相用**过期快照**覆盖（经典 lost update，
+ *  实测把刚写入的新 key 回滚成旧 key → 配置页复制出死 key → Studio 401）。单飞队列保证写-写互斥 */
+let vaultQueue: Promise<void> = Promise.resolve();
+
+/** 密钥入保险库（exported）：index.ts 启动/热重载签发链路（refreshMemoryKeys）成功拿到 key 后
+ *  按 uid 同步刷新，消灭「key 轮转后保险库留旧 key → 配置页/Studio 复制即 401、须等
+ *  「用户与密钥」Tab 列表自愈」的窗口。
+ *  写入在全局队列内串行执行，且 DPAPI await 之后**重读磁盘最新内容**再合并写入——双保险
+ *  消灭并发丢更新。dirOverride 供单测注入临时目录 */
+export function vaultStore(uid: string, plain: string, dirOverride?: string): Promise<void> {
+  const vaultPath = dirOverride ? join(dirOverride, 'user-keys.vault.json') : VAULT_FILE;
+  const run = vaultQueue.then(async () => {
+    if (vaultSeenPlain.get(uid) === plain && loadVault(vaultPath)[uid]) return;
+    const apply = (value: string): void => {
+      const fresh = loadVault(vaultPath); // await 之后重读：合并并发期间他人写入，绝不整份回写旧快照
+      fresh[uid] = value;
+      saveVault(fresh, vaultPath);
+      vaultSeenPlain.set(uid, plain);
+    };
+    if (process.platform === 'win32') {
+      const b64 = Buffer.from(plain, 'utf8').toString('base64');
+      const sealed = await dpapi('protect', b64);
+      if (sealed) { apply(sealed); return; }
+      console.warn('[memory-users] DPAPI 保护失败，降级 base64 混淆存储（建议检查 PowerShell 可用性）');
+      apply(`plain:${b64}`);
+    } else {
+      apply(`plain:${Buffer.from(plain, 'utf8').toString('base64')}`);
+    }
+  });
+  vaultQueue = run.catch(() => { /* 单次写失败不阻塞队列中的后续写（错误已向上传播给调用方） */ });
+  return run;
 }
 
 /** 取密钥明文（reveal / 打开记忆空间用；解不开返回 undefined） */
@@ -520,8 +535,15 @@ export async function revealUserKey(config: BridgeConfig, uid: string): Promise<
 
 // ============ 重置（Regenerate） ============
 
-/** 重置密钥（Admin Regenerate：旧 key 立即失效，新 key 入保险库）。方案 §六：危险操作，
- *  前端二次确认 + 提示「所有使用方需同步更新 + 重启会话」；此处负责执行与留痕 */
+/** 密钥轮转监听（LCB wiring 注册）：配置页重置产生新 key 后同步刷新进程内 userKeys 缓存。
+ *  不注册/不刷新的后果：LCB 继续向会话下发已作废旧 key 直到重启——用户在配置页「重置自救」
+ *  反而加重 401（2026-10-22 真机事故根因之一） */
+type UserKeyRotatedListener = (uid: string, newKey: string) => void;
+let userKeyRotatedListener: UserKeyRotatedListener | undefined;
+export function onUserKeyRotated(fn: UserKeyRotatedListener): void { userKeyRotatedListener = fn; }
+
+/** 重置密钥（Admin Regenerate：旧 key 立即失效，新 key 入保险库 + 联动刷新 LCB 缓存）。
+ *  方案 §六：危险操作，前端二次确认 + 提示「所有使用方需同步更新」；此处负责执行与留痕 */
 export async function resetUserKey(config: BridgeConfig, uid: string): Promise<RevealResult> {
   if (!isValidUserId(uid)) return { ok: false, error: '用户名非法' };
   const memory = config.memory;
@@ -533,6 +555,7 @@ export async function resetUserKey(config: BridgeConfig, uid: string): Promise<R
   if (r.ok && typeof result.user_key === 'string' && result.user_key) {
     await vaultStore(uid, result.user_key);
     auditMemory('reset', { user_id: uid });
+    userKeyRotatedListener?.(uid, result.user_key);
     return { ok: true, key: result.user_key };
   }
   auditMemory('reset-fail', { user_id: uid, status: r.status });

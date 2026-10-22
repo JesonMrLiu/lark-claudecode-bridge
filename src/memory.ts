@@ -177,17 +177,26 @@ export async function probeMemoryHealth(endpoint: string, timeoutMs = 2000): Pro
 }
 
 /** BridgeDeps.memory 最小接口（§6.6）：探活供启动/状态页；namespacesFor 供 B2 ns 矩阵；
- *  userKeys 供 env 下发取 per-bot key（dev 模式为空 Map——身份走 header） */
+ *  userKeys 供 env 下发取 per-bot key（dev 模式为空 Map——身份走 header）；
+ *  ensureFreshKeys 供消息路径做「身份新鲜度保障」（identityMap 切换/密钥重置后的第一条
+ *  消息必须拿到与新映射一致的 key，否则 api_key 模式下身份由 key 决定，会拿旧用户 key
+ *  把记忆静默写回旧 ns——OPENVIKING_USER 只是声明头，服务端会剥除） */
 export interface MemoryProvider {
   isHealthy(): Promise<MemoryHealth>;
   /** 某 bot 的 ns 映射（account/user 前缀；peer 轴按 workspace 运行期派生，不在此暴露） */
   namespacesFor(appId: string): { account: string; userPrefix: string };
   /** 启动/热重载时 Admin API 签发的 per-bot user key（appId → key）；未签发/未启用为空 */
   userKeys(): ReadonlyMap<string, string>;
+  /** 绑定「签发刷新」实现（wiring 侧单飞包装的 refreshMemoryKeys；缺省未绑定 = 空操作，测试用） */
+  bindEnsureFreshKeys(fn: () => Promise<void>): void;
+  /** 身份新鲜度保障：配置快照与上次签发一致 → 立即返回（无网络请求）；不一致 → 单飞触发
+   *  一次签发刷新并等待完成。永不 reject（失败已在签发层落日志，不阻断消息） */
+  ensureFreshKeys(): Promise<void>;
 }
 
 /** 生产实现：全部现读 config.memory 与共享 key 缓存（同一 config 引用被热重载 mutate，改段即生效） */
 export function createMemoryProvider(config: BridgeConfigLike, userKeys: ReadonlyMap<string, string>): MemoryProvider {
+  let ensureFn: (() => Promise<void>) | undefined;
   return {
     isHealthy: () => (config.memory?.enabled
       ? probeMemoryHealth(memoryEndpoint(config.memory))
@@ -201,6 +210,10 @@ export function createMemoryProvider(config: BridgeConfigLike, userKeys: Readonl
         : `${appId}-`,
     }),
     userKeys: () => userKeys,
+    bindEnsureFreshKeys: (fn) => { ensureFn = fn; },
+    ensureFreshKeys: async () => {
+      try { await ensureFn?.(); } catch { /* 新鲜度保障失败不阻断消息；原因已在签发层落日志 */ }
+    },
   };
 }
 /** createMemoryProvider 只需 config 的 memory 段（结构子集，避免循环 import BridgeConfig） */
@@ -232,7 +245,9 @@ export interface MemoryKeyOutcome {
  *
  * OpenViking 0.5.0 实弹实测（探针：创建→重复→重签→列表→删除，全绿）修正了三条旧假设：
  *  ① key **非确定性**——seed 参数被服务端忽略，同一 user 每次重签都换新 key。因此「同 seed
- *     重签同值、LCB 无须持久化」不成立，重启必须重新拿到 key（靠下面的三级回退拿，不靠 seed）。
+ *     重签同值、LCB 无须持久化」不成立，重启必须重新拿到 key（靠列表回读拿，不靠 seed）。
+ *     且轮转有真实代价：重签即作废旧 key，在跑会话/Studio/本地插件集体 401——故本函数
+ *     「列表回读优先」，仅在用户不存在（创建）或回读不到（重签兜底）时才产生新 key。
  *  ② 重复创建返回 **409 ALREADY_EXISTS**，不是「幂等返回同值」。旧实现一旦 409 就记 error 放弃，
  *     于是「首启建过用户 → 之后每次重启都 409 → 永远拿不到 key → 永远无记忆」——本函数的重签
  *     与读回两级回退就是为消灭这个死循环（服务重启、root key 轮换、一键初始化重建用户都会踩）。
@@ -351,34 +366,44 @@ export async function ensureRemoteAccount(
   };
 }
 
-/** 单个 bot 的 user key 签发（三级回退，消灭 409 死循环）：
- *  ① POST 创建（首启路径）② 409 已存在 → POST /users/{uid}/key 重签（旧 key 立即失效）
- *  ③ 重签失败 → GET /users 列表回读明文 api_key（api_key 模式列表可回带，实测确认）
+/** 单个身份的 user key 获取（回读优先，绝不无故轮转）：
+ *  ① GET /users 列表回读明文 api_key（api_key 模式服务端可回带，实测确认）——用户已存在时
+ *     直接采用现存 key：重启/热重载/映射切换零轮转，所有持有旧 key 的消费方（在跑会话、
+ *     Studio、本地插件）完全无感。旧实现「create→409→一律重签」让每次 LCB 重启作废全部
+ *     bot 密钥（在跑会话集体 401，用户到配置页重置自救反而雪上加霜），已废弃
+ *  ② 列表未命中（用户不存在或未回带明文）→ POST 创建（新用户首签路径），响应携带 user_key
+ *  ③ 创建撞 409（与列表间竞态/should_expose_user_key=false 等形态）→ POST /users/{uid}/key
+ *     重签（此时才轮转，最后手段），失败再列表回读一次；均失败返回 error 文案
  *  seed 仍随创建请求带上（未来服务端若实现确定性签发即天然幂等），当前版本被忽略也无害 */
 async function signOneUserKey(
-  base: string, account: string, appId: string, rootKey: string, timeoutMs: number,
+  base: string, account: string, uid: string, rootKey: string, timeoutMs: number,
 ): Promise<{ userKey?: string; error?: string }> {
   const usersBase = `${base}/api/v1/admin/accounts/${encodeURIComponent(account)}/users`;
-  const seed = createHash('sha256').update(`${appId}:${rootKey}`).digest('hex').slice(0, 32);
-  const created = await adminFetch(usersBase, rootKey, 'POST', { user_id: appId, role: 'user', seed }, timeoutMs);
+  const listed = await adminFetch(usersBase, rootKey, 'GET', undefined, timeoutMs);
+  if (listed.ok && Array.isArray(listed.result)) {
+    const hit = (listed.result as Array<{ user_id?: string; api_key?: string }>).find((u) => u?.user_id === uid);
+    if (hit && typeof hit.api_key === 'string' && hit.api_key) return { userKey: hit.api_key };
+  }
+  const seed = createHash('sha256').update(`${uid}:${rootKey}`).digest('hex').slice(0, 32);
+  const created = await adminFetch(usersBase, rootKey, 'POST', { user_id: uid, role: 'user', seed }, timeoutMs);
   if (created.ok) {
     const key = created.result?.user_key;
     if (typeof key === 'string' && key) return { userKey: key };
     return { error: '创建成功但响应未带 user_key（服务端 should_expose_user_key=false？）' };
   }
   if (created.status === 409) {
-    const re = await adminFetch(`${usersBase}/${encodeURIComponent(appId)}/key`, rootKey, 'POST', undefined, timeoutMs);
+    const re = await adminFetch(`${usersBase}/${encodeURIComponent(uid)}/key`, rootKey, 'POST', undefined, timeoutMs);
     if (re.ok) {
       const key = re.result?.user_key;
       if (typeof key === 'string' && key) return { userKey: key };
     }
-    const listed = await adminFetch(usersBase, rootKey, 'GET', undefined, timeoutMs);
-    const users = Array.isArray(listed.result) ? listed.result as Array<{ user_id?: string; api_key?: string }> : [];
-    const hit = users.find((u) => u?.user_id === appId);
+    const relisted = await adminFetch(usersBase, rootKey, 'GET', undefined, timeoutMs);
+    const users = Array.isArray(relisted.result) ? relisted.result as Array<{ user_id?: string; api_key?: string }> : [];
+    const hit = users.find((u) => u?.user_id === uid);
     if (hit && typeof hit.api_key === 'string' && hit.api_key) return { userKey: hit.api_key };
     return {
       error: `用户已存在但重签与回读均失败（重签 HTTP ${re.status}${re.error ? ` ${re.error}` : ''}；`
-        + `列表 ${listed.status}${listed.error ? ` ${listed.error}` : ''}）——请到配置页「用户与密钥」重置该用户密钥`,
+        + `列表 ${relisted.status}${relisted.error ? ` ${relisted.error}` : ''}）——请到配置页「用户与密钥」重置该用户密钥`,
     };
   }
   if (created.status === 404) {
