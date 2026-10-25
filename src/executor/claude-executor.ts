@@ -28,6 +28,22 @@ export interface ExecutorCallbacks {
   onMcpStatus?(servers: McpServerStatus[]): void;
 }
 
+/**
+ * 进度播报内置约束（2026-10-23，每个任务随 --append-system-prompt 注入）：
+ * Claude Code 原生事件流没有「中文步骤」概念，进度卡的步骤流水完全依赖 TodoWrite
+ * （content=步骤名、activeForm=「正在…」）——不约束则多数任务（尤其小任务）不使用
+ * TodoWrite，进度卡只剩工具罗列。此约束让 Claude 主动维护中文步骤流水，进度卡得以
+ * 显示「真实处理步骤」；同时约束 AskUserQuestion 的提问质量（背景 + 选项说明）。
+ * 与 per-app 人格补充（config apps[].append_system_prompt）合并注入，人格不受影响。
+ */
+const PROGRESS_SOP = [
+  '【任务进度播报约束】',
+  '- 接到任务后，先用 TodoWrite 制定执行计划：每个步骤用简短的中文描述（用户视角，如「拉取候选并按热度排序」「生成配图并质检」）。',
+  '- 执行中每进入一个新阶段，立即更新 TodoWrite：当前步骤的 activeForm 用「正在…」句式（如「正在生成配图」）；完成的步骤及时标记 completed；一次只有一个步骤处于 in_progress。',
+  '- 即使是简单任务，也拆成 2-3 个步骤维护 TodoWrite，让用户能从进度卡看到执行推进。',
+  '- 使用 AskUserQuestion 提问时，题干必须写清背景与上下文；每个选项必须填写 description，说明该选项的含义、与其他选项的差异、选择的后果，让用户能据此独立决策。',
+].join('\n');
+
 /** canUseTool 第三参（SDK 原样透传的子集）：suggestions 为 CLI 建议的权限更新（如 ExitPlanMode 后 setMode acceptEdits） */
 export interface CanUseToolContext {
   suggestions?: unknown[];
@@ -106,7 +122,25 @@ const BG_WAIT_SILENCE_TIMEOUT_MS = 15 * 60 * 1000;
 /** 工具摘要的主字段优先级：命中即直接展示人类可读值，不再贴原始 JSON */
 const SUMMARY_INPUT_KEYS = ['command', 'file_path', 'url', 'query', 'pattern', 'path', 'skill'] as const;
 
-function summarizeToolInput(input: Record<string, unknown>): string {
+/** 交互类工具的摘要白名单（2026-10-25）：入参是面向渲染的结构（题干/计划正文），JSON 原文
+ *  截断上卡纯技术噪音——按工具改写为人类化短语；题干本身已在提问区完整显示，不回显 */
+const INTERACTIVE_TOOL_SUMMARY: Record<string, (input: Record<string, unknown>) => string> = {
+  AskUserQuestion: (input) => {
+    const qs = input.questions;
+    const n = Array.isArray(qs) ? qs.length : 0;
+    return `向用户提问（${n} 题）`;
+  },
+  ExitPlanMode: (input) => {
+    const plan = input.plan;
+    const n = typeof plan === 'string' ? plan.length : 0;
+    return n > 0 ? `提交执行计划（共 ${n.toLocaleString()} 字）` : '提交执行计划';
+  },
+};
+
+/** 导出供单元测试（交互类工具摘要白名单） */
+export function summarizeToolInput(toolName: string, input: Record<string, unknown>): string {
+  const special = INTERACTIVE_TOOL_SUMMARY[toolName];
+  if (special) return special(input);
   for (const k of SUMMARY_INPUT_KEYS) {
     if (typeof input[k] === 'string' && (input[k] as string).trim()) return input[k] as string;
   }
@@ -404,13 +438,16 @@ class SessionProcess {
         ...(opts.model ? { model: opts.model } : {}),
         ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
         ...(opts.plugins ? { plugins: opts.plugins.map((p) => ({ type: 'local' as const, path: p.path })) } : {}),
-        // extraArgs 合并口：调用方传入（--settings 档案认证）+ 人格补充（--append-system-prompt，
-        // CLI 2.1.x 只认命令行参数，SDK 同名 option 被静默丢弃——见 RunTaskOptions.appendSystemPrompt 注释）
-        ...((opts.extraArgs && Object.keys(opts.extraArgs).length) || opts.appendSystemPrompt
+        // extraArgs 合并口：调用方传入（--settings 档案认证）+ 内置进度播报约束 + 人格补充
+        // （--append-system-prompt，CLI 2.1.x 只认命令行参数，SDK 同名 option 被静默丢弃
+        // ——见 RunTaskOptions.appendSystemPrompt 注释）
+        ...((opts.extraArgs && Object.keys(opts.extraArgs).length) || opts.appendSystemPrompt || PROGRESS_SOP
           ? {
             extraArgs: {
               ...(opts.extraArgs ?? {}),
-              ...(opts.appendSystemPrompt ? { 'append-system-prompt': opts.appendSystemPrompt } : {}),
+              ...([PROGRESS_SOP, opts.appendSystemPrompt].filter(Boolean).join('\n\n')
+                ? { 'append-system-prompt': [PROGRESS_SOP, opts.appendSystemPrompt].filter(Boolean).join('\n\n') }
+                : {}),
             },
           }
           : {}),
@@ -539,9 +576,11 @@ class SessionProcess {
             if (!message.parent_tool_use_id) turn.turns++;
             for (const block of message.message.content) {
               if (block.type === 'text') {
-                // 子代理文本加标识前缀（forwardSubagentText 转发），与主 Agent 输出在进度卡上区分
-                const prefix = message.parent_tool_use_id ? '【子代理】' : '';
-                await turn.cb.onProgress({ kind: 'text', content: `${prefix}${block.text}` });
+                // 子代理文本加标识前缀（forwardSubagentText 转发），与主 Agent 输出在进度卡上区分；
+                // sub 字段供进度卡把文本块归组到对应子代理条目（transcript 消费前缀形态不变）
+                const isSubText = !!message.parent_tool_use_id;
+                const prefix = isSubText ? '【子代理】' : '';
+                await turn.cb.onProgress({ kind: 'text', content: `${prefix}${block.text}`, ...(isSubText ? { sub: true } : {}) });
               } else if (block.type === 'tool_use') {
                 const input = (block.input ?? {}) as Record<string, unknown>;
                 turn.toolNames.set(block.id, block.name);
@@ -560,7 +599,7 @@ class SessionProcess {
                 await turn.cb.onProgress({
                   kind: 'tool-start',
                   tool: block.name,
-                  summary: summarizeToolInput(input),
+                  summary: summarizeToolInput(block.name, input),
                   ...(isSub ? { sub: true } : {}),
                 });
               }

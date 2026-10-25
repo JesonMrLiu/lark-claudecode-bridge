@@ -1,9 +1,13 @@
 import {
   buildProgressCard, buildProgressParts, buildSinkNoticeCard, buildPartialUpdateActions, buildQaButtonActions,
-  toolLabel, STEP_TOOLS_MAX, LOOSE_TOOLS_MAX,
+  toolLabel, STEP_TOOLS_MAX, LOOSE_TOOLS_MAX, TEXT_ENTRY_MAX, TEXT_CHAR_BUDGET, STACK_ENTRY_MAX,
   type ProgressState, type TaskPhase, type TaskStep, type SubagentTask, type ToolStep, type TodoItem,
 } from './card-builder.js';
 import type { ConfirmationRequest } from '../types.js';
+
+/** 发言原文留存上限（rawText，仅终态结论重叠匹配用、不上卡）：超过后 endsWith 匹配按
+ *  失败保守处理（不隐藏、结论照常承载，最坏局部重复但不丢内容） */
+const RAW_TEXT_MAX = 2000;
 
 export interface CardSender {
   sendCard(card: unknown): Promise<string>;        // 返回 messageId
@@ -21,10 +25,10 @@ export interface CardSender {
 }
 
 /** 进度卡初始文案：markStarted 据此识别「尚未进入执行阶段」——首个执行事件到达时切为执行中 */
-const INITIAL_STATUS = '已接收，启动中…';
+const INITIAL_STATUS = '🚀 已接收，启动中…';
 /** init 到达后的启动阶段文案（CLI 进程已起、会话已建，仍在加载上下文/工具）：markSessionReady
  *  切入此态，markStarted 同样允许从此态接管——冷启动大头发生在 init 之前，先让用户看到进程已建立 */
-const BOOT_STATUS = '会话已建立，加载上下文与工具中…';
+const BOOT_STATUS = '⚙️ 会话已建立，加载上下文与工具中…';
 /** 单次卡片更新请求超时：飞书 SDK 的 axios 无超时（timeout=0），请求被网络黑洞时
  *  flush 串行链会无限期挂起（生产实测单次挂 7.4 分钟）——挂起期间计时/交互区全停，
  *  与任务卡死无从区分。到点按失败处理（seq 不推进）下轮重试；若超时请求实际已在
@@ -86,6 +90,9 @@ export class ProgressCard {
   private heartbeatTimer?: NodeJS.Timeout;
   private lastActivityAt = Date.now();
   private done = false;
+  /** 提问挂起时记录的关联发言条目（提问前最近一段）：用户提交答案后收敛——那段是提问的
+   *  铺垫材料，题干/选项说明已随提问区完整显示，答案落定后继续占过程流就是残留 */
+  private qaLinkedSpeech?: { step?: TaskStep; tool?: ToolStep };
   /** 工具折叠面板模式（仅实体卡/cardkit 通道）：消息卡通道对新组件兼容面未验证，降级不含面板 */
   private panelMode = false;
   /** 局部更新内容缓存（element_id → 上次下发 content）：内容未变的组件跳过，
@@ -101,7 +108,7 @@ export class ProgressCard {
   constructor(
     private sender: CardSender,
     title: string,
-    private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number; cardWidthMode?: 'default' | 'fill'; updateTimeoutMs?: number; channelKey?: string } = {},
+    private opts: { flushIntervalMs?: number; idleHeartbeatMs?: number; cardWidthMode?: 'default' | 'fill'; updateTimeoutMs?: number; channelKey?: string; stackMax?: number } = {},
   ) {
     this.state = {
       title, status: INITIAL_STATUS, startedAt: Date.now(),
@@ -116,7 +123,7 @@ export class ProgressCard {
     // 整卡 PATCH，功能不退化（面板随之取消，步骤行内联工具计数）
     if (this.sender.sendCardEntity) {
       try {
-        const { messageId, cardId } = await this.sender.sendCardEntity(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', true));
+        const { messageId, cardId } = await this.sender.sendCardEntity(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', true, this.opts.stackMax));
         this.messageId = messageId;
         this.cardId = cardId;
         this.panelMode = true;
@@ -125,7 +132,7 @@ export class ProgressCard {
       }
     }
     if (!this.messageId) {
-      this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', false));
+      this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', false, this.opts.stackMax));
       this.panelMode = false;
     }
     this.lastStructure = this.structureKey();
@@ -143,13 +150,49 @@ export class ProgressCard {
     }, 1000).unref();
   }
 
-  /** 流式文本块到达（活动信号）：产品决策——运行中与终态都不在主卡渲染过程文本/回复正文，
-   *  完整回复由 index.ts 收尾逻辑独立多卡直接展示；此方法清执行瞬态（💭 处理中即焚——
-   *  模型已开始吐字）并刷新空闲计时，不再积累 buffer */
-  appendText(_delta: string): void {
+  /**
+   * Claude 发言块到达（流式文本事件，每块一个完整段落）：过程流改版（2026-10-22）——
+   * 发言**原文**作为过程条目进入当前池（sub=true 归组到运行中子代理，主代理归 active
+   * 步骤/未归属池），与工具调用混排、倒序展示（💬 前缀原样上卡，截 TEXT_ENTRY_MAX 防
+   * 单条巨幅发言撑爆卡片）。完整回复仍由 index.ts 收尾独立多卡直接展示（此处只留过程）。
+   * 同时清执行瞬态（💭 处理中即焚——模型已开始吐字）。
+   */
+  appendText(text: string, sub = false): void {
     if (this.done) return;
     this.clearTransient();
+    const trimmed = text.trim();
+    if (trimmed) {
+      const entry: ToolStep = {
+        name: '__text__', label: '文本', summary: trimmed.slice(0, TEXT_ENTRY_MAX),
+        ok: true, kind: 'text', rawText: trimmed.slice(0, RAW_TEXT_MAX),
+      };
+      if (sub) {
+        const agent = [...this.state.agents].reverse().find((a) => a.status === 'running');
+        if (agent && agent.tools.length < STEP_TOOLS_MAX) agent.tools.push(entry);
+      } else if (this.state.steps.every((s) => s.pseudo)) {
+        // 伪步骤切分（2026-10-25，无 TodoWrite 时）：每段发言开一个新条目，上一段随之转 done；
+        // 其后的工具经 toolStart 的 active 归属落到本条目下，各挂自己的「已使用 N 个工具」面板。
+        // 发言原文即条目行内容（二次改版：完整原文、不另起 💬 平铺副本——「截断行标题 +
+        // 下方 💬 完整平铺」的双份展示被用户否决）；1500 字防爆卡上限。
+        // 存在任何真步骤（TodoWrite 已驱动）时不启用，维持原 active/loose 归属
+        for (const s of this.state.steps) if (s.status === 'active') s.status = 'done';
+        this.state.steps.push({
+          title: trimmed.length > 1500 ? `${trimmed.slice(0, 1500)}…` : trimmed,
+          status: 'active',
+          pseudo: true,
+          rawText: trimmed.slice(0, RAW_TEXT_MAX),
+          tools: [],
+          activatedAt: Date.now(),
+        });
+      } else {
+        const active = this.state.steps.find((s) => s.status === 'active');
+        const pool = active ? active.tools : this.state.looseTools;
+        const cap = active ? STEP_TOOLS_MAX : LOOSE_TOOLS_MAX;
+        if (pool.length < cap) pool.push(entry);
+      }
+    }
     this.lastActivityAt = Date.now();
+    void this.flush(); // 发言即刻上卡（Claude 说完一段可能直接 finish，不等下个工具事件）
   }
 
   /**
@@ -252,8 +295,13 @@ export class ProgressCard {
    */
   setTodos(todos: TodoItem[]): void {
     if (this.done) return;
-    const prev = new Map(this.state.steps.map((s) => [s.title, s]));
-    this.state.steps = todos.map((t) => {
+    // 伪步骤（TodoWrite 到来前的准备期发言段）保留为已完成历史条目混排进执行栈
+    // （activatedAt 更早、渲染自然沉底）；真步骤的键匹配只在非伪步骤间进行
+    const pseudoDone = this.state.steps
+      .filter((s) => s.pseudo)
+      .map((s) => ({ ...s, status: 'done' as const }));
+    const prev = new Map(this.state.steps.filter((s) => !s.pseudo).map((s) => [s.title, s]));
+    this.state.steps = [...pseudoDone, ...todos.map((t) => {
       const old = prev.get(t.content);
       const status = t.status === 'completed' ? 'done' as const : t.status === 'in_progress' ? 'active' as const : 'pending' as const;
       const activatedAt = old?.activatedAt ?? (status === 'active' ? Date.now() : undefined);
@@ -265,7 +313,7 @@ export class ProgressCard {
         ...(activatedAt !== undefined ? { activatedAt } : {}),
         ...(status !== 'done' && old?.recent ? { recent: old.recent } : {}),
       };
-    });
+    })];
     this.clearTransient();
     this.lastActivityAt = Date.now();
     void this.flush();
@@ -368,16 +416,56 @@ export class ProgressCard {
 
   /**
    * 挂起/清除内嵌提问确认（#3）：每题选项全宽单行 + 提交按钮全部在主卡上，qa-pick PATCH 选中态。
-   * 决策后 clearQuestion() 收回区域
+   * 决策后 clearQuestion() 收回区域。挂起时记录提问前最近一段发言（qaLinkedSpeech）——
+   * 用户提交答案后由 collapseQuestionSpeech() 收敛（超时未答不调用，内容保留可读）
    */
   setQuestion(req: import('./card-builder.js').EmbeddedQuestionState | undefined): void {
     if (this.done) return;
     this.state.question = req;
+    // 挂起时记录关联发言；清除时保留记录（等 collapseQuestionSpeech 消费——清除与收敛
+    // 是两个动作：提交路径先 setQuestion(undefined) 再 collapse；超时路径只清除不收敛）
+    if (req) this.qaLinkedSpeech = this.latestSpeechRef();
     this.setWaiting(!!req);
     // 提问区收回时同步清选中态脏标记（按钮已随全量替换消失，qa-only 空批次无意义）
     if (!req) this.qaButtonsDirty = false;
     this.lastActivityAt = Date.now();
     void this.flush();
+  }
+
+  /**
+   * 收敛提问关联发言（2026-10-25）：用户提交答案后调用——提问前的铺垫发言（方案正文等）
+   * 使命已尽（题干与选项说明随提问区完整显示过），merged 标记后从过程流消失（复用终态
+   * 承载的渲染过滤）。超时未作答不调用：内容保留，用户回来还能读
+   */
+  collapseQuestionSpeech(): void {
+    const ref = this.qaLinkedSpeech;
+    this.qaLinkedSpeech = undefined;
+    if (!ref || this.done) return;
+    if (ref.step) ref.step.merged = true;
+    if (ref.tool) ref.tool.merged = true;
+    this.lastActivityAt = Date.now();
+    void this.flush(); // merged 引起 sig 变化 → 全量替换刷新
+  }
+
+  /** 提问前最近一段发言条目定位（与 appendText 归属同构）：TodoWrite 已驱动时取
+   *  tools/未归属池里最后一条 text 明细，否则取最后一个伪步骤条目；互为回退 */
+  private latestSpeechRef(): { step?: TaskStep; tool?: ToolStep } {
+    for (let i = this.state.steps.length - 1; i >= 0; i--) {
+      const tools = this.state.steps[i].tools;
+      for (let j = tools.length - 1; j >= 0; j--) {
+        const t = tools[j];
+        if (t.kind === 'text' && !t.merged) return { tool: t };
+      }
+    }
+    for (let j = this.state.looseTools.length - 1; j >= 0; j--) {
+      const t = this.state.looseTools[j];
+      if (t.kind === 'text' && !t.merged) return { tool: t };
+    }
+    for (let i = this.state.steps.length - 1; i >= 0; i--) {
+      const s = this.state.steps[i];
+      if (s.pseudo && !s.merged) return { step: s };
+    }
+    return {};
   }
 
   /** 当前某题的选中答案（wiring 的 qa-pick 回调同步给 qaPending 校验用；公开读，
@@ -448,28 +536,103 @@ export class ProgressCard {
   }
 
   /**
-   * 终态收敛。resultChars：完整回复字数（有回复时传入）——终态不渲染回复正文，仅在该值
-   * 非空时显示一行「完整回复已单独发送」指引（正文由 index.ts 收尾独立多卡直接展示）。
+   * 终态收敛。result.fullText：完整回复（有回复时传入）——按动态承载额度（发言区预算
+   * TEXT_CHAR_BUDGET − 剩余可见过程发言展示成本）切分：额度内前缀承载进终态结论条目
+   * （✅ 置顶），与结论重叠的过程发言条目隐藏（卡上同一段话只出现一次）；装不下的剩余
+   * 后缀由 index.ts 补发续卡。返回 { inlineChars }（主卡实际承载字数，index 据此切续卡）。
    * phase：终态阶段（done 绿 / stopped 灰 / error 红），驱动结论行 emoji 与 header 色；缺省 done。
    * 工具动态与子代理清单保留到终态（呼应原型：终态卡可回看本次做了哪些动作）。
    */
-  async finish(summary: string, resultChars?: number, phase: TaskPhase = 'done'): Promise<void> {
+  async finish(summary: string, result?: { fullText?: string }, phase: TaskPhase = 'done'): Promise<{ inlineChars: number }> {
     this.done = true;
     this.state.done = true;
     this.state.phase = phase;
     clearInterval(this.flushTimer);
     clearInterval(this.heartbeatTimer);
     this.sinkNoticeRetry = undefined; // 心跳已停，补打失去驱动；终态后旧卡提示已无意义
+    // 正常完成时未转 done 的伪步骤收尾为完成（发言与工具均已实际发生）；
+    // stopped/error 终态保留 active，由渲染如实标注「未完成」
+    if (phase === 'done') {
+      for (const s of this.state.steps) if (s.pseudo && s.status === 'active') s.status = 'done';
+    }
     this.state.status = summary;
     this.state.runningTool = undefined;
     this.state.thinking = false;
     this.state.heartbeat = undefined;
-    this.state.resultChars = resultChars;
+    const fullText = phase === 'done' ? result?.fullText?.trim() ?? '' : '';
+    this.state.resultChars = fullText ? fullText.length : undefined;
+    const inlineChars = fullText ? this.settleFinalResult(fullText) : 0;
+    this.state.resultInlineChars = fullText ? inlineChars : undefined;
     // 终态不再带交互区（决策未落的最极端兜底；正常路径 plan/question/confirm 先于 finish settle）
     this.state.confirm = undefined;
     this.state.plan = undefined;
     this.state.question = undefined;
     await this.flush(); // 经由同一串行链落地，保证是最后一张（终态不被旧 flush 覆盖）
+    return { inlineChars };
+  }
+
+  /**
+   * 终态结论承载（2026-10-25 主卡承载改版核心）：完整回复优先在主卡上呈现——
+   * 1) 从尾往前把与回复重叠的过程发言条目隐藏（endsWith 链匹配，截断条目宽容匹配去「…」；
+   *    匹配失败保守不隐藏——最坏局部重复、不丢内容）；
+   * 2) 承载额度 = 发言区预算 − 剩余可见发言展示成本；额度不足时从最旧的可见发言继续收敛
+   *    让位（结论优先于过程叙事，与渲染层「倒序优先、更早发言收敛」同一取向），直到够或清空；
+   * 3) 额度内前缀压入终态结论条目（✅ 置顶伪步骤），返回实际承载字数（0 = 全量走续卡）。
+   */
+  private settleFinalResult(fullText: string): number {
+    type SpeakRef = { text: string; cost: number; hide: () => void; hidden: boolean };
+    const spoken: SpeakRef[] = [];
+    for (const s of this.state.steps) {
+      if (s.pseudo && s.rawText && !s.merged) {
+        spoken.push({ text: s.rawText, cost: s.title.length, hidden: false, hide: () => { s.merged = true; } });
+      }
+      for (const t of s.tools) {
+        if (t.kind === 'text' && t.rawText && !t.merged) {
+          spoken.push({ text: t.rawText, cost: t.summary.length, hidden: false, hide: () => { t.merged = true; } });
+        }
+      }
+    }
+    for (const t of this.state.looseTools) {
+      if (t.kind === 'text' && t.rawText && !t.merged) {
+        spoken.push({ text: t.rawText, cost: t.summary.length, hidden: false, hide: () => { t.merged = true; } });
+      }
+    }
+    let visibleCost = spoken.reduce((sum, sp) => sum + sp.cost, 0);
+    // ① 重叠收敛：从最新发言往前，凡是被完整回复尾部覆盖的条目一律隐藏（去同文重复）
+    let tail = fullText;
+    for (let i = spoken.length - 1; i >= 0; i--) {
+      const sp = spoken[i];
+      const bare = sp.text.endsWith('…') ? sp.text.slice(0, -1) : ''; // 截断条目宽容匹配
+      if (tail.endsWith(sp.text)) {
+        sp.hidden = true; sp.hide(); visibleCost -= sp.cost; tail = tail.slice(0, tail.length - sp.text.length);
+      } else if (bare && tail.endsWith(bare)) {
+        sp.hidden = true; sp.hide(); visibleCost -= sp.cost; tail = tail.slice(0, tail.length - bare.length);
+      } else {
+        break;
+      }
+    }
+    // ② 额度腾挪：仍不够承载全文时，从最旧的可见发言继续收敛（结论优先），直到够或清空
+    let cap = Math.max(0, TEXT_CHAR_BUDGET - visibleCost);
+    if (cap < fullText.length) {
+      for (const sp of spoken) {
+        if (cap >= fullText.length) break;
+        if (sp.hidden) continue;
+        sp.hidden = true; sp.hide(); visibleCost -= sp.cost;
+        cap = Math.max(0, TEXT_CHAR_BUDGET - visibleCost);
+      }
+    }
+    // ③ 结论条目：额度内前缀（✅ 置顶，activatedAt 最新自然居倒序栈顶）；额度为 0 时不压条目
+    if (cap <= 0) return 0;
+    const inline = fullText.slice(0, cap);
+    this.state.steps.push({
+      title: inline,
+      status: 'done',
+      pseudo: true,
+      conclusion: true,
+      tools: [],
+      activatedAt: Date.now(),
+    });
+    return inline.length;
   }
 
   /**
@@ -527,13 +690,13 @@ export class ProgressCard {
         // 沉底重发沿用当前模式：原先是实体模式则新建实体（旧实体已随消息撤回弃用），
         // 工具折叠面板随通道走（实体卡有、消息卡降级无）
         if (this.sender.sendCardEntity && oldCardId) {
-          const { messageId, cardId } = await this.sender.sendCardEntity(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', true));
+          const { messageId, cardId } = await this.sender.sendCardEntity(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', true, this.opts.stackMax));
           this.messageId = messageId;
           this.cardId = cardId;
           this.panelMode = true;
           this.seq = 0; // sequence 按实体计数：新实体从 1 重新递增
         } else {
-          this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', false));
+          this.messageId = await this.sender.sendCard(buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', false, this.opts.stackMax));
           this.panelMode = false;
         }
         this.partialCache.clear();
@@ -616,7 +779,7 @@ export class ProgressCard {
               // 通常只有计时行变化，步骤多时不至于整批全量触达 batch_update 频控
               const allActions = this.hasInputPending()
                 ? buildQaButtonActions(this.state)
-                : buildPartialUpdateActions(this.state, this.panelMode, withQaButtons);
+                : buildPartialUpdateActions(this.state, this.panelMode, withQaButtons, this.opts.stackMax);
               const actions = this.hasInputPending()
                 ? allActions
                 : allActions.filter((a) => {
@@ -640,7 +803,7 @@ export class ProgressCard {
               // 期间新点击重新置位的 dirty 由下一轮 partial（qa 例外通道）自动补发
               withQaButtons = this.qaButtonsDirty;
               this.qaButtonsDirty = false;
-              await withTimeout(this.sender.replaceCard(this.cardId, expectedSeq, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', this.panelMode)), timeoutMs);
+              await withTimeout(this.sender.replaceCard(this.cardId, expectedSeq, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', this.panelMode, this.opts.stackMax)), timeoutMs);
               this.partialCache.clear();
               this.lastStructure = structure;
             }
@@ -651,7 +814,7 @@ export class ProgressCard {
             // 否则确认按钮根本不上屏。计时/状态行在挂起期间停更可接受（任务实际在等用户）
             const structure = this.structureKey();
             if (this.hasInputPending() && structure === this.lastStructure) break;
-            await withTimeout(this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', this.panelMode)), timeoutMs);
+            await withTimeout(this.sender.updateCard(this.messageId!, buildProgressCard(this.state, this.opts.cardWidthMode ?? 'default', this.panelMode, this.opts.stackMax)), timeoutMs);
             this.lastStructure = structure;
           }
           this.seq = expectedSeq; // 仅成功后提交推进
@@ -736,11 +899,13 @@ export class ProgressCard {
    *  清空 form 内未提交的自定义输入（用户点选项时输入框里可能已打了字） */
   private structureKey(): string {
     const s = this.state;
-    const parts = buildProgressParts(s, this.panelMode);
+    const parts = buildProgressParts(s, this.panelMode, this.opts.stackMax);
+    const statusBlock = [parts.status, parts.cur, parts.heartbeat].filter(Boolean).join('\n');
     return JSON.stringify([
       s.phase, !!s.confirm, !!s.plan, !!s.question, !!s.done, this.panelMode,
       parts.items.map((x) => x.sig),
       s.looseTools.length > 0,
+      statusBlock.length > 0, // 状态区出现/消失是元素级结构变化（空时不渲染，partial 无法增删元素）
     ]);
   }
 }

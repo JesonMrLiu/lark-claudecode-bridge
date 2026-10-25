@@ -216,6 +216,9 @@ export interface BridgeConfig {
 export interface CardConfig {
   /** 卡片宽度：default = 飞书默认（与消息等宽留边）；fill = 撑满聊天窗口 */
   width?: 'default' | 'fill';
+  /** 执行栈条目渲染上限（步骤+子代理合计，进行中条目永不收敛）：更早的已完成条目折叠
+   *  为一行收敛汇总——防卡高随任务时长线性失控；缺省 10 */
+  stackMax?: number;
 }
 
 /** 会话行为配置（整体可选） */
@@ -315,7 +318,8 @@ export type PermissionDecision = 'allow' | 'deny' | 'allow-session';
 export type TodoItemStatus = 'pending' | 'in_progress' | 'completed';
 
 export type ProgressEvent =
-  | { kind: 'text' | 'status'; content: string }
+  | { kind: 'text'; content: string; sub?: boolean }
+  | { kind: 'status'; content: string }
   /** 模型思考期（CLI status=requesting 心跳）：进度卡显示「💭 处理中…」于执行栈顶，
    *  首个步骤/工具/文本事件到达即焚（v5：替代旧「等待模型响应…」笼罩性状态行） */
   | { kind: 'thinking' }

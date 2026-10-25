@@ -105,17 +105,27 @@ function normalizeSession(doc: Record<string, unknown>): SessionConfig | undefin
   return out;
 }
 
-/** 卡片展示段（整体可选）：width 严格枚举（default = 飞书默认宽度；fill = 撑满聊天窗口） */
+/** 卡片展示段（整体可选）：width 严格枚举（default = 飞书默认宽度；fill = 撑满聊天窗口）；
+ *  stack_max = 执行栈条目渲染上限（正整数，缺省 10） */
 function normalizeCard(doc: Record<string, unknown>): CardConfig | undefined {
   const raw = doc.card;
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== 'object') throw new Error('card 必须为对象（含 width），请检查 config.yaml');
-  const c = raw as { width?: unknown };
-  if (c.width === undefined || c.width === null) return {};
-  if (c.width !== 'default' && c.width !== 'fill') {
-    throw new Error(`card.width 必须为 default / fill（当前值：${String(c.width)}），请检查 config.yaml`);
+  const c = raw as { width?: unknown; stack_max?: unknown };
+  const out: CardConfig = {};
+  if (c.width !== undefined && c.width !== null) {
+    if (c.width !== 'default' && c.width !== 'fill') {
+      throw new Error(`card.width 必须为 default / fill（当前值：${String(c.width)}），请检查 config.yaml`);
+    }
+    out.width = c.width;
   }
-  return { width: c.width };
+  if (c.stack_max !== undefined && c.stack_max !== null) {
+    if (typeof c.stack_max !== 'number' || !Number.isInteger(c.stack_max) || c.stack_max < 3) {
+      throw new Error(`card.stack_max 必须为 ≥3 的整数（当前值：${String(c.stack_max)}），请检查 config.yaml`);
+    }
+    out.stackMax = c.stack_max;
+  }
+  return out;
 }
 
 /** config.yaml 中单个 app 的原始形状（snake_case） */

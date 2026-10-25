@@ -20,8 +20,8 @@ import { ProgressCard, feishuErrorBody } from './gateway/progress-card.js';
 import {
   DECISION_TEXT, TOOLS_TOGGLE_REQUEST_ID,
   buildPlanConfirmCard, buildPlanSettledCard, buildPlanTailCard, buildResultTailCard, buildWorkspaceSwitchedCard,
-  planChunkHeader, resultChunkHeader,
-  type PlanCardRequest, type ResultCardRequest,
+  planChunkHeader, resultContinuationHeader,
+  type PlanCardRequest,
   type QuestionCardRequest, type QuestionCardAnswers,
 } from './gateway/card-builder.js';
 import { chunkText } from './util/chunk-text.js';
@@ -676,9 +676,9 @@ export function createBridge(
           : undefined,
       },
       `任务 · ${wsName}`,
-      // card.width 热生效：每任务现读 config（与同款「同对象 mutate 即生效」语义一致）；
-      // channelKey 供工作动态展开/收起按钮回调定位本卡（回调 value 携带）
-      { cardWidthMode: config.card?.width ?? 'default', channelKey: key },
+      // card.width / card.stack_max 热生效：每任务现读 config（与同款「同对象 mutate 即生效」
+      // 语义一致）；channelKey 供工作动态展开/收起按钮回调定位本卡（回调 value 携带）
+      { cardWidthMode: config.card?.width ?? 'default', channelKey: key, stackMax: config.card?.stackMax },
     );
     const confirmTimeoutMs = opts.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
     const cardSendTimeoutMs = opts.cardSendTimeoutMs ?? CARD_SEND_TIMEOUT_MS;
@@ -1104,7 +1104,7 @@ export function createBridge(
               deps.audit?.write(app.appId, { kind: 'redact', ruleIds: [...new Set(streamRedaction.hits)], source: 'stream' });
             }
             if (streamRedaction.canary) onSecurityEvent({ kind: 'canary', source: 'stream' });
-            progress.appendText(streamRedaction.text);
+            progress.appendText(streamRedaction.text, e.sub ?? false);
             // 落盘 · assistant：流式文本块全文（每块一行，天然增量）
             deps.transcript?.assistant({
               v: 1, ts: now(), kind: 'assistant', app: app.appId,
@@ -1156,7 +1156,8 @@ export function createBridge(
         });
         return;
       }
-      // finalText 提前算好：finish 携带字数，终态进度卡据此显示「完整回复已单独发送」提示行。
+      // finalText 提前算好：finish 按动态承载额度切分进主卡结论条目，并返回实际承载字数
+      // （续卡只发装不下的剩余后缀）。
       // R3：先脱敏再落盘/发送——transcript 写入（下方 result 事件）与结果卡都消费脱敏后文本，
       // bridge 自己的落盘不再残留明文（方案 v3 §八.4：脱敏点在 transcript 之前，非发送点）
       const finalRedaction = getRedactor(config.security).text(outcome.finalText?.trim() ?? '');
@@ -1165,16 +1166,14 @@ export function createBridge(
       }
       if (finalRedaction.canary) onSecurityEvent({ kind: 'canary', source: 'final' });
       const finalText = finalRedaction.text;
-      // A3 滚动轻注记：新话题首条回复尾部带一次（仅此一条，可配置关闭）——不发独立提示
-      // 消息（群聊里机器人自言自语就是噪音），失忆困惑由注记 + /resume 兜底；记忆层上线后
-      // 此注记可弱化/去除。注记只进回传文本，不进 transcript（传输层装饰，非模型产出）
+      // A3 滚动轻注记：新话题首条回复带一次（仅此一条，可配置关闭）——并入终态状态行
+      // （不单独占一条消息，群聊里机器人自言自语就是噪音），失忆困惑由注记 + /resume 兜底。
+      // 注记只进回传文本，不进 transcript（传输层装饰，非模型产出）
       const rollNote = rolled && config.session?.groupRollNotify !== false
         ? '已开启新话题（此前讨论 /resume 可找回）'
         : '';
-      const replyText = finalText
-        ? (rollNote ? `${finalText}\n\n---\n${rollNote}` : finalText)
-        : rollNote;
-      await progress.finish('已完成', finalText.length || undefined);
+      const doneSummary = rollNote ? `已完成 · ${rollNote}` : '已完成';
+      const { inlineChars } = await progress.finish(doneSummary, finalText ? { fullText: finalText } : undefined);
       archive(outcome.sessionId);
       deps.transcript?.result({
         v: 1, ts: now(), kind: 'result', app: app.appId,
@@ -1196,23 +1195,25 @@ export function createBridge(
           `本会话上下文已较大${scale}，建议发送 /new 开启新会话（/resume 可随时切回）。阈值可在 config.yaml 的 session.context_remind_tokens 调整，设为 0 关闭`,
         );
       }
-      // 结果回传两段式：finalText 非空即独立多卡直接展示（~3000 字/块，连发间隔 300ms 防飞书
-      // 消息限流）——不论长短都不再进进度卡正文（主卡只留提示行），彻底消除「折叠看不到全文」
-      // 与「卡片/消息两边重复」（旧三段式 ≤400 终态自载的边界问题）。尾卡纯展示，想继续对话/
-      // 提意见直接回复消息即可
-      if (replyText) {
-        const chunks = chunkText(replyText);
-        const total = chunks.length;
-        const resultReq: ResultCardRequest = {
-          charCount: finalText.length, workspaceName: wsName,
-        };
-        for (let i = 0; i < total; i++) {
-          if (i > 0) await new Promise((r) => setTimeout(r, 300));
-          if (i === total - 1) {
-            await deps.gateway.sendCardTo(msg.chatId,
-              buildResultTailCard(resultReq, chunks[i], { index: total, total }, config.card?.width ?? 'default'));
-          } else {
-            await deps.gateway.sendTextTo(msg.chatId, `${resultChunkHeader(resultReq, i + 1, total)}\n\n${chunks[i]}`);
+      // 结果回传（2026-10-25 主卡承载改版）：完整回复优先承载进主卡终态结论条目（finish 内
+      // 按动态额度 = 发言区预算 − 过程发言已占切分，重叠发言条目已隐藏）——额度装下即全文
+      // 在主卡，不再单独发卡（落实「信息不重复推送：主卡能完整显示就不单独发卡」既定原则）；
+      // 装不下的剩余后缀补发续卡（首部「（续 · 共 N 字）」，仍超 ~3000 字/块按 chunkText
+      // 分张，连发间隔 300ms 防飞书限流）。尾卡纯展示，想继续对话/提意见直接回复消息即可
+      if (finalText) {
+        const remaining = finalText.length - inlineChars;
+        if (remaining > 0) {
+          const chunks = chunkText(finalText.slice(inlineChars));
+          const total = chunks.length;
+          for (let i = 0; i < total; i++) {
+            if (i > 0) await new Promise((r) => setTimeout(r, 300));
+            const head = resultContinuationHeader(remaining, i + 1, total);
+            if (i === total - 1) {
+              await deps.gateway.sendCardTo(msg.chatId,
+                buildResultTailCard(head, chunks[i], config.card?.width ?? 'default'));
+            } else {
+              await deps.gateway.sendTextTo(msg.chatId, `${head}\n\n${chunks[i]}`);
+            }
           }
         }
       }
@@ -1401,10 +1402,13 @@ export function createBridge(
           }
           qaPending.delete(action.value.requestId);
           qa.resolve(result);
-          // 清除主进度卡的内嵌提问区（按钮随 setQuestion(undefined) 的 flush 消失）
+          // 清除主进度卡的内嵌提问区（按钮随 setQuestion(undefined) 的 flush 消失）；
+          // 提交即收敛提问前的铺垫发言（方案正文等，题干已随提问区显示过，不再占过程流；
+          // 超时未答路径不收敛，内容保留可读）
           const prog = activeProgress.get(qa.channelKey);
           if (prog) {
             prog.setQuestion(undefined);
+            prog.collapseQuestionSpeech();
             prog.setStatus('答案已提交，继续执行…');
           }
           return { toast: { type: 'success', content: '答案已提交' } };

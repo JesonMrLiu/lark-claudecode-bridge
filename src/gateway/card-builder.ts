@@ -1,18 +1,25 @@
 import type { CardDecision, ConfirmationRequest, PermissionDecision, TodoItemStatus } from '../types.js';
 import type { AskQuestionRequest } from '../executor/permission-gate.js';
 
-/** 任务阶段：驱动卡片彩色 header 模板与状态行色点 */
+/** 任务阶段：驱动状态行文案与终态 emoji 结论（✅/❌/⏹） */
 export type TaskPhase = 'boot' | 'running' | 'waiting' | 'done' | 'stopped' | 'error';
 
 /** 工具调用明细行（折叠面板/工具清单内的一行） */
 export interface ToolStep {
-  /** 原始工具名（Read / Write / Bash / mcp__…，toolResult 匹配用） */
+  /** 原始工具名（Read / Write / Bash / mcp__…，toolResult 匹配用）；文本条目固定 '__text__' */
   name: string;
-  /** 人类化标签（读取文件 / 执行命令 …；MCP 名自动缩短） */
+  /** 人类化标签（读取文件 / 执行命令 …；MCP 名自动缩短）；文本条目为 '文本' */
   label: string;
-  /** 操作对象摘要（命令 / 路径 / 查询） */
+  /** 操作对象摘要（命令 / 路径 / 查询）；文本条目为 Claude 发言原文（截断） */
   summary: string;
   ok: boolean | 'running';
+  /** 条目类型：缺省=工具调用；'text'=Claude 过程发言（原样展示，2026-10-22 过程流改版） */
+  kind?: 'text';
+  /** 发言原文（截 RAW_TEXT_MAX，仅终态结论重叠匹配用，不上卡） */
+  rawText?: string;
+  /** 终态重叠标记（2026-10-25）：该发言已被终态结论条目完整承载，渲染层跳过——
+   *  落实「卡上同一段话只出现一次」（用户既定原则） */
+  merged?: boolean;
 }
 
 /** 「刚完成」命令行（↳ 灰）的归属数据：工具落定时记到所属条目，下一条工具开始前保持显示 */
@@ -31,6 +38,16 @@ export interface TaskStep {
   activatedAt?: number;
   /** 最近一次落定的工具（↳ 刚完成 行归属本步骤；步骤完成即收起） */
   recent?: RecentTool;
+  /** 伪步骤（2026-10-25）：无 TodoWrite 时的发言段切分条目——title=发言首行摘要，
+   *  随下一段发言开启（或 setTodos 到来 / 任务正常终态）转 done；setTodos 全量替换时保留 */
+  pseudo?: boolean;
+  /** 发言原文（截 RAW_TEXT_MAX，仅终态结论重叠匹配用，不上卡） */
+  rawText?: string;
+  /** 终态重叠标记：该发言段已被终态结论条目承载，渲染层跳过（同上，去同文重复） */
+  merged?: boolean;
+  /** 终态结论条目（2026-10-25）：任务收尾时承载完整回复（额度内前缀）的伪步骤——
+   *  行首用任务级终态符 ✅（「仅终态结论行保留 ✅」约定），激活时刻最新、倒序置顶 */
+  conclusion?: boolean;
 }
 
 /** 子代理/后台任务（task_started / task_notification 驱动的一等步骤） */
@@ -75,9 +92,12 @@ export interface ProgressState {
   /** 运行心跳（灰色小字，渲染在执行栈与计时行之间）：上下文压缩/等待后台任务/决策结果等
    *  有信息量的状态文案；执行事件（工具/文本/待办）到达即清空 */
   heartbeat?: string;
-  /** 终态结果提示行：完整回复的字数（finish 传入）——终态不渲染回复正文（由收尾独立
-   *  多卡直接展示），只留一行「已单独发送」指引 */
+  /** 终态结果承载（2026-10-25 主卡承载改版）：resultChars=完整回复总字数（finish 传入）；
+   *  resultInlineChars=主卡结论条目实际承载的字数（动态额度切分后）。两者关系驱动提示行三态：
+   *  inline ≥ total → 全文已承载，无提示行；0 < inline < total → 「续篇见下方消息」；
+   *  inline = 0 → 额度耗尽全量续卡，「完整回复见下方消息」 */
   resultChars?: number;
+  resultInlineChars?: number;
   /** 挂起中的工具确认（非空时卡片顶部渲染确认区），决策后置回 undefined */
   confirm?: ConfirmationRequest;
   /** 计划审批挂起（#3+#6）：v5 计划正文与确认卡均独立直发（buildPlanConfirmCard），
@@ -102,12 +122,22 @@ export interface EmbeddedQuestionState {
   answers: Record<number, string | string[]>;
 }
 
-/** 单步骤面板内工具明细行上限（卡片体量防爆；超出后计数停止增长） */
+/** 单步骤折叠面板内工具明细上限（面板收起不占版面，上限防 JSON 体量；超出后计数停止增长） */
 export const STEP_TOOLS_MAX = 20;
 /** 未归属工具池上限 */
 export const LOOSE_TOOLS_MAX = 30;
 /** 子代理清单最多渲染条数（超出折叠为「…等共 N 个」） */
-const AGENT_LIST_MAX = 5;
+const AGENT_LIST_MAX = 10;
+/** 执行栈条目渲染上限（步骤+子代理合计，进行中条目不计入削减——永不收敛）：更早的已完成
+ *  条目折叠为「…另有 N 个更早步骤已收敛」一行——防卡高随任务时长线性失控（每条目至少
+ *  2 行，25+ 条目即 50+ 行）；config.card.stack_max 可调 */
+export const STACK_ENTRY_MAX = 10;
+/** 全卡发言平铺总字符预算：倒序条目优先消耗（最新条目的发言完整平铺），预算耗尽后的
+ *  更早发言降级为灰色计数行——飞书单卡 30KB 硬上限的防爆闸（发言单条可达数百字）。
+ *  同时是终态结论条目的承载额度基数（动态额度 = 本值 − 剩余可见过程发言展示成本） */
+export const TEXT_CHAR_BUDGET = 4000;
+/** Claude 发言条目的单条截断长度（原样展示但防单条巨幅发言撑爆卡片） */
+export const TEXT_ENTRY_MAX = 400;
 /** 展开/收起按钮回调的固定 requestId：新版卡片已无此按钮，仅为存量旧卡回调兜底分流保留 */
 export const TOOLS_TOGGLE_REQUEST_ID = 'lcb_tools_toggle';
 
@@ -135,16 +165,13 @@ export function toolLabel(name: string): string {
   return name;
 }
 
-/** 阶段 → 卡片 header 模板色（飞书 header.template 枚举）：整卡状态一眼可辨 */
-const PHASE_TEMPLATE: Record<TaskPhase, string> = {
-  boot: 'blue', running: 'blue', waiting: 'orange',
-  done: 'green', stopped: 'grey', error: 'red',
-};
-
 /** 常用标记与次要信息样式。
  *  执行栈条目用 emoji 状态符（v5：飞书原生渲染、视觉更醒目）——🔄 进行中（可多个并存=并行）
  *  ✅ 已完成 ❌ 失败 ⬜ 未执行 ⏹ 停止/未完成；折叠面板明细行保留 ✓/✗ 命名色（小尺寸更清爽） */
+/** 任务级终态结论符（buildStatusLine 终态结论行专用，保持大图标醒目） */
 const OK_MARK = `✅`;
+/** 步骤/子代理行完成符（2026-10-25 统一绿✓：与折叠面板内 ✓ 同一「完成」语言，替代原 ✅） */
+const STEP_DONE_MARK = `<font color='green'>✓</font>`;
 const ERR_MARK = `❌`;
 const RUN_MARK = `🔄`;
 const HALT_MARK = `⏹`;
@@ -153,11 +180,11 @@ const OK_TICK = `<font color='green'>✓</font>`;
 const ERR_TICK = `<font color='red'>✗</font>`;
 const GREY = (s: string): string => `<font color='grey'>${s}</font>`;
 
-function card(elements: unknown[], widthMode: 'default' | 'fill' = 'default', header?: { title: string; template: string }): unknown {
+function card(elements: unknown[], widthMode: 'default' | 'fill' = 'default'): unknown {
+  // v2.0.1 样式基线：无彩色 header 模板，标题一律为正文首行加粗（2026-10-22 用户要求去掉标题样式颜色）
   return {
     schema: '2.0',
     config: { update_multi: true, ...(widthMode === 'fill' ? { width_mode: 'fill' } : {}) },
-    ...(header ? { header: { title: { tag: 'plain_text', content: header.title }, template: header.template } } : {}),
     body: { elements },
   };
 }
@@ -186,13 +213,21 @@ export function buildImageCard(caption: string | undefined, imgKey: string, widt
  *  心跳行 / 计时行 / 收敛提示行。工具折叠面板内容不做局部更新（面板内 element 局部更新
  *  待真机验证），明细随结构变化全量替换刷新 */
 export const STATUS_ELEMENT_ID = 'lcb_status';
+/** @deprecated 2026-10-25 起命令行并入状态区（STATUS_ELEMENT_ID），仅存量旧卡兼容保留 */
 export const CUR_ELEMENT_ID = 'lcb_cur';
+/** @deprecated 2026-10-25 起心跳行并入状态区（STATUS_ELEMENT_ID），仅存量旧卡兼容保留 */
 export const HEARTBEAT_ELEMENT_ID = 'lcb_hb';
 export const TIMER_ELEMENT_ID = 'lcb_timer';
 export const TAIL_ELEMENT_ID = 'lcb_tail';
 function itemLineElementId(index: number): string { return `lcb_it_${index}`; }
+/** 发言平铺块 ID（局部更新定位用） */
 function itemPanelElementId(index: number): string { return `lcb_pt_${index}`; }
+/** 工具折叠面板 ID（2026-10-25 与发言平铺块分离——此前两者共用 lcb_pt_N，同卡内元素
+ *  重 ID 被飞书 1001 Duplicate 拒绝，实体卡创建/全量替换全部失败，沉底撤回旧卡后
+ *  新卡同样被拒 → 进度卡永久消失） */
+function itemToolsPanelElementId(index: number): string { return `lcb_tp_${index}`; }
 const LOOSE_PANEL_ELEMENT_ID = 'lcb_pt_loose';
+const LOOSE_TEXT_ELEMENT_ID = 'lcb_tx_loose';
 
 /**
  * 状态行（v5 语义）：
@@ -210,10 +245,23 @@ function buildStatusLine(state: ProgressState): string {
     if (state.phase === 'stopped') return `**⏹ ${s}**`;
     return `**✅ ${s}**`;
   }
-  if (state.thinking) return `**💭 处理中…**`;
+  if (state.thinking) return `**🔄 处理中…**`;
   const s = (state.status ?? '').trim();
-  if (s && state.phase === 'boot') return `<font color='grey'>● ${s}</font>`;
+  // 启动文案自带 emoji（🚀/⚙️），灰显即可（2026-10-25 去掉旧 ● 圆点，统一 emoji 状态符）
+  if (s && state.phase === 'boot') return `<font color='grey'>${s}</font>`;
+  // 空栈兜底（2026-10-25 消空白）：执行栈无任何条目时状态行常显「处理中」，
+  // 不再依赖 thinking 心跳窗口——boot 文案被首个事件清掉后的静默间隙不再整卡空白；
+  // 栈一旦出现任何条目（步骤/伪步骤/子代理/未归属工具）即让位恢复空行。
+  // 单行文案：飞书 markdown 中「\n + <font>」组合的第二行会被吞（真机实锤）
+  if (state.phase === 'running' && isExecutionStackEmpty(state)) {
+    return `**🔄 处理中…** · <font color='grey'>正在思考与准备（尚无步骤产出）</font>`;
+  }
   return '';
+}
+
+/** 执行栈是否完全为空（无步骤/伪步骤、无子代理、无未归属工具与发言） */
+function isExecutionStackEmpty(state: ProgressState): boolean {
+  return state.steps.length === 0 && state.agents.length === 0 && state.looseTools.length === 0;
 }
 
 /** 全局命令行（↳）：仅当运行中的工具未归属到任何执行栈条目（无步骤/子代理的降级视图，
@@ -233,20 +281,53 @@ function buildCurLine(state: ProgressState): string {
   return `<font color='grey'>↳</font> ${GREY(`刚完成 **${rt.label}**${rt.summary ? ` ${rt.summary}` : ''}`)}`;
 }
 
-/** 工具明细行（面板/清单内）：运行中蓝 ●，落定 ✓ 绿 / ✗ 红 + 加粗动作 + 灰色对象 */
+/** 工具明细行（折叠面板内）：运行中 🔄，落定 ✓ 绿 / ✗ 红 + 加粗动作 + 灰色对象；
+ *  Claude 发言条目（kind='text'）原样展示——💬 前缀 + 原文（含换行与 markdown，
+ *  与 Claude Code 终端一致的渲染观感），不套状态符/加粗（发言无成败语义） */
 function toolLine(t: ToolStep): string {
+  if (t.kind === 'text') {
+    const s = t.summary.trim();
+    return s ? `💬 ${s}` : '';
+  }
   const target = t.summary ? ` ${GREY(t.summary)}` : '';
-  if (t.ok === 'running') return `<font color='blue'>●</font> 正在${t.label}${target}`;
+  if (t.ok === 'running') return `🔄 正在${t.label}${target}`;
   return `${t.ok ? OK_TICK : ERR_TICK} **${t.label}**${target}`;
 }
 
+/**
+ * Claude 发言平铺内容（2026-10-23 改版：主卡版面=中文步骤流水 + 发言叙事，工具收进
+ * 折叠面板）。只取条目池中的发言（kind='text'），**倒序**平铺（最新发言在最上，紧贴
+ * 条目标题行），running 不存在于此。charBudget 为字符预算：倒序逐条消耗，耗尽即停
+ * （剩余更早发言以灰色一行收敛）。返回 content 与实际消耗（used），供全卡共享预算扣减。
+ */
+function textEntryContent(tools: ToolStep[], charBudget?: number): { content: string; used: number } {
+  const texts = tools.filter((t) => t.kind === 'text' && t.ok !== 'running' && !t.merged);
+  if (texts.length === 0) return { content: '', used: 0 };
+  const ordered = [...texts].reverse(); // 倒序：最新发言在最上
+  const lines: string[] = [];
+  let used = 0;
+  let hidden = 0;
+  for (const t of ordered) {
+    const line = toolLine(t);
+    if (!line) { continue; }
+    const cost = line.length + 1;
+    if (charBudget !== undefined && used + cost > charBudget) {
+      hidden = ordered.length - lines.length;
+      break;
+    }
+    lines.push(line);
+    used += cost;
+  }
+  if (hidden > 0) lines.push(GREY(`…另有 ${hidden} 条更早发言已收敛`));
+  return { content: lines.join('\n'), used };
+}
+
 /** 工具折叠面板（飞书 collapsible_panel：点击 ⌄ 或文案展开，客户端本地行为，不走回调）。
- *  v4 纯文字形态：无边框/无底色/零内边距——只留灰色「已使用 N 个工具」文案 + 紧跟右侧 ⌄
- *  （2026-10-21 真机反馈：带边框圆角渲染成按钮长条，体验差）。仅实体卡（cardkit）通道渲染。
- *  面板内容只放已完成的明细（running 行过滤）——执行中的命令永远只在 ↳ 行，杜绝面板内
- *  残留陈旧「正在执行」行造成的混乱 */
+ *  2026-10-23 恢复（v5 形态）：工具罗列退出主卡版面，收进「已使用 N 个工具 ^」折叠——
+ *  版面主体让位给中文步骤流水与发言叙事。无边框/无底色/零内边距，仅灰色计数文案 + ⌄。
+ *  面板内容只放已落定明细（running 行过滤，正序——历史清单语义），正在执行的命令只在 ↳ 行 */
 function toolsPanelElement(elementId: string, title: string, tools: ToolStep[]): unknown {
-  const settled = tools.filter((t) => t.ok !== 'running').slice(-STEP_TOOLS_MAX);
+  const settled = tools.filter((t) => t.ok !== 'running' && t.kind !== 'text').slice(-STEP_TOOLS_MAX);
   return {
     tag: 'collapsible_panel',
     expanded: false,
@@ -265,18 +346,17 @@ function toolsPanelElement(elementId: string, title: string, tools: ToolStep[]):
 }
 
 /** 步骤行（v5 执行栈条目）：🔄 进行中（加粗，优先 activeForm，下方跟自己的 ↳ 命令行）/
- *  ✅ 完成 / ⬜ 未执行（灰）；终态时未走完的步骤如实标注（⏹ 未完成 / ⬜ 未执行） */
-function stepStackLine(s: TaskStep, state: ProgressState, panelMode: boolean): string {
+ *  ✓ 完成 / ⬜ 未执行（灰）；终态结论条目例外用任务级 ✅（「仅终态结论行保留 ✅」约定）；
+ *  终态时未走完的步骤如实标注（⏹ 未完成 / ⬜ 未执行） */
+function stepStackLine(s: TaskStep, state: ProgressState): string {
   if (state.done && s.status === 'active') return `${HALT_MARK} ${GREY(`${s.activeLabel ?? s.title}（未完成）`)}`;
   if (state.done && s.status === 'pending') return `${PEND_MARK} ${GREY(`${s.title}（未执行）`)}`;
   if (s.status === 'active') {
     const label = (s.activeLabel ?? s.title).trim();
-    return `${RUN_MARK} **${label}**${stackCurLine(s)}`;
+    // 伪步骤行=发言原文本体（不加粗：叙述文本整段加粗观感差）；真步骤行保持加粗标题
+    return `${RUN_MARK} ${s.pseudo ? label : `**${label}**`}${stackCurLine(s)}`;
   }
-  if (s.status === 'done') {
-    // 零工具的完成步骤不显示计数（避免「· 0 个工具」噪音）
-    return `${OK_MARK} ${s.title}${!panelMode && s.tools.length > 0 ? GREY(` · ${s.tools.length} 个工具`) : ''}`;
-  }
+  if (s.status === 'done') return `${s.conclusion ? OK_MARK : STEP_DONE_MARK} ${s.title}`;
   return `${PEND_MARK} ${GREY(s.title)}`;
 }
 
@@ -287,7 +367,7 @@ function agentStackLine(t: SubagentTask, now: number, state: ProgressState): str
     const sec = Math.max(0, Math.floor((now - t.startedAt) / 1000));
     return `${RUN_MARK} **${t.description}**${GREY(` · 子代理（已运行 ${Math.floor(sec / 60)} 分 ${sec % 60} 秒）`)}${stackCurLine(t)}`;
   }
-  const mark = t.status === 'done' ? OK_MARK : t.status === 'failed' ? ERR_MARK : HALT_MARK;
+  const mark = t.status === 'done' ? STEP_DONE_MARK : t.status === 'failed' ? ERR_MARK : HALT_MARK;
   let suffix = GREY(' · 子代理');
   if (t.summary) {
     const s = t.summary.slice(0, 80);
@@ -321,9 +401,12 @@ export interface ProgressPartContent {
   /** 全局命令行（↳，仅未归属工具/降级视图非空），空串表示无该组件 */
   cur: string;
   /** 执行栈条目（v5 倒序：步骤与子代理按启动时间混排、最新在上；⬜ 未执行沉底）。
-   *  每条目一个 element，工具折叠面板紧跟其下（实体卡模式）。
-   *  sig 为结构签名（不含秒数/↳ 行等易变内容）——局部更新路径据此识别结构变化 */
-  items: Array<{ id: string; line: string; sig: string; panel?: { id: string; title: string; tools: ToolStep[] } }>;
+   *  每条目：行 element + 发言平铺 element（text，Claude 发言原文倒序，空则无）+
+   *  工具折叠面板（panel，已落定工具明细收进「已使用 N 个工具 ^」）。
+   *  text 字段：仅执行栈条目存在（pending 沉底行/子代理超限行无），空串表示暂无发言——
+   *  空串不渲染元素（空 markdown 占空行，2026-10-25 根除），出现/消失由 sig 的 x 位驱动全量替换。
+   *  sig 为结构签名（含面板工具数——面板内容不参与局部更新，靠结构变化全量替换刷新） */
+  items: Array<{ id: string; line: string; sig: string; text?: string; panel?: { id: string; title: string; tools: ToolStep[] } }>;
   /** 子代理超限折叠提示行（…等共 N 个子代理），空串表示无 */
   agentsMore: string;
   /** 运行心跳行（上下文压缩/等待后台任务/决策结果等灰色小字），空串表示无 */
@@ -331,30 +414,42 @@ export interface ProgressPartContent {
   /** 收敛提示行（终态指引），空串表示无该组件 */
   tail: string;
   timer: string;
-  /** 未归属工具面板（TodoWrite 出现前的准备动作等），无则为 undefined */
-  loose?: { id: string; title: string; tools: ToolStep[] };
+  /** 未归属发言平铺（TodoWrite 出现前的准备动作叙述等），有未归属池时存在 */
+  looseText?: { id: string; content: string };
+  /** 未归属工具折叠面板，池内有已落定工具时存在 */
+  loosePanel?: { id: string; title: string; tools: ToolStep[] };
 }
 
-/** 面板内已落定的工具数（running 行不入面板——执行中的命令只在 ↳ 行） */
-const settledCount = (tools: ToolStep[]): number => tools.filter((t) => t.ok !== 'running').length;
+/** 面板内已落定的工具数（running 行不入面板——执行中的命令只在 ↳ 行；
+ *  发言条目 kind='text' 不是工具不计数——与面板明细同口径（明细渲染同样过滤 text），2026-10-25 修正） */
+const settledCount = (tools: ToolStep[]): number =>
+  tools.filter((t) => t.ok !== 'running' && t.kind !== 'text').length;
 
 /** 步骤式内容源：确认区/终态收敛行等所有可变文本都在这里，整卡与局部更新共用。
  *  执行栈排序（v5 倒序）：非 pending 条目（active/done 步骤 + 子代理）按激活时间倒序——
- *  最新在最上；⬜ 未执行步骤保持 TodoWrite 顺序沉底。子代理渲染上限：运行中全部保留，
- *  落定按最近优先补足，超出折叠为「…等共 N 个子代理」计数行 */
-export function buildProgressParts(state: ProgressState, panelMode: boolean): ProgressPartContent {
+ *  最新在最上；⬜ 未执行步骤保持 TodoWrite 顺序沉底。
+ *  版面分工（2026-10-23）：步骤行 + 发言平铺（text，倒序、全卡 TEXT_CHAR_BUDGET 字符
+ *  预算，倒序条目优先消费）+ 工具折叠面板（panel，「已使用 N 个工具 ^」，面板内容不占
+ *  版面、不参与局部更新——工具数进 sig 触发全量替换刷新）。
+ *  子代理渲染上限：运行中全部保留，落定按最近优先补足，超出折叠为「…等共 N 个子代理」计数行 */
+export function buildProgressParts(state: ProgressState, panelMode: boolean, stackMax: number = STACK_ENTRY_MAX): ProgressPartContent {
   const now = Date.now();
-  type Entry = { sig: string; line: string; at: number; tools: ToolStep[]; desc: string };
+  type Entry = { sig: string; line: string; at: number; tools: ToolStep[]; desc: string; live: boolean; concl: boolean };
   const entries: Entry[] = [];
   const pendings: TaskStep[] = [];
   for (const s of state.steps) {
     if (s.status === 'pending') { pendings.push(s); continue; }
+    // 终态重叠收敛（2026-10-25）：被结论条目完整承载的发言段不再渲染（同文只出现一次）——
+    // merged 消失会引起 sig 的 x 位/文本位变化 → 结构签名变 → 全量替换刷新
+    if (s.merged) continue;
     entries.push({
-      sig: `s:${s.title}|${s.status[0]}|t${settledCount(s.tools)}`,
-      line: stepStackLine(s, state, panelMode),
+      sig: `s:${s.title}|${s.status[0]}|t${settledCount(s.tools)}|x${s.tools.some((t) => t.kind === 'text' && t.ok !== 'running' && !t.merged) ? 1 : 0}`,
+      line: stepStackLine(s, state),
       at: s.activatedAt ?? 0,
       tools: s.tools,
       desc: s.title,
+      live: s.status === 'active',
+      concl: s.conclusion === true,
     });
   }
   const runningAgents = state.agents.filter((a) => a.status === 'running');
@@ -363,18 +458,60 @@ export function buildProgressParts(state: ProgressState, panelMode: boolean): Pr
   const shownAgents = [...runningAgents, ...settledAgents.slice(0, agentCap)];
   for (const a of shownAgents) {
     entries.push({
-      sig: `a:${a.id}|${a.status[0]}|t${settledCount(a.tools)}`,
+      sig: `a:${a.id}|${a.status[0]}|t${settledCount(a.tools)}|x${a.tools.some((t) => t.kind === 'text' && t.ok !== 'running') ? 1 : 0}`,
       line: agentStackLine(a, now, state),
       at: a.startedAt,
       tools: a.tools,
       desc: a.description,
+      live: a.status === 'running',
+      concl: false,
     });
   }
   entries.sort((x, y) => y.at - x.at); // 倒序：最新在最上（Array.sort 稳定，同刻保插入序）
-  const items: ProgressPartContent['items'] = entries.map((e, i) => {
-    const part: ProgressPartContent['items'][number] = { id: itemLineElementId(i), line: e.line, sig: e.sig };
-    const settled = settledCount(e.tools);
-    if (panelMode && settled > 0) part.panel = { id: itemPanelElementId(i), title: `已使用 ${settled} 个工具`, tools: e.tools };
+  // 终态聚焦（2026-10-25）：done 终态时用户只关注结论/方案——过程条目整体收敛为一行
+  // 「⚙ 本次执行 N 个步骤 · M 个工具操作」概要，结论条目（✅）照常置顶承载。error/stopped
+  // 不聚焦：过程步骤有诊断定位价值，维持全量展示。处理态走条目上限收敛（进行中永不收敛），
+  // 动态变化完整保留
+  const finalFocused = state.done && state.phase === 'done';
+  const liveEntries = entries.filter((e) => e.live);
+  const settledEntries = entries.filter((e) => !e.live);
+  let shown: Entry[];
+  let folded: Entry[];
+  let foldedLine: string;
+  if (finalFocused) {
+    shown = entries.filter((e) => e.concl);
+    folded = entries.filter((e) => !e.concl);
+    const tools = folded.reduce((sum, e) => sum + settledCount(e.tools), 0);
+    foldedLine = `⚙ 本次执行 ${folded.length} 个步骤${tools > 0 ? ` · ${tools} 个工具操作` : ''}`;
+  } else {
+    // 执行栈条目上限收敛（2026-10-25，防卡高随任务时长线性失控）：进行中条目（active 步骤 /
+    // running 子代理）永不收敛——动态变化是主卡的存在意义；其余按最新优先补足上限，更早的
+    // 已完成条目折叠为一行灰色汇总。收敛行文案含条目数与工具数（回看价值保留在计数里）
+    const settledCap = Math.max(0, stackMax - liveEntries.length);
+    shown = [...liveEntries, ...settledEntries.slice(0, settledCap)].sort((x, y) => y.at - x.at);
+    folded = settledEntries.slice(settledCap);
+    const tools = folded.reduce((sum, e) => sum + settledCount(e.tools), 0);
+    foldedLine = `…另有 ${folded.length} 个更早步骤${tools > 0 ? ` · 已使用 ${tools} 个工具` : ''}已收敛`;
+  }
+  let textBudget = TEXT_CHAR_BUDGET; // 发言平铺字符预算：倒序条目优先（最新发言完整可见）
+  const items: ProgressPartContent['items'] = shown.map((e, i) => {
+    const part: ProgressPartContent['items'][number] = { id: itemLineElementId(i), line: e.line, sig: e.sig, text: '' };
+    const hasText = e.tools.some((t) => t.kind === 'text' && t.ok !== 'running' && !t.merged);
+    const settledTools = settledCount(e.tools);
+    if (hasText) {
+      if (textBudget > 0) {
+        const r = textEntryContent(e.tools, textBudget);
+        part.text = r.content;
+        textBudget -= r.used;
+      } else {
+        part.text = GREY('（更早发言已收敛）');
+      }
+    }
+    // 工具折叠面板：有已落定工具才出现（仅实体卡通道；消息卡对 collapsible_panel 兼容面
+    // 未验证，降级为行内计数——sig 中的 tN 变化触发全量替换刷新）
+    if (settledTools > 0 && panelMode) {
+      part.panel = { id: itemToolsPanelElementId(i), title: `已使用 ${settledTools} 个工具`, tools: e.tools };
+    }
     return part;
   });
   for (const s of pendings) {
@@ -384,6 +521,13 @@ export function buildProgressParts(state: ProgressState, panelMode: boolean): Pr
       sig: `p:${s.title}|p`,
     });
   }
+  if (folded.length > 0) {
+    items.push({
+      id: itemLineElementId(items.length),
+      line: GREY(foldedLine),
+      sig: `f:${folded.length}|${foldedLine}`,
+    });
+  }
   const agentsMore = state.agents.length > shownAgents.length ? GREY(`…等共 ${state.agents.length} 个子代理`) : '';
   if (agentsMore) {
     items.push({ id: itemLineElementId(items.length), line: agentsMore, sig: `m:${state.agents.length}` });
@@ -391,16 +535,32 @@ export function buildProgressParts(state: ProgressState, panelMode: boolean): Pr
   const status = buildStatusLine(state);
   const cur = buildCurLine(state);
   const heartbeat = state.heartbeat?.trim() ? GREY(state.heartbeat.trim()) : '';
-  // 收敛提示行：仅终态留「完整回复已单独发送」指引（v5 移除挂起期「正文已收起」——
-  // 决策区本就置顶/独立成卡，无需再占一行）
+  // 收敛提示行三态（2026-10-25 主卡承载改版）：全文承载 → 无提示行（结论就在卡上，不重复
+  // 占行）；部分承载 → 「续篇见下方消息」（剩余后缀由收尾续卡补发）；零承载（额度被过程
+  // 发言占满）→ 「完整回复见下方消息」。非终态/无回复不出行
   const tail = state.done && state.resultChars !== undefined
-    ? `---\n${GREY(`完整回复已单独发送（共 ${state.resultChars.toLocaleString()} 字），见下方消息`)}`
+    ? (state.resultInlineChars === undefined || state.resultInlineChars >= state.resultChars
+      ? ''
+      : state.resultInlineChars > 0
+        ? `---\n${GREY('回复较长已分段，续篇见下方消息')}`
+        : `---\n${GREY(`完整回复见下方消息（共 ${state.resultChars.toLocaleString()} 字）`)}`)
     : '';
+  const looseTexts = state.looseTools.filter((t) => t.kind === 'text' && t.ok !== 'running');
   const looseSettled = settledCount(state.looseTools);
-  const loose = panelMode && looseSettled > 0
+  // 未归属池：有池即渲染发言块（与结构签名的 looseTools.length>0 条件一致）；发言消费
+  // 剩余预算，工具进折叠面板
+  const looseText = state.looseTools.length > 0
+    ? {
+      id: LOOSE_TEXT_ELEMENT_ID,
+      content: looseTexts.length > 0
+        ? (textBudget > 0 ? textEntryContent(state.looseTools, textBudget).content : GREY('（更早发言已收敛）'))
+        : '',
+    }
+    : undefined;
+  const loosePanel = panelMode && looseSettled > 0
     ? { id: LOOSE_PANEL_ELEMENT_ID, title: `其他操作 · 已使用 ${looseSettled} 个工具`, tools: state.looseTools }
     : undefined;
-  return { status, cur, items, agentsMore, heartbeat, tail, timer: buildTimerLine(state), loose };
+  return { status, cur, items, agentsMore, heartbeat, tail, timer: buildTimerLine(state), looseText, loosePanel };
 }
 
 /** 计时行文案——整卡渲染与局部更新共用 */
@@ -420,17 +580,21 @@ function buildTimerLine(state: ProgressState): string {
 
 /**
  * 进度卡整卡渲染（结构变化 / 沉底重发 / 降级整卡 PATCH 共用）。
- * 版面（v5，自上而下）：确认区（置顶）→ 状态行（💭 处理中/启动/终态结论；执行中为空）
- * → 全局命令行（降级视图）→ 执行栈条目×N（倒序混排，面板穿插其下）→ 未归属工具面板
- * → 心跳行（灰色小字）→ 收敛提示行 → hr → 计时行。
+ * 版面（2026-10-22 改版，自上而下）：标题行（v2.0.1 式正文首行加粗，无彩色 header）→
+ * 确认区（置顶）→ 提问区 → 状态行（💭 处理中/启动/终态结论；执行中为空）
+ * → 全局命令行（降级视图）→ 执行栈条目×N（倒序混排：最新处理在最上；每条目下紧跟
+ * 其已落定工具明细的**倒序平铺** element）→ 未归属工具明细 → 心跳行（灰色小字）
+ * → 收敛提示行 → hr → 计时行。
+ * 整体倒序展示：上面的处理是最近的，下面是更早/已处理的（用户 2026-10-22 要求）。
  * 计划审批不再内嵌本卡（v5：独立确认卡 buildPlanConfirmCard 紧跟方案正文直发）。
- * panelMode：仅实体卡（cardkit）通道为 true——工具明细折叠面板（collapsible_panel，需客户端
- * V7.9+）只在已验证支持卡片 JSON 2.0 组件全量的通道渲染；消息卡通道降级为行内计数、无面板。
+ * panelMode 参数保留兼容调用方（原折叠面板模式位），明细两种通道统一平铺。
  */
-export function buildProgressCard(state: ProgressState, widthMode: 'default' | 'fill' = 'default', panelMode = false): unknown {
-  const parts = buildProgressParts(state, panelMode);
+export function buildProgressCard(state: ProgressState, widthMode: 'default' | 'fill' = 'default', panelMode = false, stackMax: number = STACK_ENTRY_MAX): unknown {
+  const parts = buildProgressParts(state, panelMode, stackMax);
   const elements: unknown[] = [];
-  // 决策区置顶：需要用户操作的确认/提问区块放卡片最上方，与下方执行状态区分层——
+  // 标题行（v2.0.1 样式基线：正文首行加粗，无彩色 header 模板）
+  elements.push(md(`**${state.title}**`));
+  // 决策区置顶：需要用户操作的确认/提问区块放标题之后，与下方执行状态区分层——
   // 用户一进卡先看到「要做什么」，不用在一堆状态行里找按钮
   if (state.confirm) {
     const body = state.confirm.diff
@@ -466,6 +630,15 @@ export function buildProgressCard(state: ProgressState, widthMode: 'default' | '
       const sel = q.answers[qIndex];
       const picked = Array.isArray(sel) ? sel : sel !== undefined ? [sel] : [];
       formElements.push(md(`**${qIndex + 1}. ${qq.question}**${qq.multiSelect ? '（可多选）' : ''}`));
+      // 选项说明清单（2026-10-23 补全：CLI 传来的 description 此前被丢弃，用户面对光秃秃
+      // 的按钮无从决策）——有说明的选项逐条灰字渲染「• label — 说明」，紧贴按钮上方
+      const described = qq.options.filter((o) => o.description?.trim());
+      if (described.length > 0) {
+        formElements.push(md(qq.options
+          .map((o) => (o.description?.trim() ? `<font color='grey'>• ${o.label} — ${o.description.trim()}</font>` : null))
+          .filter(Boolean)
+          .join('\n')));
+      }
       qq.options.forEach((o, optIndex) => {
         formElements.push(embeddedQaOptionButton(q.requestId, qIndex, optIndex, o.label, picked.includes(o.label)));
       });
@@ -491,26 +664,30 @@ export function buildProgressCard(state: ProgressState, widthMode: 'default' | '
     });
     elements.push({ tag: 'form', name: 'qa_form', elements: formElements });
   }
-  // 状态行（💭 处理中 / 启动文案 / 终态结论；执行中为空——版面主体是执行栈）
-  elements.push({ tag: 'markdown', content: parts.status, element_id: STATUS_ELEMENT_ID });
-  // 全局命令行（仅未归属工具/降级视图非空）
-  elements.push({ tag: 'markdown', content: parts.cur, element_id: CUR_ELEMENT_ID });
-  // 执行栈条目（倒序混排，每条目一个 element，工具折叠面板穿插其下——「正在使用」的命令行
-  // 跟随所属条目，用完转「刚完成」灰显保持）
-  for (const it of parts.items) {
-    elements.push({ tag: 'markdown', content: it.line, element_id: it.id });
-    if (it.panel) elements.push(toolsPanelElement(it.panel.id, it.panel.title, it.panel.tools));
+  // 状态区（2026-10-25 三合一）：状态行 + 全局命令行 + 心跳行合并为单 element——
+  // 飞书对空 markdown 元素仍渲染占位空行，此前 cur/hb 恒渲染导致状态下方悬空一行；
+  // 内容为空时整个不渲染（出现/消失经 structureKey 触发全量替换，非空期间走局部更新）
+  const statusBlock = [parts.status, parts.cur, parts.heartbeat].filter(Boolean).join('\n');
+  if (statusBlock) {
+    elements.push({ tag: 'markdown', content: statusBlock, element_id: STATUS_ELEMENT_ID });
   }
-  // 未归属工具面板（TodoWrite 出现前的准备动作等）
-  if (parts.loose) elements.push(toolsPanelElement(parts.loose.id, parts.loose.title, parts.loose.tools));
-  // 心跳行（上下文压缩/等待后台任务/决策结果等灰色小字；执行事件到达即清空）
-  elements.push({ tag: 'markdown', content: parts.heartbeat, element_id: HEARTBEAT_ELEMENT_ID });
+  // 执行栈条目（倒序混排：最新处理在最上）。每条目 = 行 element + 发言平铺 element
+  // （text 恒渲染，内容变化走局部更新）+ 工具折叠面板（收起不占版面，内容随结构
+  // 变化全量替换刷新）。「正在使用」的 ↳ 行跟随条目标题，用完转「刚完成」灰显保持
+  parts.items.forEach((it, i) => {
+    elements.push({ tag: 'markdown', content: it.line, element_id: it.id });
+    if (it.text) elements.push({ tag: 'markdown', content: it.text, element_id: itemPanelElementId(i) });
+    if (it.panel) elements.push(toolsPanelElement(it.panel.id, it.panel.title, it.panel.tools));
+  });
+  // 未归属发言平铺 + 工具折叠面板（TodoWrite 出现前的准备动作等）
+  if (parts.looseText) elements.push({ tag: 'markdown', content: parts.looseText.content, element_id: parts.looseText.id });
+  if (parts.loosePanel) elements.push(toolsPanelElement(parts.loosePanel.id, parts.loosePanel.title, parts.loosePanel.tools));
   // 收敛提示行（终态指引）：仅非空时渲染
   if (parts.tail) elements.push({ tag: 'markdown', content: parts.tail, element_id: TAIL_ELEMENT_ID });
   // 计时行上方加分隔横线，与正文/决策区做视觉划分
   elements.push({ tag: 'hr' });
   elements.push({ tag: 'markdown', content: parts.timer, element_id: TIMER_ELEMENT_ID });
-  return card(elements, widthMode, { title: state.title, template: PHASE_TEMPLATE[state.phase] ?? 'blue' });
+  return card(elements, widthMode);
 }
 
 /**
@@ -543,22 +720,35 @@ export function buildQaButtonActions(state: ProgressState): Array<{ action: stri
 
 /**
  * 局部更新 actions（cardkit batch_update 的 partial_update_element）：状态行、全局命令行、
- * 每个执行栈条目行、心跳行、收敛提示行与计时行的 content 替换。panelMode 必须与整卡渲染
- * 一致——条目行的行内工具计数随面板有无而不同，两种路径内容源若不一致会导致整卡/局部渲染
- * 漂移。工具面板内容不在局部更新内（面板内 element 更新待真机验证），明细随结构变化全量
- * 替换刷新——调用方（progress-card）会对内容未变化的组件做过滤后再发送，避免每秒全量刷
- * 所有 element。
+ * 每个执行栈条目行与其明细平铺块、未归属明细块、心跳行、收敛提示行与计时行的 content
+ * 替换。明细平铺块是普通 markdown element（element_id 稳定、恒渲染），content 变化
+ * （新工具落定/预算收敛降级）走局部更新即可，不再触发整卡替换——调用方
+ * （progress-card）会对内容未变化的组件做过滤后再发送，避免每秒全量刷所有 element。
  * includeQaButtons=true 时追加 qa 选项按钮的局部替换（选中态变化不触发全量替换——那会
  * 清空 form 内未提交的自定义输入，改走按钮 element_id 级局部更新）。
  */
-export function buildPartialUpdateActions(state: ProgressState, panelMode: boolean, includeQaButtons = false): Array<{ action: string; params: { element_id: string; partial_element: unknown } }> {
-  const parts = buildProgressParts(state, panelMode);
+export function buildPartialUpdateActions(state: ProgressState, panelMode: boolean, includeQaButtons = false, stackMax: number = STACK_ENTRY_MAX): Array<{ action: string; params: { element_id: string; partial_element: unknown } }> {
+  const parts = buildProgressParts(state, panelMode, stackMax);
+  const statusBlock = [parts.status, parts.cur, parts.heartbeat].filter(Boolean).join('\n');
   const actions: Array<{ action: string; params: { element_id: string; partial_element: unknown } }> = [
-    { action: 'partial_update_element', params: { element_id: STATUS_ELEMENT_ID, partial_element: { content: parts.status } } },
-    { action: 'partial_update_element', params: { element_id: CUR_ELEMENT_ID, partial_element: { content: parts.cur } } },
-    ...parts.items.map((it) => ({ action: 'partial_update_element' as const, params: { element_id: it.id, partial_element: { content: it.line } } })),
-    { action: 'partial_update_element', params: { element_id: HEARTBEAT_ELEMENT_ID, partial_element: { content: parts.heartbeat } } },
+    // 状态区（status+cur+hb 合一）：仅存在且非空时局部更新；从有到无由 structureKey
+    // 捕获走全量替换（partial 无法删除元素）
+    ...(statusBlock
+      ? [{ action: 'partial_update_element' as const, params: { element_id: STATUS_ELEMENT_ID, partial_element: { content: statusBlock } } }]
+      : []),
+    ...parts.items.flatMap((it, i) => {
+      const line = { action: 'partial_update_element' as const, params: { element_id: it.id, partial_element: { content: it.line } } };
+      // 发言平铺块（与整卡渲染同 element_id 推导：itemPanelElementId(数组序)）；
+      // 工具折叠面板内容不参与局部更新（随结构签名变化全量替换刷新）
+      const text = it.text
+        ? [{ action: 'partial_update_element' as const, params: { element_id: itemPanelElementId(i), partial_element: { content: it.text } } }]
+        : [];
+      return [line, ...text];
+    }),
   ];
+  if (parts.looseText) {
+    actions.push({ action: 'partial_update_element', params: { element_id: parts.looseText.id, partial_element: { content: parts.looseText.content } } });
+  }
   if (parts.tail) {
     actions.push({ action: 'partial_update_element', params: { element_id: TAIL_ELEMENT_ID, partial_element: { content: parts.tail } } });
   }
@@ -590,10 +780,11 @@ export function planSummaryLines(plan: string, max = 3): string[] {
 }
 
 /**
- * 计划确认卡（v5 独立直发）：橙色 header「执行计划 · 待确认」，上半部方案要点摘要、
- * 下半部审批表单（批准/按意见修改/放弃 + 意见输入框）。由 index 侧 planAsk 在方案正文
- * 多卡落地后紧接着发送——顺序即动线（先方案、后确认），不再依赖主卡强制沉底保证顺序。
- * 走普通消息卡通道（决策后整卡收口为终态卡，无局部更新需求；表单提交语义与原内嵌 form 一致）
+ * 计划确认卡（v5 独立直发）：标题「执行计划 · 待确认」（v2.0.1 式正文首行加粗，无彩色
+ * header），上半部方案要点摘要、下半部审批表单（批准/按意见修改/放弃 + 意见输入框）。
+ * 由 index 侧 planAsk 在方案正文多卡落地后紧接着发送——顺序即动线（先方案、后确认），
+ * 不再依赖主卡强制沉底保证顺序。走普通消息卡通道（决策后整卡收口为终态卡，无局部更新
+ * 需求；表单提交语义与原内嵌 form 一致）
  */
 export function buildPlanConfirmCard(req: PlanCardRequest, widthMode: 'default' | 'fill' = 'default'): unknown {
   const lines = planSummaryLines(req.plan);
@@ -601,7 +792,7 @@ export function buildPlanConfirmCard(req: PlanCardRequest, widthMode: 'default' 
     ? lines.map((l) => `• ${l}`).join('\n')
     : GREY('方案内容较短，完整正文见上方「执行计划」卡片');
   return card([
-    md(`**方案要点**\n${summary}\n${GREY(`完整方案见上方「执行计划」卡片（共 ${req.plan.length.toLocaleString()} 字）`)}`),
+    md(`**执行计划 · 待确认**\n\n**方案要点**\n${summary}\n${GREY(`完整方案见上方「执行计划」卡片（共 ${req.plan.length.toLocaleString()} 字）`)}`),
     {
       tag: 'form',
       name: 'plan_form',
@@ -618,17 +809,17 @@ export function buildPlanConfirmCard(req: PlanCardRequest, widthMode: 'default' 
         { tag: 'input', name: 'feedback', width: 'fill', multiline: true, rows: 3, max_length: 1000, placeholder: { tag: 'plain_text', content: '修改意见（选填）：选择「按意见修改」时随意见一起提交' } },
       ],
     },
-  ], widthMode, { title: '执行计划 · 待确认', template: 'orange' });
+  ], widthMode);
 }
 
 /**
- * 计划确认卡终态收口：决策（批准/按意见修改/放弃/超时自动放弃）落定后整卡 PATCH 为灰色
- * 静态卡——按钮消失防重复点击，决策结果一眼可辨（更新失败仅落日志，不影响流程）
+ * 计划确认卡终态收口：决策（批准/按意见修改/放弃/超时自动放弃）落定后整卡 PATCH 为静态卡
+ * ——按钮消失防重复点击，决策结果一眼可辨（更新失败仅落日志，不影响流程）
  */
 export function buildPlanSettledCard(text: string, widthMode: 'default' | 'fill' = 'default'): unknown {
   return card([
-    md(`**${text}**\n${GREY('本卡已收口；任务执行进度见任务进度卡')}`),
-  ], widthMode, { title: '执行计划 · 已处理', template: 'grey' });
+    md(`**执行计划 · 已处理**\n\n**${text}**\n${GREY('本卡已收口；任务执行进度见任务进度卡')}`),
+  ], widthMode);
 }
 
 function planButton(decision: CardDecision, label: string, type: string, requestId: string, name: string): unknown {
@@ -683,30 +874,25 @@ export interface QuestionCardRequest {
 /** 已选答案的中间态（wiring 侧维护）：问题下标 → 选中的 option label（multiSelect 为数组） */
 export type QuestionCardAnswers = Record<number, string | string[]>;
 
-// ---------- 结论多卡（完整回复分块直接展示） ----------
+// ---------- 结论续卡（2026-10-25 主卡承载改版：完整回复优先承载进主卡结论条目，
+// 动态额度装不下的剩余后缀才补发续卡——同一段内容只在主卡或续卡一处完整呈现） ----------
 
-export interface ResultCardRequest {
-  charCount: number;
-  workspaceName: string;
-}
-
-/** 结论块头部标号行：尾卡放彩色 header（绿）标题，非尾卡（sendTextTo 文本卡）作为正文首行。
- *  纯文本（不带 **），header plain_text 与 markdown 正文两处共用 */
-export function resultChunkHeader(req: ResultCardRequest, index: number, total: number): string {
-  return `完整回复（${total > 1 ? `${index}/${total} · ` : ''}共 ${req.charCount.toLocaleString()} 字）`;
+/** 续卡头部标号行：标明这是主卡结论的续篇与剩余字数（多张时带序号） */
+export function resultContinuationHeader(remainingChars: number, index: number, total: number): string {
+  return `**完整回复（续 · 共 ${remainingChars.toLocaleString()} 字${total > 1 ? ` · ${index}/${total}` : ''}）**`;
 }
 
 /**
- * 结论尾卡：完整回复多卡的最后一张——末块正文（绿色 header 标号 + 正文，纯展示无交互组件；
- * 想继续对话/提意见直接回复消息即可）。仍走消息卡通道以支持 config.card.width 与头部渲染。
+ * 续卡：主卡结论装不下的剩余后缀分块直发——首部标号行 + 正文（纯展示无交互组件；
+ * 想继续对话/提意见直接回复消息即可）。中间块走文本消息（sendTextTo + 同款头部），
+ * 尾块走消息卡通道以支持 config.card.width。
  */
 export function buildResultTailCard(
-  req: ResultCardRequest,
+  header: string,
   chunkContent: string,
-  pos: { index: number; total: number },
   widthMode: 'default' | 'fill' = 'default',
 ): unknown {
-  return card([md(chunkContent)], widthMode, { title: resultChunkHeader(req, pos.index, pos.total), template: 'green' });
+  return card([md(`${header}\n\n${chunkContent}`)], widthMode);
 }
 
 // ---------- 计划多卡（plan 正文与结论同款两段式直发，无特例按钮） ----------
@@ -717,8 +903,8 @@ export function planChunkHeader(req: PlanCardRequest, index: number, total: numb
 }
 
 /**
- * 计划尾卡：计划正文多卡的最后一张——末块正文（蓝色 header 标号 + 正文，纯展示无交互组件；
- * 审批按钮在主进度卡的内嵌 plan 区）。仍走消息卡通道以支持 config.card.width 与头部渲染。
+ * 计划尾卡：计划正文多卡的最后一张——末块正文（标号行 + 正文，v2.0.1 式无彩色 header，
+ * 纯展示无交互组件；审批入口在独立计划确认卡）。仍走消息卡通道以支持 config.card.width。
  */
 export function buildPlanTailCard(
   req: PlanCardRequest,
@@ -726,7 +912,7 @@ export function buildPlanTailCard(
   pos: { index: number; total: number },
   widthMode: 'default' | 'fill' = 'default',
 ): unknown {
-  return card([md(chunkContent)], widthMode, { title: planChunkHeader(req, pos.index, pos.total), template: 'blue' });
+  return card([md(`**${planChunkHeader(req, pos.index, pos.total)}**\n\n${chunkContent}`)], widthMode);
 }
 
 // ---------- 工作区切换卡（裸 /ws）：左按钮右路径一行一工作区，点击即切换，切换后整卡终态 ----------
