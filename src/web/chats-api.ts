@@ -1,4 +1,7 @@
-// 「会话记录」页后端（三接口，全部只读）：树（机器人 → 通道）/ 话题（CC 会话聚合）/ 时间线。
+// 「会话记录」页后端（四接口，全部只读）：机器人下拉（轻量）/ 会话列表（按机器人分页）/ 话题 / 时间线。
+// 下拉与会话列表拆成两个接口（2026-10-28 主人拍板）：先秒出机器人名单（零飞书调用），
+// 选中机器人再按页拉会话——拍平/排序/关键词过滤下沉服务端，群名与真名解析只为「当前页涉及的
+// 通道/用户」执行；前端「加载更多」追加下一页，查询/切机器人一律重查第 1 页最新数据。
 // 数据源全部是 LCB 自有落盘，与记忆增强是否开启完全无关：
 // - transcripts/<appId>/<chatId>/<YYYY-MM-DD>.jsonl：对话全文流水（transcript-writer，按天分文件）
 // - sessions.<appId>.json：每通道话题索引（sessionId + 首条消息摘要，/resume 列表同源）
@@ -249,130 +252,186 @@ function buildDisplayName(
   return { displayName: `${label} ·${chatIdTail(chatId)}`, chatType, nameSource: 'fallback' };
 }
 
-// ============ ① 树：GET /api/chats/tree ============
+// ============ ① 机器人下拉：GET /api/chats/bots ============
 
-/** 「用户+/new」会话条目（一次 /new = 一个 sessionId）：列表页的列表项即此粒度 */
-export interface ChatSessionSummary {
+/** 机器人下拉条目（轻量：仅本地统计，零飞书调用——下拉要秒出） */
+export interface ChatBotEntry {
+  appId: string;
+  name: string;
+  /** 会话总数（sessions.<appId>.json 全通道条数，与会话列表接口 total 同口径） */
+  sessions: number;
+  /** 全库最后活跃时间（会话索引最大 updatedAt；空串=尚无会话索引），前端默认选中用 */
+  lastActiveAt: string;
+}
+
+/** 机器人名单：transcripts 子目录 = 有落盘的机器人（与旧树接口同口径，没数据的机器人不列出来）；
+ *  名称取 config（损坏/缺项退 appId）；只读 sessions.<appId>.json 统计条数与最后活跃 */
+export function chatBots(configPath: string): { bots: ChatBotEntry[] } {
+  let config: BridgeConfig | undefined;
+  try { config = loadConfig(configPath); } catch { /* 配置损坏也照常扫目录：名称退化为 appId */ }
+  const appNames = new Map((config?.apps ?? []).map((a) => [a.appId, a.name || a.appId]));
+  const bots: ChatBotEntry[] = [];
+  for (const appId of listDirs(TRANSCRIPTS_DIR)) {
+    const store = readSessionStore(appId);
+    let sessions = 0;
+    let lastActiveAt = '';
+    for (const st of Object.values(store)) {
+      for (const t of st.sessions ?? []) {
+        if (!t?.sessionId) continue;
+        sessions++;
+        if ((t.updatedAt ?? '') > lastActiveAt) lastActiveAt = t.updatedAt ?? '';
+      }
+    }
+    bots.push({ appId, name: appNames.get(appId) ?? appId, sessions, lastActiveAt });
+  }
+  bots.sort((a, b) => b.lastActiveAt.localeCompare(a.lastActiveAt)); // 最近活跃在前
+  return { bots };
+}
+
+// ============ ② 会话列表（分页）：GET /api/chats/sessions ============
+
+/** 会话列表条目（一次 /new = 一个 sessionId，跨通道拍平）：列表页的列表项即此粒度 */
+export interface ChatSessionEntry {
   sessionId: string;
   /** 首条消息摘要（session-store 口径，取 updatedAt 最新一条）；空则退 sessionId 前 8 位 */
   title: string;
   updatedAt: string;
-  /** 参与用户（channelKey 拆出；同 sessionId 跨用户合并，常态 1 人） */
-  users: Array<{ userId: string; name?: string }>;
-}
-export interface ChatChannelSummary {
   chatId: string;
-  displayName: string;
+  /** 通道显示名（群名/用户名/降级串——列表项副行与详情头部渲染用） */
+  chatName: string;
   /** p2p / group；拉不到时可能为空串 */
   chatType: string;
-  nameSource: 'feishu' | 'access' | 'fallback';
+  /** 参与用户（同 sessionId 跨用户合并，常态 1 人） */
   users: Array<{ userId: string; name?: string }>;
-  /** 有记录的日期（新→旧），前端日期下拉直接用 */
-  dates: string[];
-  lastActiveAt: string;
-  /** 话题数（session-store 口径 = 该通道全部 CC 会话） */
-  topics: number;
-  sizeBytes: number;
-  /** 会话条目（updatedAt 降序）。数据源 = sessions.<appId>.json，树接口本就在读，零新增 IO */
-  sessions: ChatSessionSummary[];
 }
-export interface ChatBotSummary { appId: string; name: string; channels: ChatChannelSummary[] }
+export interface ChatSessionsPage {
+  appId: string;
+  name: string;
+  /** 关键词过滤后的总条数（前端「已全部加载」文案与翻尽判断用） */
+  total: number;
+  page: number;
+  size: number;
+  /** page*size < total ——前端「加载更多」按钮显隐的唯一依据 */
+  hasMore: boolean;
+  /** 当前页切片（updatedAt 降序，同刻按 sessionId 降序——跨页次序稳定，加载更多不重不漏） */
+  sessions: ChatSessionEntry[];
+}
 
-export async function chatsTree(configPath: string): Promise<{ bots: ChatBotSummary[] }> {
-  let config: BridgeConfig | undefined;
-  try { config = loadConfig(configPath); } catch { /* 配置损坏也照常扫目录：显示名退化为 appId */ }
-  const appNames = new Map((config?.apps ?? []).map((a) => [a.appId, a.name || a.appId]));
-  const access = readAccessNames();
-  const bots: ChatBotSummary[] = [];
-  for (const appId of listDirs(TRANSCRIPTS_DIR)) {
-    const store = readSessionStore(appId);
-    // channelKey = `${chatId}:${userId}`（session/channel.ts 口径）→ 按 chatId 聚合用户、话题数与会话条目
-    const usersByChat = new Map<string, string[]>();
-    const topicCountByChat = new Map<string, number>();
-    /** (chatId, sessionId) 聚合：跨 userId 合并、updatedAt 取最新、标题同步取最新一条的摘要（与 chatTopics 同口径） */
-    const sessionsByChat = new Map<string, Map<string, { title: string; updatedAt: string; users: Set<string> }>>();
-    for (const [key, st] of Object.entries(store)) {
-      const i = key.lastIndexOf(':');
-      if (i <= 0) continue;
-      const chatId = key.slice(0, i);
-      const userId = key.slice(i + 1);
-      let arr = usersByChat.get(chatId);
-      if (!arr) usersByChat.set(chatId, arr = []);
-      if (!arr.includes(userId)) arr.push(userId);
-      topicCountByChat.set(chatId, (topicCountByChat.get(chatId) ?? 0) + (st.sessions?.length ?? 0));
-      let bySid = sessionsByChat.get(chatId);
-      if (!bySid) sessionsByChat.set(chatId, bySid = new Map());
-      for (const t of st.sessions ?? []) {
-        if (!t?.sessionId) continue;
-        const cur = bySid.get(t.sessionId);
-        if (cur) {
-          cur.users.add(userId);
-          if ((t.updatedAt ?? '') > cur.updatedAt) {
-            cur.updatedAt = t.updatedAt ?? '';
-            cur.title = t.summary ?? '';
-          }
-        } else {
-          bySid.set(t.sessionId, { title: t.summary ?? '', updatedAt: t.updatedAt ?? '', users: new Set([userId]) });
-        }
-      }
-    }
-    const channels: ChatChannelSummary[] = [];
-    for (const chatId of listDirs(join(TRANSCRIPTS_DIR, appId))) {
-      const dates: string[] = [];
-      let lastActiveMs = 0;
-      let sizeBytes = 0;
-      for (const f of listDateFiles(join(TRANSCRIPTS_DIR, appId, chatId))) {
-        dates.push(f.slice(0, 10));
-        try {
-          const st = statSync(join(TRANSCRIPTS_DIR, appId, chatId, f));
-          lastActiveMs = Math.max(lastActiveMs, st.mtimeMs);
-          sizeBytes += st.size;
-        } catch { /* 文件恰好被清理：跳过 */ }
-      }
-      const users = usersByChat.get(chatId) ?? [];
-      const meta = await fetchChatMeta(appId, chatId);
-      // 发信人真名：飞书通讯录解析为权威，access 仅兜底——合并顺序 feishu 在后（同 key 胜出），
-      // 且 access 里 name===userId 的自指记录（配对时拿不到真名落了原始 id）不参与兜底，
-      // 否则会把飞书真名顶回 ou_ 串（2026-10-17 主人反馈会话页 ou_ 满屏的根因之一）
-      const feishuNames = await fetchUserNames(appId, users);
-      const accessNames = new Map<string, string>();
-      for (const [uid, n] of access) {
-        if (n && n !== uid) accessNames.set(uid, n);
-      }
-      const nameMap = new Map<string, string>([...accessNames, ...feishuNames]);
-      backfillAccessNames([...feishuNames]);
-      const name = buildDisplayName(meta, users, nameMap, chatId);
-      // 会话条目（列表页列表项）：名字复用本通道已解析的 nameMap，无额外飞书调用
-      const sessions: ChatSessionSummary[] = [];
-      for (const [sessionId, v] of sessionsByChat.get(chatId) ?? []) {
-        sessions.push({
-          sessionId,
-          title: v.title || sessionId.slice(0, 8), // 无摘要的历史数据退化为短 id
-          updatedAt: v.updatedAt,
-          users: [...v.users].map((userId) => ({ userId, ...(nameMap.get(userId) ? { name: nameMap.get(userId) } : {}) })),
-        });
-      }
-      sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-      channels.push({
-        chatId,
-        displayName: name.displayName,
-        chatType: name.chatType,
-        nameSource: name.nameSource,
-        users: users.map((userId) => ({ userId, ...(nameMap.get(userId) ? { name: nameMap.get(userId) } : {}) })),
-        dates,
-        lastActiveAt: lastActiveMs ? new Date(lastActiveMs).toISOString() : '',
-        topics: topicCountByChat.get(chatId) ?? 0,
-        sizeBytes,
-        sessions,
-      });
-    }
-    channels.sort((a, b) => b.lastActiveAt.localeCompare(a.lastActiveAt));
-    bots.push({ appId, name: appNames.get(appId) ?? appId, channels });
+const PAGE_SIZE_DEFAULT = 20;
+const PAGE_SIZE_MAX = 100;
+
+/**
+ * 分页会话列表（2026-10-28 主人拍板：不要一次性全量返回，每页 20 条）。
+ * 拍平/排序/关键词过滤/切片全部在服务端完成；群名与真名解析只为当前页涉及的通道与用户执行
+ * （旧树接口是全机器人全通道解析，拆分后下拉秒出 + 单机器人按页拉）。
+ * 关键词匹配 hay：会话标题 + chatId + 用户 id + 磁盘已缓存的群名/人名。缓存未命中的名字
+ * 刻意不触发飞书解析——搜索不该有 API 副作用，名字一旦解析入缓存，下轮搜索自然可命中。
+ */
+export async function chatSessionsPage(
+  configPath: string,
+  appId: string,
+  query: { page?: number; size?: number; kw?: string } = {},
+): Promise<ChatSessionsPage> {
+  const size = Math.min(Math.max(Math.floor(query.size ?? PAGE_SIZE_DEFAULT) || PAGE_SIZE_DEFAULT, 1), PAGE_SIZE_MAX);
+  if (!ID_RE.test(appId)) {
+    // 非法 id（防路径穿越）：空页而非报错（查看器不因坏参数挂掉）
+    return { appId, name: appId, total: 0, page: 1, size, hasMore: false, sessions: [] };
   }
-  return { bots };
+  let config: BridgeConfig | undefined;
+  try { config = loadConfig(configPath); } catch { /* 配置损坏也照常出列表：机器人名退化为 appId */ }
+  const botName = (config?.apps ?? []).find((a) => a.appId === appId)?.name || appId;
+  const kw = (query.kw ?? '').trim().toLowerCase();
+  const emptyOf = (page: number): ChatSessionsPage => ({ appId, name: botName, total: 0, page, size, hasMore: false, sessions: [] });
+
+  // ---- 第一步（纯本地）：sessions.<appId>.json 聚合全部会话 → 关键词过滤 → 排序切片 ----
+  const store = readSessionStore(appId);
+  const access = readAccessNames();
+  /** hay 用到的人名：先吃磁盘缓存（零 API），缓存未命中退 id 匹配；access 自指记录（name===id）不算名字 */
+  const cachedNameOf = (uid: string): string => {
+    const n = getCachedUserName(appId, uid);
+    if (n) return n;
+    const a = access.get(uid);
+    return a && a !== uid ? a : '';
+  };
+  // channelKey = `${chatId}:${userId}`（session/channel.ts 口径）→ (chatId, sessionId) 聚合：
+  // 跨 userId 合并、updatedAt 取最新、标题同步取最新一条摘要（与旧树接口/chatTopics 同口径）
+  type Agg = { title: string; updatedAt: string; users: Set<string> };
+  const byChat = new Map<string, Map<string, Agg>>();
+  const usersByChat = new Map<string, string[]>(); // 通道全部参与用户（显示名降级串「群聊（N人）」用）
+  for (const [key, st] of Object.entries(store)) {
+    const i = key.lastIndexOf(':');
+    if (i <= 0) continue;
+    const chatId = key.slice(0, i);
+    const userId = key.slice(i + 1);
+    let arr = usersByChat.get(chatId);
+    if (!arr) usersByChat.set(chatId, arr = []);
+    if (!arr.includes(userId)) arr.push(userId);
+    let bySid = byChat.get(chatId);
+    if (!bySid) byChat.set(chatId, bySid = new Map());
+    for (const t of st.sessions ?? []) {
+      if (!t?.sessionId) continue;
+      const cur = bySid.get(t.sessionId);
+      if (cur) {
+        cur.users.add(userId);
+        if ((t.updatedAt ?? '') > cur.updatedAt) {
+          cur.updatedAt = t.updatedAt ?? '';
+          cur.title = t.summary ?? '';
+        }
+      } else {
+        bySid.set(t.sessionId, { title: t.summary ?? '', updatedAt: t.updatedAt ?? '', users: new Set([userId]) });
+      }
+    }
+  }
+  type Row = { sessionId: string; title: string; updatedAt: string; chatId: string; users: string[] };
+  const rows: Row[] = [];
+  for (const [chatId, bySid] of byChat) {
+    const chatNameCached = getCachedChatMeta(appId, chatId)?.name ?? '';
+    for (const [sessionId, v] of bySid) {
+      const title = v.title || sessionId.slice(0, 8); // 无摘要的历史数据退化为短 id
+      const users = [...v.users];
+      const hay = `${title} ${chatId} ${users.map((u) => `${u} ${cachedNameOf(u)}`).join(' ')} ${chatNameCached}`.toLowerCase();
+      if (kw && !hay.includes(kw)) continue;
+      rows.push({ sessionId, title, updatedAt: v.updatedAt, chatId, users });
+    }
+  }
+  rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.sessionId.localeCompare(a.sessionId));
+  const total = rows.length;
+  if (!total) return emptyOf(Math.max(1, Math.floor(query.page ?? 1) || 1));
+  const lastPage = Math.max(1, Math.ceil(total / size));
+  const page = Math.min(Math.max(Math.floor(query.page ?? 1) || 1, 1), lastPage); // 越界钳到最后一页
+  const slice = rows.slice((page - 1) * size, page * size);
+
+  // ---- 第二步（只为当前页）：群名/真名解析（缓存优先，未命中才打飞书）+ 显示名组装 ----
+  const pageUsers = [...new Set(slice.flatMap((r) => r.users))];
+  const feishuNames = await fetchUserNames(appId, pageUsers);
+  // 发信人真名：飞书通讯录解析为权威，access 仅兜底——合并顺序 feishu 在后（同 key 胜出）；
+  // access 里 name===userId 的自指记录不参与兜底，否则会把飞书真名顶回 ou_ 串（2026-10-17 主人反馈）
+  const accessNames = new Map<string, string>();
+  for (const [uid, n] of access) {
+    if (n && n !== uid) accessNames.set(uid, n);
+  }
+  const nameMap = new Map<string, string>([...accessNames, ...feishuNames]);
+  backfillAccessNames([...feishuNames]);
+  const metaByChat = new Map<string, ChatMeta | undefined>();
+  for (const chatId of new Set(slice.map((r) => r.chatId))) {
+    metaByChat.set(chatId, await fetchChatMeta(appId, chatId));
+  }
+  const sessions: ChatSessionEntry[] = slice.map((r) => {
+    const dn = buildDisplayName(metaByChat.get(r.chatId), usersByChat.get(r.chatId) ?? [], nameMap, r.chatId);
+    return {
+      sessionId: r.sessionId,
+      title: r.title,
+      updatedAt: r.updatedAt,
+      chatId: r.chatId,
+      chatName: dn.displayName,
+      chatType: dn.chatType,
+      users: r.users.map((userId) => ({ userId, ...(nameMap.get(userId) ? { name: nameMap.get(userId) } : {}) })),
+    };
+  });
+  return { appId, name: botName, total, page, size, hasMore: page * size < total, sessions };
 }
 
-// ============ ② 话题：GET /api/chats/topics ============
+// ============ ③ 话题：GET /api/chats/topics ============
 
 export interface ChatTopicSummary { sessionId: string; title: string; updatedAt: string; users: string[] }
 
@@ -410,7 +469,7 @@ export function chatTopics(appId: string, chatId: string): { topics: ChatTopicSu
   return { topics };
 }
 
-// ============ ③ 时间线：GET /api/chats/timeline ============
+// ============ ④ 时间线：GET /api/chats/timeline ============
 
 export interface ToolStep { ts: string; tool: string; ok?: boolean }
 /** 任务 = 一条飞书消息触发的一次 CC 执行：user 提问 + 流式回复拼接 + 工具步骤 + 收尾状态 */

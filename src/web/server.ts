@@ -33,7 +33,7 @@ import { bridgeStatus, probePortOccupier, resolveLcbEntry, restartBridgeWithHelp
 import { getAutostartStatus, setAutostartEnabled } from './autostart.js';
 import { checkUpdate, hasNewerVersion, installMode, runUpdate } from './update.js';
 import { memoryStatus, testMemoryConnection } from './memory-api.js';
-import { chatsTree, chatTopics, chatTimeline, fetchUserNames } from './chats-api.js';
+import { chatBots, chatSessionsPage, chatTopics, chatTimeline, fetchUserNames } from './chats-api.js';
 import { AccessControl } from '../access/access-control.js';
 import {
   authMeta, authThrottleState, changePassword, clearAuthFailures, clearSessionCookie, createSession,
@@ -518,13 +518,30 @@ async function handle(
       return json(res, 400, { error: e instanceof Error ? e.message : String(e) });
     }
   }
-  // ---- 会话记录（只读查看器）：LCB 本地 transcripts 时间线 + 话题聚合 + 飞书真群名 ----
-  if (path === '/api/chats/tree' && req.method === 'GET') {
+  // ---- 会话记录（只读查看器）：机器人下拉 / 会话列表分页 / 话题聚合 / 时间线 ----
+  // ① 机器人下拉（轻量，零飞书调用）与 ② 会话列表（按机器人分页，每页 20）拆成两个接口：
+  // 先查机器人名单，选中后再按页拉该机器人的会话（2026-10-28 主人拍板）
+  if (path === '/api/chats/bots' && req.method === 'GET') {
     if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先完成 bootstrap 向导' });
     try {
-      return json(res, 200, await chatsTree(ctx.configPath));
+      return json(res, 200, chatBots(ctx.configPath));
     } catch (e) {
-      return json(res, 500, { error: `会话树扫描失败：${e instanceof Error ? e.message : String(e)}` });
+      return json(res, 500, { error: `机器人列表扫描失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }
+  if (path === '/api/chats/sessions' && req.method === 'GET') {
+    if (firstRun) return json(res, 404, { error: '尚无配置文件（首次安装），请先完成 bootstrap 向导' });
+    const q = (k: string) => url.searchParams.get(k) ?? undefined;
+    const page = Number(q('page'));
+    const size = Number(q('size'));
+    try {
+      return json(res, 200, await chatSessionsPage(ctx.configPath, q('app') ?? '', {
+        ...(Number.isFinite(page) && page > 0 ? { page: Math.floor(page) } : {}),
+        ...(Number.isFinite(size) && size > 0 ? { size: Math.floor(size) } : {}),
+        kw: q('kw'),
+      }));
+    } catch (e) {
+      return json(res, 500, { error: `会话列表查询失败：${e instanceof Error ? e.message : String(e)}` });
     }
   }
   if (path === '/api/chats/topics' && req.method === 'GET') {

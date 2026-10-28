@@ -1,20 +1,25 @@
 // ============ 会话 ============
-// LCB 本地聊天时间线只读查看器（「用户+/new」会话维度）：一次 /new = 一个会话条目（sessionId 粒度），
-// 左列表平铺全部会话、按最后活跃时间降序；右内容区的话题/时间/成员由选中会话唯一决定，
-// 只保留关键词定位。后端 /api/chats/*（chats-api.ts）：树（含每通道会话条目）+ 任务时间线，
-// 全部只读、缺数据静默容忍。任务 = 一条飞书消息触发的一次 CC 执行。
-// 搜索过滤只切换列表项显隐、不重建 DOM（兼容中文输入法组合输入）。
+// LCB 本地聊天时间线只读查看器（「用户+/new」会话维度）：一次 /new = 一个会话条目（sessionId 粒度）。
+// 两接口分段加载（2026-10-28 改版）：① /api/chats/bots 秒出机器人下拉（轻量、零飞书调用）→
+// ② /api/chats/sessions 按选中的机器人分页拉会话列表（拍平/排序/关键词过滤在服务端，每页 20 条）：
+// 「查询会话」/切机器人/↻ 刷新一律重查第 1 页最新数据整表替换；底部「加载更多」有下一页才显示，
+// 翻尽后显示「已全部加载」文案。右内容区时间线走 /api/chats/timeline 不变（任务 = 一次 CC 执行）。
+// 列表关键词为查询制（回车/查询按钮才生效，主人定过「不要选一下就搜」），服务端全量过滤。
 import { $, esc, api, toast } from '../core.js';
 import { renderMarkdown } from '../markdown.js';
 
-/** 页面态（切页重进即重置；不做跨页缓存——树接口本身就是目录扫描，量级很轻） */
+/** 页面态（切页重进即重置） */
 const ST = {
-  bots: [],                     // /api/chats/tree
-  app: '', chat: '', session: '', // 当前选中：机器人 + 通道 + 会话（sessionId）
-  sessions: [],                 // 当前机器人的会话条目（拍平 + updatedAt 降序）
+  bots: [],                     // /api/chats/bots（appId/name/sessions/lastActiveAt，下拉用）
+  app: '', name: '',            // 当前机器人 appId 与显示名（sessions 接口回填）
+  chat: '', session: '',        // 当前选中：通道 + 会话（sessionId）
+  sessions: [],                 // 已加载的会话条目（第 1..N 页累积；updatedAt 降序，服务端排好）
+  total: 0, page: 0, hasMore: false, // 分页态：total=过滤后总数；hasMore=false 即「已全部加载」
+  busy: false, busyMore: false, // 重查/加载更多防重入
   nameByUser: {},               // userId → 显示名（access 人名 + 飞书解析名，兜底尾号）
-  kw: '',                       // 关键词（定位对话用；''=不检索）
-  kwHits: [], kwAt: 0,          // 关键词命中的任务索引与当前指向
+  kw: '',                       // 列表关键词（查询制：回车/查询按钮写入，随请求下发服务端过滤）
+  taskKw: '',                   // 详情时间线关键词（「查询」按钮写入，与列表关键词互不相干）
+  kwHits: [], kwAt: 0,          // 详情关键词命中的任务索引与当前指向
   tasks: [], truncated: false, partial: false,
 };
 
@@ -45,7 +50,7 @@ export const page = {
     el.innerHTML = `
     <div class="panel">
       <header class="panel-head"><h3>查询条件</h3>
-        <div class="panel-actions"><span class="dim" style="font-size:11.5px">选择机器人后，左侧列出全部「用户 + /new」会话</span></div></header>
+        <div class="panel-actions"><span class="dim" style="font-size:11.5px">选择机器人后点「查询会话」，每次加载最新 20 条</span></div></header>
       <div class="panel-body">
         <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
           <div><label class="fld">飞书机器人 *</label>
@@ -60,32 +65,26 @@ export const page = {
       <div class="panel" style="margin:0">
         <header class="panel-head"><h3>会话列表</h3>
           <div class="panel-actions"><span class="tag off" id="chCnt"></span></div></header>
-        <div style="padding:10px 12px 8px"><input type="search" id="chQ" placeholder="搜索会话：标题 / 用户 / 群名"></div>
+        <div style="padding:10px 12px 8px"><input type="search" id="chQ" placeholder="搜索会话：标题 / 用户 / 群名（回车查询）"></div>
         <div class="chat-list-panel" id="chList" style="border-top:1px solid var(--border)"></div>
+        <div id="chMore" style="padding:10px 12px;text-align:center"></div>
       </div>
       <div class="panel" style="margin:0;min-height:440px" id="chDetail"></div>
       <div class="chats-boot" id="chBoot" role="status" aria-live="polite">
-        <div class="chats-boot-box"><span class="br-spin-sm" aria-hidden="true"></span><span id="chBootTxt">正在加载会话目录…</span></div>
+        <div class="chats-boot-box"><span class="br-spin-sm" aria-hidden="true"></span><span id="chBootTxt">正在加载机器人列表…</span></div>
       </div>
     </div>`;
-    // 列表搜索实时过滤（旧版缺输入监听、输入时不过滤——本次顺手补上）；IME 组合期间暂停，选词结束再过滤
-    let composing = false;
-    $('#chQ').addEventListener('compositionstart', () => { composing = true; });
-    $('#chQ').addEventListener('compositionend', () => { composing = false; applyFilter(); });
-    $('#chQ').oninput = () => { if (!composing) applyFilter(); };
+    // 列表关键词查询制：回车/「查询会话」统一生效（主人定过「不要选一下就搜」），服务端全量过滤
+    $('#chQ').onkeydown = (e) => { if (e.key === 'Enter') $('#chGo').click(); };
+    // ① 先查机器人下拉（轻量接口，零飞书调用）
     try {
-      const r = await api('GET', '/api/chats/tree');
+      const r = await api('GET', '/api/chats/bots');
       ST.bots = r.bots ?? [];
     } catch (e) {
       hideBoot();
-      $('#chDetail').innerHTML = `<div class="empty" style="margin-top:60px">会话树加载失败：${esc(e.message)}</div>`;
+      $('#chDetail').innerHTML = `<div class="empty" style="margin-top:60px">机器人列表加载失败：${esc(e.message)}</div>`;
       return;
     }
-    // 真名依赖 contact:user.base:readonly 权限：只要还有「未解析的 ou_ 用户」就给出指路提示
-    //（配对过的人名不受影响照常显示；全部解析到真名才隐藏提示）
-    const hasAnonOu = ST.bots.some((b) => b.channels.some((c) => c.users.some((u) => !u.name && /^ou_/i.test(u.userId))));
-    const permHint = $('#chPermHint');
-    if (permHint) permHint.hidden = !hasAnonOu;
     const botSel = $('#chBot');
     botSel.innerHTML = ST.bots.map((b) => `<option value="${esc(b.appId)}">${esc(b.name)}（${esc(b.appId)}）</option>`).join('');
     if (!ST.bots.length) {
@@ -95,56 +94,112 @@ export const page = {
       $('#chGo').disabled = true;
       return;
     }
-    $('#chGo').onclick = () => void openBot(botSel.value);
+    // ② 选中机器人后再查会话列表：切机器人 / 点「查询会话」= 重查第 1 页最新数据
+    $('#chGo').onclick = () => void freshQuery();
     botSel.onchange = () => { $('#chGo').click(); };
-    // 默认选中最近活跃的第一个有会话的机器人，进来即有内容可看
-    const firstBot = ST.bots.find((b) => b.channels.some((c) => c.sessions?.length));
-    if (firstBot) {
-      botSel.value = firstBot.appId;
-      bootStage('正在加载会话详情…');
-      try {
-        await openBot(firstBot.appId);
-      } finally {
-        hideBoot(); // 成功/空态/报错任何出口都撤层，加载层绝不残留
-      }
-    } else {
-      hideBoot();
-      openBot(botSel.value); // 有通道但全部无会话索引（如旧数据）：列表空态兜底
+    // 默认选中最近活跃且第一个有会话的机器人，进来即有内容可看
+    const firstBot = ST.bots.find((b) => b.sessions > 0) ?? ST.bots[0];
+    botSel.value = firstBot.appId;
+    bootStage('正在加载会话列表…');
+    try {
+      await freshQuery();
+    } finally {
+      hideBoot(); // 成功/空态/报错任何出口都撤层，加载层绝不残留
     }
   },
 };
 
-/** 拍平当前机器人的会话条目（跨通道）并按 updatedAt 降序；hay 供列表搜索（标题/用户/群名） */
-function flattenSessions(app) {
-  const bot = ST.bots.find((b) => b.appId === app);
-  if (!bot) return [];
-  const out = [];
-  for (const c of bot.channels) {
-    for (const s of c.sessions ?? []) {
-      out.push({
-        app, chatId: c.chatId, chatName: c.displayName, chatType: c.chatType,
-        sessionId: s.sessionId, title: s.title, updatedAt: s.updatedAt, users: s.users ?? [],
-        hay: `${s.title} ${(s.users ?? []).map((u) => u.name || u.userId).join(' ')} ${c.displayName}`.toLowerCase(),
-      });
-    }
-  }
-  return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+/** 拉一页会话列表（服务端拍平/排序/关键词过滤，每页 20 条） */
+async function fetchPage(p) {
+  const q = new URLSearchParams({ app: ST.app, page: String(p) });
+  if (ST.kw) q.set('kw', ST.kw);
+  return api('GET', `/api/chats/sessions?${q.toString()}`);
 }
 
-/** 切机器人：重拍平会话列表并默认选中最近活跃第一条 */
-async function openBot(app) {
-  ST.app = app;
-  ST.sessions = flattenSessions(app);
-  renderList();
-  const first = ST.sessions[0];
-  if (first) await selectSession(first.chatId, first.sessionId);
-  else renderDetailEmpty();
+/** 重查第 1 页最新数据（「查询会话」/切机器人/进页默认加载共用）：整表替换并默认选中首条；
+ *  opts.keep 用于 ↻ 刷新——当前会话若仍在最新列表里则留在原地，否则落回首条 */
+async function freshQuery(opts = {}) {
+  if (ST.busy) return;
+  ST.busy = true;
+  const keep = opts.keep ?? null;
+  ST.app = $('#chBot')?.value || ST.app;
+  ST.kw = ($('#chQ')?.value || '').trim();
+  ST.page = 1;
+  ST.hasMore = false;
+  // 加载反馈只在底部状态条一处（renderMoreBar('busy')），列表区不再重复挂「加载中」——
+  // 旧列表原样保留到新数据到达（2026-10-28 主人反馈：两处「加载中」重复，删列表区那个）
+  renderMoreBar('busy');
+  try {
+    const r = await fetchPage(1);
+    ST.name = r.name || ST.app;
+    ST.total = r.total ?? 0;
+    ST.page = r.page ?? 1;
+    ST.hasMore = !!r.hasMore;
+    ST.sessions = r.sessions ?? [];
+    refreshPermHint();
+    renderList();
+    const back = keep && ST.sessions.find((s) => s.chatId === keep.chat && s.sessionId === keep.session);
+    if (back) await selectSession(back.chatId, back.sessionId);
+    else if (ST.sessions[0]) await selectSession(ST.sessions[0].chatId, ST.sessions[0].sessionId);
+    else renderDetailEmpty();
+  } catch (e) {
+    $('#chList').innerHTML = `<div class="empty">会话列表加载失败：${esc(e.message)}</div>`;
+    renderDetailEmpty();
+  } finally {
+    ST.busy = false;
+    renderMoreBar();
+  }
+}
+
+/** 「加载更多」：拉下一页追加（不重置选中、不重查已加载数据）；防重入 */
+async function loadMore() {
+  if (!ST.hasMore || ST.busyMore || ST.busy) return;
+  ST.busyMore = true;
+  renderMoreBar('busy');
+  try {
+    const r = await fetchPage(ST.page + 1);
+    ST.name = r.name || ST.app;
+    ST.total = r.total ?? ST.total;
+    ST.page = r.page ?? ST.page;
+    ST.hasMore = !!r.hasMore;
+    ST.sessions.push(...(r.sessions ?? []));
+    refreshPermHint();
+    renderList();
+  } catch (e) {
+    toast(`加载更多失败：${e.message}`, true);
+  } finally {
+    ST.busyMore = false;
+    renderMoreBar();
+  }
+}
+
+/** 列表底部状态：有下一页 → 「加载更多」按钮；翻尽 → 「已全部加载」文案；空列表不渲染 */
+function renderMoreBar(state) {
+  const el = $('#chMore');
+  if (!el) return;
+  if (!ST.total) { el.innerHTML = ''; return; }
+  if (state === 'busy') { el.innerHTML = '<span class="mini-note">加载中…</span>'; return; }
+  if (ST.hasMore) {
+    el.innerHTML = '<button class="btn sm" id="chMoreBtn">加载更多</button>';
+    const b = $('#chMoreBtn');
+    if (b) b.onclick = () => void loadMore();
+  } else {
+    el.innerHTML = `<span class="mini-note">已全部加载，共 ${ST.total} 个会话</span>`;
+  }
+}
+
+/** 真名依赖 contact:user.base:readonly 权限：已加载的会话里还有「未解析的 ou_ 用户」就指路
+ *（分页改版后跟随当前已加载数据判断，不再全树扫描） */
+function refreshPermHint() {
+  const hint = $('#chPermHint');
+  if (!hint) return;
+  hint.hidden = !ST.sessions.some((s) => s.users.some((u) => !u.name && /^ou_/i.test(u.userId)));
 }
 
 async function selectSession(chatId, sessionId) {
   ST.chat = chatId;
   ST.session = sessionId;
-  ST.kw = '';
+  ST.taskKw = '';
   ST.kwHits = [];
   ST.kwAt = 0;
   ST.nameByUser = {};
@@ -179,24 +234,12 @@ function renderList() {
         <div class="c-badges">${typeTag(s.chatType)}</div>
       </div>
     </div>`).join('')
-    || '<div class="empty">暂无会话记录<br><span class="mini-note">该机器人还没有可展示的会话索引（早期落盘数据不含会话边界）。</span></div>';
-  $('#chCnt').textContent = `${ST.sessions.length} 个会话`;
+    || `<div class="empty">${ST.kw ? '没有匹配的会话' : '暂无会话记录'}<br><span class="mini-note">${ST.kw ? '换个关键词，或清空后点「查询会话」重试。' : '该机器人还没有可展示的会话索引（早期落盘数据不含会话边界）。'}</span></div>`;
+  $('#chCnt').textContent = `${ST.sessions.length} / ${ST.total} 个会话`;
   el.querySelectorAll('.chat-obj').forEach((n) => {
     const go = () => void selectSession(ST.sessions[Number(n.dataset.i)].chatId, ST.sessions[Number(n.dataset.i)].sessionId);
     n.onclick = go;
     n.onkeydown = (e) => { if (e.key === 'Enter') go(); };
-  });
-  applyFilter();
-}
-
-/** 搜索过滤：只切换显隐不重建 DOM（兼容中文输入法组合输入）；hay 已含标题/用户/群名 */
-function applyFilter() {
-  const inp = $('#chQ');
-  if (!inp) return;
-  const kw = (inp.value || '').trim().toLowerCase();
-  $('#chList').querySelectorAll('.chat-obj').forEach((n) => {
-    const s = ST.sessions[Number(n.dataset.i)];
-    n.hidden = !!kw && !(s?.hay ?? n.textContent.toLowerCase()).includes(kw);
   });
 }
 
@@ -241,7 +284,6 @@ function renderDetailEmpty() {
 
 function renderDetailSkeleton() {
   const s = curSession();
-  const bot = ST.bots.find((b) => b.appId === ST.app);
   $('#chDetail').innerHTML = `
     <header class="panel-head" style="padding-bottom:12px;border-bottom:1px solid var(--border)">
       <h3 id="chDName"></h3>${typeTag(s?.chatType)}
@@ -276,29 +318,20 @@ function renderDetailSkeleton() {
   $('#chatKw').onkeydown = (e) => { if (e.key === 'Enter') $('#chatGo').click(); };
   $('#kwPrev').onclick = () => { ST.kwAt--; gotoKwHit(); };
   $('#kwNext').onclick = () => { ST.kwAt++; gotoKwHit(); };
-  $('#kwClear').onclick = () => { ST.kw = ''; $('#chatKw').value = ''; renderTimeline(); };
+  $('#kwClear').onclick = () => { ST.taskKw = ''; $('#chatKw').value = ''; renderTimeline(); };
   $('#chatRefresh').onclick = () => void fullRefresh();
 }
 
-/** 刷新 = 重拉树 + 重拍平 + 尽量留在当前会话（不在了就落到最新一条） */
+/** 刷新 = 重查第 1 页最新数据 + 尽量留在当前会话（不在了就落到最新一条） */
 async function fullRefresh() {
-  try {
-    const r = await api('GET', '/api/chats/tree');
-    ST.bots = r.bots ?? [];
-  } catch (e) { toast(`刷新失败：${e.message}`, true); }
-  ST.sessions = flattenSessions(ST.app);
-  const keep = ST.sessions.find((s) => s.chatId === ST.chat && s.sessionId === ST.session);
-  renderList();
-  if (keep) await selectSession(ST.chat, ST.session);
-  else if (ST.sessions[0]) await selectSession(ST.sessions[0].chatId, ST.sessions[0].sessionId);
-  else renderDetailEmpty();
+  await freshQuery({ keep: { chat: ST.chat, session: ST.session } });
 }
 
 async function loadTimeline() {
   const tl = $('#chatTl');
   if (!tl || !ST.session) return;
   // 筛选值以 DOM 现值为准（查询按钮已把关键词写入 DOM；selectSession 流程骨架刚重建）
-  ST.kw = ($('#chatKw')?.value || '').trim();
+  ST.taskKw = ($('#chatKw')?.value || '').trim();
   ST.kwAt = 0;
   tl.innerHTML = '<div class="hint" style="padding:6px 2px">加载中…</div>';
   const p = new URLSearchParams({ app: ST.app, chat: ST.chat, session: ST.session });
@@ -341,7 +374,7 @@ function renderTimeline() {
     fillRange();
     return;
   }
-  const botName = ST.bots.find((b) => b.appId === ST.app)?.name || '机器人';
+  const botName = ST.name || '机器人';
   let html = '';
   let lastDate = '';
   let idx = 0;
@@ -379,12 +412,12 @@ function renderTimeline() {
 
 // ============ 关键词定位：任务级命中 → n/m 计数 + 上下切换 + 滚动定位 ============
 
-/** 渲染后收集命中并跳到第一处（ST.kw 由「查询」写入） */
+/** 渲染后收集命中并跳到第一处（ST.taskKw 由「查询」写入） */
 function bindKwNav(tl) {
   const nav = $('#kwNav');
   if (!nav) return;
   ST.kwHits = [];
-  const kw = (ST.kw || '').toLowerCase();
+  const kw = (ST.taskKw || '').toLowerCase();
   if (kw) {
     ST.tasks.forEach((t, i) => {
       const hay = `${t.prompt || ''}\n${t.reply || ''}\n${(t.tools || []).map((x) => x.tool || '').join('\n')}`.toLowerCase();
@@ -446,7 +479,7 @@ function taskHtml(t, botName, idx) {
       ${meAva}
       <div class="m-body">
         <div class="m-meta" style="justify-content:flex-end">${esc(who)} <span>${esc(fmtTime(t.ts))}</span></div>
-        <div class="m-bubble">${promptHtml(t.prompt, ST.kw)}</div>
+        <div class="m-bubble">${promptHtml(t.prompt, ST.taskKw)}</div>
       </div>
     </div>
     ${tools}
