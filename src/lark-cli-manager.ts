@@ -362,7 +362,7 @@ export type LarkCliAuthState = 'authorized' | 'unauthorized' | 'unknown' | 'expi
 
 export interface LarkCliAuthStatus {
   state: LarkCliAuthState;
-  /** 未授权的原因（error.subtype / message / reason），供 UI 悬浮提示 */
+  /** 未授权的原因（error.subtype / message / reason）；authorized 时可为 needs_refresh 的续期提示 */
   detail?: string;
   /** 已授权时的可读身份（账号名 / 邮箱） */
   identity?: string;
@@ -435,6 +435,25 @@ function parseIdentities(v: unknown): LarkCliAuthStatus | undefined {
   }
   const u = user as Record<string, unknown>;
   if (str(u.status) === 'ready') return { state: 'authorized', identity: pickIdentity(u) };
+  // 实测（2026-10-30）：access token 过期但 refresh token 仍有效时 status="needs_refresh"、
+  // tokenStatus="needs_refresh"、message 含 "needs refresh"——这是**健康待续期**态：
+  // 下一次用户 API 调用会自动刷新（refresh token 7 天滑动窗口，用即续）。
+  // 绝不能落进兜底报 unauthorized——access token 实测仅约 2 小时寿命，误报会让概览页
+  // 在每次授权成功 2 小时后翻回「未授权」，用户被迫反复扫码（2026-10-30 用户实测反馈）。
+  if (
+    str(u.tokenStatus) === 'needs_refresh'
+    || str(u.status) === 'needs_refresh'
+    || /needs refresh/i.test(str(u.message) ?? '')
+  ) {
+    const when = str(u.refreshExpiresAt)?.slice(0, 10); // "2026-11-01T20:47:24+08:00" → 日期段
+    return {
+      state: 'authorized',
+      identity: pickIdentity(u),
+      detail: when
+        ? `用户 token 待自动刷新（refresh token 有效期至 ${when}，下次使用自动续期）`
+        : '用户 token 待自动刷新（下次使用自动续期）',
+    };
+  }
   // 实测（2026-09）：refresh token 失效后 status="missing"、tokenStatus="expired"、
   // message 含 "refresh token expired"——用户曾授权过，与「从未授权」必须区分展示
   const msg = str(u.message);

@@ -47,7 +47,7 @@ import { cleanupClientCliConf, ensureClientCliConf, ensureMemoryServiceRunning, 
 import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
-import { handleCommand, applyWorkspaceSwitch, workspaceListMarkdown } from './session/commands.js';
+import { handleCommand, applyWorkspaceSwitch, workspaceListMarkdown, deputyWorkspacePolicy } from './session/commands.js';
 import { isLocalCommandRewrite, matchTrigger, rewriteByTrigger } from './session/triggers.js';
 import { Semaphore, channelKey } from './session/channel.js';
 import { TranscriptWriter, sweepTranscripts, type TranscriptRecorder } from './transcript/transcript-writer.js';
@@ -470,11 +470,13 @@ export function createBridge(
     // currentWorkspace 语义：store 中已设置的工作区优先，否则 app 默认，最后全局默认——
     // 保证 /new、/status 回复与实际一致。用 || 而非 ??：archiveSession 为新通道建档时
     // workspaceName 存 ''（归档时不知工作区），空串必须回退默认，否则 inventory 键错位。
-    // 分身角色配置了工作区白名单时恒锁首个允许的工作区：命令上下文、inventory 键与任务
-    // wsName 同源锁定，通道 state 旧存的 workspaceName 一律不采信；未配置白名单 =
-    // 权限轴「全给」，与主机器人同规则（state 优先 → app 默认 → 全局默认）
-    const currentWorkspace = app.role === 'deputy' && app.allowedWorkspaces?.length
-      ? app.allowedWorkspaces[0]
+    // 分身（deputy）白名单语义（2026-10-31 改版）：白名单 ≥2 项 = 白名单内可切换（state 中
+    // workspaceName 在允许集合内则采信，越界/空回退集合首项）；1 项 = 锁定恒取首项；
+    // 未配置 = 权限轴「全给」，同样按集合校验 state（防脏数据指向已删除工作区）。
+    // 命令上下文、inventory 键与任务 wsName 同源，与 deputyWorkspacePolicy 判定口径一致
+    const deputyPolicy = app.role === 'deputy' ? deputyWorkspacePolicy(app.allowedWorkspaces, config) : undefined;
+    const currentWorkspace = deputyPolicy
+      ? (deputyPolicy.allow.some((w) => w.name === st?.workspaceName) ? st!.workspaceName! : deputyPolicy.allow[0]!.name)
       : (st?.workspaceName || app.defaultWorkspace || config.defaults.workspace);
     // 2.4 触发词两段式补充（ask_detail）：上一条消息命中「需补充」规则且正在等待时，本条
     // 非 / 消息（同一用户）视作补充内容——与原始消息拼接后对该规则重新改写：补充内容即
@@ -517,6 +519,8 @@ export function createBridge(
       // 连 admin 本人艾特分身也不放行（要用管理命令请找主机器人）
       isAdmin: app.role !== 'deputy' && deps.access.isAdmin(msg.userId),
       isDeputy: app.role === 'deputy',
+      // 分身工作区白名单原样透传（deputyWorkspacePolicy 判定用）；未配置为 undefined = 全给
+      allowedWorkspaces: app.allowedWorkspaces,
       currentWorkspace: () => currentWorkspace,
       getInventory: () => inventories.get(`${app.appId}:${currentWorkspace}`),
       // /mcp 实时拉取：当前工作区有存活 query 才有实时数据（5s 超时），否则回退 init/收尾快照
@@ -1416,24 +1420,31 @@ export function createBridge(
         return { toast: { type: 'info', content: '该提问已被处理或已过期' } };
       }
       // 工作区切换卡（裸 /ws）：无 Promise 挂起——wsPending 提供 admin 校验、stale 失效
-      // 与工作区快照。权限语义与 /ws use 一致是「admin 可切换」而非「仅发起人」：member
-      // 能拿卡看列表，点按钮被拒（卡片保持原样，admin 仍可点），与其它卡的 ownerId 校验刻意不同。
-      // 分身机器人工作区已锁定（allowed_workspaces），切换一律拒绝
+      // 与工作区快照。权限语义与 /ws use 一致而非「仅发起人」：主机器人 admin 可切（member
+      // 能拿卡看列表，点按钮被拒，卡片保持原样，admin 仍可点）；分身白名单内人人可切、
+      // 白名单外一律拒绝——回调时点现调 deputyWorkspacePolicy 实时重校验（防发卡后配置
+      // 热重载白名单缩小/锁定、旧卡仍可点的时序漏洞），与其它卡的 ownerId 校验刻意不同
       const wsc = wsPending.get(action.value.requestId);
       if (wsc) {
-        if (app.role === 'deputy') {
-          return { toast: { type: 'info', content: '分身机器人已锁定工作区，不可切换' } };
+        const deputyPolicy = app.role === 'deputy' ? deputyWorkspacePolicy(app.allowedWorkspaces, config) : undefined;
+        if (deputyPolicy?.locked) {
+          return { toast: { type: 'info', content: '分身机器人工作区已锁定（allowed_workspaces 仅 1 项），不可切换' } };
         }
         if (wsc.stale) {
           return { toast: { type: 'info', content: '该列表已过期，请以最新 /ws 卡片为准' } };
         }
-        if (!deps.access.isAdmin(action.operatorId)) {
+        if (!deputyPolicy && !deps.access.isAdmin(action.operatorId)) {
           console.log(tag, `[卡片回调] 非 admin ${action.operatorId} 点击工作区卡 ${action.value.requestId}，已忽略`);
           return { toast: { type: 'info', content: '切换工作区仅管理员可用' } };
         }
         const target = wsc.workspaces.find((w) => w.name === action.value.ws);
         if (!target) {
           return { toast: { type: 'info', content: '该工作区不存在，请重新发送 /ws' } };
+        }
+        // 白名单外实时拒绝（发卡快照已过滤，此处防热重载后白名单收窄的窗口期）
+        if (deputyPolicy && !deputyPolicy.switchable.some((w) => w.name === target.name)) {
+          console.log(tag, `[卡片回调] 分身白名单外工作区 ${target.name}（${action.operatorId}），已拒绝`);
+          return { toast: { type: 'info', content: '该工作区不在 allowed_workspaces 白名单内，不可切换' } };
         }
         // 当前项判定（disabled 按钮不回调；不支持 disabled 的客户端点当前项时兜底，防冗余
         // 切换清掉续接指针）：实时 workspaceName 优先，跟随默认未显式切换则回退发卡时快照

@@ -637,15 +637,22 @@ details.adv>.adv-body{padding:2px 2px 14px}
 .picked-path .hint{font-size:11.5px;color:var(--mut)}
 
 /* ═══ 会话页（查询条件 + 会话列表 + 消息流） ═══ */
-.chats-layout{display:grid;grid-template-columns:290px minmax(0,1fr);gap:14px;align-items:start;position:relative}
-@media (max-width:1080px){.chats-layout{grid-template-columns:1fr}}
+/* 两栏等高（主人反馈：左右底边一高一低）：grid 默认 stretch 令两栏拉伸等高，面板改纵向 flex、
+   滚动区吃满剩余高度；整栏高度仍由左栏列表 max-height 封顶，页面总长度不变 */
+.chats-layout{display:grid;grid-template-columns:290px minmax(0,1fr);gap:14px;position:relative}
+.chats-layout>.panel{display:flex;flex-direction:column;min-height:0}
+@media (max-width:1080px){.chats-layout{grid-template-columns:1fr}.chats-layout>.panel{display:block}}
 /* 整页加载层：进页初始链路（树→话题→时间线）期间盖住列表+详情区，完成/出错即被 JS 移除 */
 .chats-boot{position:absolute;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;background:var(--boot-veil);-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);animation:fadein .16s ease}
 .chats-boot-box{display:flex;flex-direction:column;align-items:center;color:var(--mut);font-size:12.5px}
-.chat-list-panel{padding:0!important;max-height:calc(100vh - 278px);overflow-y:auto}
+.chat-list-panel{padding:0!important;max-height:calc(100vh - 278px);overflow-y:auto;flex:1 1 auto;min-height:0}
 @media (max-width:1080px){.chat-list-panel{max-height:340px}}
-/* 消息流固定高度滚动（主人反馈 #4c：不随内容无限拉高） */
-.chats-scroll{max-height:calc(100vh - 330px);overflow-y:auto;padding:2px 6px 2px 2px}
+/* 消息流固定高度滚动（主人反馈 #4c：不随内容无限拉高）；上限与左栏列表对齐
+  （原 330 比左栏 278 矮 52px，加上两栏头部结构差，是底部错位 44.7px 的根源） */
+.chats-scroll{max-height:calc(100vh - 285px);overflow-y:auto;padding:2px 6px 2px 2px;flex:1 1 auto;min-height:0}
+/* 右栏详情体纵向 flex：消息流吃满卡片剩余高度（两栏等高的右半边实现）；窄屏堆叠恢复原上限 */
+#chDetail .panel-body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+@media (max-width:1080px){.chats-scroll{max-height:calc(100vh - 330px)}}
 /* 任务块（关键词定位的锚点）：默认透明，命中高亮时描边 */
 .chat-task{padding:4px 6px;border-radius:10px;transition:background .15s}
 .chat-task.kw-active{background:var(--pri-w);outline:1.5px solid var(--pri)}
@@ -693,7 +700,7 @@ mark.kw-mark{background:var(--warn-bg);color:var(--warn-tx);border-radius:3px;pa
 .cmsg .m-full[hidden]{display:none}
 .csum{
   border:1px solid var(--border);border-radius:11px;background:var(--card);
-  padding:11px 14px;margin:10px 0 10px 37px;max-width:min(76%,640px);
+  padding:11px 14px;margin:10px 0 10px 37px;max-width:min(76%,740px);
 }
 .csum-top{display:flex;align-items:center;gap:8px}
 .csum-top b{font-size:13px}

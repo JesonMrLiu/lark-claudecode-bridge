@@ -42,11 +42,14 @@ export interface CommandContext {
   config: BridgeConfig;
   /** 本机器人显示名：多机器人同群/多会话时 /status 需要辨认对谁说话 */
   appName: string;
-  /** member 不能 /ws use 切换工作区（spec 权限分级）；分身机器人（deputy）恒 false——
-   *  管理面（工作区/模型档案/插件）全局共享，分身用户不该触碰，admin 本人在分身里同样不放行 */
+  /** member 不能 /ws use 切换工作区（spec 权限分级）；分身机器人（deputy）不校验 admin——
+   *  白名单内切换对所有用户开放（配置数量即权限开关），白名单外一律拒绝（见 deputyWorkspacePolicy） */
   isAdmin: boolean;
-  /** 分身机器人标记：工作区已锁定（allowed_workspaces），/ws use、/reload-plugins 等直接拒绝 */
+  /** 分身机器人标记：工作区切换走 deputyWorkspacePolicy 白名单判定；/reload-plugins 等管理命令仍直接拒绝 */
   isDeputy?: boolean;
+  /** 分身工作区白名单（apps[].allowed_workspaces 原样透传）。undefined = 未配置（权限轴全给）；
+   *  仅 isDeputy 时消费，主机器人忽略 */
+  allowedWorkspaces?: readonly string[];
   currentWorkspace(): string;
   stopCurrentTask(): boolean;
   /** 本 app 当前工作区最近一次会话的加载清单（SDK init 消息缓存）；尚无会话时 undefined */
@@ -109,6 +112,34 @@ function tail(items: string[]): string {
 }
 
 /**
+ * 分身（deputy）工作区白名单判定（/ws 文本命令与 index.ts 卡片回调、currentWorkspace 计算共用，
+ * 防三处漂移）。白名单语义（2026-10-31 改版，替代旧「恒锁首项」）：
+ * - 未配置 / 空数组 = 权限轴「全给」：全部已配置工作区可切换（与 R2 写根 index.ts securityGuard 一致）
+ * - 配置 1 项 = 锁定：无可切换项（配置数量即禁切开关），/ws 出锁定文本不出卡
+ * - 配置 ≥2 项 = 仅白名单内可切换，白名单外一律拒绝
+ * 主机器人（primary）不走此函数——权限走 isAdmin。
+ * allow 中的名字经 config.workspaces 映射（config.ts 启动/加载时已校验拼写；此处 filter 兜底
+ * 清单变动，参照 /new 对 store 工作区名的防御式处理），顺序保持白名单声明序。
+ */
+export interface DeputyWorkspacePolicy {
+  /** true = 白名单锁定（有效可切工作区 ≤1），/ws 出锁定文本、切换一律拒绝 */
+  locked: boolean;
+  /** 允许（展示/驻留）的工作区全集：currentWorkspace 越界回退取 allow[0] */
+  allow: Workspace[];
+  /** 可切换子集：卡片列出与 /ws use、卡片回调的实时校验均以此为准；locked 时为空数组 */
+  switchable: Workspace[];
+}
+
+export function deputyWorkspacePolicy(allowed: readonly string[] | undefined, config: BridgeConfig): DeputyWorkspacePolicy {
+  const byName = new Map(config.workspaces.map((w) => [w.name, w]));
+  const allow = (allowed && allowed.length > 0 ? allowed : config.workspaces.map((w) => w.name))
+    .map((n) => byName.get(n))
+    .filter((w): w is Workspace => Boolean(w));
+  const locked = allow.length <= 1;
+  return { locked, allow, switchable: locked ? [] : allow };
+}
+
+/**
  * 切换工作区落盘语义（/ws use 文本命令与 /ws 卡片按钮回调共用，防两处漂移）：
  * 保留历史会话记录与通道级 model/planMode 偏好，但清除续接指针——旧会话的上下文
  * 绑定原工作区目录，跨工作区自动续接容易答非所问
@@ -165,7 +196,7 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
       return {
         handled: true,
         pointerTouched: true,
-        reply: `✅ 已开启新会话（工作区：${ws}${wsPath ? `，路径 ${wsPath}` : ''}）。历史会话未清空，/resume 可随时切回`,
+        reply: `✅ 已开启新会话（工作区：${ws}${wsPath ? `，路径 ${wsPath}` : ''}）`,
       };
     }
     case 'resume': {
@@ -245,32 +276,39 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
     }
     case 'ws': {
       const sub = args[0];
+      // 分身白名单判定（主机器人 undefined——权限走 isAdmin，不走白名单）
+      const deputy = ctx.isDeputy ? deputyWorkspacePolicy(ctx.allowedWorkspaces, ctx.config) : undefined;
       if (!sub) {
-        // 分身机器人工作区恒锁定（allowed_workspaces），卡片上全是点了必拒的按钮，不如直接回文本
-        if (ctx.isDeputy) {
-          return { handled: true, reply: `⛔ 分身机器人已锁定工作区：**${ctx.currentWorkspace()}**（allowed_workspaces），不可切换。` };
+        // 白名单锁定（≤1 项）：卡片上全是点了必拒/必同项的按钮，不如直接回文本
+        if (deputy?.locked) {
+          return { handled: true, reply: `⛔ 分身机器人工作区已锁定：**${ctx.currentWorkspace()}**（allowed_workspaces 仅 1 项，不可切换）。` };
         }
-        // 裸 /ws：卡片列出全部工作区，点击工作区名直接切换。
-        // 权限校验放回调时点（admin 可切、member 看卡被拒），与 /ws use 的语义一致
+        // 裸 /ws：卡片列出可切换工作区（分身 = 白名单子集 / 未配置白名单 = 全部；主机器人 = 全部），
+        // 点击工作区名直接切换。权限校验放回调时点（主机器人 admin 可切、member 看卡被拒；
+        // 分身白名单内人人可切），与 /ws use 的语义一致
         const requestId = randomUUID();
         return {
           handled: true,
           cardRequestId: requestId,
           card: buildWorkspaceCard(
-            { requestId, workspaces: ctx.config.workspaces, currentName: ctx.currentWorkspace() },
+            { requestId, workspaces: deputy ? deputy.switchable : ctx.config.workspaces, currentName: ctx.currentWorkspace() },
             ctx.config.card?.width ?? 'default',
           ),
         };
       }
       if (sub === 'list') {
-        const list = workspaceListMarkdown(ctx.config.workspaces, ctx.currentWorkspace());
+        if (deputy?.locked) return { handled: true, reply: `**工作区列表**\n- **${ctx.currentWorkspace()}**（已锁定，allowed_workspaces 仅 1 项）` };
+        const list = workspaceListMarkdown(deputy ? deputy.switchable : ctx.config.workspaces, ctx.currentWorkspace());
         return { handled: true, reply: `**工作区列表**\n${list}` };
       }
       if (sub === 'use') {
-        if (ctx.isDeputy) return { handled: true, reply: '⛔ 分身机器人已锁定工作区（allowed_workspaces），不可切换；如需变更请修改 config.yaml' };
-        if (!ctx.isAdmin) return { handled: true, reply: '⛔ 切换工作区仅管理员可用' };
-        const target = ctx.config.workspaces.find((w) => w.name === args[1]);
-        if (!target) return { handled: true, reply: `工作区 "${args[1] ?? ''}" 不存在，/ws 查看` };
+        if (deputy?.locked) return { handled: true, reply: '⛔ 分身机器人工作区已锁定（allowed_workspaces 仅 1 项），不可切换' };
+        // 主机器人维持 admin 权限分级；分身白名单内人人可切（①A）
+        if (!deputy && !ctx.isAdmin) return { handled: true, reply: '⛔ 切换工作区仅管理员可用' };
+        const candidates = deputy ? deputy.switchable : ctx.config.workspaces;
+        const target = candidates.find((w) => w.name === args[1]);
+        // 分身与主机器人共用统一话术：不区分「不存在」与「白名单外」，不解释保护对象
+        if (!target) return { handled: true, reply: `工作区 "${args[1] ?? ''}" 不存在或不在允许切换的范围内，/ws 查看` };
         applyWorkspaceSwitch(store, key, target);
         return { handled: true, pointerTouched: true, reply: `✅ 已切换工作区：**${target.name}**（${target.path}）。已自动开启新会话（/resume 可切回历史）` };
       }

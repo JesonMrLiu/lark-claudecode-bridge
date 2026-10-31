@@ -50,14 +50,14 @@ export const page = {
     el.innerHTML = `
     <div class="panel">
       <header class="panel-head"><h3>查询条件</h3>
-        <div class="panel-actions"><span class="dim" style="font-size:11.5px">选择机器人后点「查询会话」，每次加载最新 20 条</span></div></header>
+        <!--<div class="panel-actions"><span class="dim" style="font-size:11.5px">选择机器人后点「查询会话」，每次加载最新 20 条</span></div>--></header>
       <div class="panel-body">
         <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
           <div><label class="fld">飞书机器人 *</label>
             <select id="chBot" style="width:220px"></select></div>
           <button class="btn primary" id="chGo">${svg(IC.search, 13)} 查询会话</button>
         </div>
-        <div class="mini-note" style="margin-top:8px">记录落盘于 <code>~/.lark-claudecode-bridge/transcripts/</code>；列表按会话最后活跃时间降序，点进即看该会话跨天全部消息。</div>
+        <div class="mini-note" style="margin-top:8px"><!--记录落盘于 <code>~/.lark-claudecode-bridge/transcripts/</code>；-->列表按会话最后活跃时间降序，点进即看该会话跨天全部消息。</div>
         <div class="mini-note" id="chPermHint" hidden style="margin-top:4px;color:var(--warn-tx)">ⓘ 当前显示为飞书 ID（ou_…）：请在飞书开放平台为对应机器人应用开通「获取用户基本信息」（contact:user.base:readonly）权限并发布版本；开通后约 10 分钟内自动恢复真名，无须重启。</div>
       </div>
     </div>
