@@ -3,7 +3,9 @@
 // - 进页即锁：每次进入配置页（刷新/新开标签）都要输入密码，服务端会话放行 API（会话已持久化，
 //   桥接器重启后会话延续，重启轮询/刷新不再被 401 拦截；手动锁屏/登出仍即时吊销）
 // - 默认密码 123456；解锁响应带 isDefault，仍为默认密码时每次登录弹「修改默认密码」引导
-// - 无操作自动锁屏：lockMinutes 分钟（服务端 webauth.json，默认 30 分钟；0=永不），双端同步过期
+// - 无操作自动锁屏：lockMinutes 分钟（服务端 webauth.json，默认 30 分钟；0=永不），双端同步过期。
+//   「操作」= 鼠标键盘交互 或 本页 API 成功响应（与服务端滑动续期同语义，2026-11-01 起），
+//   且经 localStorage 心跳跨标签页共享——后台标签页不再误吊销前台正在使用的会话
 // - 恢复初始密码两条路：本弹窗（验当前密码）/ 本机终端 `lcb reset-password`（忘记密码兜底）
 // - 密文落盘在服务端（webauth.json 只存 salt+md5），前端全程不接触哈希
 import { $, api, toast, hooks } from './core.js';
@@ -17,6 +19,32 @@ export const AUTH = {
   lastActive: Date.now(),
   enteredPwd: '', // 本次解锁所输密码（仅内存）：引导改密时作为「当前密码」提交，免重复输入
 };
+
+// ---- 全局活跃心跳（localStorage 跨标签页共享）----
+// 「无操作」必须是浏览器级的，不是单标签页级的：此前各标签页只记自己的 lastActive，
+// 后台标签页看门狗到点即 lockPage——而 lockPage 会调 /api/auth/logout 吊销全局会话，
+// 把前台正在活跃使用的其他标签页一起踢下线（用户视角：我明明一直在用，突然要解锁）。
+// 现在活跃时写心跳、判定读全局最新值：任意标签页有活动 ⇒ 所有标签页都不锁。
+const LS_ACTIVE_KEY = 'lcb.lastActive';
+let lastBeatAt = 0;
+
+/** 记录一次活跃：刷新本页时间戳 + 节流写全局心跳（mousemove 高频，5s 一次足够） */
+function beatActivity(force = false) {
+  const now = Date.now();
+  AUTH.lastActive = now;
+  if (!force && now - lastBeatAt < 5000) return;
+  lastBeatAt = now;
+  try { localStorage.setItem(LS_ACTIVE_KEY, String(now)); } catch { /* 隐私模式/file:// 下不可用：退化为本页判定 */ }
+}
+
+/** 全局最近活跃时刻：本页时间戳与共享心跳取新（读不到/异常 → 退化为本页时间戳） */
+function globalLastActive() {
+  try {
+    const t = Number(localStorage.getItem(LS_ACTIVE_KEY));
+    if (Number.isFinite(t) && t > 0) return Math.max(AUTH.lastActive, t);
+  } catch { /* 同上 */ }
+  return AUTH.lastActive;
+}
 
 const minsText = (m) => (m >= 60 ? `${m / 60} 小时` : `${m} 分钟`);
 const svg = (inner, s = 15) => `<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
@@ -44,10 +72,11 @@ export function lockPage() {
 /** 无操作超时判定 + 锁屏：供活跃事件/看门狗 tick/页面回前台共用。
  * 返回是否已触发锁屏。核心修复：判定必须在「刷新 lastActive」之前做——
  * 否则后台标签页/睡眠唤醒后回来的第一个交互会先把 lastActive 刷成「刚刚」，
- * 看门狗永远判不超时 → 遮罩不出现，而服务端会话早已过期 → 僵尸态（页面正常但数据全 401） */
+ * 看门狗永远判不超时 → 遮罩不出现，而服务端会话早已过期 → 僵尸态（页面正常但数据全 401）。
+ * 判定基线是全局活跃（globalLastActive 跨标签页）：其他标签页正在用 ⇒ 本页不锁、不吊销会话 */
 function checkIdle() {
   if (!AUTH.unlocked || !AUTH.lockMinutes) return false;
-  if (Date.now() - AUTH.lastActive <= AUTH.lockMinutes * 60000) return false;
+  if (Date.now() - globalLastActive() <= AUTH.lockMinutes * 60000) return false;
   lockPage();
   toast('已因长时间无操作自动锁屏，请重新输入密码', true);
   return true;
@@ -59,7 +88,7 @@ async function finishUnlock(meta, via) {
   AUTH.everUnlocked = true;
   AUTH.isDefault = !!meta.isDefault;
   AUTH.lockMinutes = Number(meta.lockMinutes) || 0;
-  AUTH.lastActive = Date.now();
+  beatActivity(true); // 解锁即全局活跃（force 越过节流）：其他标签页的看门狗立即知晓
   $('#lockMask').hidden = true;
   $('#lockBtn').hidden = false;
   $('#settingsBtn').hidden = false;
@@ -191,7 +220,7 @@ export async function openSettingsModal() {
     try {
       await api('PUT', '/api/auth/settings', { lockMinutes: v });
       AUTH.lockMinutes = v;
-      AUTH.lastActive = Date.now();
+      beatActivity(true); // 改完设置重置计时（force 越过节流，全标签页同步）
       closeModal();
       toast(v ? `✅ 已设置：无操作 ${minsText(v)} 后自动锁屏` : '✅ 已关闭自动锁屏');
     } catch (e) { toast(e.message, true); }
@@ -208,10 +237,16 @@ export function initAuth({ onUnlock }) {
   $('#lockBtn').innerHTML = svg(IC_LOCK, 14);
   $('#settingsBtn').onclick = () => void openSettingsModal();
   $('#lockBtn').onclick = () => { lockPage(); toast('已锁定，输入密码可重新进入'); };
-  // 无操作看门狗：任意交互先判超时（超时即锁屏，且本次不记活跃），否则刷新 lastActive。
+  // 无操作看门狗：任意交互先判超时（超时即锁屏，且本次不记活跃），否则记一次全局活跃。
   // 「先判后记」是关键：睡眠/后台标签页节流期间 tick 停摆，回来第一个交互必须先补一次判定
   ['mousemove', 'keydown', 'click', 'wheel', 'touchstart'].forEach((ev) =>
-    document.addEventListener(ev, () => { if (!checkIdle()) AUTH.lastActive = Date.now(); }, { passive: true }));
+    document.addEventListener(ev, () => { if (!checkIdle()) beatActivity(); }, { passive: true }));
+  // API 活动也计入「使用」：页面自动轮询/数据自动刷新（概览 5s、设备 2s 等）说明用户正盯着
+  // 页面工作——只认鼠标键盘会误伤「看板模式」（放着看进度 30 分钟即被锁，主人 2026-11-01 反馈）。
+  // 此语义与服务端滑动续期（任何 /api/* 都续会话）完全一致，双端不再有「会话还活着、页面却锁了」
+  // 的错位。代价：人走开但轮询页挂着时锁屏不触发——手动 🔒 与「永不」档位仍在，且内网他人
+  // 新开页面仍要密码（主威胁模型不变）。仅本页已解锁时记：锁屏中的 401/重试不算活跃
+  hooks.onApiActivity = () => { if (AUTH.unlocked) beatActivity(); };
   // 切回标签页 / 窗口聚焦时立即判定：不等被浏览器节流的 tick（后台页定时器可迟至 1 次/分钟）
   document.addEventListener('visibilitychange', () => { if (!document.hidden) checkIdle(); });
   window.addEventListener('focus', checkIdle);

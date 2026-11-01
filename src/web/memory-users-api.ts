@@ -21,11 +21,12 @@ import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import type { BridgeConfig, MemoryConfig } from '../types.js';
 import { MANAGED_OV_CONF, MEMORY_MANAGED_DIR } from '../memory-installer.js';
-import { DEFAULT_MEMORY_ACCOUNT, isValidUserId, memoryAccount, memoryEndpoint, ensureRemoteAccount, probeMemoryHealth } from '../memory.js';
+import { DEFAULT_MEMORY_ACCOUNT, WEB_USER_ID, DEFAULT_MEMORY_UID, isValidUserId, memoryAccount, memoryEndpoint, ensureRemoteAccount, probeMemoryHealth, resolveMemoryUid } from '../memory.js';
 import { maskSecret } from './config-api.js';
 
-/** 网页管理端用户约定 uid（方案 §四 阶段 3：{"user_id":"web"}） */
-export const WEB_USER_ID = 'web';
+/** 网页管理端用户约定 uid（方案 §四 阶段 3：{"user_id":"web"}）——定义移至 memory.ts
+ *  （resolveMemoryUid 的管理面守卫单源），此处 re-export 保持既有引用路径不变 */
+export { WEB_USER_ID };
 /** 密钥保险库（uid → base64(DPAPI(plain))；DPAPI CurrentUser 域绑定，换机/换账户不可解密） */
 const VAULT_FILE = join(MEMORY_MANAGED_DIR, 'user-keys.vault.json');
 /** 审计日志（JSONL 追加；查看/重置/删除/初始化留痕，方案 §六「管理员每次查看行为留痕」） */
@@ -294,13 +295,16 @@ export async function listMemoryUsers(config: BridgeConfig): Promise<MemoryUsers
   }
   const rawUsers = (Array.isArray(r.json.result) ? r.json.result : []) as Array<{ user_id?: string; role?: string; api_key?: string }>;
   const botNames = new Map(config.apps.map((a) => [a.appId, a.name] as const));
+  // 机器人侧生效身份集合（缺省共享 main / 显式映射 uid）：命中即算 bot 身份——
+  // 缺省口径下所有 bot 收敛到同一个 uid，不能再按「uid===appId」判断归属
+  const botUids = new Set(config.apps.map((a) => (config.memory ? resolveMemoryUid(config.memory, a.appId) : DEFAULT_MEMORY_UID)));
   const rows: MemoryUserRow[] = [];
   for (const u of rawUsers) {
     const uid = String(u.user_id ?? '');
     if (!uid) continue;
     // 保险库自愈：列表明文回带的 api_key 刷入保险库（DPAPI 重加密）——重装/换 Key 后无须重初始化
     if (typeof u.api_key === 'string' && u.api_key) await vaultStore(uid, u.api_key);
-    const kind: MemoryUserRow['kind'] = uid === WEB_USER_ID ? 'web' : botNames.has(uid) ? 'bot' : 'other';
+    const kind: MemoryUserRow['kind'] = uid === WEB_USER_ID ? 'web' : botNames.has(uid) || botUids.has(uid) ? 'bot' : 'other';
     // 聊天者维度（历史复合 ID：{appId}-{ou_xxx}，插件旧口径创建）：前缀归属到对应飞书应用，
     // 页面显示「<应用名> · 聊天者」——OpenViking 无显示名字段（user_id 仅 ASCII），1933 右上角
     // 只能显示技术 ID，人可读对照以本列表为准
@@ -340,7 +344,7 @@ export interface InitOutcome {
   detail: string;
 }
 
-/** 一键初始化（方案 §六：建 web 用户 + 各 bot 用户 → 签 key → 加密落盘）。幂等可重跑：
+/** 一键初始化（方案 §六：建 web 用户 + 各 bot 生效身份用户（缺省共享 main）→ 签 key → 加密落盘）。幂等可重跑：
  *  已存在用户由列表自愈回读 key（创建响应的 user_key 只出现一次，但 api_key 模式列表可回带）。
  *  dev 模式 / 服务不可达：直接说明，不视为失败动作。 */
 export async function initMemoryUsers(config: BridgeConfig): Promise<InitOutcome> {
@@ -368,8 +372,9 @@ export async function initMemoryUsers(config: BridgeConfig): Promise<InitOutcome
       detail: '请核对 config.yaml 的 memory.account（缺省 default）是否与服务端账号一致',
     };
   }
-  // 期望用户：web + 每个 bot（appId 即 OpenViking 侧 user_id，与 ensureMemoryUserKeys 签发口径一致）
-  const desired = [WEB_USER_ID, ...config.apps.map((a) => a.appId)];
+  // 期望用户：web + 各 bot 解析后的生效身份去重（缺省全体 bot 收敛到共享 main——不再按 appId
+  // 每应用建一个用户；显式映射的 uid 同样在此列，与 ensureMemoryUserKeys 签发口径一致）
+  const desired = [WEB_USER_ID, ...new Set(config.apps.map((a) => resolveMemoryUid(memory, a.appId)))];
   // 先列表自愈：已存在用户的 key 直接刷保险库（避免对已存在用户重复创建撞 409）
   const listR = await adminCall(memory, rootKey, 'GET', adminPath(memory, '/users'));
   const known = new Set<string>();

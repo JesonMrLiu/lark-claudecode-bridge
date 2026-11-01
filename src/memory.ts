@@ -28,6 +28,15 @@ export const DEFAULT_MEMORY_ENDPOINT = 'http://127.0.0.1:1933';
  *  服务端初始化后固定存在 default 账号，故以此为缺省 */
 export const DEFAULT_MEMORY_ACCOUNT = 'default';
 
+/** 网页管理端约定 uid（方案 §四 阶段 3：{"user_id":"web"}）。定义在 memory.ts（resolveMemoryUid
+ *  要对它做「管理面身份不参与映射」守卫），memory-users-api.ts re-export 保持既有引用路径 */
+export const WEB_USER_ID = 'web';
+
+/** 未显式关联（identityMap 无条目）时机器人的缺省记忆身份：全体 bot 共享同一 OpenViking 用户
+ *  「main」——多台机器人天然共用一份记忆（互相可见、互相沉淀），且不会每个飞书应用都建一个
+ *  cli_xxx 用户。需要隔离时在配置页把某台机器人显式关联到其他用户即可（identityMap 优先级更高） */
+export const DEFAULT_MEMORY_UID = 'main';
+
 /** memory 段的生效账号（缺省 DEFAULT_MEMORY_ACCOUNT；显式配置优先） */
 export function memoryAccount(memory: Pick<MemoryConfig, 'account'>): string {
   return memory.account?.trim() || DEFAULT_MEMORY_ACCOUNT;
@@ -41,14 +50,17 @@ export function memoryEndpoint(memory: Pick<MemoryConfig, 'endpoint'>): string {
 
 /**
  * 机器人生效的记忆身份（OpenViking user_id，identityMap 解析的唯一真相）：
- * - identityMap 显式条目（非空白）→ 映射 uid（共享记忆 = 多台机器人映射同一 uid）
- * - 无条目 → 专属用户（uid 即 appId，历史口径，现有部署零迁移零行为变化）
+ * - web（管理面固定身份）→ 恒为 'web'，不参与映射（网页端不是机器人，永远用自己的用户）
+ * - identityMap 显式条目（非空白）→ 映射 uid（多台机器人映射同一 uid = 共享记忆）
+ * - 无条目 → 缺省共享用户 main（DEFAULT_MEMORY_UID）——全体 bot 天然共用一份记忆，
+ *   不再按 appId 各建专属用户
  * 纯函数：memoryEnvFor / ensureMemoryUserKeys / namespacesFor / 配置页关联卡共用同一解析，
  * 保证「签发谁、下发谁的 key、env 身份轴、页面展示」四处口径永远一致。
  */
 export function resolveMemoryUid(memory: Pick<MemoryConfig, 'identityMap'>, appId: string): string {
+  if (appId === WEB_USER_ID) return WEB_USER_ID;
   const mapped = memory.identityMap?.[appId]?.trim();
-  return mapped || appId;
+  return mapped || DEFAULT_MEMORY_UID;
 }
 
 /** OpenViking user_id 合法性（路径安全 + uid 口径）：字母数字下划线连字符，≤128。
@@ -63,11 +75,11 @@ export function isValidUserId(uid: string): boolean {
  * memory.enabled 时的 ns env 下发（§6.4/§6.6）——返回值由调用方以「保留既有值」方式并入
  * taskEnv（apps[].env 手配 OPENVIKING_* = 专家覆盖口，优先级最高）。键语义：
  * - OPENVIKING_ACCOUNT：账号轴（全局），缺省 lcb
- * - OPENVIKING_USER：用户轴**每条消息拼装**，按 identityMap 分两态：
- *   ① 无显式映射（uid = appId，历史缺省）→ {appId}-{userId}，群聊按人隔离（deputy 的 appId
- *      天然不同于主 bot——「分身有自己的记忆、永不读主人记忆」的实现点，行为与历史版本一致）
- *   ② 显式映射（共享/指定身份）→ 固定为映射 uid，**不带 userId 后缀**：共享身份必须是稳定
- *      单一身份（多台机器人读写同一 ns），与 api_key 模式下 key 自带的身份严格一致
+ * - OPENVIKING_USER：用户轴**每条消息拼装**，恒为生效身份 uid（resolveMemoryUid 解析值）：
+ *   ① 缺省（无显式映射）→ 共享用户 main——全体 bot 共用一份记忆（多台机器人关联同一身份
+ *      即共享记忆的缺省形态），与 api_key 模式下 key 自带的身份严格一致
+ *   ② 显式映射（隔离/指定身份）→ 固定为映射 uid：共享身份必须是稳定单一身份（多台机器人
+ *      读写同一 ns），不带任何 per-chat 后缀
  * - OPENVIKING_API_KEY：连接 key。api_key 模式 = 该 bot 关联身份的 user key（userKeys 缓存
  *   按 appId 索引、值为映射 uid 的 key，共享者值重复；root key 永不下发子进程）；
  *   dev 模式无 key（身份经 header 隔离）
@@ -94,7 +106,7 @@ export function memoryEnvFor(
     OPENVIKING_URL: memoryEndpoint(memory),
   };
   const uid = resolveMemoryUid(memory, appId);
-  if (userId) env.OPENVIKING_USER = uid === appId ? `${appId}-${userId}` : uid;
+  if (userId) env.OPENVIKING_USER = uid;
   const key = userKeys?.get(appId);
   if (key) env.OPENVIKING_API_KEY = key;
   return env;
@@ -203,11 +215,8 @@ export function createMemoryProvider(config: BridgeConfigLike, userKeys: Readonl
       : Promise.resolve({ healthy: false, detail: 'memory 段未开启' })),
     namespacesFor: (appId: string) => ({
       account: config.memory ? memoryAccount(config.memory) : DEFAULT_MEMORY_ACCOUNT,
-      // 缺省（uid=appId）沿用历史「appId-」前缀口径（ns 矩阵还展示 per-chat 后缀拼法）；
-      // 显式映射 → 身份轴即映射 uid（无 per-chat 维度，与 env 下发严格一致）
-      userPrefix: config.memory && resolveMemoryUid(config.memory, appId) !== appId
-        ? resolveMemoryUid(config.memory, appId)
-        : `${appId}-`,
+      // 身份轴恒为生效 uid（缺省共享 main / 显式映射 uid），与 env 下发严格一致
+      userPrefix: config.memory ? resolveMemoryUid(config.memory, appId) : DEFAULT_MEMORY_UID,
     }),
     userKeys: () => userKeys,
     bindEnsureFreshKeys: (fn) => { ensureFn = fn; },
@@ -239,8 +248,8 @@ export interface MemoryKeyOutcome {
  *   POST /api/v1/admin/accounts/{account}/users 签发
  * - **按 distinct 映射后 uid 签发**（resolveMemoryUid）：共享身份只签/重签一次，结果按 appId
  *   展开回填（值重复）——index.ts 的 userKeys 缓存口径（Map<appId, key>）保持不变
- * - 缺失用户自动创建：signOneUserKey 的首路径就是 POST 创建（409 才走重签），故 identityMap
- *   指向的新共享 uid / 新增 bot 的专属用户在签发时即自动建成，无须单独初始化
+ * - 缺失用户自动创建：signOneUserKey 的首路径就是 POST 创建（409 才走重签），故缺省共享
+ *   main / identityMap 指向的新共享 uid 在签发时即自动建成，无须单独初始化
  * - 失败不抛出（逐 uid 记 error）：记忆不可用不应阻断机器人服务，与插件发现的容错基调一致
  *
  * OpenViking 0.5.0 实弹实测（探针：创建→重复→重签→列表→删除，全绿）修正了三条旧假设：

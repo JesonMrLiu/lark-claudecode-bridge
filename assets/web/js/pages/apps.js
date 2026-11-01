@@ -66,6 +66,20 @@ export function toProfileModelOptions(prof) {
   return models.map((m) => ({ value: m, tag: m === prof.model ? '默认' : '' }));
 }
 
+// ---- 常用触发词预置（飞书机器人菜单场景：中文菜单词 → bridge 本地命令，见 config.example.yaml） ----
+const DEFAULT_TRIGGERS = [
+  { match: '新会话', rewrite: '/new' },
+  { match: '结束会话', rewrite: '/stop' },
+  { match: '历史会话', rewrite: '/resume' },
+  { match: '切换工作区', rewrite: '/ws' },
+];
+/** 纯函数（可测）：已有规则中缺失的常用触发词（按 match 去重——首词命中即生效，重复 match 无意义；
+ *  已有行 match 为空（半填行）不参与比对）。返回可一次性追加的规则数组（副本，改写不影响常量） */
+export function mergeDefaultTriggers(existing) {
+  const have = new Set((existing || []).map((t) => String(t?.match ?? '').trim()).filter(Boolean));
+  return DEFAULT_TRIGGERS.filter((d) => !have.has(d.match)).map((d) => ({ ...d }));
+}
+
 const CAND = { at: 0, skills: null, plugins: null, skillsError: '', pluginsError: '', inflight: null };
 const CAND_TTL = 60_000;
 /** 拉候选（失败时保留旧缓存继续用；全新失败返回 error 字段，组件空候选但已选值不受影响） */
@@ -237,7 +251,10 @@ function openAppDrawer(apps, idx, snap) {
     <div class="banner info" style="margin-bottom:10px"><span>命中即改写消息后入队；<code>{text}</code>=原文，<code>{args}</code>=首词后的参数。match 以 <code>/</code> 开头或关键词 = 消息首词精确匹配；可指向 bridge 本地命令（如 match=新会话、rewrite=/new）。<span class="tag info" style="margin-left:6px">热生效</span></span></div>
     <table><thead><tr><th style="width:34%">match</th><th>rewrite</th><th style="width:76px" title="开启后命中先追问补充内容，下一条消息与原文合并再执行（两段式触发）">追问补充</th><th style="width:70px"></th></tr></thead>
     <tbody data-list="triggers"></tbody></table>
-    <button class="btn sm" data-add="triggers" style="margin-top:8px">＋ 添加规则</button>`;
+    <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn sm primary" data-add-default="triggers" title="一键补齐飞书菜单常用触发词：新会话→/new、结束会话→/stop、历史会话→/resume、切换工作区→/ws（已存在的自动跳过）">⚡ 一键添加常用触发词</button>
+      <button class="btn sm" data-add="triggers">＋ 添加规则</button>
+    </div>`;
 
   const paneEnv = () => `
     <div class="mini-note" style="margin-bottom:8px">注入该机器人的 Claude 子进程，覆盖本机同名值；~/.claude/settings.json 已配置的键会被 CLI 自身应用且优先，无须在此重复。<span class="tag warn" style="margin-left:4px">需重启</span></div>
@@ -384,6 +401,15 @@ function openAppDrawer(apps, idx, snap) {
             draw();
             paintTabs();
             tb.querySelector('input')?.focus();
+          };
+          // 一键补齐常用触发词：只追加缺失项（按 match 去重），全存在时仅提示不改动
+          p.querySelector('[data-add-default="triggers"]').onclick = () => {
+            const missing = mergeDefaultTriggers(app.triggers);
+            if (!missing.length) return toast('4 条常用触发词均已存在，无需重复添加');
+            (app.triggers = app.triggers || []).push(...missing); // mergeDefaultTriggers 已返回副本
+            draw();
+            paintTabs();
+            toast(`已添加 ${missing.length} 条常用触发词（保存抽屉后生效）`);
           };
         }
         if (cur === 'env') {

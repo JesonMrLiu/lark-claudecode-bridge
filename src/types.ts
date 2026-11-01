@@ -172,8 +172,9 @@ export interface MemoryConfig {
   granularity?: 'bot' | 'bot-user';
   /** 机器人 → OpenViking 用户 关联表（记忆身份映射，「用户与密钥」Tab 可视化管理）：
    *  键 = 飞书 appId，值 = OpenViking user_id（ASCII，见 memory-users-api isValidUserId）。
-   *  每台机器人关联且仅关联一个用户；缺省（无条目）= 专属用户（uid 即 appId，历史口径零迁移）。
-   *  多台机器人映射同一 uid = 共享同一份记忆。变更经 saveDoc 落盘后由 memory 热重载链路重签生效 */
+   *  每台机器人关联且仅关联一个用户；缺省（无条目）= 全体 bot 共享用户 main（DEFAULT_MEMORY_UID），
+   *  不再按 appId 各建专属用户。多台机器人映射同一 uid = 共享同一份记忆。
+   *  变更经 saveDoc 落盘后由 memory 热重载链路重签生效 */
   identityMap?: Record<string, string>;
   /** OpenViking user_id → 中文显示名（仅 LCB 侧存储与配置页展示——服务端 user_id 仅 ASCII 且
    *  无显示名字段，人可读对照以本映射为准；user_id 本身保持 ASCII 稳定标识） */

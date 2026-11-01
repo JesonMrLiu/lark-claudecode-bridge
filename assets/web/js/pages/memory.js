@@ -691,10 +691,12 @@ const fmtActive = (iso) => {
 
 /** doc.memory 兜底取段（granularity 同款口径）；identityMap / displayNames 均为可选 Record */
 const memSeg = () => (S.doc.memory && typeof S.doc.memory === 'object') ? S.doc.memory : {};
-/** 机器人生效记忆身份（与后端 resolveMemoryUid 同口径：显式映射优先，缺省 = 专属用户 uid=appId） */
+/** 缺省共享记忆身份（与后端 DEFAULT_MEMORY_UID 同口径：未显式关联的机器人共用 main） */
+const DEFAULT_UID = 'main';
+/** 机器人生效记忆身份（与后端 resolveMemoryUid 同口径：显式映射优先，缺省 = 共享用户 main） */
 const resolvedUid = (appId) => {
   const map = memSeg().identityMap;
-  return (map && typeof map === 'object' ? (map[appId] || '').trim() : '') || appId;
+  return (map && typeof map === 'object' ? (map[appId] || '').trim() : '') || DEFAULT_UID;
 };
 /** uid 的中文显示名（doc.displayNames 显式条目；服务端 user_id 仅 ASCII，人可读对照以本映射为准） */
 const uidDisplayName = (uid) => {
@@ -847,7 +849,7 @@ function renderUsersTab(el, { st, m }) {
     bodyHtml = `<div class="card">
       <div style="background:var(--off-bg);border-radius:10px;padding:14px 16px">
         <b>当前为 ${esc(u.authMode || 'dev')} 模式：无须用户密钥</b>
-        <div class="hint" style="margin-top:4px;line-height:1.7">本机回环免鉴权，机器人身份经命名空间隔离（显式关联的身份固定为映射 uid）——浏览器打开记忆空间可直接访问。部署走向多人共享 / 出现敏感内容隔离需求时，配置 root_api_key 切换到 api_key 模式后，回本页即可管理用户与密钥。</div>
+        <div class="hint" style="margin-top:4px;line-height:1.7">本机回环免鉴权，机器人身份经命名空间隔离（身份恒为生效关联 uid：缺省共享 main，显式映射为映射 uid）——浏览器打开记忆空间可直接访问。部署走向多人共享 / 出现敏感内容隔离需求时，配置 root_api_key 切换到 api_key 模式后，回本页即可管理用户与密钥。</div>
       </div>
       ${bindingCardHtml(st.bots || [])}
       ${granularityCardHtml(gran)}</div>`;
@@ -865,7 +867,7 @@ function renderUsersTab(el, { st, m }) {
         <button class="btn sm primary" id="memUserCreate" title="新建 OpenViking 用户（可填中文显示名称，仅本页展示）">＋ 新建用户</button>
         <button class="btn sm" id="memUsersRefresh">↻ 刷新</button>
       </div>
-      <div class="desc" style="margin-top:6px">记忆身份 = OpenViking 用户（账号 <code>${esc(m.account || 'default')}</code> 下）。每台机器人<b>关联且仅关联一个</b>身份，会话记忆读写该身份——多台机器人关联同一身份即共享记忆。
+      <div class="desc" style="margin-top:6px">记忆身份 = OpenViking 用户（账号 <code>${esc(m.account || 'default')}</code> 下）。每台机器人<b>关联且仅关联一个</b>身份，会话记忆读写该身份——缺省统一关联共享用户 <code>main</code>（多台机器人共用一份记忆），需要隔离时在下方关联区改绑其他用户。
         <span class="tip" style="vertical-align:-1px" data-tip="密钥落盘已加密；1933 网页右上角身份显示的是技术 ID（服务端仅支持 ASCII、无显示名字段），中文对照以本页「显示名称」为准——点用户行「编辑」可修改。用户 ID 由 OpenViking 绑定在密钥与数据目录中，不支持修改。">ⓘ</span></div>
       ${u.authInitNeeded ? `<div class="hint" style="margin-top:10px;padding:9px 14px;background:var(--warn-bg);color:var(--warn-tx);border-radius:10px">🔑 待初始化鉴权：网页端用户尚未创建，浏览器打开记忆空间会 401——LCB 启动已包含 web 用户自动签发，稍候点「↻ 刷新」；持续缺失请检查服务与 root key。</div>` : ''}
       ${u.users.length === 0 && !u.authInitNeeded ? '<div class="hint" style="margin-top:12px">暂无用户——点「＋ 新建用户」创建，或由 LCB 启动时自动补签。</div>' : ''}
@@ -884,7 +886,7 @@ const granularityCardHtml = (gran) => `
   <div class="card" style="margin-top:14px;">
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       <b style="font-size:13.5px">记忆粒度</b>
-      <span class="hint">${gran === 'bot-user' ? '已选择：bot × 人（每位聊天者独立空间）' : '当前：每 bot 一把密钥（默认，单机自用零损失）'}</span>
+      <span class="hint">${gran === 'bot-user' ? '已选择：bot × 人（每位聊天者独立空间）' : '当前：全部机器人共享 main 身份（默认，单机自用零损失）'}</span>
       <span style="flex:1"></span>
       <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
         <span class="hint">升级到 bot×人（暂不支持升级）</span>
@@ -900,7 +902,8 @@ const granularityCardHtml = (gran) => `
  * 「飞书机器人 → 记忆身份」关联卡：每台机器人一个下拉（关联且仅关联一个用户；多台关联同一
  * 用户 = 共享记忆）。选择只暂存（行内亮「保存」），保存经确认弹窗写 doc.identityMap → saveDoc
  * 落盘 → memory 热重载自动重签（新 uid 由签发路径自动建户）→ 下一条消息生效。
- * 选项：我的专属用户（不存在也保留，标「待创建」）→ 其他可用用户 → ➕ 新建共享身份并绑定（弹窗）。
+ * 选项：缺省共享用户 main（不存在也保留，标「待创建」）→ 其他可用用户（含历史 appId 专属用户，
+ * 可选回以接续旧记忆）→ ➕ 新建共享身份并绑定（弹窗）。
  * web / 历史聊天者身份不可作为关联目标（前者网页专用，后者是旧口径遗留）。
  */
 function bindingCardHtml(bots) {
@@ -911,10 +914,13 @@ function bindingCardHtml(bots) {
   const rowsHtml = bots.map((b) => {
     const cur = resolvedUid(b.appId);
     const opts = [];
-    const hasOwn = users.some((x) => x.userId === b.appId);
-    opts.push(`<option value="${esc(b.appId)}" ${cur === b.appId ? 'selected' : ''}>${esc(b.appId)}（我的专属用户${hasOwn ? '' : ' · 待创建'}）</option>`);
+    // 首选项 = 缺省共享用户 main（与后端 DEFAULT_MEMORY_UID 同口径；未显式关联的机器人都在这里）
+    const mainDisp = uidDisplayName(DEFAULT_UID);
+    const mainN = membersOf(bots, DEFAULT_UID).length;
+    const mainOwn = users.some((x) => x.userId === DEFAULT_UID);
+    opts.push(`<option value="${esc(DEFAULT_UID)}" ${cur === DEFAULT_UID ? 'selected' : ''}>${esc(mainDisp || DEFAULT_UID)}（缺省 · 共享记忆${mainOwn ? '' : ' · 待创建'}${mainN ? ` · ${mainN} 台关联` : ''}）</option>`);
     for (const x of eligible) {
-      if (x.userId === b.appId) continue;
+      if (x.userId === DEFAULT_UID) continue;
       const n = membersOf(bots, x.userId).length;
       const disp = uidDisplayName(x.userId);
       const label = `${disp || x.userId}（${[disp ? x.userId : null, n ? `${n} 台关联` : '未关联'].filter(Boolean).join(' · ')}）`;
@@ -923,9 +929,9 @@ function bindingCardHtml(bots) {
     opts.push('<option value="__new__">➕ 新建共享身份并绑定…</option>');
     const mates = membersOf(bots, cur).filter((x) => x.appId !== b.appId);
     const curDisp = uidDisplayName(cur);
-    const curDesc = cur === b.appId
-      ? `当前：关联专属用户 <code>${esc(cur)}</code>（独立记忆，互不可见）`
-      : `当前：关联${curDisp ? `「${esc(curDisp)}」` : ''} <code>${esc(cur)}</code>${mates.length ? `（与 ${esc(mates.map((x) => x.name || x.appId).join('、'))} 共用）` : '（暂无同伴）'}`;
+    const curDesc = cur === DEFAULT_UID
+      ? `当前：关联缺省共享用户 <code>${esc(DEFAULT_UID)}</code>（与未显式关联的机器人共用一份记忆）`
+      : `当前：关联${curDisp ? `「${esc(curDisp)}」` : ''} <code>${esc(cur)}</code>${mates.length ? `（与 ${esc(mates.map((x) => x.name || x.appId).join('、'))} 共用）` : '（独立记忆）'}`;
     return `<div data-bindrow="${esc(b.appId)}" style="display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">
       <div style="min-width:200px;flex:1">
         <div style="font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap">${esc(b.name || b.appId)}
@@ -1067,7 +1073,7 @@ function openBindInfoModal() {
     width: 'min(560px,92vw)',
     bodyHtml: `
       <div class="sub-title">关联规则</div>
-      <div class="desc" style="margin:0">每台飞书机器人<b>只能关联一个</b> OpenViking 用户；缺省关联自己的专属用户（uid = appId）。</div>
+      <div class="desc" style="margin:0">每台飞书机器人<b>只能关联一个</b> OpenViking 用户；缺省统一关联共享用户 <code>main</code>（所有未显式关联的机器人共用一份记忆，不再按应用各建用户）。</div>
       <div class="sub-title" style="margin-top:14px">共享记忆</div>
       <div class="desc" style="margin:0">多台机器人关联<b>同一个</b>用户即共享记忆：互相可见、互相沉淀（A 机器人记住的事，B 机器人也能召回）。</div>
       <div class="sub-title" style="margin-top:14px">生效与迁移</div>
@@ -1126,8 +1132,8 @@ function bindUsersTabActions(el, { m, st }) {
       const botName = bots.find((b) => b.appId === appId)?.name || appId;
       const dispOf = (uid) => uidDisplayName(uid) || (usersSnapshot?.users ?? []).find((x) => x.userId === uid)?.userId || uid;
       const others = (uid) => membersOf(bots, uid).filter((b) => b.appId !== appId);
-      const uidDesc = (uid) => uid === appId
-        ? `专属用户 <b>${esc(uid)}</b>（独立记忆）`
+      const uidDesc = (uid) => uid === DEFAULT_UID
+        ? `缺省共享用户 <b>${esc(DEFAULT_UID)}</b>（与未显式关联的机器人共用一份记忆）`
         : `用户 <b>${esc(dispOf(uid))}</b>（当前关联：${esc(others(uid).map((b) => b.name || b.appId).join('、')) || '无'}）`;
       if (!(await confirmDialog({
         title: '确认更改关联的用户',

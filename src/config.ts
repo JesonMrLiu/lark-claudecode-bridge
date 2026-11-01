@@ -426,8 +426,8 @@ export function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | un
   // 身份映射两字段（多机器人 → 共享 OpenViking 用户；配置页 saveDoc 以 camelCase 原样写 YAML）：
   // identityMap = appId → OpenViking user_id；displayNames = uid → 中文显示名。运行时的
   // resolveMemoryUid / memoryEnvFor / ensureMemoryUserKeys 全经 config.memory.identityMap
-  // 解析身份——此处不透传等于「页面保存成功、运行时永远回退 appId 专属身份」，机器人会话
-  // 沉淀到不了共享用户（映射重构后的断点即在此：本函数曾漏读这两个字段，配置加载即静默丢弃）。
+  // 解析身份——此处不透传等于「页面保存成功、运行时永远回落缺省共享 main」，显式关联形同虚设
+  // （映射重构后的断点即在此：本函数曾漏读这两个字段，配置加载即静默丢弃）。
   // 非法条目 warn 跳过不硬抛：normalizeMemory 抛错会让 section() 把整个 memory 段当缺失，
   // 一条写坏拖垮全部记忆配置语义过重
   const parseUidRecord = (v: unknown, key: string, mode: 'uidValue' | 'uidKey'): Record<string, string> | undefined => {
