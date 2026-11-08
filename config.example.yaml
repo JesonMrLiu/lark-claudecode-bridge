@@ -20,7 +20,8 @@ apps:
     #                          自动展开斜杠命令（可触发 skills / 插件命令，如 /superpowers:brainstorming）；
     #                          仅在需要改写参数/附加指令时才配触发词。
     #                          match 以 / 开头 = 首 token 精确匹配（/produce 命中、/produced 不命中），
-    #                          否则 = 整条消息包含该关键词即命中；{text}=原文全文，{args}=去掉首 token 的剩余参数。
+    #                          否则 = 整条消息与触发词完全一致（trim 后相等）才命中，仅包含不触发
+    #                          （防日常聊天误命中，飞书菜单发送精确文本不受影响）；{text}=原文全文，{args}=去掉首 token 的剩余参数。
     #                          rewrite 可指向 bridge 本地命令（/new /ws /reload-plugins 等，飞书菜单
     #                          场景常用：match=新会话, rewrite=/new）——由 bridge 本地执行，不透传给
     #                          Claude Code；也可指向技能/插件命令或普通指令（照旧当任务入队）。

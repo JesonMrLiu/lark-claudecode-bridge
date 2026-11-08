@@ -31,7 +31,8 @@ function applyRewrite(template: string, text: string, args: string): string {
  * - 斜杠形态（match 以 / 开头）：消息首 token 精确相等才命中（/produce 命中，/produced 不命中）；
  *   本地命令（RESERVED）最高优先级直接放行；斜杠消息未命中任何规则也返回 null——
  *   由 handleCommand 的 default 分支原文透传给 Claude Code 派发斜杠命令。
- * - 关键词形态（match 不带 /）：整条消息包含该关键词即命中，按数组顺序首个生效。
+ * - 关键词形态（match 不带 /）：整条消息与关键词完全一致（trim 后相等）才命中，
+ *   按数组顺序首个生效——「包含即命中」会让日常聊天里的只言片语误触发改写，故为全内容精确匹配。
  * 占位符：{text}=原始全文，{args}=去掉首 token 的剩余参数（斜杠形态）/ 全文（关键词形态）。
  */
 export function matchTrigger(text: string, rules: TriggerRule[] | undefined): { rule: TriggerRule; rewritten: string } | null {
@@ -52,9 +53,20 @@ export function matchTrigger(text: string, rules: TriggerRule[] | undefined): { 
     }
     return { rule, rewritten };
   }
-  const rule = rules.find((r) => !r.match.startsWith('/') && t.includes(r.match));
+  const rule = rules.find((r) => !r.match.startsWith('/') && t === r.match.trim());
   if (!rule) return null;
   return { rule, rewritten: applyRewrite(rule.rewrite, t, t) };
+}
+
+/**
+ * 对已命中规则的文本直接套用改写模板，不重新做匹配判定。
+ * 两段式触发（ask_detail）合并补充内容时用：合并文本 = 原文 + 补充，斜杠形态首 token 仍能
+ * 命中 matchTrigger 可照走原路；关键词形态改为全内容精确匹配后，合并文本必然不再等于
+ * match——若重新匹配会得到 null 把改写模板整个丢掉，必须走本函数直取模板。
+ * 占位符语义与关键词形态命中时一致：{text}/{args} 均替换为传入的完整文本。
+ */
+export function applyRuleRewrite(rule: TriggerRule, text: string): string {
+  return applyRewrite(rule.rewrite, text, text);
 }
 
 /**

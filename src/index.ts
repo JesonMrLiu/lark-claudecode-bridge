@@ -48,7 +48,7 @@ import { isImageFile } from './util/file-types.js';
 import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
 import { handleCommand, applyWorkspaceSwitch, workspaceListMarkdown, deputyWorkspacePolicy } from './session/commands.js';
-import { isLocalCommandRewrite, matchTrigger, rewriteByTrigger } from './session/triggers.js';
+import { applyRuleRewrite, isLocalCommandRewrite, matchTrigger, rewriteByTrigger } from './session/triggers.js';
 import { Semaphore, channelKey } from './session/channel.js';
 import { TranscriptWriter, sweepTranscripts, type TranscriptRecorder } from './transcript/transcript-writer.js';
 import { nowBeijingISO } from './util/beijing-time.js';
@@ -493,10 +493,12 @@ export function createBridge(
         && msg.userId === pendingSup.userId) {
       supplementPending.delete(key);
       const combined = `${pendingSup.originalText} ${trimmedText}`;
-      // ?? combined 兜底理论不可达：rule 本身按 combined 仍会命中（首 token/关键词都在）。
+      // 斜杠形态合并后首 token 仍命中，matchTrigger 原路返回；关键词形态已改全内容精确匹配，
+      // 合并文本必然不再等于 match（重新匹配得 null 会把改写模板整个丢掉），?? 直接对规则套
+      // 模板（{text}/{args}=合并全文，与命中时的替换语义一致）。
       // 关键词形态的改写不含补充内容（matchTrigger 仅斜杠形态自动追加 args）——补充是本次
       // 合并的核心增量，改写结果里没有就显式拼到末尾，绝不把用户刚给的链接/要求吞掉
-      const finalPrompt = rewriteByTrigger(combined, [pendingSup.rule]) ?? combined;
+      const finalPrompt = rewriteByTrigger(combined, [pendingSup.rule]) ?? applyRuleRewrite(pendingSup.rule, combined);
       const merged = finalPrompt.includes(trimmedText) ? finalPrompt : `${finalPrompt} ${trimmedText}`;
       await deps.gateway.sendTextTo(msg.chatId, '已收到补充，任务开始');
       enqueue(key, msg, merged, currentWorkspace);
