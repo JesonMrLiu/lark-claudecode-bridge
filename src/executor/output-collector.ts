@@ -17,7 +17,7 @@ export class OutputCollector {
     const p = input.file_path ?? input.notebook_path;
     if (typeof p !== 'string' || !p) return;
     // 只收工作区内文件：plan mode 的计划文件（~/.claude/plans/*.md）、临时目录等
-    // 工作区外产物不属于「本次修改/新增的文件」，不进收尾清单、不参与用户点名回传
+    // 工作区外产物不属于任务产出，不参与图片自动回传与 transcript 记录
     const abs = resolve(this.cwd, p);
     const rel = relative(this.cwd, abs);
     if (rel.startsWith('..') || isAbsolute(rel)) return;

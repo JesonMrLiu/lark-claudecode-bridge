@@ -1,7 +1,7 @@
 // 装配主流程：消息 → 访问控制 → 命令 → 通道队列 → 执行 → 确认卡片 → 回传
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { basename, join, relative, resolve, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import type {
   BridgeConfig, CardActionEvent, CardActionResponse, CardDecision, ConfirmationRequest, FeishuAppConfig, GatewayHandlers,
   IncomingMessage, PermissionDecision, ProgressEvent, SessionInventory, TriggerRule,
@@ -26,8 +26,6 @@ import {
 } from './gateway/card-builder.js';
 import { chunkText } from './util/chunk-text.js';
 import { runTask, killResidentSession, killAllResidentSessions } from './executor/claude-executor.js';
-import { buildFileDiffCards } from './gateway/diff-card.js';
-import { collectFileDiff } from './util/workspace-diff.js';
 import type { McpServerStatus } from '@anthropic-ai/claude-agent-sdk';
 import {
   PermissionGate, DEFAULT_ALLOW_TOOLS_LIST, DEFAULT_DANGEROUS_COMMANDS, DEFAULT_ALLOW_ALL_TOOLS,
@@ -45,7 +43,6 @@ import {
 import { WEB_USER_ID, onUserKeyRotated, vaultStore } from './web/memory-users-api.js';
 import { cleanupClientCliConf, ensureClientCliConf, ensureMemoryServiceRunning, stopManagedServer } from './memory-installer.js';
 import { isImageFile } from './util/file-types.js';
-import { FileTracker } from './util/file-tracker.js';
 import { SessionStore, migrateLegacySessions } from './session/session-store.js';
 import { handleCommand, applyWorkspaceSwitch, workspaceListMarkdown, deputyWorkspacePolicy } from './session/commands.js';
 import { applyRuleRewrite, isLocalCommandRewrite, matchTrigger, rewriteByTrigger } from './session/triggers.js';
@@ -210,9 +207,6 @@ export function createBridge(
   // 通道级权限闸：「本次会话不再询问」的记忆跨任务生效（spec：直至 /new），
   // 故 gate 归通道持有而非每任务新建——每任务新建会把授权缩成任务级，任务 B 又要重新确认
   const gates = new Map<string, PermissionGate>();
-  // 通道级非图片文件清单：任务收尾 record、用户消息命中 basename 后 clear，
-  // 用于实现「默认不发非图片文件，用户主动点名才发」的回传规则
-  const fileTracker = new FileTracker();
   const confirmPending = new Map<string, {
     resolve: (d: PermissionDecision) => void;
     req: ConfirmationRequest;
@@ -348,51 +342,10 @@ export function createBridge(
     }
   }
 
-  /**
-   * 用户按数字取 diff：任务收尾发过数字编号文件清单后，回复纯数字即视为查看对应文件的
-   * 本次改动（unified diff）。范围外提示；diff 短发卡片、长发 .md 文件附件。
-   * 仅在本通道存在清单时拦截（否则纯数字放行为普通任务，如「3」也可能是发给模型的内容）。
-   * 返回 true 表示已处理（processMessage 应拦截，不再交给 Claude Code）。
-   */
-  async function tryDeliverNumberedDiff(msg: IncomingMessage, key: string): Promise<boolean> {
-    const t = msg.text.trim();
-    if (!/^\d+$/.test(t)) return false;
-    const files = fileTracker.get(key);
-    if (files.length === 0) return false; // 无清单：数字按普通消息进任务
-    const n = Number(t);
-    const ws = fileTracker.getWorkspace(key);
-    if (!(n >= 1 && n <= files.length) || !ws) {
-      await deps.gateway.sendTextTo(msg.chatId, `编号超出范围（1-${files.length}），请对应上方文件清单回复`);
-      return true;
-    }
-    const file = files[n - 1];
-    const rel = relative(ws, file);
-    const displayName = rel.startsWith('..') ? basename(file) : rel;
-    const diff = await collectFileDiff(ws, file).catch(() => null);
-    if (diff === null || !diff.trim()) {
-      await deps.gateway.sendTextTo(msg.chatId, `${displayName} 本次无可展示的改动（非 git 仓库 / 未改动 / 二进制）`);
-      return true;
-    }
-    // 全面卡片化（用户决策）：不论多长一律多卡展示（~2800 字/块），不再落盘 .md 发文件附件；
-    // 连发间隔 300ms 防飞书消息频率限制；极长 diff（>10 万字 ≈ 35+ 张卡）先提示总卡数再发
-    const widthMode = config.card?.width ?? 'default';
-    const cards = buildFileDiffCards(diff, { fileName: displayName }, widthMode);
-    if (diff.length > 100_000) {
-      await deps.gateway.sendTextTo(msg.chatId, `${displayName} 的 diff 极长（约 ${diff.length.toLocaleString()} 字符），将分 ${cards.length} 张卡片陆续发送，请稍候`);
-    }
-    for (let i = 0; i < cards.length; i++) {
-      if (i > 0) await new Promise((r) => setTimeout(r, 300));
-      await deps.gateway.sendCardTo(msg.chatId, cards[i]);
-    }
-    return true;
-  }
-
   async function processMessage(msg: IncomingMessage): Promise<void> {
     const key = channelKey(msg.chatId, msg.userId);
-    // 0. 用户对收尾文件清单回复纯数字 → 发该文件的本次 diff（清单序号），命中后拦截
-    // 不再交给 Claude Code。消息里提到文件名不再发文件本体（用户反馈：提到 ≠ 要文件，
-    // 子串误判还会拦截提问不送给模型）——明确要文件时由模型侧 send_file 工具按意图判断
-    if (await tryDeliverNumberedDiff(msg, key)) return;
+    // 0.（已移除）收尾文件清单卡与「回复纯数字查 diff」链路整体下线（用户反馈：清单卡不需要）。
+    // 数字消息不再被拦截，按普通任务进模型；明确要文件本体时由模型侧 send_file 工具按意图判断
     // 1. 访问控制：白名单外首个使用者自动成为 admin（免配对），其后未知用户发配对码
     // 每条消息先重读 access.json：lcb pair / 运行终端等独立进程批准写盘后，
     // 长存的内存实例不 reload 会查到旧白名单 → 反复发配对码且整盘覆写抹掉新用户（死循环）
@@ -1224,7 +1177,7 @@ export function createBridge(
         }
       }
       // 图片自动发（im.image.create 通道），非图片文件不自动回传——
-      // 用户从下面的文件清单里看到改了哪些文件，回复数字看该文件 diff；
+      // 收尾文件清单卡与数字查 diff 已移除（用户反馈）：改动了哪些文件由最终回复正文说明，
       // 明确要文件本体时由模型侧 send_file 工具处理（notify-sop 提示词约束）
       const uploadProducedImages = async (): Promise<void> => {
         const imageFiles = outcome.producedFiles
@@ -1234,24 +1187,9 @@ export function createBridge(
           await deps.gateway.uploadAndSendFile(msg.chatId, f);
         }
       };
-      // 把非图片文件记入通道（含工作区根，数字取 diff 时用），供后续用户消息
-      // 按清单序号取该文件 diff（图片已自动发，不进 tracker）
-      const wsRoot = workspacePath(wsName);
-      const nonImageFiles = outcome.producedFiles.filter((f) => !isImageFile(f));
-      fileTracker.record(key, nonImageFiles, { workspace: wsRoot });
-      // 收尾文件清单（数字编号 + 相对路径）：用户从这里知道改了哪些文件——回复数字看该文件
-      // 本次改动（diff）；计划文件等工作区外路径已被 OutputCollector 按 cwd 过滤，不会混进清单
-      if (nonImageFiles.length > 0) {
-        const list = nonImageFiles.map((f, i) => {
-          const rel = relative(wsRoot, f);
-          return `${i + 1}. ${rel.startsWith('..') ? f : rel}`; // 工作区外（理论不出现）回退绝对路径
-        }).join('\n');
-        await deps.gateway.sendTextTo(msg.chatId,
-          `本次修改/新增的文件（共 ${nonImageFiles.length} 个）：\n${list}\n\n回复数字可查看对应文件的本次改动`);
-      }
       await uploadProducedImages();
-      // 「改动汇总」卡已移除（用户反馈）：改动详情改为按需查看——用户对文件清单回复数字
-      // 即发该文件的本次 diff（tryDeliverNumberedDiff，Phase 2），不再收尾主动铺汇总卡
+      // （已移除）收尾文件清单卡（「本次修改/新增的文件」+ 回复数字查 diff）与「改动汇总」卡
+      // 均不再发送（用户反馈）：producedFiles 仅保留图片自动发与 transcript 记录用途
     } catch (e) {
       // 主动中止（/stop 或 4h 硬超时）：SDK 多数场景把 AbortError("Operation aborted") 抛进消息循环
       // 而非正常收尾——按停止处理不误报「出错」，与上方 executor 正常 return 后的 aborted 判断二选一命中
