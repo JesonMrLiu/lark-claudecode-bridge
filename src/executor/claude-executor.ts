@@ -33,7 +33,8 @@ export interface ExecutorCallbacks {
  * Claude Code 原生事件流没有「中文步骤」概念，进度卡的步骤流水完全依赖 TodoWrite
  * （content=步骤名、activeForm=「正在…」）——不约束则多数任务（尤其小任务）不使用
  * TodoWrite，进度卡只剩工具罗列。此约束让 Claude 主动维护中文步骤流水，进度卡得以
- * 显示「真实处理步骤」；同时约束 AskUserQuestion 的提问质量（背景 + 选项说明）。
+ * 显示「真实处理步骤」；同时约束 AskUserQuestion 的提问质量（题干自含背景、
+ * 禁方位引用——问题区渲染在发言区上方、正文后到 + 选项说明）。
  * 与 per-app 人格补充（config apps[].append_system_prompt）合并注入，人格不受影响。
  */
 const PROGRESS_SOP = [
@@ -41,7 +42,7 @@ const PROGRESS_SOP = [
   '- 接到任务后，先用 TodoWrite 制定执行计划：每个步骤用简短的中文描述（用户视角，如「拉取候选并按热度排序」「生成配图并质检」）。',
   '- 执行中每进入一个新阶段，立即更新 TodoWrite：当前步骤的 activeForm 用「正在…」句式（如「正在生成配图」）；完成的步骤及时标记 completed；一次只有一个步骤处于 in_progress。',
   '- 即使是简单任务，也拆成 2-3 个步骤维护 TodoWrite，让用户能从进度卡看到执行推进。',
-  '- 使用 AskUserQuestion 提问时，题干必须写清背景与上下文；每个选项必须填写 description，说明该选项的含义、与其他选项的差异、选择的后果，让用户能据此独立决策。',
+  '- 使用 AskUserQuestion 提问时，题干必须自含背景要点——飞书进度卡的问题区渲染在发言区上方且先于正文显示，禁止使用「上述方案/如上/上文」等方位引用（用户看到问题时正文尚未展示，方位引用必然指错方向）；每个选项必须填写 description，说明该选项的含义、与其他选项的差异、选择的后果，让用户能据此独立决策。',
 ].join('\n');
 
 /** canUseTool 第三参（SDK 原样透传的子集）：suggestions 为 CLI 建议的权限更新（如 ExitPlanMode 后 setMode acceptEdits） */
