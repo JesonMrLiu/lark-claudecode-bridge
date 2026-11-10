@@ -228,6 +228,9 @@ export interface SessionConfig {
   /** 上下文超长提醒阈值（tokens，估算口径 = 最后一次 result 的 input+cache 三项之和）。
    *  0 = 关闭提醒；缺省用 DEFAULT_CONTEXT_REMIND_TOKENS（150000） */
   contextRemindTokens?: number;
+  /** AskUserQuestion 提问卡挂起窗（分钟）：飞书是异步场景，用户可能很久之后才点卡片——
+   *  超时后问题失效（模型按未作答自行决策），迟到提交会收到「已失效」提示而非静默丢弃。缺省 60 */
+  askTimeoutMinutes?: number;
   /** 飞书推送规范化（#11）：启用时 SOP 提示词注入 appendSystemPrompt（软约束）+ notify-server 硬兜底。缺省 true */
   notifySop?: boolean;
   /** 工具可用性说明注入 appendSystemPrompt（软约束）：对抗 Claude Code 2.1.117+ dynamic tool loading

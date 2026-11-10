@@ -63,6 +63,11 @@ export const DEFAULT_DANGEROUS_COMMANDS: readonly RegExp[] =
 // 超时默认 10 分钟：飞书端可能长时间无人点击卡片
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
+// 提问卡（AskUserQuestion）挂起窗默认 60 分钟：飞书异步作答，用户可能很久之后才点卡片——
+// 沿用确认卡的 10 分钟会在用户作答前就判超时，模型收到「未作答」而用户的答案永远送不到
+// （2026-11-09 用户连续两次踩中）。经 config session.ask_timeout_minutes 可调
+export const DEFAULT_QUESTION_TIMEOUT_MS = 60 * 60 * 1000;
+
 // 与 claude-executor 的 canUseTool 判别联合对齐（deny 分支 message 必填；
 // allow 分支可带 updatedInput——AskUserQuestion 的用户答案经此回传 CLI）
 export type GateDecision =
@@ -163,6 +168,9 @@ export class PermissionGate {
       /** 提问回调：AskUserQuestion 工具调用时触发（飞书问题选项卡片）；未配置时一律拒绝并让模型改用文本 */
       askQuestion?: (req: AskQuestionRequest) => Promise<AskQuestionResult>;
       timeoutMs?: number;
+      /** 提问卡挂起窗兜底：缺省 DEFAULT_QUESTION_TIMEOUT_MS（60 分钟）。正常流程 wiring 侧
+       *  同款超时（+60s 缓冲传入）先到点清理卡片并 resolve({})，本值仅兜底 wiring 失效 */
+      questionTimeoutMs?: number;
       /** 免确认白名单（静态值或 getter）；缺省 DEFAULT_ALLOW_TOOLS */
       allowTools?: ReadonlySet<string> | (() => ReadonlySet<string>);
       /** 全部工具免确认（静态值或 getter）；缺省 DEFAULT_ALLOW_ALL_TOOLS（开） */
@@ -263,7 +271,7 @@ export class PermissionGate {
       if (questions.length === 0) {
         return { behavior: 'deny', message: 'AskUserQuestion 携带的问题结构不完整（至少 1 个问题、每问至少 2 个选项），请改用文本说明' };
       }
-      const timeoutMs = this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+      const timeoutMs = this.opts.questionTimeoutMs ?? DEFAULT_QUESTION_TIMEOUT_MS;
       const answers = await this.withTimeout(this.opts.askQuestion({ questions, workspaceName }), timeoutMs);
       // 空答案对象与超时同义：wiring 层超时（或发卡失败降级）resolve({}) 时不再误当"用户提交了空表单"
       // 放行——统一走 deny，由模型根据任务性质决定继续还是停下等待

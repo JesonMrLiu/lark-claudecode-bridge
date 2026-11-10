@@ -19,7 +19,7 @@ import { registerChatInfoSource } from './gateway/gateway-registry.js';
 import { ProgressCard, feishuErrorBody } from './gateway/progress-card.js';
 import {
   DECISION_TEXT, TOOLS_TOGGLE_REQUEST_ID,
-  buildPlanConfirmCard, buildPlanSettledCard, buildPlanTailCard, buildResultTailCard, buildWorkspaceSwitchedCard,
+  buildPlanConfirmCard, buildPlanSettledCard, buildPlanTailCard, buildResultTailCard, buildTextCard, buildWorkspaceSwitchedCard,
   planChunkHeader, resultContinuationHeader,
   type PlanCardRequest,
   type QuestionCardRequest, type QuestionCardAnswers,
@@ -640,6 +640,10 @@ export function createBridge(
       { cardWidthMode: config.card?.width ?? 'default', channelKey: key, stackMax: config.card?.stackMax },
     );
     const confirmTimeoutMs = opts.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS;
+    // 提问卡挂起窗（2026-11-09 A 修）：飞书异步作答，缺省 60 分钟、session.ask_timeout_minutes
+    // 可调；gate 侧传 askTimeoutMs + 60s 兜底（正常流程下方 askQuestion 闭包的定时器先到点，
+    // 清卡片 + resolve({})，gate 兜底永不先响——杜绝「卡片还活着但答案已无人接收」的竞态）
+    const askTimeoutMs = Math.max(1, config.session?.askTimeoutMinutes ?? 60) * 60_000;
     const cardSendTimeoutMs = opts.cardSendTimeoutMs ?? CARD_SEND_TIMEOUT_MS;
     // 通道级复用：已存在则沿用（allow-session 记忆跨任务），不存在才建。
     // 白名单/黑名单经 getter 传入：gate 虽按通道永久复用，decide 时才经 getter 现读
@@ -777,9 +781,9 @@ export function createBridge(
             const gc = setTimeout(() => {
               qaPending.delete(qaReq.requestId);
               progress.setQuestion(undefined);
-              progress.setStatus(`提问超时（${Math.round(confirmTimeoutMs / 60000)} 分钟未作答），已按未作答处理；模型自行决策或停下等待你的回复`);
+              progress.setStatus(`提问超时（${Math.round(askTimeoutMs / 60000)} 分钟未作答），已按未作答处理；模型自行决策或停下等待你的回复`);
               resolve({});
-            }, confirmTimeoutMs);
+            }, askTimeoutMs);
             gc.unref();
             qaPending.set(qaReq.requestId, {
               resolve: (r) => {
@@ -795,6 +799,7 @@ export function createBridge(
           });
         },
         timeoutMs: GATE_FALLBACK_TIMEOUT_MS,
+        questionTimeoutMs: askTimeoutMs + 60_000,
       });
       gates.set(key, gate);
     }
@@ -1297,6 +1302,23 @@ export function createBridge(
       // 提问回调分流（#3）：qa-pick 仅 PATCH 选中态（不消耗挂起项，等所有题答完才 submit）；
       // qa-submit 全部作答后一次性 resolve 并 clearQuestion。主进度卡的 PATCH 由 ProgressCard 内部 flush 串行化
       const qa = qaPending.get(action.value.requestId);
+      // 迟到/孤儿提交（2026-11-09 B 修）：问题已超时关闭或桥接器重启后 qaPending 无此项——
+      // 此前会一路落到确认卡的孤儿分支，toast「已被处理或已过期」让用户误以为答案已送达
+      // （用户两次实测踩中）。这里显式拦截 qa 形态动作：toast 明示答案未送达，并把旧卡整卡
+      // 替换为终态提示卡（按钮消失不再诱导点击），引导用户直接发消息告知决定
+      if (!qa && (action.value.decision === 'qa-pick' || action.value.decision === 'qa-submit')) {
+        const submitted = action.value.decision === 'qa-submit';
+        return {
+          toast: { type: 'warning', content: submitted ? '该问题已失效，答案未送达——请直接发消息告诉我你的决定' : '该问题已失效，卡片按钮已不可用' },
+          card: {
+            type: 'raw',
+            data: buildTextCard(
+              '**该问题已失效**（超时自动关闭或桥接器已重启），答案没有送达。\n\n请直接发消息告诉我你的决定，我会按新消息继续处理。',
+              config.card?.width ?? 'default',
+            ),
+          },
+        };
+      }
       if (qa) {
         if (action.operatorId !== qa.ownerId) {
           console.log(tag, `[卡片回调] 非发起人 ${action.operatorId} 点击提问区 ${action.value.requestId}，已忽略`);
