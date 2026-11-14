@@ -179,6 +179,19 @@ function modelFormHtml(model, endpoint) {
     ? `已保存 ${embKeyHint || '••••'}，留空不修改`
     : embKeyHint ? `当前沿用主 Key ${embKeyHint}，填写后独立` : '留空沿用主 Key（可单独指定）';
   const embBasePlaceholder = model.embeddingApiBaseResolved || '留空沿用主端点';
+  // 意图模型块（可选）展示数据：端点/Key 的「已生效沿用值」由后端按渲染 ov.conf 同口径给出
+  const qpOwn = !!model.queryPlannerKeyOwn;
+  const qpKeyHint = secretVal(model.queryPlannerApiKeyResolved);
+  const qpKeyPlaceholder = qpOwn
+    ? `已保存 ${qpKeyHint || '••••'}，留空不修改`
+    : `留空沿用主 Key${qpKeyHint ? `（现生效 ${qpKeyHint}）` : ''}`;
+  const qpBasePlaceholder = model.queryPlannerApiBaseResolved || '留空沿用主端点';
+  const qpSet = !!model.queryPlannerModel;
+  // Rerank 块（可选）：Key/端点均不沿用主块，三件齐全才启用
+  const rrOwn = !!model.rerankKeyOwn;
+  const rrKeyHint = secretVal(model.rerankApiKey);
+  const rrKeyPlaceholder = rrOwn ? `已保存 ${rrKeyHint || '••••'}，留空不修改` : '独立 Key（不沿用主 Key）';
+  const rrSet = !!(model.rerankModel && model.rerankApiBase && model.rerankApiKey);
   // 左右两栏面板（提炼主模型 | 向量模型）：用「权限」页同款 row-2col 响应式栅格，窄屏自动上下叠放
   const panel = (title, hint, inner) => `
     <div style="border:1px solid var(--border);border-radius:10px;padding:14px 16px 4px;background:var(--field);min-width:0">
@@ -189,32 +202,65 @@ function modelFormHtml(model, endpoint) {
   const fld = (label, inner, hint) => `
     <div style="margin-bottom:12px"><label>${label}</label>${inner}
       ${hint ? `<div class="hint" style="margin-top:3px">${hint}</div>` : ''}</div>`;
+  // 已配置的可选 Tab 加 ✓ 角标（一眼看出哪些增强块在生效）
+  const optBadge = (set) => set ? ' <span style="color:var(--ok-tx)">✓</span>' : '';
   return `
-  <div class="row-2col" style="gap:16px;align-items:stretch">
-    ${panel('提炼主模型配置', 'vlm · 会话归档时提炼记忆', `
-      ${fld('服务商预设（填表助手，值可改）', `<select id="memProvider">
-        <option value="">— 选择预设 —</option>
-        ${Object.entries(PRESETS).map(([k, p]) => `<option value="${k}" ${model.provider === k ? 'selected' : ''}>${p.label}</option>`).join('')}
-      </select>`, '选择后只预填空字段，已填值不覆盖（同时预填右侧向量模型名）')}
-      ${fld('API 端点（api_base）', `<input type="text" id="memApiBase" value="${esc(model.apiBase || '')}" placeholder="https://…/v1">`, 'OpenAI 协议端点，与机器人对话用的厂商档案相互独立')}
-      ${fld(`API Key ${secretVal(model.apiKey) ? `<span class="hint">已保存 ${esc(secretVal(model.apiKey))}，留空不修改</span>` : ''}`, `<input type="password" id="memApiKey" value="" placeholder="${esc(PRESETS[model.provider]?.key_hint || 'sk-…（本地端点可留空）')}">`)}
-      ${fld('提炼模型（vlm）', `<input type="text" id="memVlm" value="${esc(model.vlmModel || '')}" placeholder="glm-4.7">`, '归档会话时提炼记忆的对话模型，可选更强档位')}
-    `)}
-    ${panel('向量模型配置', 'embedding · 向量化入库与召回', `
-      ${fld('向量模型（embedding）', `<input type="text" id="memEmb" value="${esc(model.embeddingModel || '')}" placeholder="embedding-3">`, '测试连接会真调一次验证')}
-      ${fld('向量端点（独立）', `<input type="text" id="memEmbBase" value="${esc(model.embeddingApiBase || '')}" placeholder="${esc(embBasePlaceholder)}">`, '跨厂商组合时单独指定（如主模型=glm + 向量=OpenAI 系）；留空沿用主端点')}
-      ${fld('向量 Key（独立）', `<input type="password" id="memEmbKey" value="" placeholder="${esc(embKeyPlaceholder)}">`, '与主 Key 相同时留空即可；两块凭证互不影响（留空 = 不修改）')}
-    `)}
+  <div class="subtabs" id="memModelTabs">
+    <button class="active" data-mmtab="base">VLM 与向量模型</button>
+    <button data-mmtab="qp">意图模型（可选）${optBadge(qpSet)}</button>
+    <button data-mmtab="rr">Rerank 模型（可选）${optBadge(rrSet)}</button>
   </div>
-  <div class="row" style="margin-top:12px;align-items:end">
-    <div style="flex:1;min-width:260px"><label>服务端点（OpenViking server）</label><input type="text" id="memEndpoint" value="${esc(endpoint || DEFAULT_ENDPOINT)}" placeholder="${DEFAULT_ENDPOINT}">
-      <div class="hint" style="margin-top:3px">一般无须修改：一键安装自动回写；远程模式填外部服务地址</div></div>
+  <div data-mmpanel="base">
+    <div class="row-2col" style="gap:16px;align-items:stretch">
+      ${panel('提炼主模型配置', 'vlm · 会话归档时提炼记忆', `
+        ${fld('服务商预设（填表助手，值可改）', `<select id="memProvider">
+          <option value="">— 选择预设 —</option>
+          ${Object.entries(PRESETS).map(([k, p]) => `<option value="${k}" ${model.provider === k ? 'selected' : ''}>${p.label}</option>`).join('')}
+        </select>`, '选择后只预填空字段，已填值不覆盖（同时预填右侧向量模型名）')}
+        ${fld('API 端点（api_base）', `<input type="text" id="memApiBase" value="${esc(model.apiBase || '')}" placeholder="https://…/v1">`, 'OpenAI 协议端点，与机器人对话用的厂商档案相互独立')}
+        ${fld(`API Key ${secretVal(model.apiKey) ? `<span class="hint">已保存 ${esc(secretVal(model.apiKey))}，留空不修改</span>` : ''}`, `<input type="password" id="memApiKey" value="" placeholder="${esc(PRESETS[model.provider]?.key_hint || 'sk-…（本地端点可留空）')}">`)}
+        ${fld('提炼模型（vlm）', `<input type="text" id="memVlm" value="${esc(model.vlmModel || '')}" placeholder="glm-4.7">`, '归档会话时提炼记忆的对话模型，可选更强档位')}
+      `)}
+      ${panel('向量模型配置', 'embedding · 向量化入库与召回', `
+        ${fld('向量模型（embedding）', `<input type="text" id="memEmb" value="${esc(model.embeddingModel || '')}" placeholder="embedding-3">`, '测试连接会真调一次验证')}
+        ${fld('向量端点（独立）', `<input type="text" id="memEmbBase" value="${esc(model.embeddingApiBase || '')}" placeholder="${esc(embBasePlaceholder)}">`, '跨厂商组合时单独指定（如主模型=glm + 向量=OpenAI 系）；留空沿用主端点')}
+        ${fld('向量 Key（独立）', `<input type="password" id="memEmbKey" value="" placeholder="${esc(embKeyPlaceholder)}">`, '与主 Key 相同时留空即可；两块凭证互不影响（留空 = 不修改）')}
+      `)}
+    </div>
+    <div class="row" style="margin-top:12px;align-items:end">
+      <div style="flex:1;min-width:260px"><label>服务端点（OpenViking server）</label><input type="text" id="memEndpoint" value="${esc(endpoint || DEFAULT_ENDPOINT)}" placeholder="${DEFAULT_ENDPOINT}">
+        <div class="hint" style="margin-top:3px">一般无须修改：一键安装自动回写；远程模式填外部服务地址</div></div>
+    </div>
+  </div>
+  <div data-mmpanel="qp" style="display:none">
+    ${panel('意图模型配置（query_planner）', '检索期意图分析 / 查询规划', `
+      ${fld('意图模型（query_planner）', `<input type="text" id="memQpModel" value="${esc(model.queryPlannerModel || '')}" placeholder="留空 = 不启用（自动沿用提炼模型）">`, '')}
+      ${fld('意图端点（独立）', `<input type="text" id="memQpBase" value="${esc(model.queryPlannerApiBase || '')}" placeholder="${esc(qpBasePlaceholder)}">`, '留空沿用主端点（典型场景 = 同厂商换轻量模型）；跨厂商组合时单独指定')}
+      ${fld('意图 Key（独立）', `<input type="password" id="memQpKey" value="" placeholder="${esc(qpKeyPlaceholder)}">`, '留空沿用主 Key；填写后按块独立（留空 = 不修改）')}
+    `)}
+    <div class="hint" style="margin-top:2px">意图模型属于检索增强可选项：只填模型名即可启用（端点/Key 自动沿用主块）；全部留空 = 关闭该增强，零副作用。</div>
+  </div>
+  <div data-mmpanel="rr" style="display:none">
+    ${panel('Rerank 模型配置（rerank）', '检索结果重排 · 提升召回精度', `
+      ${fld('Rerank 模型（rerank）', `<input type="text" id="memRrModel" value="${esc(model.rerankModel || '')}" placeholder="留空 = 不启用（纯向量召回）">`, '重排模型对召回结果按相关度重排序，显著提升检索精度。OpenAI 兼容协议（如硅基流动 Qwen/Qwen3-Reranker-8B、Jina、DashScope 兼容端点）')}
+      ${fld('Rerank 端点（完整 URL）', `<input type="text" id="memRrBase" value="${esc(model.rerankApiBase || '')}" placeholder="https://api.siliconflow.cn/v1/rerank">`, '注意：是<b>完整请求地址</b>（含 /rerank 路径），与主块「端点基址」语义不同，不做路径拼接')}
+      ${fld('Rerank Key（独立）', `<input type="password" id="memRrKey" value="" placeholder="${esc(rrKeyPlaceholder)}">`, '不沿用主 Key——Rerank 常是另一家厂商（如主块=智谱、Rerank=硅基流动），沿用会埋错凭证')}
+    `)}
+    <div class="hint" style="margin-top:2px">三件（模型 / 完整 URL 端点 / Key）<b>齐全才启用</b>——缺任何一件该段不生效（保持纯向量召回，零风险）；启用后 Rerank 调用失败也只自动回落向量检索，不影响可用性。</div>
   </div>`;
 }
 
 /** 绑定模型表单交互（预设联动 / 测试连接双绿 / 保存 + P1 立即生效）。isWizard 只影响保存后的
  *  提示文案；canApply（已安装视图）= 保存后检测到模型变更时提供「立即生效」 */
 function bindModelForm(isWizard, canApply) {
+  // 模型配置三 Tab 切换（VLM与向量 | 意图模型 | Rerank）：纯前端显隐，跨 Tab 字段保存时统一读取
+  document.querySelectorAll('#memModelTabs [data-mmtab]').forEach((b) => {
+    b.onclick = () => {
+      document.querySelectorAll('#memModelTabs [data-mmtab]').forEach((x) => x.classList.toggle('active', x === b));
+      const t = b.dataset.mmtab;
+      document.querySelectorAll('[data-mmpanel]').forEach((p) => { p.style.display = p.dataset.mmpanel === t ? '' : 'none'; });
+    };
+  });
   // 预设联动：只预填主块空字段（已手填的值不覆盖；向量块留空沿用——跨厂商组合才手填）
   $('#memProvider').onchange = (e) => {
     const p = PRESETS[e.target.value];
@@ -224,11 +270,12 @@ function bindModelForm(isWizard, canApply) {
     if (!$('#memEmb').value.trim()) $('#memEmb').value = p.embedding_model;
     $('#memApiKey').placeholder = p.key_hint || 'sk-…';
   };
-  // 测试连接：表单现值直测（不落盘）——向量块留空回退主块现值，与渲染 ov.conf 同口径
+  // 测试连接：表单现值直测（不落盘）——向量块留空回退主块现值，与渲染 ov.conf 同口径；
+  // 意图/Rerank 为可选报告项（真调一次但不计入双绿门禁：主配置可用性不因可选块失败而受阻）
   $('#memTest').onclick = async () => {
     const btn = $('#memTest');
     btn.disabled = true;
-    $('#memTestResult').textContent = '测试中（真实调用 embedding + 提炼模型各一次）…';
+    $('#memTestResult').textContent = '测试中（真实调用 embedding + 提炼模型各一次，可选块一并探测）…';
     $('#memTestReport').style.display = 'none';
     try {
       const r = await api('POST', '/api/memory/test-connection', {
@@ -238,13 +285,24 @@ function bindModelForm(isWizard, canApply) {
         embedding_model: $('#memEmb').value.trim(),
         embedding_api_base: $('#memEmbBase').value.trim(),
         embedding_api_key: $('#memEmbKey').value.trim(),
+        query_planner_model: $('#memQpModel').value.trim(),
+        query_planner_api_base: $('#memQpBase').value.trim(),
+        query_planner_api_key: $('#memQpKey').value.trim(),
+        rerank_model: $('#memRrModel').value.trim(),
+        rerank_api_base: $('#memRrBase').value.trim(),
+        rerank_api_key: $('#memRrKey').value.trim(),
       });
       const line = (name, c) => `${c.ok ? '✅' : '❌'} ${name}：${c.detail}`;
       $('#memTestResult').innerHTML = r.ok
-        ? '<span class="tag ok">双绿通过</span> 可以保存' + (isWizard ? '并一键安装' : '')
+        ? '<span class="tag ok">双绿通过</span> 可以保存' + (isWizard ? '并一键安装' : '') + '（可选块结果见下）'
         : '<span class="tag err">未通过</span> 请按下方报告修正';
       $('#memTestReport').style.display = '';
-      $('#memTestReport').textContent = `${line('向量模型', r.embedding)}\n${line('提炼模型', r.vlm)}`;
+      $('#memTestReport').textContent = [
+        line('向量模型', r.embedding),
+        line('提炼模型', r.vlm),
+        ...(r.queryPlanner ? [line('意图模型（可选）', r.queryPlanner)] : []),
+        ...(r.rerank ? [line('Rerank（可选）', r.rerank)] : []),
+      ].join('\n');
     } catch (e) {
       $('#memTestResult').innerHTML = `<span class="tag err">请求失败</span> ${esc(e.message)}`;
     }
@@ -264,13 +322,26 @@ function bindModelForm(isWizard, canApply) {
     const newEmbBase = $('#memEmbBase').value.trim();
     const rawKey = $('#memApiKey').value.trim();
     const rawEmbKey = $('#memEmbKey').value.trim();
+    // 意图/Rerank 可选块（模型名留空 = 关闭该增强；端点/Key 留空 = 沿用/保持）
+    const newQpModel = $('#memQpModel').value.trim();
+    const newQpBase = $('#memQpBase').value.trim();
+    const rawQpKey = $('#memQpKey').value.trim();
+    const newRrModel = $('#memRrModel').value.trim();
+    const newRrBase = $('#memRrBase').value.trim();
+    const rawRrKey = $('#memRrKey').value.trim();
     const pv = $('#memProvider').value;
     const modelChanged = newApiBase !== (prev.api_base || '')
       || newVlm !== (prev.vlm_model || '')
       || newEmb !== (prev.embedding_model || '')
       || newEmbBase !== (prev.embedding_api_base || '')
       || (pv || '') !== (prev.provider || '')
-      || !!rawKey || !!rawEmbKey;
+      || !!rawKey || !!rawEmbKey
+      // 可选块变更同样触发「立即生效」检测（否则保存了意图/Rerank 却不会重渲染 ov.conf）
+      || newQpModel !== (prev.query_planner_model || '')
+      || newQpBase !== (prev.query_planner_api_base || '')
+      || newRrModel !== (prev.rerank_model || '')
+      || newRrBase !== (prev.rerank_api_base || '')
+      || !!rawQpKey || !!rawRrKey;
     mem.endpoint = $('#memEndpoint').value.trim() || DEFAULT_ENDPOINT;
     const next = {
       ...prev,
@@ -283,30 +354,50 @@ function bindModelForm(isWizard, canApply) {
     // 向量端点（非凭证）：留空 = 清除 → 沿用主端点（与输入框提示一致）
     if (!newEmbBase) delete next.embedding_api_base;
     else next.embedding_api_base = newEmbBase;
+    // 意图块：模型名留空 = 整块清除（未启用）；端点留空沿用主端点。Key 空值保留脱敏对象回填
+    if (!newQpModel) delete next.query_planner_model;
+    else next.query_planner_model = newQpModel;
+    if (!newQpBase) delete next.query_planner_api_base;
+    else next.query_planner_api_base = newQpBase;
+    // Rerank 块：模型名留空 = 整块清除；端点/Key 渲染层要求三件齐全才渲染
+    if (!newRrModel) delete next.rerank_model;
+    else next.rerank_model = newRrModel;
+    if (!newRrBase) delete next.rerank_api_base;
+    else next.rerank_api_base = newRrBase;
     mem.model = next;
     if (rawKey) mem.model.api_key = rawKey; // Key 空值保留脱敏对象 → applySecrets 回填主 Key（留空=不修改）
     if (rawEmbKey) mem.model.embedding_api_key = rawEmbKey; // 向量 Key 按块独立，同款回填
+    if (rawQpKey) mem.model.query_planner_api_key = rawQpKey; // 意图 Key 按块独立（留空沿用主 Key）
+    if (rawRrKey) mem.model.rerank_api_key = rawRrKey; // Rerank Key 独立（不沿用主块）
+    // Rerank 完整性预检（三件齐全才被 renderOvConf 渲染；Key 视「已保存值」为齐）——
+    // 半填给出提示但不阻塞保存（主配置照常生效，Rerank 段不渲染 = 纯向量召回零风险）
+    const rrComplete = !!(newRrModel && newRrBase && (rawRrKey || (typeof prev.rerank_api_key === 'string' && prev.rerank_api_key)));
+    const rrPartial = !!((newRrModel || newRrBase || rawRrKey) && !rrComplete);
     if (!await saveDoc()) return;
+    // Rerank 半填提示（并入各分支文案——toast 单元素覆盖，分开弹会互吃）
+    const rrWarn = rrPartial ? '⚠ Rerank 三件（模型/完整URL端点/Key）需齐全才启用，当前将不生效。' : '';
     if (isWizard) {
       // 保存即解锁「⚡ 一键安装」：重渲染让 modelSaved 重新计算（不让用户对着灰按钮困惑到刷新）
-      toast('模型配置已保存——「⚡ 一键安装」已解锁');
+      toast(rrWarn + '模型配置已保存——「⚡ 一键安装」已解锁', rrPartial);
       hooks.rerender();
       return;
     }
     if (modelChanged && canApply) {
       const ok = await confirmDialog({
         title: '使新配置立即生效',
-        message: '模型配置已保存。<br><br>记忆服务需<b>重新渲染配置并重启</b>才能应用新模型（运行中的进程不会热加载）。<br>立即生效？',
+        message: '模型配置已保存。<br><br>记忆服务需<b>重新渲染配置并重启</b>才能应用新模型（运行中的进程不会热加载）。'
+          + (rrPartial ? '<br><br>⚠ Rerank 三件（模型/完整URL端点/Key）需齐全才启用，当前将不生效。' : '')
+          + '<br><br>立即生效？',
         confirmText: '立即生效',
       });
       if (ok) {
         await startPipeline('/api/memory/apply', '正在应用新模型配置（重渲染 → 重启服务 → 校验插件），本页实时显示进度')();
         return;
       }
-      toast('已保存。稍后点「检查修复」或再次保存时选择「立即生效」即可应用');
+      toast(rrWarn + '已保存。稍后点「检查修复」或再次保存时选择「立即生效」即可应用', rrPartial);
       return;
     }
-    toast('记忆模型配置已保存（未开启记忆时仅保存，打开开关后生效）');
+    toast(rrWarn + '记忆模型配置已保存（未开启记忆时仅保存，打开开关后生效）', rrPartial);
   };
 }
 
@@ -461,7 +552,7 @@ function renderWizard(el, { m, model, modelSaved }) {
       <button class="btn sm" id="memTest">测试连接</button>
       <button class="btn sm primary" id="memSaveModel">保存配置</button>
     </div>
-    <div class="desc" style="margin-top:6px">记忆的<b>提炼（vlm）与向量化（embedding）</b>走 OpenAI 协议端点，两块可各自独立端点与 Key（跨厂商组合），默认向量块沿用主块。建议先 [测试连接] 双绿，再保存并一键安装。</div>
+    <div class="desc" style="margin-top:6px">记忆的<b>提炼（vlm）与向量化（embedding）</b>走 OpenAI 协议端点；「意图模型 / Rerank 模型」为可选检索增强，不配置不影响使用。</div>
     ${modelFormHtml(model, m.endpoint)}
     <div id="memTestResult" class="hint" style="margin-top:8px"></div>
     <pre class="report" id="memTestReport" style="display:none;margin-top:6px"></pre>
@@ -600,7 +691,7 @@ function renderInstalled(el, { st, m, model, inst, state, meta, remoteConfigured
       <button class="btn sm" id="memTest">测试连接</button>
       <button class="btn sm primary" id="memSaveModel">保存配置</button>
     </div>
-    <div class="desc" style="margin-top:6px">记忆的<b>提炼（vlm）与向量化（embedding）</b>走 OpenAI 协议端点，两块可各自独立端点与 Key（跨厂商组合），默认向量块沿用主块。变更后先 [测试连接] 双绿再保存；保存后可「立即生效」。</div>
+    <div class="desc" style="margin-top:6px">记忆的<b>提炼（vlm）与向量化（embedding）</b>走 OpenAI 协议端点，默认向量块沿用主块；「意图模型 / Rerank 模型」为可选检索增强，不配置不影响使用。</div>
     ${modelFormHtml(model, m.endpoint)}
     <div id="memTestResult" class="hint" style="margin-top:8px"></div>
     <pre class="report" id="memTestReport" style="display:none;margin-top:6px"></pre>

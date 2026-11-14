@@ -420,6 +420,14 @@ export function normalizeMemory(doc: Record<string, unknown>): MemoryConfig | un
       // 双端点拆分（最终方案 §五-P2）：向量块独立端点/Key，缺省沿用主块（渲染 ov.conf 时回退）
       ...(str(mm.embedding_api_base, 'model.embedding_api_base') ? { embeddingApiBase: str(mm.embedding_api_base, 'model.embedding_api_base')! } : {}),
       ...(str(mm.embedding_api_key, 'model.embedding_api_key') ? { embeddingApiKey: str(mm.embedding_api_key, 'model.embedding_api_key')! } : {}),
+      // 意图模型块（query_planner，可选）：模型名 = 触发开关；端点/Key 留空沿用主块
+      ...(str(mm.query_planner_model, 'model.query_planner_model') ? { queryPlannerModel: str(mm.query_planner_model, 'model.query_planner_model')! } : {}),
+      ...(str(mm.query_planner_api_base, 'model.query_planner_api_base') ? { queryPlannerApiBase: str(mm.query_planner_api_base, 'model.query_planner_api_base')! } : {}),
+      ...(str(mm.query_planner_api_key, 'model.query_planner_api_key') ? { queryPlannerApiKey: str(mm.query_planner_api_key, 'model.query_planner_api_key')! } : {}),
+      // Rerank 块（可选）：三件齐全才被 renderOvConf 渲染（此处仅形状透传，渲染层硬门禁）
+      ...(str(mm.rerank_model, 'model.rerank_model') ? { rerankModel: str(mm.rerank_model, 'model.rerank_model')! } : {}),
+      ...(str(mm.rerank_api_base, 'model.rerank_api_base') ? { rerankApiBase: str(mm.rerank_api_base, 'model.rerank_api_base')! } : {}),
+      ...(str(mm.rerank_api_key, 'model.rerank_api_key') ? { rerankApiKey: str(mm.rerank_api_key, 'model.rerank_api_key')! } : {}),
     };
     if (Object.keys(model).length === 0) model = undefined;
   }

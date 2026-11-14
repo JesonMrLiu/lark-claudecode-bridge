@@ -505,11 +505,17 @@ async function handle(
     // 表单现值直测（不落盘）：把 Key/端点/模型名错误挡在开启之前（§6.8 双绿门禁）。
     // P2 双端点拆分：主 Key 与向量 Key 分别回退各自已保存值（表单留空 = 测已保存值）
     const body = await readJsonBody(req);
-    let saved: { apiKey?: string; embeddingApiKey?: string } | undefined;
+    let saved: { apiKey?: string; embeddingApiKey?: string; queryPlannerApiKey?: string; rerankApiKey?: string } | undefined;
     if (!firstRun) {
       try {
         const model = loadConfig(ctx.configPath).memory?.model;
-        saved = { apiKey: model?.apiKey, embeddingApiKey: model?.embeddingApiKey };
+        saved = {
+          apiKey: model?.apiKey,
+          embeddingApiKey: model?.embeddingApiKey,
+          // 意图/Rerank 块 Key 同款回退测试（表单留空 = 测已保存值）
+          queryPlannerApiKey: model?.queryPlannerApiKey,
+          rerankApiKey: model?.rerankApiKey,
+        };
       } catch { /* 按无保存值直测 */ }
     }
     try {

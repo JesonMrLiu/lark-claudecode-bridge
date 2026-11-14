@@ -267,13 +267,21 @@ function vlmProvider(p: MemoryModelConfig['provider']): string {
 /** 渲染 ov.conf（纯函数 exported 便于单测）。rootKey 已有则复用（重装不换 key，否则插件侧缓存/用户侧配置全部失效）。
  *  P2 双端点拆分：embedding.dense 与 vlm 各自独立——向量块显式配置（embeddingApiBase/embeddingApiKey）
  *  优先，未设置回退主块（apiBase/apiKey），既有单份配置零迁移即可用；跨厂商组合（vlm=glm +
- *  embedding=openai 系）填向量块两字段即可。 */
+ *  embedding=openai 系）填向量块两字段即可。
+ *  检索增强双可选段（2026-11-14）：
+ *  - query_planner：模型名是触发开关（填写才渲染），端点/Key 留空在渲染层回退主块——保证段
+ *    一旦出现即凭证完整（上游 get_query_planner() 对空段本就回退 vlm，这里提前在 LCB 侧完成
+ *    同一语义的回退，跨厂商组合也成立）；provider 沿用主块映射（意图模型是轻量对话模型，
+ *    与 vlm 同协议域）。
+ *  - rerank：三件齐全才渲染（上游校验器对 openai provider 强制 api_key + api_base，半填会
+ *    产出非法配置让服务启动崩溃循环——渲染层硬门禁）；api_base 是完整请求 URL（上游直接
+ *    POST 不拼接）；Key 不回退主块（rerank 常是另一家厂商，回退会埋错凭证）。 */
 export function renderOvConf(
   model: MemoryModelConfig,
   opts: { workspaceDir: string; port: number; rootApiKey?: string },
 ): { conf: Record<string, unknown>; rootApiKey: string } {
   const rootApiKey = opts.rootApiKey ?? randomBytes(24).toString('hex');
-  const conf = {
+  const conf: Record<string, unknown> = {
     storage: { workspace: opts.workspaceDir },
     embedding: {
       dense: {
@@ -297,6 +305,31 @@ export function renderOvConf(
       root_api_key: rootApiKey,
     },
   };
+  // 意图模型（可选段）：模型名填写才渲染；端点/Key 渲染层回退主块（段出现即凭证完整）。
+  // provider 映射随端点回退语义：端点沿用主块 → 沿用主块 provider 映射（同厂商换轻量模型的
+  // 典型场景，glm 原生适配器最贴合）；端点显式独立 → 协议域独立，恒走 openai 适配器
+  //（显式指定另一端点即另一协议域——Ollama/硅基流动等；智谱 /api/paas/v4 本就 openai 兼容，
+  // 误配成独立端点也照常工作，不会像沿用 glm 适配器那样打错协议）
+  if (model.queryPlannerModel) {
+    conf.query_planner = {
+      provider: model.queryPlannerApiBase ? 'openai' : vlmProvider(model.provider),
+      model: model.queryPlannerModel,
+      api_base: model.queryPlannerApiBase ?? model.apiBase ?? '',
+      api_key: model.queryPlannerApiKey ?? model.apiKey ?? '',
+      temperature: 0.0,
+      max_retries: 2,
+    };
+  }
+  // Rerank（可选段）：三件齐全才渲染——上游 openai provider 校验 api_key+api_base 必填，
+  // 半填段 = 服务启动崩溃循环；缺段 = is_available()=false 纯向量召回（安全缺省）
+  if (model.rerankModel && model.rerankApiBase && model.rerankApiKey) {
+    conf.rerank = {
+      provider: 'openai',
+      model: model.rerankModel,
+      api_base: model.rerankApiBase,
+      api_key: model.rerankApiKey,
+    };
+  }
   return { conf, rootApiKey };
 }
 

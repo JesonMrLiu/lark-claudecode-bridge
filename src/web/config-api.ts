@@ -80,6 +80,10 @@ export function applySecrets(newDoc: Record<string, unknown>, oldDoc: Record<str
         ...newModel,
         ...(isUnchangedSecret(newModel.api_key) ? { api_key: oldModel.api_key } : {}),
         ...(isUnchangedSecret(newModel.embedding_api_key) ? { embedding_api_key: oldModel.embedding_api_key } : {}),
+        // 意图/Rerank 块 Key 同款按块独立回填（页面「打开直接保存」不丢已配 Key；
+        // rerank Key 不与主块互联回退，三块凭证互不串扰）
+        ...(isUnchangedSecret(newModel.query_planner_api_key) ? { query_planner_api_key: oldModel.query_planner_api_key } : {}),
+        ...(isUnchangedSecret(newModel.rerank_api_key) ? { rerank_api_key: oldModel.rerank_api_key } : {}),
       };
     }
     doc.memory = newMemory;
@@ -121,6 +125,9 @@ export function docForClient(doc: Record<string, unknown>): Record<string, unkno
         ...mm,
         api_key: maskSecret(typeof mm.api_key === 'string' ? mm.api_key : undefined),
         embedding_api_key: maskSecret(typeof mm.embedding_api_key === 'string' ? mm.embedding_api_key : undefined),
+        // 意图/Rerank 块 Key 按块独立脱敏（与主 Key / 向量 Key 同款：只回显尾 4 位提示）
+        query_planner_api_key: maskSecret(typeof mm.query_planner_api_key === 'string' ? mm.query_planner_api_key : undefined),
+        rerank_api_key: maskSecret(typeof mm.rerank_api_key === 'string' ? mm.rerank_api_key : undefined),
       };
     }
     out.memory = m;

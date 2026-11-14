@@ -146,6 +146,33 @@ export interface MemoryModelConfig {
   embeddingApiBase?: string;
   /** embedding 块 Key；缺省沿用 apiKey。配置页输入；GET 脱敏回显，不参与日志 */
   embeddingApiKey?: string;
+  /**
+   * 意图模型（query_planner 块，可选）：检索期意图分析/查询规划用轻量对话模型，独立于归档提炼
+   * 模型可指定更便宜档位（上游 ov.conf 的 query_planner 段与 vlm 段同构 VLMConfig）。三件套
+   * 语义与 embedding 块一致：模型名是触发开关（填写才渲染该段）；端点/Key 留空沿用主块
+   * （典型场景 = 同厂商换轻量模型）。不配置时上游 get_query_planner() 自动回退 vlm 段，
+   * 行为与升级前完全一致。配置页输入；GET 脱敏回显，不参与日志。
+   */
+  queryPlannerModel?: string;
+  /** query_planner 块端点；缺省沿用 apiBase */
+  queryPlannerApiBase?: string;
+  /** query_planner 块 Key；缺省沿用 apiKey */
+  queryPlannerApiKey?: string;
+  /**
+   * Rerank 模型（rerank 块，可选）：检索结果重排提升召回精度（上游 ov.conf 顶层 rerank 段，
+   * LCB 固定走 provider='openai' 的 OpenAI 兼容协议，覆盖硅基流动/Jina/DashScope 兼容端点等
+   * 主流形态；vikingdb ak/sk 与 cohere/jev 专有协议不在表单范围）。**三件齐全才渲染该段**：
+   * 上游校验器对 openai provider 强制 api_key + api_base，半填会渲染出非法配置导致服务启动
+   * 崩溃循环——渲染层硬门禁挡下。端点为完整请求 URL（含 /rerank 路径，上游直接 POST 不做
+   * 拼接）；Key 不沿用主块（rerank 常是另一家厂商，沿用会埋错凭证）。未配置时服务端
+   * RerankConfig.is_available()=false = 纯向量召回，与既有行为一致；rerank 调用失败也只
+   * 回落向量检索，不影响可用性。
+   */
+  rerankModel?: string;
+  /** rerank 端点（完整请求 URL，如 https://api.siliconflow.cn/v1/rerank） */
+  rerankApiBase?: string;
+  /** rerank Key（独立，不沿用主块） */
+  rerankApiKey?: string;
 }
 /** 长期记忆段（整体可选；生命周期方案 §6）：缺省/enabled=false = 零开销——不下发 env、不注入插件、
  *  不产生告警，LCB 行为与无此段完全一致（总验收「可插拔」条款）。热生效：env 下发与插件装配均每任务

@@ -98,6 +98,17 @@ export async function memoryStatus(config: BridgeConfig): Promise<Record<string,
             embeddingApiBaseResolved: memory.model.embeddingApiBase ?? memory.model.apiBase,
             embeddingApiKey: maskSecret(memory.model.embeddingApiKey ?? memory.model.apiKey),
             embeddingKeyOwn: !!memory.model.embeddingApiKey,
+            // 意图模型块（可选）：回退口径与渲染 ov.conf 一致——端点/Key 未配置时 resolved 值 =
+            // 主块现值（页面展示「已沿用主块」，模型名留空 = 未启用，上游自动回退 vlm）
+            ...(memory.model.queryPlannerModel ? { queryPlannerModel: memory.model.queryPlannerModel } : {}),
+            queryPlannerApiBaseResolved: memory.model.queryPlannerApiBase ?? memory.model.apiBase,
+            queryPlannerApiKeyResolved: maskSecret(memory.model.queryPlannerApiKey ?? memory.model.apiKey),
+            queryPlannerKeyOwn: !!memory.model.queryPlannerApiKey,
+            // Rerank 块（可选）：不展示回退值（Key/端点均不回退主块），模型名空 = 未启用（纯向量召回）
+            ...(memory.model.rerankModel ? { rerankModel: memory.model.rerankModel } : {}),
+            ...(memory.model.rerankApiBase ? { rerankApiBase: memory.model.rerankApiBase } : {}),
+            rerankApiKey: maskSecret(memory.model.rerankApiKey),
+            rerankKeyOwn: !!memory.model.rerankApiKey,
           }
           : undefined,
       }
@@ -187,6 +198,33 @@ async function checkVlm(apiBase: string, apiKey: string | undefined, model: stri
   }
 }
 
+/** Rerank 真调一次（最小 query×2 documents；OpenViking 同款请求形状：直接 POST 完整 URL，
+ *  flat body {model, query, documents}）；2xx + results 非空数组才算绿。
+ *  api_base 是完整请求 URL（含 /rerank 路径）——与主块 base URL 语义不同，不在这里补路径 */
+async function checkRerank(apiUrl: string, apiKey: string | undefined, model: string): Promise<ConnCheck> {
+  try {
+    const res = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify({ model, query: '连通性测试', documents: ['文档一：连通性测试文档', '文档二：无关文档'], top_n: 2 }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const body = (await res.json().catch(() => ({}))) as { results?: unknown; error?: { message?: string } };
+    if (!res.ok) {
+      return { ok: false, detail: `HTTP ${res.status}${body.error?.message ? `：${body.error.message}` : ''}` };
+    }
+    if (!Array.isArray(body.results) || body.results.length === 0) {
+      return { ok: false, detail: '响应无 results（端点是否为完整 rerank URL？模型名是否为重排模型？）' };
+    }
+    return { ok: true, detail: `重排已应答（返回 ${body.results.length} 条结果）` };
+  } catch (e) {
+    return { ok: false, detail: e instanceof Error ? (e.name === 'TimeoutError' || e.name === 'AbortError' ? '超时（>20s）' : e.message) : String(e) };
+  }
+}
+
 /**
  * POST /api/memory/test-connection：模型表单 [测试连接] 后端（§6.8 双绿门禁）。
  * body 为表单现值（不落盘）——用户可先测通再保存/开启；双绿 = embedding 与 vlm 各真调一次。
@@ -196,11 +234,22 @@ async function checkVlm(apiBase: string, apiKey: string | undefined, model: stri
  * saved：配置中已保存的 Key——输入框脱敏不回显，表单 Key 留空时回退已保存值测试
  * （否则已配置过的用户点测试必 401）；表单填了新值则测新值（换 Key 前先验证）。
  * 向量块回退链：表单向量 Key → 已保存向量 Key → 表单主 Key → 已保存主 Key。
+ * 可选块（不入门禁，只报告）：意图模型（query_planner，chat/completions 同款检查，端点/Key
+ * 表单留空回退主块已保存值——与渲染 ov.conf 的回退口径一致）；rerank（三件任一填写即测，
+ * 完整 URL 直 POST——留空 = 未配置报「未配置」不算失败）。主配置双绿照旧门禁。
  */
+export interface MemoryConnReport {
+  embedding: ConnCheck; vlm: ConnCheck;
+  queryPlanner?: ConnCheck;
+  rerank?: ConnCheck;
+  ok: boolean;
+}
 export async function testMemoryConnection(body: {
   api_base?: unknown; api_key?: unknown; vlm_model?: unknown; embedding_model?: unknown;
   embedding_api_base?: unknown; embedding_api_key?: unknown;
-}, saved?: { apiKey?: string; embeddingApiKey?: string }): Promise<{ embedding: ConnCheck; vlm: ConnCheck; ok: boolean }> {
+  query_planner_model?: unknown; query_planner_api_base?: unknown; query_planner_api_key?: unknown;
+  rerank_model?: unknown; rerank_api_base?: unknown; rerank_api_key?: unknown;
+}, saved?: { apiKey?: string; embeddingApiKey?: string; queryPlannerApiKey?: string; rerankApiKey?: string }): Promise<MemoryConnReport> {
   const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
   const apiBase = str(body.api_base);
   const apiKey = str(body.api_key) || saved?.apiKey?.trim() || undefined;
@@ -228,5 +277,28 @@ export async function testMemoryConnection(body: {
   const vlm = vlmModel
     ? await checkVlm(apiBase, apiKey, vlmModel)
     : bad('vlm 模型未填写');
-  return { embedding, vlm, ok: embedding.ok && vlm.ok };
+  // ---- 可选块（并行真调，结果只报告不计入门禁）----
+  // 意图模型：表单留空回退主块现值（与 renderOvConf 渲染回退完全一致——测的就是生效值）；
+  // Key 回退链：表单 → 已保存意图 Key → 主 Key（表单 → 已保存主 Key，由 apiKey 变量承接）
+  const qpModel = str(body.query_planner_model);
+  const qpApiBase = str(body.query_planner_api_base) || apiBase;
+  const qpApiKey = str(body.query_planner_api_key) || saved?.queryPlannerApiKey?.trim() || apiKey;
+  const queryPlanner = qpModel
+    ? await checkVlm(qpApiBase, qpApiKey, qpModel)
+    : undefined;
+  // Rerank：模型/端点/Key 任一有值即测（表单留空回退已保存值）；端点必须是完整 URL（含 /rerank）
+  const rrModel = str(body.rerank_model) || '';
+  const rrApiBase = str(body.rerank_api_base);
+  const rrApiKey = str(body.rerank_api_key) || saved?.rerankApiKey?.trim() || undefined;
+  const rerank = (rrModel || rrApiBase || rrApiKey)
+    ? (!rrApiBase || !/^https?:\/\//.test(rrApiBase) || !rrModel || !rrApiKey)
+      ? bad('Rerank 三件（模型 / 完整 URL 端点 / Key）需齐全才可启用——将不渲染该段')
+      : await checkRerank(rrApiBase, rrApiKey, rrModel)
+    : undefined;
+  return {
+    embedding, vlm,
+    ...(queryPlanner ? { queryPlanner } : {}),
+    ...(rerank ? { rerank } : {}),
+    ok: embedding.ok && vlm.ok,
+  };
 }
