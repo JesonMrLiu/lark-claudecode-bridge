@@ -5,6 +5,34 @@
 // 飞书 interactive 卡片 JSON 上限约 30KB，3000 个 CJK 字符 UTF-8 约 9KB，留足卡片包壳余量
 export const CHUNK_MAX_CHARS = 3000;
 
+// 围栏配平：切割只按段落/行/字符，不感知 ``` 代码围栏开合，切点落在代码块内部时
+// 前块以未闭合围栏结尾（渲染器自动补齐、恰好看似正常），后块以裸代码内容开头被当
+// 普通文本、块内孤立的闭合围栏反而打开新代码框——正文串进代码显示。此处跨块跟踪
+// 围栏状态：块首处于代码内补打开围栏（带原语言标记）、块尾未闭合补闭合围栏，保证
+// 每块自身闭合、渲染永不串块。简化约定：仅认行首 ``` 围栏（trimStart 后判定，4+
+// 反引号长围栏同样命中），~~~ 波浪围栏与深度缩进围栏不处理（飞书场景罕见）
+function balanceFences(chunks: string[]): string[] {
+  let inside = false;
+  let lang = '';
+  return chunks.map((chunk) => {
+    const prefix = inside ? `\`\`\`${lang}\n` : '';
+    for (const line of chunk.split('\n')) {
+      const t = line.trimStart();
+      if (!t.startsWith('```')) continue;
+      if (inside) {
+        inside = false;
+        lang = '';
+      } else {
+        inside = true;
+        // 围栏打开行的 info string 取首个词作语言标记（`` ```js `` → js），续块开头复用
+        lang = t.slice(3).trim().split(/\s+/)[0] ?? '';
+      }
+    }
+    const suffix = inside ? '\n```' : '';
+    return `${prefix}${chunk}${suffix}`;
+  });
+}
+
 export function chunkText(text: string, maxChars = CHUNK_MAX_CHARS): string[] {
   const src = text.trim();
   if (!src) return [];
@@ -38,5 +66,5 @@ export function chunkText(text: string, maxChars = CHUNK_MAX_CHARS): string[] {
     }
   }
   flush();
-  return chunks;
+  return balanceFences(chunks);
 }
