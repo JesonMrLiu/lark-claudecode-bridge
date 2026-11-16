@@ -832,6 +832,8 @@ export class FeishuGateway {
 
   /**
    * 上传图片并发送带 caption 的卡片（caption 显示在图片上方，逐张发图带编号说明用）。
+   * 图片卡固定 compact 紧凑宽度 + img custom_width 限宽（2026-11-16 发图优化，不消费
+   * config.card.width——图片卡自适应用途固定紧凑宽，不再撑满窗口）。
    * 卡片形态发送失败时降级为「caption 文本卡 + 纯图片消息」两条，保证图片必达
    * （img 卡片元素对 message 型 image_key 的兼容性异常兜底）。
    */
@@ -842,7 +844,7 @@ export class FeishuGateway {
     const imageKey = up?.image_key;
     if (!imageKey) throw new Error(`上传图片失败: ${JSON.stringify(up)}`);
     try {
-      return await this.sendCard(chatId, buildImageCard(caption, imageKey, this.cardWidth()));
+      return await this.sendCard(chatId, buildImageCard(caption, imageKey));
     } catch (e) {
       this.log.warn('图片卡片发送失败，降级为说明文本 + 图片消息两条：', e);
       if (caption) await this.sendText(chatId, caption).catch(() => {});

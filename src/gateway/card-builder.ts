@@ -180,11 +180,13 @@ const OK_TICK = `<font color='green'>✓</font>`;
 const ERR_TICK = `<font color='red'>✗</font>`;
 const GREY = (s: string): string => `<font color='grey'>${s}</font>`;
 
-function card(elements: unknown[], widthMode: 'default' | 'fill' = 'default'): unknown {
+/** 卡片宽度模式（飞书卡片 JSON 2.0 config.width_mode）：default 不传该字段（PC 端上限
+ *  600px，与旧行为一致）/ fill 撑满聊天窗口 / compact 固定 400px 紧凑宽度 */
+function card(elements: unknown[], widthMode: 'default' | 'fill' | 'compact' = 'default'): unknown {
   // v2.0.1 样式基线：无彩色 header 模板，标题一律为正文首行加粗（2026-10-22 用户要求去掉标题样式颜色）
   return {
     schema: '2.0',
-    config: { update_multi: true, ...(widthMode === 'fill' ? { width_mode: 'fill' } : {}) },
+    config: { update_multi: true, ...(widthMode !== 'default' ? { width_mode: widthMode } : {}) },
     body: { elements },
   };
 }
@@ -200,12 +202,29 @@ export function buildTextCard(markdown: string, widthMode: 'default' | 'fill' = 
 export function buildSinkNoticeCard(title: string, widthMode: 'default' | 'fill' = 'default'): unknown {
   return card([md(`**${title}**\n\n任务仍在正常执行，最新状态请看下方消息。`)], widthMode);
 }
-/** 图片卡片：caption（可选）显示在图片上方——逐张发图时带编号说明用；宽度同 buildTextCard */
-export function buildImageCard(caption: string | undefined, imgKey: string, widthMode: 'default' | 'fill' = 'default'): unknown {
+/** 图片显示宽度(px)（2026-11-16 发图优化）：img 元素 custom_width 硬约束——图片按原始
+ *  宽高比缩到该宽显示，不再被客户端拉伸到卡片满宽（大图看不全的根因）；飞书有效值
+ *  上限 600px，480 留出安全余量，在 compact 卡内容区（~368px）内会自动收边贴合 */
+export const IMAGE_DISPLAY_WIDTH = 480;
+
+/**
+ * 图片卡片（2026-11-16 发图优化）：整卡固定 compact 紧凑宽度（400px，卡片贴合图片、
+ * 不走默认 600px 宽卡留白），img 元素 custom_width 限宽 + fit_horizontal 保比例 +
+ * preview 点击放大看原图。caption（可选）显示在图片上方——逐张发图时带编号说明用。
+ * 不再消费 config.card.width（该配置服务文本/进度卡；图片卡自适应用途固定紧凑宽）。
+ */
+export function buildImageCard(caption: string | undefined, imgKey: string): unknown {
   const elements: unknown[] = [];
   if (caption) elements.push(md(caption));
-  elements.push({ tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: caption ?? '图片' } });
-  return card(elements, widthMode);
+  elements.push({
+    tag: 'img',
+    img_key: imgKey,
+    alt: { tag: 'plain_text', content: caption ?? '图片' },
+    mode: 'fit_horizontal',
+    custom_width: IMAGE_DISPLAY_WIDTH,
+    preview: true,
+  });
+  return card(elements, 'compact');
 }
 
 /** 进度卡可局部更新的组件 ID（cardkit element_id，字母开头/字母数字下划线/≤20 字符）：
