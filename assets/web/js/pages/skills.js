@@ -149,9 +149,9 @@ function browseSkill(s) {
         </nav>
         <div class="dw-pane">
           <div id="sbModes" style="display:none;gap:8px;margin-bottom:8px" class="subtabs">
-            <button data-mode="both" class="active">两者都看</button>
+            <button data-mode="view" class="active">只看视图</button>
             <button data-mode="raw">只看原文</button>
-            <button data-mode="view">只看视图</button>
+            <button data-mode="both">两者都看</button>
           </div>
           <div id="sbFileName" class="mini-note" style="margin-bottom:6px">点击左侧文件查看内容</div>
           <div id="sbView" style="display:none;flex:1;min-height:0;border:1px solid var(--border);border-radius:10px;padding:12px;overflow:auto;font-size:13px;line-height:1.6;background:var(--sunk)"></div>
@@ -167,7 +167,7 @@ function browseSkill(s) {
       const fileName = body.querySelector('#sbFileName');
       const viewPane = body.querySelector('#sbView');
       const rawPane = body.querySelector('#sbRaw');
-      let mode = 'both';
+      let mode = 'view'; // 默认只看视图；同抽屉内连续查看文件时保留用户切换过的模式
       const isMd = (p) => /\.(md|markdown)$/i.test(p);
       const applyMode = () => {
         modes.querySelectorAll('[data-mode]').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
@@ -186,7 +186,7 @@ function browseSkill(s) {
           if (isMd(r.name)) {
             viewPane.innerHTML = renderMarkdown(r.content);
             modes.style.display = 'flex';
-            applyMode(); // md：按当前模式（默认两者都看）
+            applyMode(); // md：按当前模式（默认只看视图）
           } else {
             viewPane.innerHTML = `<pre style="margin:0;white-space:pre-wrap;font-size:12px">${esc(r.content)}</pre>`;
             modes.style.display = 'none';
