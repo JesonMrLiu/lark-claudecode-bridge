@@ -393,7 +393,7 @@ body.drawer-resizing{cursor:ew-resize;user-select:none}
 .drawer-foot .sp{flex:1}
 /* 抽屉内左侧子导航（skill 文件浏览等） */
 .dw-layout{display:flex;gap:20px;align-items:flex-start}
-.dw-nav{width:150px;flex:0 0 auto;position:sticky;top:0;display:flex;flex-direction:column;gap:2px}
+.dw-nav{width:150px;flex:0 0 auto;position:sticky;top:0;display:flex;flex-direction:column;gap:3px}
 .dw-nav button{
   display:flex;align-items:center;gap:8px;width:100%;padding:7px 11px;
   border:0;background:none;border-radius:var(--r-s);cursor:pointer;
@@ -403,7 +403,20 @@ body.drawer-resizing{cursor:ew-resize;user-select:none}
 .dw-nav button.active{background:var(--pri-w);color:var(--pri);font-weight:600}
 .dw-nav button .cnt{margin-left:auto;font-size:11px;color:var(--faint)}
 .dw-pane{flex:1;min-width:0}
-@media (max-width:760px){.dw-layout{flex-direction:column}.dw-nav{flex-direction:row;flex-wrap:wrap;width:100%;position:static}}
+/* 填充模式（skill 文件浏览）：抽屉体变纵向 flex，布局区撑满剩余高度，左右两栏各自内部滚动 */
+.drawer-body.dw-fill{display:flex;flex-direction:column}
+.dw-layout.fill{flex:1;min-height:200px;align-items:stretch}
+.dw-layout.fill .dw-nav{min-height:0}
+.dw-layout.fill .dw-pane{display:flex;flex-direction:column;min-height:0}
+@media (max-width:760px){
+  .dw-layout{flex-direction:column}.dw-nav{flex-direction:row;flex-wrap:wrap;width:100%;position:static}
+  /* 窄屏下两栏上下堆叠，高度撑满无意义 → 回退块布局 + 视口上限 */
+  .drawer-body.dw-fill{display:block}
+  .dw-layout.fill{flex:none;min-height:0}
+  .dw-layout.fill .dw-pane{display:block}
+  .dw-layout.fill .dw-nav,.dw-layout.fill .dw-pane #sbView{max-height:60vh}
+  .dw-layout.fill .dw-pane #sbRaw{flex:none;height:56vh}
+}
 
 /* ═══ Dlg（confirmDialog/promptDialog 自挂载弹窗） ═══ */
 .modal-mask{position:fixed;inset:0;background:rgba(13,17,26,.42);z-index:80;display:flex;align-items:center;justify-content:center;animation:fadein .16s ease}

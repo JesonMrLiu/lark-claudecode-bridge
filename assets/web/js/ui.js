@@ -206,6 +206,7 @@ export function openDrawer({ title, bodyHtml, footHtml, onMount, snap }) {
 export function closeDrawer() {
   if ($('#drawerMask').hidden) return;
   $('#drawerMask').hidden = true;
+  $('#drawerBody').classList.remove('dw-fill'); // skill 浏览的撑满布局是按抽屉叠加的，关抽屉时还原
   drawerOnMount = null;
   drawerSnap = null;
 }

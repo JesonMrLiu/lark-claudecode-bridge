@@ -143,8 +143,8 @@ function browseSkill(s) {
     title: `${s.name} · ${sourceTag(s)}`,
     bodyHtml: `
       <div class="hint" style="margin:0 0 10px"><code>${esc(s.path)}</code></div>
-      <div class="dw-layout">
-        <nav class="dw-nav" id="sbTree" style="width:250px;border:1px solid var(--border);border-radius:10px;padding:8px;max-height:62vh;overflow:auto;font-size:13px">
+      <div class="dw-layout fill">
+        <nav class="dw-nav" id="sbTree" style="width:250px;min-height:0;border:1px solid var(--border);border-radius:10px;padding:8px;overflow:auto;font-size:13px">
           <span class="hint">目录加载中…</span>
         </nav>
         <div class="dw-pane">
@@ -154,13 +154,14 @@ function browseSkill(s) {
             <button data-mode="view">只看视图</button>
           </div>
           <div id="sbFileName" class="mini-note" style="margin-bottom:6px">点击左侧文件查看内容</div>
-          <div id="sbView" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;max-height:56vh;overflow:auto;font-size:13px;line-height:1.6;background:var(--sunk)"></div>
-          <textarea id="sbRaw" readonly style="display:none;width:100%;min-height:56vh;font-family:var(--mono);font-size:12px"></textarea>
+          <div id="sbView" style="display:none;flex:1;min-height:0;border:1px solid var(--border);border-radius:10px;padding:12px;overflow:auto;font-size:13px;line-height:1.6;background:var(--sunk)"></div>
+          <textarea id="sbRaw" readonly style="display:none;width:100%;flex:1;min-height:0;font-family:var(--mono);font-size:12px"></textarea>
         </div>
       </div>`,
     footHtml: `<span class="sp"></span><button class="btn" data-act="close">关闭</button>`,
     onMount({ body, foot }) {
       foot.querySelector('[data-act="close"]').onclick = () => closeDrawer();
+      body.classList.add('dw-fill'); // 抽屉体变纵向 flex：布局区撑满到底（closeDrawer 里清理）
       const tree = body.querySelector('#sbTree');
       const modes = body.querySelector('#sbModes');
       const fileName = body.querySelector('#sbFileName');
@@ -214,7 +215,7 @@ function browseSkill(s) {
         }
         for (const f of files) {
           const row = document.createElement('button');
-          row.style.cssText = 'display:block;width:100%;text-align:left;border:0;background:none;font:inherit;cursor:pointer;padding:4px 8px;border-radius:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+          row.style.cssText = 'display:block;width:100%;text-align:left;border:0;background:none;font:inherit;line-height:1.5;cursor:pointer;padding:5px 9px;border-radius:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
           row.onmouseenter = () => { row.style.background = 'var(--pri-w)'; };
           row.onmouseleave = () => { if (!row.dataset.active) row.style.background = ''; };
           const childPath = `${dir.replace(/[\\/]+$/, '')}/${f.name}`;
